@@ -843,7 +843,165 @@ ROOT -> PROJECT -> USER
 - `install/update/uninstall/enable/disable` 的 `input` / 返回值结构是宿主桥接契约的一部分，运行时只负责分发，不负责替你定义业务字段。
 - 如果 payload 显式试图操作 `ROOT` 层，运行时会直接拒绝调用。
 
-### 5.9 `vulcan.config.*`
+### 5.9 受管 Python 与 Node 子运行时
+
+Lua 仍然是一等调度层。受管 Python 与 Node.js 只是由 Lua 通过 `vulcan.runtime.python.*` 和 `vulcan.runtime.node.*` 调用的子执行面，不替代 skill entry 模型、不替代 Lua VM 池，也不改变宿主 SDK 契约。
+
+正常调用链为：
+
+1. skill 在 `dependencies.yaml` 声明 Python 或 Node.js 需求。
+2. 运行时根目录先通过受管运行时拉取脚本准备好主程序。
+3. Lua 通过 `vulcan.runtime.python.invoke(...)` 或 `vulcan.runtime.node.invoke(...)` 调用 Python / Node.js 文件。
+4. 运行时按需创建带版本的依赖环境，复用常驻 worker，并把结构化结果返回给 Lua。
+
+调用声明了受管子运行时的 skill 前，需要先准备运行时：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deps/fetch_managed_runtimes.ps1 -RuntimeRoot <runtime_root> -Target all
+```
+
+```bash
+RUNTIME_ROOT=<runtime_root> scripts/deps/fetch_managed_runtimes.sh all
+```
+
+拉取脚本会把可携带的运行时放入 `<runtime_root>/dependencies/runtimes/...`。运行时创建的包环境位于 `<runtime_root>/dependencies/envs/...`，并按运行时版本、平台、包管理器版本与 lockfile 内容生成稳定 hash。
+
+最小 `dependencies.yaml`：
+
+```yaml
+python_runtime:
+  version: "3.12.7"
+  package_manager: uv
+  package_manager_version: "0.11.17"
+  lockfile: python/requirements.lock
+node_runtime:
+  version: "22.11.0"
+  package_manager: pnpm
+  package_manager_version: "9.15.0"
+  package_json: node/package.json
+  lockfile: node/pnpm-lock.yaml
+```
+
+Lua 调用示例：
+
+```lua
+local python_result = vulcan.runtime.python.invoke({
+    file = "python/handler.py",
+    handler = "main",
+    timeout_ms = 30000,
+    args = {
+        text = "hello",
+    },
+})
+
+if not python_result.ok then
+    error("python failed: " .. tostring(python_result.error))
+end
+
+local node_result = vulcan.runtime.node.invoke({
+    file = "node/handler.mjs",
+    handler = "main",
+    timeout_ms = 30000,
+    args = python_result.value,
+})
+
+if not node_result.ok then
+    error("node failed: " .. tostring(node_result.error))
+end
+```
+
+Python handler 接收 JSON 兼容参数与上下文：
+
+```python
+def main(args, ctx):
+    return {
+        "text": args.get("text", ""),
+        "ctx_is_dict": isinstance(ctx, dict),
+    }
+```
+
+Node.js handler 使用 ESM 模块。未传 `handler` 时默认查找 `default`，并以 `main` 作为 fallback；显式 `handler = "main"` 会调用命名导出：
+
+```javascript
+export async function main(args, ctx) {
+  return {
+    text: args.text || "",
+    ctxIsObject: ctx && typeof ctx === "object",
+  };
+}
+```
+
+状态 API：
+
+| API | 返回值 | 说明 |
+| --- | --- | --- |
+| `vulcan.runtime.python.status()` | table | 当前 skill 的 `python_runtime` 声明状态 |
+| `vulcan.runtime.node.status()` | table | 当前 skill 的 `node_runtime` 声明状态 |
+
+稳定状态字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `available` | `boolean` | 声明是否能解析到已准备好的运行时 |
+| `configured` | `boolean` | skill 是否在 `dependencies.yaml` 声明了该运行时 |
+| `ready` | `boolean` | 包环境是否已经创建 |
+| `runtime` | `"python" \| "node"` | 子运行时类型 |
+| `runtime_version` | `string?` | 解析成功后的运行时版本 |
+| `runtime_executable` | `string?` | 解析成功后的子运行时可执行文件路径 |
+| `package_manager` | `string?` | `uv` 或 `pnpm` |
+| `package_manager_version` | `string?` | 声明的包管理器版本 |
+| `package_manager_executable` | `string?` | 解析成功后的包管理器可执行文件路径 |
+| `env_hash` | `string?` | 稳定包环境 hash |
+| `env_dir` | `string?` | 解析成功后的包环境目录 |
+| `message` | `string?` | 可读状态说明 |
+| `error` | `string?` | 无法从 available/configured 进入 ready 时的解析错误 |
+
+调用输入：
+
+| 字段 | 类型 | 是否必填 | 说明 |
+| --- | --- | --- | --- |
+| `file` | `string` | 是 | 当前 skill 目录内的安全相对路径 |
+| `handler` | `string` | 否 | Python 默认 `main`；Node 默认 `default`，并 fallback 到 `main` |
+| `args` | JSON 兼容 Lua 值 | 否 | 传给子 handler |
+| `timeout_ms` | 正整数 | 否 | 单次调用超时；超时 worker 会被丢弃 |
+
+调用返回：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `ok` | `boolean` | 子 handler 是否成功完成 |
+| `value` | JSON 兼容值 | handler 返回值；失败时为 `nil` / `null` |
+| `stdout` | `string` | 捕获到的 Python stdout 或 Node `console.log/info` 输出 |
+| `stderr` | `string` | 捕获到的 Python stderr 或 Node `console.warn/error` 输出 |
+| `error` | `string?` | 子运行时错误信息 |
+| `trace` | `string?` | 可用时返回 Python traceback 或 Node stack trace |
+| `status` | `string?` | worker 层失败状态，例如 timeout 或输出损坏 |
+| `timed_out` | `boolean?` | 调用超过 `timeout_ms` 时为 true |
+| `worker_reused` | `boolean` | 本次调用是否复用了已有常驻 worker |
+| `env_hash` | `string` | 本次调用使用的包环境 hash |
+| `env_dir` | `string` | 本次调用使用的包环境目录 |
+
+行为注意事项：
+
+- 新环境 hash 的第一次 invoke 会创建包环境；后续调用复用环境 marker，并通常复用常驻 worker。
+- Python 模块按文件路径加载，并在 Python worker 内缓存。
+- Node.js 模块按原生 Node ESM 行为导入。只要依赖写进 `package.json` 并由 `pnpm-lock.yaml` 锁定，default import、named import、namespace import、relative import、side-effect import 与 dynamic import 都应遵守 Node 原生规则。
+- 对 Node.js，运行时会先把当前 skill 目录复制进受管环境的 import root，再执行导入。这样可以让 bare dependency 解析停留在受管 `node_modules` 内，同时避免 Windows 符号链接权限问题。
+- 子代码应返回 JSON 可序列化值。不可序列化结果会作为结构化子错误返回，而不是让 Lua skill VM 崩溃。
+- `stdout` 与 `stderr` 会进入调用结果，由 Lua 决定是否展示、脱敏或记录。
+- skill 不应依赖系统 Python、系统 Node.js、外部 `node_modules` 或未声明包。
+
+可运行包示例见 [Managed Runtime Example](../../examples/managed_runtime/README.md)。仓库开发阶段可以用布局检查器与隔离冒烟脚本做端到端验证：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/debug-tools/managed_runtime_smoke.ps1
+```
+
+```bash
+bash scripts/debug-tools/managed_runtime_smoke.sh
+```
+
+### 5.10 `vulcan.config.*`
 
 这组能力用于读取和维护**当前 skill 自己的字符串配置**。
 

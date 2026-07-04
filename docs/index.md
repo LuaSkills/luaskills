@@ -84,6 +84,7 @@ Skill development is available in English. The deepest host, FFI, provider, and 
 - [FFI demo runtime](../examples/ffi/demo_runtime/README.md)
 - [Host provider demo](../examples/ffi/host_provider_demo/README.md)
 - [Rust demo](../examples/demo-rust/README.md): direct crate host integration with `call_skill` and `vulcan.host.*`.
+- [Managed Python/Node runtime example](../examples/managed_runtime/README.md): Lua-first skill package that calls managed Python and Node.js child runtimes.
 - `cargo run --bin luaskills-debug -- inspect --runtime-root <dir> --skill-path <dir>`: repository-side single-skill debug bin that syncs one skill into a real `runtime_root` before loading it.
 - New hosts should pass only `runtime_root` for LuaSkills runtime layout. LuaSkills derives `bin`, `libs`, `lua_packages`, `resources`, `skills`, `temp`, `dependencies`, `state`, `databases`, `config`, and `system_lua_lib` from that root.
 - [FFI demo package entry](../examples/demo-ffi/README.md)

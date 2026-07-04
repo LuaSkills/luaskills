@@ -22,6 +22,7 @@ LuaSkills 是 LuaSkills 生态的核心运行时库，适合需要“可安装�
 - 当前请求、skill 目录、资源目录、依赖路径、客户端信息等运行时上下文注入。
 - 通过 `host_result` 提供宿主结构化结果桥接，第一版标准结果种类为 `change_set`。
 - SQLite / LanceDB 可选绑定，支持状态型、记忆型、搜索型 skill。
+- 受管 Python 与 Node.js 子运行时，Lua skill 可通过 `vulcan.runtime.python.*` 与 `vulcan.runtime.node.*` 调用。
 - Rust API、标准 C ABI、公共 `_json` FFI 等多种接入面。
 - TypeScript、Python、Go SDK 生态接入路径。
 
@@ -62,6 +63,7 @@ LuaSkills 不试图接管宿主产品本身。
 | 宿主运行时租约 | 提供公共 `runtime_lease` 与带 authority 的 `system_runtime_lease`，支持持久 Lua VM 状态、宿主路径上下文和 `system_lua_lib` 风格执行面。 |
 | 宿主结构化结果 | 宿主可显式开启 `host_result`，让 skill 在主文本结果之外返回 `change_set` 等第四返回值结构。 |
 | 数据库 Provider | 支持 SQLite / LanceDB 的 `dynamic_library`、`host_callback`、`space_controller` 模式。 |
+| 受管子运行时 | 允许 Lua skill 调用带版本、带 lock 依赖、带常驻 worker 池的 Python 与 Node.js handler，并返回结构化 stdout / stderr / error。 |
 | 多语言接入 | 提供 Rust API、标准 C ABI、公共 `_json` FFI 和 SDK 接入路径。 |
 | Skill Root | 支持 `ROOT`、`PROJECT`、`USER` 等分层 root，并由宿主控制管理权限。 |
 

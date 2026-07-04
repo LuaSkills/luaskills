@@ -23,6 +23,7 @@ It provides:
 - Runtime context injection for current requests, skill directories, resources, dependency roots, and client metadata.
 - Host-owned structured result bridging through `host_result`, including the first canonical `change_set` result kind.
 - Optional SQLite and LanceDB bindings for stateful or memory-oriented skills.
+- Managed Python and Node.js child runtimes that Lua skills can call through `vulcan.runtime.python.*` and `vulcan.runtime.node.*`.
 - Rust API integration for Rust hosts.
 - Standard C ABI and public `_json` FFI for non-Rust hosts.
 - SDK-oriented integration paths for TypeScript, Python, and Go.
@@ -70,6 +71,7 @@ LuaSkills is especially useful when you need a split between runtime truth and h
 | Host runtime leases | Support public `runtime_lease` and authority-bound `system_runtime_lease` calls for persistent Lua VM state, host-owned path contexts, and `system_lua_lib`-style execution. |
 | Structured host results | Let hosts opt into `host_result` so skills can return a fourth structured payload such as `change_set` without replacing the main text result. |
 | Database providers | Support dynamic-library, host-callback, and space-controller modes for SQLite and LanceDB. |
+| Managed child runtimes | Let Lua skills call versioned Python and Node.js handlers with locked dependencies, pooled workers, and structured stdout/stderr/error feedback. |
 | Multi-language integration | Expose Rust APIs, standard C ABI, and public `_json` FFI for SDKs and host bridges. |
 | Skill roots | Support layered roots such as `ROOT`, `PROJECT`, and `USER` with host-controlled management authority. |
 

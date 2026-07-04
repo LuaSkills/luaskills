@@ -77,6 +77,7 @@ Skill 作者最应该记住的边界是：skill 应依赖 `vulcan.context.*` 和
 - [FFI Demo Runtime](../../examples/ffi/demo_runtime/README.md)
 - [Host Callback Demo](../../examples/ffi/host_provider_demo/README.md)
 - [LuaSkills Rust Demo](../../examples/demo-rust/README.md)：Rust crate 直连宿主示例，覆盖 `call_skill` 与 `vulcan.host.*`。
+- [受管 Python/Node 运行时示例](../../examples/managed_runtime/README.md)：Lua 一等调度，调用受管 Python 与 Node.js 子运行时。
 - `cargo run --bin luaskills-debug -- inspect --runtime-root <目录> --skill-path <目录>`：仓库内单 skill 调试 bin，会先把 skill 同步进真实 `runtime_root` 再完成加载。
 - 新宿主集成应只传 `runtime_root` 作为 LuaSkills 运行时布局入口。LuaSkills 会从该根目录推导 `bin`、`libs`、`lua_packages`、`resources`、`skills`、`temp`、`dependencies`、`state`、`databases`、`config` 与 `system_lua_lib`。
 - [LuaSkills FFI Demo](../../examples/demo-ffi/README.md)

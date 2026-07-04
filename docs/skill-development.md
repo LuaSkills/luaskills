@@ -843,7 +843,165 @@ Notes:
 - `install/update/uninstall/enable/disable` request and response payloads are part of the host bridge contract. The runtime dispatches them but does not define your business schema.
 - If one payload explicitly targets the `ROOT` layer, the runtime rejects it before dispatch.
 
-### 5.9 `vulcan.config.*`
+### 5.9 Managed Python And Node Child Runtimes
+
+Lua remains the first-class orchestration layer. Managed Python and Node.js runtimes are child execution surfaces that Lua calls through `vulcan.runtime.python.*` and `vulcan.runtime.node.*`; they do not replace the skill entry model, the Lua VM pool, or the host SDK contract.
+
+The normal flow is:
+
+1. The skill declares Python or Node.js needs in `dependencies.yaml`.
+2. The runtime root is prepared once with the managed runtime fetch script.
+3. Lua calls a Python or Node.js file through `vulcan.runtime.python.invoke(...)` or `vulcan.runtime.node.invoke(...)`.
+4. The runtime lazily creates a versioned environment, keeps a pooled worker alive, and returns a structured result to Lua.
+
+Prepare runtimes before invoking skills that declare managed child runtimes:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deps/fetch_managed_runtimes.ps1 -RuntimeRoot <runtime_root> -Target all
+```
+
+```bash
+RUNTIME_ROOT=<runtime_root> scripts/deps/fetch_managed_runtimes.sh all
+```
+
+The fetch scripts place portable runtimes under `<runtime_root>/dependencies/runtimes/...`. Runtime-created package environments live under `<runtime_root>/dependencies/envs/...` and are keyed by runtime version, platform, package manager version, and lockfile content.
+
+Minimal `dependencies.yaml`:
+
+```yaml
+python_runtime:
+  version: "3.12.7"
+  package_manager: uv
+  package_manager_version: "0.11.17"
+  lockfile: python/requirements.lock
+node_runtime:
+  version: "22.11.0"
+  package_manager: pnpm
+  package_manager_version: "9.15.0"
+  package_json: node/package.json
+  lockfile: node/pnpm-lock.yaml
+```
+
+Lua invocation:
+
+```lua
+local python_result = vulcan.runtime.python.invoke({
+    file = "python/handler.py",
+    handler = "main",
+    timeout_ms = 30000,
+    args = {
+        text = "hello",
+    },
+})
+
+if not python_result.ok then
+    error("python failed: " .. tostring(python_result.error))
+end
+
+local node_result = vulcan.runtime.node.invoke({
+    file = "node/handler.mjs",
+    handler = "main",
+    timeout_ms = 30000,
+    args = python_result.value,
+})
+
+if not node_result.ok then
+    error("node failed: " .. tostring(node_result.error))
+end
+```
+
+Python handlers receive JSON-compatible arguments and context:
+
+```python
+def main(args, ctx):
+    return {
+        "text": args.get("text", ""),
+        "ctx_is_dict": isinstance(ctx, dict),
+    }
+```
+
+Node.js handlers are ESM modules. The default handler is `default`, with `main` as a fallback when `handler` is omitted; explicit `handler = "main"` calls the named export:
+
+```javascript
+export async function main(args, ctx) {
+  return {
+    text: args.text || "",
+    ctxIsObject: ctx && typeof ctx === "object",
+  };
+}
+```
+
+Status APIs:
+
+| API | Return Value | Notes |
+| --- | --- | --- |
+| `vulcan.runtime.python.status()` | table | status for the current skill's `python_runtime` declaration |
+| `vulcan.runtime.node.status()` | table | status for the current skill's `node_runtime` declaration |
+
+Stable status fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `available` | `boolean` | whether the declaration can be resolved to a prepared runtime |
+| `configured` | `boolean` | whether the skill declared the runtime in `dependencies.yaml` |
+| `ready` | `boolean` | whether the package environment has already been created |
+| `runtime` | `"python" \| "node"` | child runtime kind |
+| `runtime_version` | `string?` | declared runtime version when resolved |
+| `runtime_executable` | `string?` | resolved child runtime executable path |
+| `package_manager` | `string?` | `uv` or `pnpm` |
+| `package_manager_version` | `string?` | declared package manager version |
+| `package_manager_executable` | `string?` | resolved package manager executable path |
+| `env_hash` | `string?` | stable package environment hash |
+| `env_dir` | `string?` | resolved package environment directory |
+| `message` | `string?` | human-readable state description |
+| `error` | `string?` | resolution error when available/configured cannot become ready |
+
+Invoke input:
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `file` | `string` | yes | safe relative path inside the current skill directory |
+| `handler` | `string` | no | Python defaults to `main`; Node defaults to `default` with `main` fallback |
+| `args` | JSON-compatible Lua value | no | passed to the child handler |
+| `timeout_ms` | positive integer | no | per-call timeout; timed-out workers are discarded |
+
+Invoke result:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ok` | `boolean` | whether the child handler completed successfully |
+| `value` | JSON-compatible value | handler return value, or `nil`/`null` on failure |
+| `stdout` | `string` | captured Python stdout or Node `console.log/info` output |
+| `stderr` | `string` | captured Python stderr or Node `console.warn/error` output |
+| `error` | `string?` | child error message |
+| `trace` | `string?` | child traceback or stack trace when available |
+| `status` | `string?` | worker-level failure status such as timeout or broken output |
+| `timed_out` | `boolean?` | true when the call exceeded `timeout_ms` |
+| `worker_reused` | `boolean` | whether this call used an existing pooled worker |
+| `env_hash` | `string` | package environment hash used by the call |
+| `env_dir` | `string` | package environment directory used by the call |
+
+Behavior notes:
+
+- The first invoke for a new environment hash creates the package environment. Later calls reuse the environment marker and usually reuse a live worker.
+- Python modules are loaded by file path and cached inside the Python worker.
+- Node.js modules are imported with native Node ESM behavior. Default, named, namespace, relative, side-effect, and dynamic imports should follow Node's normal rules when dependencies are declared in `package.json` and locked by `pnpm-lock.yaml`.
+- For Node.js, the current skill directory is copied into the managed environment import root before invocation. This keeps bare dependency resolution inside the managed `node_modules` directory and avoids Windows symlink privilege requirements.
+- Child code should return JSON-serializable values. Non-serializable results are reported as structured child errors instead of crashing the Lua skill VM.
+- `stdout` and `stderr` are captured into the result so Lua can decide whether to expose, redact, or log them.
+- Skills should not rely on system Python, system Node.js, external `node_modules`, or undeclared packages.
+
+For a working package, see [Managed Runtime Example](../examples/managed_runtime/README.md). During repository development, the layout checker and isolated smoke scripts provide a fast end-to-end verification path:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/debug-tools/managed_runtime_smoke.ps1
+```
+
+```bash
+bash scripts/debug-tools/managed_runtime_smoke.sh
+```
+
+### 5.10 `vulcan.config.*`
 
 These capabilities read and maintain **string config for the current skill itself**.
 
