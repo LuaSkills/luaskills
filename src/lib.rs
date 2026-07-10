@@ -21,12 +21,12 @@ pub use host::callbacks::{
 };
 pub use host::database::{
     LuaRuntimeDatabaseCallbackMode, LuaRuntimeDatabaseProviderMode, RuntimeDatabaseBindingContext,
-    RuntimeDatabaseKind, RuntimeLanceDbProviderAction, RuntimeLanceDbProviderCallback,
-    RuntimeLanceDbProviderJsonCallback, RuntimeLanceDbProviderRequest,
-    RuntimeLanceDbProviderResult, RuntimeSqliteProviderAction, RuntimeSqliteProviderCallback,
-    RuntimeSqliteProviderJsonCallback, RuntimeSqliteProviderRequest, set_lancedb_provider_callback,
-    set_lancedb_provider_json_callback, set_sqlite_provider_callback,
-    set_sqlite_provider_json_callback,
+    RuntimeDatabaseBindingContextSpec, RuntimeDatabaseKind, RuntimeLanceDbProviderAction,
+    RuntimeLanceDbProviderCallback, RuntimeLanceDbProviderJsonCallback,
+    RuntimeLanceDbProviderRequest, RuntimeLanceDbProviderResult, RuntimeSqliteProviderAction,
+    RuntimeSqliteProviderCallback, RuntimeSqliteProviderJsonCallback, RuntimeSqliteProviderRequest,
+    set_lancedb_provider_callback, set_lancedb_provider_json_callback,
+    set_sqlite_provider_callback, set_sqlite_provider_json_callback,
 };
 pub use host::options::{
     LuaInvocationContext, LuaRuntimeCapabilityOptions, LuaRuntimeHostOptions,

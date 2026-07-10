@@ -1,9 +1,9 @@
 use super::{
     EngineHandleJsonResult, EngineIdJsonRequest, EngineNewJsonRequest, FFI_ENGINE_COUNTER,
     FfiEngineSlot, SkillConfigGetJsonRequest, SkillConfigListJsonRequest,
-    SkillConfigSetJsonRequest, ffi_engine_registry, luaskills_ffi_call_skill_json,
-    luaskills_ffi_describe_json, luaskills_ffi_engine_free_json, luaskills_ffi_engine_new_json,
-    luaskills_ffi_is_skill_json, luaskills_ffi_list_entries_json,
+    SkillConfigSetJsonRequest, encode_json_buffer, ffi_engine_registry, lock_ffi_engine_registry,
+    luaskills_ffi_call_skill_json, luaskills_ffi_describe_json, luaskills_ffi_engine_free_json,
+    luaskills_ffi_engine_new_json, luaskills_ffi_is_skill_json, luaskills_ffi_list_entries_json,
     luaskills_ffi_list_skill_help_json, luaskills_ffi_prompt_argument_completions_json,
     luaskills_ffi_render_skill_help_detail_json, luaskills_ffi_run_lua_json,
     luaskills_ffi_runtime_lease_close_json, luaskills_ffi_runtime_lease_create_json,
@@ -14,16 +14,18 @@ use super::{
     luaskills_ffi_system_private_install_skill_from_url_manifest_json,
     luaskills_ffi_system_runtime_lease_close_json, luaskills_ffi_system_runtime_lease_create_json,
     luaskills_ffi_system_runtime_lease_eval_json, luaskills_ffi_system_runtime_lease_list_json,
-    with_engine,
+    with_engine, with_engine_mut,
 };
 use crate::ffi_standard::{FfiBorrowedBuffer, FfiOwnedBuffer, luaskills_ffi_buffer_free};
 use crate::{
     LuaEngine, LuaEngineOptions, LuaVmPoolConfig, RuntimeSkillRoot, SkillManagementAuthority,
 };
+use serde::ser::{Serialize, Serializer};
 use std::ffi::CString;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 
 /// Read one FFI JSON response string back into one serde_json value.
 /// 将单个 FFI JSON 响应字符串回读为一个 serde_json 值。
@@ -60,6 +62,43 @@ fn ffi_test_guard() -> MutexGuard<'static, ()> {
     }
 }
 
+/// One test-only serializer that always fails with quoted diagnostic text.
+/// 一个仅供测试使用、总是返回带引号诊断文本的失败序列化器。
+struct FailingJsonSerialize;
+
+impl Serialize for FailingJsonSerialize {
+    /// Return a controlled serializer failure for fallback JSON envelope tests.
+    /// 为兜底 JSON 包络测试返回受控的序列化失败。
+    ///
+    /// The serializer parameter is the active serde serializer selected by the caller.
+    /// serializer 参数是调用方选择的当前 serde 序列化器。
+    ///
+    /// Return a serializer-specific error containing text that must be JSON-escaped.
+    /// 返回一条包含必须被 JSON 转义文本的序列化器专属错误。
+    fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        Err(serde::ser::Error::custom("quoted \"serializer\" failure"))
+    }
+}
+
+/// Verify response serialization failures are returned as escaped JSON error envelopes.
+/// 验证响应序列化失败会以已转义的 JSON 错误包络返回。
+#[test]
+fn encode_json_buffer_serialization_failure_returns_escaped_error_envelope() {
+    // Decoded fallback response emitted after the original serializer fails.
+    // 原始序列化器失败后产生并解码的兜底响应。
+    let response = unsafe { decode_response_json(encode_json_buffer(&FailingJsonSerialize)) };
+
+    assert_eq!(response["ok"], false);
+    assert_eq!(
+        response["error"],
+        "Failed to serialize FFI response: quoted \"serializer\" failure"
+    );
+    assert!(response.get("result").is_none());
+}
+
 /// One test-only registered engine handle that cleans itself from the global registry on drop.
 /// 一个仅供测试使用的已注册引擎句柄，并在释放时自动从全局注册表清理。
 struct TestFfiEngineHandle {
@@ -68,9 +107,7 @@ struct TestFfiEngineHandle {
 
 impl Drop for TestFfiEngineHandle {
     fn drop(&mut self) {
-        if let Ok(mut registry) = ffi_engine_registry().lock() {
-            registry.remove(&self.engine_id);
-        }
+        lock_ffi_engine_registry().remove(&self.engine_id);
     }
 }
 
@@ -87,10 +124,7 @@ fn register_test_engine() -> TestFfiEngineHandle {
     ))
     .expect("create ffi test engine");
     let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    ffi_engine_registry()
-        .lock()
-        .expect("lock ffi engine registry")
-        .insert(engine_id, FfiEngineSlot::new(engine));
+    lock_ffi_engine_registry().insert(engine_id, FfiEngineSlot::new(engine));
     TestFfiEngineHandle { engine_id }
 }
 
@@ -638,10 +672,7 @@ fn ffi_query_json_filters_root_for_delegated_authority() {
         .load_from_roots(&[root_root, user_root])
         .expect("load query test roots");
     let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    ffi_engine_registry()
-        .lock()
-        .expect("lock ffi engine registry")
-        .insert(engine_id, FfiEngineSlot::new(engine));
+    lock_ffi_engine_registry().insert(engine_id, FfiEngineSlot::new(engine));
     let _handle = TestFfiEngineHandle { engine_id };
 
     let system_entries_request = CString::new(
@@ -687,7 +718,7 @@ fn ffi_query_json_filters_root_for_delegated_authority() {
             .iter()
             .all(|entry| entry["root_name"]
                 .as_str()
-                .map(|root_name| root_name.trim().to_ascii_uppercase() != "ROOT")
+                .map(|root_name| !root_name.trim().eq_ignore_ascii_case("ROOT"))
                 .unwrap_or(false))
     );
 
@@ -704,7 +735,7 @@ fn ffi_query_json_filters_root_for_delegated_authority() {
             .iter()
             .all(|help| help["root_name"]
                 .as_str()
-                .map(|root_name| root_name.trim().to_ascii_uppercase() != "ROOT")
+                .map(|root_name| !root_name.trim().eq_ignore_ascii_case("ROOT"))
                 .unwrap_or(false))
     );
 
@@ -888,10 +919,7 @@ fn ffi_list_entries_json_exposes_resolved_input_schema() {
         .load_from_roots(&[root_root])
         .expect("load FFI query schema root");
     let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    ffi_engine_registry()
-        .lock()
-        .expect("lock ffi engine registry")
-        .insert(engine_id, FfiEngineSlot::new(engine));
+    lock_ffi_engine_registry().insert(engine_id, FfiEngineSlot::new(engine));
 
     let list_request = CString::new(
         serde_json::json!({
@@ -926,11 +954,76 @@ fn ffi_list_entries_json_exposes_resolved_input_schema() {
     assert_eq!(entry["parameters"][0]["name"], "nodes");
     assert_eq!(entry["parameters"][0]["param_type"], "array");
 
-    ffi_engine_registry()
-        .lock()
-        .expect("lock ffi engine registry")
-        .remove(&engine_id);
+    lock_ffi_engine_registry().remove(&engine_id);
     let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+/// Verify JSON FFI engine handles can be created and freed after the global registry lock is poisoned.
+/// 验证全局注册表锁 poison 后仍可通过 JSON FFI 创建并释放引擎句柄。
+#[test]
+fn ffi_engine_registry_recovers_after_poisoned_lock_for_json_handles() {
+    let _guard = ffi_test_guard();
+
+    // Captured panic result from a registry writer that poisons the global FFI engine registry.
+    // 全局 FFI 引擎注册表写入者制造 poison 后被捕获的 panic 结果。
+    let poison_result = panic::catch_unwind(AssertUnwindSafe(|| {
+        // Guard used only to poison the global FFI engine registry for this recovery test.
+        // 仅用于为本恢复测试制造全局 FFI 引擎注册表 poison 的保护对象。
+        let _registry_guard = ffi_engine_registry()
+            .lock()
+            .expect("initial ffi engine registry lock");
+        panic!("poison ffi engine registry for recovery test");
+    }));
+
+    assert!(poison_result.is_err());
+
+    // Engine creation request executed after registry poisoning.
+    // 在注册表 poison 后执行的引擎创建请求。
+    let request = EngineNewJsonRequest {
+        options: LuaEngineOptions::new(
+            LuaVmPoolConfig {
+                min_size: 1,
+                max_size: 1,
+                idle_ttl_secs: 30,
+            },
+            crate::LuaRuntimeHostOptions::default(),
+        ),
+    };
+    // JSON request buffer passed into the JSON FFI engine creation entrypoint.
+    // 传入 JSON FFI 引擎创建入口的 JSON 请求缓冲。
+    let request_json =
+        CString::new(serde_json::to_string(&request).expect("engine new request json"))
+            .expect("engine new request cstring");
+    // Engine creation response proving registry insert recovery.
+    // 用于证明注册表 insert 已恢复的引擎创建响应。
+    let created = unsafe {
+        decode_response_json(luaskills_ffi_engine_new_json(borrowed_json_buffer(
+            &request_json,
+        )))
+    };
+
+    assert_eq!(created["ok"], true);
+
+    // Engine id created through the recovered global registry.
+    // 通过已恢复全局注册表创建得到的引擎标识。
+    let engine_id = created["result"]["engine_id"]
+        .as_u64()
+        .expect("created engine id");
+    // Engine free request used to verify registry remove recovery.
+    // 用于验证注册表 remove 已恢复的引擎释放请求。
+    let free_request = CString::new(
+        serde_json::to_string(&EngineIdJsonRequest { engine_id }).expect("free request json"),
+    )
+    .expect("free request cstring");
+    // Engine free response proving registry removal still succeeds after poisoning.
+    // 用于证明 poison 后注册表删除仍会成功的引擎释放响应。
+    let freed = unsafe {
+        decode_response_json(luaskills_ffi_engine_free_json(borrowed_json_buffer(
+            &free_request,
+        )))
+    };
+
+    assert_eq!(freed["ok"], true);
 }
 
 /// Verify that one engine can be created and freed through the JSON FFI surface.
@@ -1166,14 +1259,58 @@ fn with_engine_releases_registry_lock_before_operation() {
     let _guard = ffi_test_guard();
     let handle = register_test_engine();
     let result = with_engine(handle.engine_id, |_engine| {
-        let registry_lock = ffi_engine_registry().try_lock();
+        // Registry availability after try_lock; Poisoned still proves the mutex was not held.
+        // try_lock 后得到的注册表可用性；Poisoned 仍证明互斥锁未被持有。
+        let registry_available = match ffi_engine_registry().try_lock() {
+            Ok(_guard) => true,
+            Err(TryLockError::Poisoned(_poisoned)) => true,
+            Err(TryLockError::WouldBlock) => false,
+        };
         assert!(
-            registry_lock.is_ok(),
+            registry_available,
             "registry lock should be acquirable while engine operation is running"
         );
         Ok(())
     });
     assert!(result.is_ok());
+}
+
+/// Verify one FFI engine handle remains usable after its own engine lock is poisoned.
+/// 验证单个 FFI 引擎句柄自身的引擎锁 poison 后仍可继续使用。
+#[test]
+fn with_engine_recovers_after_engine_handle_lock_poisoned() {
+    // Test-wide guard that serializes access to the shared FFI engine registry.
+    // 串行化共享 FFI 引擎注册表访问的测试级保护对象。
+    let _guard = ffi_test_guard();
+    // Registered engine used to poison and then exercise the same FFI handle.
+    // 用于制造 poison 并继续访问同一 FFI 句柄的已注册引擎。
+    let handle = register_test_engine();
+    // Shared engine handle cloned from the registry so the poison panic does not hold the registry lock.
+    // 从注册表克隆出的共享引擎句柄，确保制造 poison 的 panic 不持有注册表锁。
+    let engine_handle =
+        super::clone_engine_handle(handle.engine_id).expect("clone ffi engine handle");
+    // Captured panic result from a holder that poisons only this engine handle lock.
+    // 单个引擎句柄锁持有者制造 poison 后被捕获的 panic 结果。
+    let poison_result = panic::catch_unwind(AssertUnwindSafe(|| {
+        // Guard used only to poison the registered engine handle lock.
+        // 仅用于制造已注册引擎句柄锁 poison 的保护对象。
+        let _engine = engine_handle
+            .lock()
+            .expect("initial ffi engine handle lock");
+        panic!("poison ffi engine handle for recovery test");
+    }));
+
+    assert!(poison_result.is_err());
+
+    // Read-only operation result proving shared FFI access recovers the poisoned engine lock.
+    // 只读操作结果，用于证明共享 FFI 访问可恢复已 poison 的引擎锁。
+    let read_result = with_engine(handle.engine_id, |_engine| Ok(()));
+    assert!(read_result.is_ok());
+
+    // Mutable operation result proving mutating FFI access uses the same recovery path.
+    // 可变操作结果，用于证明可变 FFI 访问使用同一条恢复路径。
+    let write_result = with_engine_mut(handle.engine_id, |_engine| Ok(()));
+    assert!(write_result.is_ok());
 }
 
 /// Verify that same-thread reentrant access returns an explicit error instead of deadlocking.

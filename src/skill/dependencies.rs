@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::dependency::types::{DependencyScope, DependencySourceType};
+use crate::runtime::path::render_host_visible_path;
 
 /// Supported archive formats used by LuaSkills dependency packages.
 /// LuaSkills 依赖包支持的归档格式。
@@ -339,10 +340,20 @@ impl SkillDependencyManifest {
     /// Load one dependency manifest from `dependencies.yaml`.
     /// 从 `dependencies.yaml` 加载一份依赖清单。
     pub fn load_from_path(path: &Path) -> Result<Self, String> {
-        let yaml_text = fs::read_to_string(path)
-            .map_err(|error| format!("Failed to read {}: {}", path.display(), error))?;
-        serde_yaml::from_str(&yaml_text)
-            .map_err(|error| format!("Failed to parse {}: {}", path.display(), error))
+        let yaml_text = fs::read_to_string(path).map_err(|error| {
+            format!(
+                "Failed to read {}: {}",
+                render_host_visible_path(path),
+                error
+            )
+        })?;
+        serde_yaml::from_str(&yaml_text).map_err(|error| {
+            format!(
+                "Failed to parse {}: {}",
+                render_host_visible_path(path),
+                error
+            )
+        })
     }
 
     /// Return whether the manifest contains any declared dependency.
@@ -383,6 +394,53 @@ impl FfiDependencySpec {
 #[cfg(test)]
 mod tests {
     use super::SkillDependencyManifest;
+    use crate::runtime::path::render_host_visible_path;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Build one unique temporary dependency-manifest test root.
+    /// 构造一个唯一的依赖清单测试临时根目录。
+    fn make_dependency_manifest_test_dir(label: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("luaskills_dependency_manifest_{label}_{nonce}"))
+    }
+
+    /// Verify dependency-manifest parse errors render paths through the host-visible formatter.
+    /// 验证依赖清单解析错误会通过宿主可见路径渲染器输出路径。
+    #[test]
+    fn dependency_manifest_parse_error_uses_host_visible_path() {
+        // Temporary root that isolates the invalid dependency manifest fixture.
+        // 隔离非法依赖清单夹具的临时根目录。
+        let temp_root = make_dependency_manifest_test_dir("parse_error_path");
+        fs::create_dir_all(&temp_root).expect("temp root should be created");
+        // Dependency manifest path used by the real load_from_path entrypoint.
+        // 真实 load_from_path 入口使用的依赖清单路径。
+        let manifest_path = temp_root.join("dependencies.yaml");
+        fs::write(&manifest_path, "tool_dependencies: [")
+            .expect("invalid dependency manifest should be written");
+        // Error returned by the real dependency manifest loader.
+        // 真实依赖清单加载器返回的错误。
+        let error = SkillDependencyManifest::load_from_path(&manifest_path)
+            .expect_err("invalid dependency manifest should fail");
+        // Expected diagnostic prefix rendered with the shared host-visible path formatter.
+        // 使用共享宿主可见路径渲染器生成的期望诊断前缀。
+        let expected_prefix = format!(
+            "Failed to parse {}:",
+            render_host_visible_path(&manifest_path)
+        );
+
+        assert!(
+            error.starts_with(&expected_prefix),
+            "unexpected error: {}",
+            error
+        );
+        // Cleanup result is intentionally ignored for best-effort temporary test artifacts.
+        // 对临时测试产物的清理结果按最佳努力原则有意忽略。
+        let _ = fs::remove_dir_all(&temp_root);
+    }
 
     /// Verify that the new dependency manifest format parses tool/lua/ffi groups correctly.
     /// 验证新的依赖清单格式能正确解析 tool/lua/ffi 三个分组。

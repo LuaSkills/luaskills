@@ -1,5 +1,7 @@
 use super::*;
 use crate::runtime::encoding::default_runtime_text_encoding;
+use crate::runtime::test_support::process_env_test_guard;
+use std::panic::{self, AssertUnwindSafe};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -146,10 +148,10 @@ fn wait_for_descendant_pid(session: &ManagedProcessSession, timeout: Duration) -
                 .lock()
                 .expect("lock child process for descendant snapshot")
                 .id();
-            if let Ok(descendants) = collect_windows_descendant_processes(root_pid) {
-                if let Some(descendant) = descendants.into_iter().map(|entry| entry.pid).next() {
-                    return descendant;
-                }
+            if let Ok(descendants) = collect_windows_descendant_processes(root_pid)
+                && let Some(descendant) = descendants.into_iter().map(|entry| entry.pid).next()
+            {
+                return descendant;
             }
         }
         let stdout = session
@@ -186,6 +188,9 @@ fn wait_for_descendant_pid(session: &ManagedProcessSession, timeout: Duration) -
 /// 验证释放最后一个会话句柄时会杀掉子进程。
 #[test]
 fn dropping_process_session_kills_child_process() {
+    // Hold the shared PATH guard while the test spawns and probes named executables.
+    // 在测试按名称启动并探测可执行文件期间持有共享 PATH 保护锁。
+    let _env_guard = process_env_test_guard();
     let session = ManagedProcessSession::open(make_drop_cleanup_request())
         .expect("open drop cleanup session");
     let pid = session.state.child.lock().expect("lock child process").id();
@@ -203,6 +208,9 @@ fn dropping_process_session_kills_child_process() {
 /// 验证显式清理会杀掉派生后代，并及时释放 reader 线程。
 #[test]
 fn killing_process_session_terminates_descendants_and_releases_readers() {
+    // Hold the shared PATH guard while the test spawns and probes named executables.
+    // 在测试按名称启动并探测可执行文件期间持有共享 PATH 保护锁。
+    let _env_guard = process_env_test_guard();
     let session = ManagedProcessSession::open(make_descendant_cleanup_request())
         .expect("open descendant cleanup session");
     let descendant_pid = wait_for_descendant_pid(&session, Duration::from_secs(15));
@@ -233,6 +241,9 @@ fn killing_process_session_terminates_descendants_and_releases_readers() {
 /// 验证显式进程树清理在直接子进程完成一次回收后会变成幂等操作。
 #[test]
 fn process_session_tree_teardown_is_idempotent_after_explicit_kill() {
+    // Hold the shared PATH guard while the test spawns a named executable.
+    // 在测试按名称启动可执行文件期间持有共享 PATH 保护锁。
+    let _env_guard = process_env_test_guard();
     let session =
         ManagedProcessSession::open(make_drop_cleanup_request()).expect("open idempotent session");
     session
@@ -294,10 +305,188 @@ fn join_one_reader_timeout_preserves_reader_handle() {
     );
 }
 
+/// Verify output buffer reads recover after the shared buffer lock is poisoned.
+/// 验证共享输出缓冲区锁 poison 后仍可恢复读取。
+#[test]
+fn process_session_output_buffer_recovers_after_poisoned_lock() {
+    // Shared output buffer used to mimic stdout or stderr storage for one session.
+    // 用于模拟单个会话 stdout 或 stderr 存储的共享输出缓冲区。
+    let buffer = Arc::new(Mutex::new(Vec::from(&b"ready"[..])));
+    // Captured panic result from a holder that poisons only the output buffer lock.
+    // 单个输出缓冲区锁持有者制造 poison 后被捕获的 panic 结果。
+    let poison_result = panic::catch_unwind(AssertUnwindSafe(|| {
+        // Guard used only to poison the output buffer lock.
+        // 仅用于制造输出缓冲区锁 poison 的保护对象。
+        let _guard = buffer
+            .lock()
+            .expect("initial process session output buffer lock");
+        panic!("poison process session output buffer for recovery test");
+    }));
+
+    assert!(poison_result.is_err());
+
+    // Bytes drained through the production read helper after poison recovery.
+    // 通过生产读取辅助函数在 poison 恢复后取出的字节。
+    let drained = drain_buffer(&buffer, 3).expect("drain poisoned output buffer");
+    assert_eq!(drained, b"rea");
+}
+
+/// Verify reader slot completion checks recover after the reader slot lock is poisoned.
+/// 验证 reader 槽位锁 poison 后完成状态检查仍可恢复。
+#[test]
+fn process_session_reader_slot_recovers_after_poisoned_lock() {
+    // Empty reader slot used to mimic a session stream without an active reader.
+    // 用于模拟没有活动 reader 的会话流空槽位。
+    let reader_slot: Mutex<Option<SessionPipeReader>> = Mutex::new(None);
+    // Captured panic result from a holder that poisons only the reader slot lock.
+    // 单个 reader 槽位锁持有者制造 poison 后被捕获的 panic 结果。
+    let poison_result = panic::catch_unwind(AssertUnwindSafe(|| {
+        // Guard used only to poison the reader slot lock.
+        // 仅用于制造 reader 槽位锁 poison 的保护对象。
+        let _guard = reader_slot
+            .lock()
+            .expect("initial process session reader slot lock");
+        panic!("poison process session reader slot for recovery test");
+    }));
+
+    assert!(poison_result.is_err());
+    assert!(ManagedProcessSessionState::reader_completed(&reader_slot));
+}
+
+/// Verify lightweight lifecycle locks recover after poisoning during session cleanup.
+/// 验证会话清理期间轻量生命周期锁 poison 后仍可恢复。
+#[test]
+fn process_session_lifecycle_state_locks_recover_after_poisoned_lock() {
+    // Hold the shared PATH guard while the test spawns a named executable.
+    // 在测试按名称启动可执行文件期间持有共享 PATH 保护锁。
+    let _env_guard = process_env_test_guard();
+    // Long-running session whose stdin, closed flag, and final status cache are poisoned and reused.
+    // 会被制造 stdin、关闭标记和最终状态缓存 poison 并继续使用的长时间运行会话。
+    let session = ManagedProcessSession::open(make_drop_cleanup_request())
+        .expect("open lifecycle poison recovery session");
+
+    // Captured panic result from a holder that poisons only the stdin pipe slot.
+    // 单个 stdin 管道槽位锁持有者制造 poison 后被捕获的 panic 结果。
+    let stdin_poison = panic::catch_unwind(AssertUnwindSafe(|| {
+        // Guard used only to poison the stdin pipe slot lock.
+        // 仅用于制造 stdin 管道槽位锁 poison 的保护对象。
+        let _guard = session
+            .state
+            .stdin
+            .lock()
+            .expect("initial process session stdin lock");
+        panic!("poison process session stdin for recovery test");
+    }));
+    assert!(stdin_poison.is_err());
+    assert!(
+        session
+            .write_values(MultiValue::new())
+            .expect("write through poisoned stdin lock")
+    );
+    session
+        .close_stdin("process.session.test")
+        .expect("close poisoned stdin lock");
+
+    // Captured panic result from a holder that poisons only the closed flag.
+    // 单个关闭标记锁持有者制造 poison 后被捕获的 panic 结果。
+    let closed_poison = panic::catch_unwind(AssertUnwindSafe(|| {
+        // Guard used only to poison the closed flag lock.
+        // 仅用于制造关闭标记锁 poison 的保护对象。
+        let _guard = session
+            .state
+            .closed
+            .lock()
+            .expect("initial process session closed lock");
+        panic!("poison process session closed flag for recovery test");
+    }));
+    assert!(closed_poison.is_err());
+    session
+        .mark_closed("process.session.test")
+        .expect("mark closed through poisoned closed flag");
+
+    // Captured panic result from a holder that poisons only the final status cache.
+    // 单个最终状态缓存锁持有者制造 poison 后被捕获的 panic 结果。
+    let final_status_poison = panic::catch_unwind(AssertUnwindSafe(|| {
+        // Guard used only to poison the final status cache lock.
+        // 仅用于制造最终状态缓存锁 poison 的保护对象。
+        let _guard = session
+            .state
+            .final_status
+            .lock()
+            .expect("initial process session final status lock");
+        panic!("poison process session final status for recovery test");
+    }));
+    assert!(final_status_poison.is_err());
+
+    // Final status returned by the normal kill path after final-status lock recovery.
+    // 最终状态锁恢复后通过正常 kill 路径返回的终态状态。
+    let killed_status = session
+        .kill_child()
+        .expect("kill child through poisoned final status cache");
+    // Cached final status read back through the recovered cache lock.
+    // 通过已恢复缓存锁回读到的最终状态。
+    let cached_status = session
+        .state
+        .cached_final_status()
+        .expect("read poisoned final status cache");
+    assert_eq!(cached_status, Some(killed_status));
+    session
+        .join_reader_threads("process.session.test")
+        .expect("join readers after lifecycle poison recovery");
+}
+
+/// Verify child process lifecycle operations recover after the child lock is poisoned.
+/// 验证子进程生命周期操作在 child 锁 poison 后仍可恢复。
+#[test]
+fn process_session_child_lock_recovers_after_poisoned_lock() {
+    // Hold the shared PATH guard while the test spawns a named executable.
+    // 在测试按名称启动可执行文件期间持有共享 PATH 保护锁。
+    let _env_guard = process_env_test_guard();
+    // Long-running session whose child mutex is poisoned before status and kill operations.
+    // 在 status 与 kill 操作前制造 child 互斥锁 poison 的长时间运行会话。
+    let session = ManagedProcessSession::open(make_drop_cleanup_request())
+        .expect("open child poison session");
+
+    // Captured panic result from a holder that poisons only the child process lock.
+    // 单个子进程锁持有者制造 poison 后被捕获的 panic 结果。
+    let child_poison = panic::catch_unwind(AssertUnwindSafe(|| {
+        // Guard used only to poison the child process lock.
+        // 仅用于制造子进程锁 poison 的保护对象。
+        let _guard = session
+            .state
+            .child
+            .lock()
+            .expect("initial process session child lock");
+        panic!("poison process session child for recovery test");
+    }));
+    assert!(child_poison.is_err());
+
+    // Status snapshot read through the recovered child lock before process teardown.
+    // 进程清理前通过已恢复 child 锁读取到的状态快照。
+    let status = session
+        .state
+        .peek_status_snapshot()
+        .expect("peek status through poisoned child lock");
+    assert!(status.running || !status.exited);
+
+    // Final status returned after kill and wait use the recovered child lock.
+    // kill 与 wait 使用已恢复 child 锁后返回的最终状态。
+    let killed_status = session
+        .kill_child()
+        .expect("kill through poisoned child lock");
+    assert!(killed_status.exited);
+    session
+        .join_reader_threads("process.session.test")
+        .expect("join readers after child poison recovery");
+}
+
 /// Verify close() keeps the child unreaped until tree cleanup completes.
 /// 验证 close() 会在进程树清理完成前保持子进程未被提前 reap。
 #[test]
 fn closing_process_session_after_child_exit_still_cleans_descendants() {
+    // Hold the shared PATH guard while the test spawns and probes named executables.
+    // 在测试按名称启动并探测可执行文件期间持有共享 PATH 保护锁。
+    let _env_guard = process_env_test_guard();
     let lua = Lua::new();
     let session = ManagedProcessSession::open(make_descendant_cleanup_request())
         .expect("open close descendant cleanup session");
@@ -324,6 +513,9 @@ fn closing_process_session_after_child_exit_still_cleans_descendants() {
 /// 验证 read() 会在根进程退出后继续等待后代进程输出。
 #[test]
 fn read_waits_for_descendant_output_after_root_exit() {
+    // Hold the shared PATH guard while the test spawns a named executable.
+    // 在测试按名称启动可执行文件期间持有共享 PATH 保护锁。
+    let _env_guard = process_env_test_guard();
     let lua = Lua::new();
     let session = ManagedProcessSession::open(make_immediate_exit_request())
         .expect("open immediate exit session");

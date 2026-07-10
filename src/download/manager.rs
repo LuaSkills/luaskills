@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -10,8 +10,39 @@ use sha2::{Digest, Sha256};
 
 use crate::dependency::types::DependencySourceType;
 use crate::download::github::{GithubReleaseApiResponse, rewrite_github_download_url};
+use crate::runtime::path::render_host_visible_path;
 use crate::runtime_logging::info as log_info;
 use crate::skill::dependencies::GithubReleaseSourceSpec;
+
+/// Render one downloader filesystem path for user-facing error messages.
+/// 为面向用户的下载器错误消息渲染单个文件系统路径。
+fn render_download_path(path: &Path) -> String {
+    render_host_visible_path(path)
+}
+
+/// Inspect whether one cached download target path is a file without hiding filesystem probe errors.
+/// 检查单个下载缓存目标路径是否为文件，同时不隐藏文件系统探测错误。
+///
+/// The target_path parameter is the deterministic cache path derived from one download request.
+/// target_path 参数是从单个下载请求派生出的确定性缓存路径。
+///
+/// Return true for an existing cache file, false for a confirmed missing cache file, or an explicit probe/type error.
+/// 已存在缓存文件返回 true，确认缺失缓存文件返回 false；探测或类型异常时返回显式错误。
+fn cached_download_target_is_file(target_path: &Path) -> Result<bool, String> {
+    match fs::metadata(target_path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(format!(
+            "Cached download target is not a file: {}",
+            render_download_path(target_path)
+        )),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect cached download target {}: {}",
+            render_download_path(target_path),
+            error
+        )),
+    }
+}
 
 /// Callback type used by callers to observe byte-level download progress.
 /// 调用方用于观察字节级下载进度的回调类型。
@@ -125,17 +156,28 @@ impl DownloadManager {
         fs::create_dir_all(&self.config.cache_root).map_err(|error| {
             format!(
                 "Failed to create download cache root {}: {}",
-                self.config.cache_root.display(),
+                render_download_path(&self.config.cache_root),
                 error
             )
         })?;
 
         let target_path = self.cached_path_for_request(request);
-        if target_path.exists() {
+        if cached_download_target_is_file(&target_path)? {
+            let metadata = fs::metadata(&target_path).map_err(|error| {
+                format!(
+                    "Failed to read cached download metadata {}: {}",
+                    render_download_path(&target_path),
+                    error
+                )
+            })?;
+            if !metadata.is_file() {
+                return Err(format!(
+                    "Download cache path {} exists but is not a regular file",
+                    render_download_path(&target_path)
+                ));
+            }
             if let Some(callback) = self.progress_callback.as_ref() {
-                let bytes_done = fs::metadata(&target_path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or_default();
+                let bytes_done = metadata.len();
                 callback(&DownloadProgress {
                     source_locator: request.source_locator.clone(),
                     bytes_done,
@@ -183,8 +225,13 @@ impl DownloadManager {
             }
             Ok(bytes)
         })?;
-        fs::write(&target_path, &bytes)
-            .map_err(|error| format!("Failed to write {}: {}", target_path.display(), error))?;
+        fs::write(&target_path, &bytes).map_err(|error| {
+            format!(
+                "Failed to write {}: {}",
+                render_download_path(&target_path),
+                error
+            )
+        })?;
         Ok(target_path)
     }
 
@@ -197,14 +244,15 @@ impl DownloadManager {
             cache_key: cache_key.to_string(),
         };
         let cached_path = self.cached_path_for_request(&request);
-        if cached_path.exists() {
-            fs::remove_file(&cached_path).map_err(|error| {
-                format!("Failed to remove {}: {}", cached_path.display(), error)
-            })?;
-        }
+        remove_stale_text_cache_before_fresh_download(&cached_path)?;
         let downloaded_path = self.download(&request)?;
-        fs::read_to_string(&downloaded_path)
-            .map_err(|error| format!("Failed to read {}: {}", downloaded_path.display(), error))
+        fs::read_to_string(&downloaded_path).map_err(|error| {
+            format!(
+                "Failed to read {}: {}",
+                render_download_path(&downloaded_path),
+                error
+            )
+        })
     }
 
     /// Download one binary payload and verify one expected SHA-256 checksum.
@@ -216,10 +264,20 @@ impl DownloadManager {
     ) -> Result<PathBuf, String> {
         let target_path = self.download(request)?;
         if let Err(error) = verify_file_sha256(&target_path, expected_sha256) {
-            let _ = fs::remove_file(&target_path);
+            remove_checksum_mismatched_download(&target_path, "before automatic redownload")
+                .map_err(|cleanup_error| format!("{}. {}", error, cleanup_error))?;
             let redownloaded_path = self.download(request)?;
             if let Err(redownload_error) = verify_file_sha256(&redownloaded_path, expected_sha256) {
-                let _ = fs::remove_file(&redownloaded_path);
+                remove_checksum_mismatched_download(
+                    &redownloaded_path,
+                    "after failed automatic redownload",
+                )
+                .map_err(|cleanup_error| {
+                    format!(
+                        "{}. Automatic redownload also failed checksum verification: {}. {}",
+                        error, redownload_error, cleanup_error
+                    )
+                })?;
                 return Err(format!(
                     "{}. Automatic redownload also failed checksum verification: {}",
                     error, redownload_error
@@ -238,8 +296,13 @@ impl DownloadManager {
             source_locator: url.to_string(),
             cache_key: cache_key.to_string(),
         })?;
-        fs::read_to_string(&cached_path)
-            .map_err(|error| format!("Failed to read {}: {}", cached_path.display(), error))
+        fs::read_to_string(&cached_path).map_err(|error| {
+            format!(
+                "Failed to read {}: {}",
+                render_download_path(&cached_path),
+                error
+            )
+        })
     }
 
     /// Resolve one GitHub release asset into an exact browser download URL.
@@ -363,7 +426,7 @@ impl DownloadManager {
             let trimmed_version = expected_version.trim().trim_start_matches('v');
             if !trimmed_version.is_empty() {
                 let candidate_tags = [trimmed_version.to_string(), format!("v{}", trimmed_version)];
-                let mut last_not_found = None;
+                let mut attempted_tag_urls = Vec::new();
                 for candidate_tag in candidate_tags {
                     let api_url = build_github_release_tag_api_url(
                         &self.config,
@@ -372,14 +435,13 @@ impl DownloadManager {
                     );
                     match self.try_fetch_github_release_from_url(&api_url)? {
                         Some(release) => return Ok(release),
-                        None => last_not_found = Some(api_url),
+                        None => attempted_tag_urls.push(api_url),
                     }
                 }
-                return Err(format!(
-                    "Failed to resolve GitHub release for repo '{}' and version '{}'; attempted tag endpoints ending with '{}'",
-                    source.repo,
+                return Err(format_github_release_tag_not_found_error(
+                    source.repo.as_str(),
                     trimmed_version,
-                    last_not_found.unwrap_or_default()
+                    &attempted_tag_urls,
                 ));
             }
         }
@@ -512,6 +574,27 @@ fn build_github_release_tag_api_url(
     )
 }
 
+/// Format a GitHub release lookup failure with every tag endpoint that was actually attempted.
+/// 使用所有真实尝试过的标签端点格式化 GitHub release 查询失败信息。
+fn format_github_release_tag_not_found_error(
+    repo: &str,
+    version: &str,
+    attempted_tag_urls: &[String],
+) -> String {
+    if attempted_tag_urls.is_empty() {
+        return format!(
+            "Failed to resolve GitHub release for repo '{}' and version '{}'; no tag endpoints were attempted",
+            repo, version
+        );
+    }
+    format!(
+        "Failed to resolve GitHub release for repo '{}' and version '{}'; attempted tag endpoints: {}",
+        repo,
+        version,
+        attempted_tag_urls.join(", ")
+    )
+}
+
 /// Normalize the effective release version used for asset name interpolation.
 /// 归一化用于资产名插值的生效 release 版本字符串。
 fn normalize_release_version(expected_version: &str, tag_name: &str) -> String {
@@ -558,18 +641,41 @@ fn infer_download_extension(url: &str) -> &'static str {
 /// Parse one checksum manifest and return the SHA-256 value matching one asset name.
 /// 解析单个校验清单，并返回与某个资产名称匹配的 SHA-256 值。
 fn parse_checksum_manifest_for_asset(content: &str, asset_name: &str) -> Result<String, String> {
-    for line in content.lines() {
+    for (line_index, line) in content.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
+        let line_number = line_index + 1;
         let mut parts = trimmed.split_whitespace();
-        let checksum = parts.next().unwrap_or_default().trim();
+        let checksum = parts.next().ok_or_else(|| {
+            format!(
+                "Checksum manifest line {} must contain one SHA-256 value and one asset file name",
+                line_number
+            )
+        })?;
         let file_name = parts
             .next()
-            .unwrap_or_default()
+            .ok_or_else(|| {
+                format!(
+                    "Checksum manifest line {} must contain one SHA-256 value and one asset file name",
+                    line_number
+                )
+            })?
             .trim_start_matches('*')
             .trim();
+        if parts.next().is_some() {
+            return Err(format!(
+                "Checksum manifest line {} must contain exactly one SHA-256 value and one asset file name",
+                line_number
+            ));
+        }
+        if file_name.is_empty() {
+            return Err(format!(
+                "Checksum manifest line {} asset file name must not be empty",
+                line_number
+            ));
+        }
         if file_name == asset_name {
             if checksum.len() == 64 && checksum.chars().all(|value| value.is_ascii_hexdigit()) {
                 return Ok(checksum.to_ascii_lowercase());
@@ -593,21 +699,50 @@ fn verify_file_sha256(path: &Path, expected_sha256: &str) -> Result<(), String> 
     if expected.len() != 64 || !expected.chars().all(|value| value.is_ascii_hexdigit()) {
         return Err(format!(
             "Expected checksum for {} is not one valid SHA-256 value",
-            path.display()
+            render_download_path(path)
         ));
     }
-    let bytes =
-        fs::read(path).map_err(|error| format!("Failed to read {}: {}", path.display(), error))?;
+    let bytes = fs::read(path)
+        .map_err(|error| format!("Failed to read {}: {}", render_download_path(path), error))?;
     let actual = format!("{:x}", Sha256::digest(&bytes));
     if actual != expected {
         return Err(format!(
             "Checksum mismatch for {}: expected {}, got {}",
-            path.display(),
+            render_download_path(path),
             expected,
             actual
         ));
     }
     Ok(())
+}
+
+/// Remove one checksum-mismatched download before continuing checksum recovery.
+/// 在继续 checksum 恢复流程前移除单个 checksum 不匹配的下载文件。
+fn remove_checksum_mismatched_download(path: &Path, cleanup_context: &str) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Failed to remove checksum-mismatched download {} {}: {}",
+            render_download_path(path),
+            cleanup_context,
+            error
+        )),
+    }
+}
+
+/// Remove one stale text cache entry before forcing a fresh text download.
+/// 强制重新下载文本前移除单个陈旧文本缓存条目。
+fn remove_stale_text_cache_before_fresh_download(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Failed to remove stale text cache {} before fresh download: {}",
+            render_download_path(path),
+            error
+        )),
+    }
 }
 
 /// Sanitize one cache-key fragment so it can safely participate in cache file names.
@@ -624,7 +759,15 @@ fn sanitize_cache_key_fragment(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_checksum_manifest_for_asset, verify_file_sha256};
+    use super::{
+        DownloadManager, DownloadManagerConfig, DownloadRequest, cached_download_target_is_file,
+        format_github_release_tag_not_found_error, parse_checksum_manifest_for_asset,
+        remove_checksum_mismatched_download, remove_stale_text_cache_before_fresh_download,
+        verify_file_sha256,
+    };
+    use crate::dependency::types::DependencySourceType;
+    use crate::runtime::path::render_host_visible_path;
+    use std::path::PathBuf;
 
     /// Verify that the checksum manifest parser resolves one matching SHA-256 entry.
     /// 验证校验清单解析器能够解析出匹配的 SHA-256 条目。
@@ -638,6 +781,208 @@ mod tests {
         let parsed = parse_checksum_manifest_for_asset(&manifest, "demo-v0.1.0-skill.zip")
             .expect("checksum should be parsed");
         assert_eq!(parsed, checksum);
+    }
+
+    /// Verify cached download target probes report invalid path errors.
+    /// 验证下载缓存目标探测会报告非法路径错误。
+    #[test]
+    fn cached_download_target_probe_errors_are_reported() {
+        // Cached download target containing one embedded NUL that metadata cannot inspect.
+        // 包含内嵌 NUL 且元数据无法探测的下载缓存目标。
+        let invalid_target_path = PathBuf::from("invalid\0cache");
+
+        // Error returned before the invalid cache target can behave like a cache miss.
+        // 在非法缓存目标表现得像缓存未命中之前返回的错误。
+        let error = cached_download_target_is_file(&invalid_target_path)
+            .expect_err("invalid cached download target probe should fail");
+
+        assert!(
+            error.contains("Failed to inspect cached download target"),
+            "unexpected error: {}",
+            error
+        );
+        assert!(error.contains("invalid"), "unexpected error: {}", error);
+    }
+
+    /// Verify corrupted cache directories are rejected before callers receive a payload path.
+    /// 验证损坏的缓存目录会在调用方收到载荷路径前被拒绝。
+    #[test]
+    fn download_rejects_cached_directory_instead_of_returning_it() {
+        // Temporary cache root that isolates the corrupted cache fixture.
+        // 隔离损坏缓存夹具的临时缓存根目录。
+        let temp_root = std::env::temp_dir().join(format!(
+            "luaskills_download_cached_directory_test_{}",
+            std::process::id()
+        ));
+        if temp_root.exists() {
+            // Stale fixture cleanup result is intentionally ignored before recreation.
+            // 重建前对陈旧夹具的清理结果有意忽略。
+            let _ = std::fs::remove_dir_all(&temp_root);
+        }
+        std::fs::create_dir_all(&temp_root).expect("temp cache root should be created");
+        // Download manager configured to allow the cache hit path before any network request.
+        // 配置为允许缓存命中路径先于任何网络请求执行的下载管理器。
+        let manager = DownloadManager::new(DownloadManagerConfig {
+            cache_root: temp_root.clone(),
+            allow_network_download: true,
+            github_base_url: None,
+            github_api_base_url: None,
+        });
+        // Download request whose deterministic cache path is occupied by a directory.
+        // 其确定性缓存路径被目录占用的下载请求。
+        let request = DownloadRequest {
+            source_type: DependencySourceType::Url,
+            source_locator: "https://example.invalid/payload.txt".to_string(),
+            cache_key: "cached-directory".to_string(),
+        };
+        // Corrupted cache path that must not be returned as a valid payload file.
+        // 不应作为有效载荷文件返回的损坏缓存路径。
+        let cached_path = manager.cached_path_for_request(&request);
+        std::fs::create_dir_all(&cached_path).expect("cached directory should be created");
+
+        let error = manager
+            .download(&request)
+            .expect_err("cached directory should be rejected");
+
+        assert_eq!(
+            error,
+            format!(
+                "Cached download target is not a file: {}",
+                render_host_visible_path(&cached_path)
+            )
+        );
+        // Cleanup result is intentionally ignored for best-effort temporary test artifacts.
+        // 对临时测试产物的清理结果按最佳努力原则有意忽略。
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    /// Verify fresh text cache cleanup treats an already-missing cache file as clean.
+    /// 验证 fresh 文本缓存清理会把已不存在的缓存文件视为已清理。
+    #[test]
+    fn fresh_text_cache_cleanup_accepts_missing_file() {
+        // Missing cache path used to verify idempotent fresh-download cleanup.
+        // 用于验证 fresh 下载清理幂等性的缺失缓存路径。
+        let missing_path = std::env::temp_dir().join(format!(
+            "luaskills_download_fresh_text_missing_test_{}",
+            std::process::id()
+        ));
+        if missing_path.exists() {
+            // Stale fixture cleanup result is intentionally ignored before the missing-path assertion.
+            // 缺失路径断言前对陈旧夹具的清理结果有意忽略。
+            if missing_path.is_dir() {
+                // Directory cleanup is needed only for stale fixtures from interrupted test runs.
+                // 目录清理仅用于处理中断测试运行留下的陈旧夹具。
+                let _ = std::fs::remove_dir_all(&missing_path);
+            } else {
+                // File cleanup is needed only for stale fixtures from interrupted test runs.
+                // 文件清理仅用于处理中断测试运行留下的陈旧夹具。
+                let _ = std::fs::remove_file(&missing_path);
+            }
+        }
+
+        remove_stale_text_cache_before_fresh_download(&missing_path)
+            .expect("missing fresh text cache file should already be clean");
+    }
+
+    /// Verify fresh text cache cleanup rejects directories before a fresh download starts.
+    /// 验证 fresh 文本缓存清理会在重新下载前拒绝目录路径。
+    #[test]
+    fn fresh_text_cache_cleanup_rejects_directory() {
+        // Temporary root that isolates the fresh text cleanup fixture.
+        // 隔离 fresh 文本清理夹具的临时根目录。
+        let temp_root = std::env::temp_dir().join(format!(
+            "luaskills_download_fresh_text_directory_test_{}",
+            std::process::id()
+        ));
+        if temp_root.exists() {
+            // Stale fixture cleanup result is intentionally ignored before recreation.
+            // 重建前对陈旧夹具的清理结果有意忽略。
+            let _ = std::fs::remove_dir_all(&temp_root);
+        }
+        std::fs::create_dir_all(&temp_root).expect("temp root should be created");
+        // Directory occupying the cache path that fresh text download wants to remove as a file.
+        // 占用 fresh 文本下载期望按文件删除路径的缓存目录。
+        let cache_path = temp_root.join("fresh-text-cache");
+        std::fs::create_dir_all(&cache_path).expect("cache directory should be created");
+
+        // Error returned before any fresh text download can start.
+        // 任何 fresh 文本下载开始前返回的错误。
+        let error = remove_stale_text_cache_before_fresh_download(&cache_path)
+            .expect_err("directory cache cleanup should fail");
+        // Expected diagnostic prefix rendered with the shared host-visible path formatter.
+        // 使用共享宿主可见路径渲染器生成的期望诊断前缀。
+        let expected_prefix = format!(
+            "Failed to remove stale text cache {} before fresh download:",
+            render_host_visible_path(&cache_path)
+        );
+
+        assert!(
+            error.starts_with(&expected_prefix),
+            "unexpected error: {}",
+            error
+        );
+        // Cleanup result is intentionally ignored for best-effort temporary test artifacts.
+        // 对临时测试产物的清理结果按最佳努力原则有意忽略。
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    /// Verify malformed checksum manifest rows fail instead of being reported as a missing asset.
+    /// 验证格式错误的校验清单行会失败，而不是被误报为缺少资产。
+    #[test]
+    fn checksum_manifest_parser_rejects_row_without_asset_name() {
+        // Manifest row with a checksum but no asset file name.
+        // 只有 checksum 而没有资产文件名的清单行。
+        let manifest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
+        // Parser diagnostic that points to the corrupted manifest row.
+        // 指向损坏清单行的解析器诊断。
+        let error = parse_checksum_manifest_for_asset(manifest, "demo-v0.1.0-skill.zip")
+            .expect_err("malformed checksum row should fail");
+
+        assert_eq!(
+            error,
+            "Checksum manifest line 1 must contain one SHA-256 value and one asset file name"
+        );
+    }
+
+    /// Verify checksum manifest rows reject extra fields that cannot belong to generated asset names.
+    /// 验证校验清单行会拒绝无法属于生成资产名的多余字段。
+    #[test]
+    fn checksum_manifest_parser_rejects_row_with_extra_fields() {
+        // Manifest row with the expected two fields plus one unexpected token.
+        // 包含期望两列以及一个额外字段的清单行。
+        let manifest =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef demo.zip extra\n";
+        // Parser diagnostic that prevents ambiguous checksum row interpretation.
+        // 防止歧义解释校验清单行的解析器诊断。
+        let error = parse_checksum_manifest_for_asset(manifest, "demo.zip")
+            .expect_err("checksum row with extra fields should fail");
+
+        assert_eq!(
+            error,
+            "Checksum manifest line 1 must contain exactly one SHA-256 value and one asset file name"
+        );
+    }
+
+    /// Verify GitHub release version failures report every tag endpoint that was attempted.
+    /// 验证 GitHub release 版本解析失败会报告所有已尝试的标签端点。
+    #[test]
+    fn github_release_tag_not_found_error_reports_all_attempted_endpoints() {
+        // Attempted tag endpoints generated by the explicit-version lookup path.
+        // 显式版本查询路径生成的已尝试标签端点。
+        let attempted_urls = vec![
+            "https://api.example.test/repos/acme/tool/releases/tags/1.2.3".to_string(),
+            "https://api.example.test/repos/acme/tool/releases/tags/v1.2.3".to_string(),
+        ];
+
+        // Error text rendered for the not-found release tag lookup.
+        // 未找到 release 标签查询时渲染出的错误文本。
+        let error =
+            format_github_release_tag_not_found_error("acme/tool", "1.2.3", &attempted_urls);
+
+        assert_eq!(
+            error,
+            "Failed to resolve GitHub release for repo 'acme/tool' and version '1.2.3'; attempted tag endpoints: https://api.example.test/repos/acme/tool/releases/tags/1.2.3, https://api.example.test/repos/acme/tool/releases/tags/v1.2.3"
+        );
     }
 
     /// Verify that file SHA-256 verification succeeds for one matching payload.
@@ -657,5 +1002,118 @@ mod tests {
         let checksum = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
         verify_file_sha256(&file_path, checksum).expect("checksum should match");
         let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    /// Verify that checksum mismatch errors render paths through the host-visible formatter.
+    /// 验证校验不匹配错误会通过宿主可见路径渲染器输出路径。
+    #[test]
+    fn file_sha256_verification_mismatch_error_uses_host_visible_path() {
+        // Temporary root that isolates the checksum mismatch fixture.
+        // 隔离校验不匹配夹具的临时根目录。
+        let temp_root = std::env::temp_dir().join(format!(
+            "luaskills_download_checksum_mismatch_test_{}",
+            std::process::id()
+        ));
+        if temp_root.exists() {
+            // Stale fixture cleanup result is intentionally ignored before recreation.
+            // 重建前对陈旧夹具的清理结果有意忽略。
+            let _ = std::fs::remove_dir_all(&temp_root);
+        }
+        std::fs::create_dir_all(&temp_root).expect("temp root should be created");
+        // Payload path used to trigger a real SHA-256 mismatch.
+        // 用于触发真实 SHA-256 不匹配的载荷路径。
+        let file_path = temp_root.join("payload.txt");
+        std::fs::write(&file_path, b"hello world").expect("payload should be written");
+        // Wrong but syntactically valid checksum used to reach the mismatch branch.
+        // 用于进入不匹配分支的语法有效但内容错误的校验值。
+        let expected_checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        // Expected diagnostic text rendered with the shared host-visible path formatter.
+        // 使用共享宿主可见路径渲染器生成的期望诊断文本。
+        let expected_error = format!(
+            "Checksum mismatch for {}: expected {}, got {}",
+            render_host_visible_path(&file_path),
+            expected_checksum,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+
+        assert_eq!(
+            verify_file_sha256(&file_path, expected_checksum)
+                .expect_err("checksum mismatch should be reported"),
+            expected_error
+        );
+        // Cleanup result is intentionally ignored for best-effort temporary test artifacts.
+        // 对临时测试产物的清理结果按最佳努力原则有意忽略。
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    /// Verify checksum recovery cleanup rejects directories before automatic redownload.
+    /// 验证 checksum 恢复清理会在自动重新下载前拒绝目录路径。
+    #[test]
+    fn checksum_mismatch_cleanup_rejects_directory_before_redownload() {
+        // Temporary root that isolates the checksum cleanup fixture.
+        // 隔离 checksum 清理夹具的临时根目录。
+        let temp_root = std::env::temp_dir().join(format!(
+            "luaskills_download_checksum_cleanup_directory_test_{}",
+            std::process::id()
+        ));
+        if temp_root.exists() {
+            // Stale fixture cleanup result is intentionally ignored before recreation.
+            // 重建前对陈旧夹具的清理结果有意忽略。
+            let _ = std::fs::remove_dir_all(&temp_root);
+        }
+        std::fs::create_dir_all(&temp_root).expect("temp root should be created");
+        // Directory occupying the path that checksum recovery wants to remove as a file.
+        // 占用 checksum 恢复期望按文件删除路径的目录。
+        let download_path = temp_root.join("bad-cache.bin");
+        std::fs::create_dir_all(&download_path).expect("download directory should be created");
+
+        // Error returned by checksum cleanup before automatic redownload.
+        // 自动重新下载前 checksum 清理返回的错误。
+        let error =
+            remove_checksum_mismatched_download(&download_path, "before automatic redownload")
+                .expect_err("directory cleanup should fail");
+        // Expected diagnostic prefix rendered with the shared host-visible path formatter.
+        // 使用共享宿主可见路径渲染器生成的期望诊断前缀。
+        let expected_prefix = format!(
+            "Failed to remove checksum-mismatched download {} before automatic redownload:",
+            render_host_visible_path(&download_path)
+        );
+
+        assert!(
+            error.starts_with(&expected_prefix),
+            "unexpected error: {}",
+            error
+        );
+        // Cleanup result is intentionally ignored for best-effort temporary test artifacts.
+        // 对临时测试产物的清理结果按最佳努力原则有意忽略。
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    /// Verify checksum recovery cleanup treats an already-missing file as cleaned.
+    /// 验证 checksum 恢复清理会把已不存在的文件视为已清理。
+    #[test]
+    fn checksum_mismatch_cleanup_accepts_missing_file() {
+        // Missing path used to verify idempotent checksum cleanup.
+        // 用于验证 checksum 清理幂等性的缺失路径。
+        let missing_path = std::env::temp_dir().join(format!(
+            "luaskills_download_checksum_cleanup_missing_test_{}",
+            std::process::id()
+        ));
+        if missing_path.exists() {
+            // Stale fixture cleanup result is intentionally ignored before the missing-path assertion.
+            // 缺失路径断言前对陈旧夹具的清理结果有意忽略。
+            if missing_path.is_dir() {
+                // Directory cleanup is needed only for stale fixtures from interrupted test runs.
+                // 目录清理仅用于处理中断测试运行留下的陈旧夹具。
+                let _ = std::fs::remove_dir_all(&missing_path);
+            } else {
+                // File cleanup is needed only for stale fixtures from interrupted test runs.
+                // 文件清理仅用于处理中断测试运行留下的陈旧夹具。
+                let _ = std::fs::remove_file(&missing_path);
+            }
+        }
+
+        remove_checksum_mismatched_download(&missing_path, "before automatic redownload")
+            .expect("missing checksum cache file should already be clean");
     }
 }

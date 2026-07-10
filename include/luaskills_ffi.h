@@ -345,6 +345,11 @@ typedef struct FfiRuntimeEntryDescriptor {
     FfiOwnedBuffer root_name;
     FfiOwnedBuffer skill_dir;
     FfiOwnedBuffer description;
+    /*
+    JSON schema for this entry's input object.
+    当前入口输入对象的 JSON schema。
+    */
+    FfiOwnedBuffer input_schema_json;
     struct FfiRuntimeEntryParameterDescriptor *parameters;
     size_t parameters_len;
 } FfiRuntimeEntryDescriptor;

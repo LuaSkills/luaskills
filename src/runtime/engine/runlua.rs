@@ -31,6 +31,57 @@ struct RunLuaExecRequest {
     caller_tool_name: Option<String>,
 }
 
+/// Runtime dependency snapshot required by isolated runlua execution.
+/// 隔离 runlua 执行所需的运行时依赖快照。
+#[derive(Clone)]
+pub(super) struct RunLuaRuntimeContext {
+    /// Dedicated Lua VM pool used only by luaexec and nested runlua calls.
+    /// 仅供 luaexec 与嵌套 runlua 调用使用的专用 Lua 虚拟机池。
+    runlua_pool: Arc<LuaVmPool>,
+    /// Loaded skill table visible to the isolated runlua VM.
+    /// 隔离 runlua 虚拟机可见的已加载技能表。
+    skills: Arc<HashMap<String, LoadedSkill>>,
+    /// Entry registry snapshot visible to nested tool calls from runlua.
+    /// runlua 内部嵌套工具调用可见的入口注册表快照。
+    entry_registry: Arc<BTreeMap<String, ResolvedEntryTarget>>,
+    /// Host options shared with the isolated runlua VM.
+    /// 与隔离 runlua 虚拟机共享的宿主选项。
+    host_options: Arc<LuaRuntimeHostOptions>,
+    /// Unified skill configuration store exposed inside the runlua VM.
+    /// 暴露到 runlua 虚拟机内部的统一技能配置存储。
+    skill_config_store: Arc<SkillConfigStore>,
+    /// Runtime skill roots used for dependency and context resolution.
+    /// 用于依赖与上下文解析的运行时技能根列表。
+    runtime_skill_roots: Vec<RuntimeSkillRoot>,
+    /// Optional LanceDB host bridge available to nested runlua calls.
+    /// 嵌套 runlua 调用可用的可选 LanceDB 宿主桥接。
+    lancedb_host: Option<Arc<LanceDbSkillHost>>,
+    /// Optional SQLite host bridge available to nested runlua calls.
+    /// 嵌套 runlua 调用可用的可选 SQLite 宿主桥接。
+    sqlite_host: Option<Arc<SqliteSkillHost>>,
+}
+
+impl RunLuaRuntimeContext {
+    /// Capture one runlua dependency snapshot from the current engine and explicit runtime state.
+    /// 从当前引擎与显式运行时状态中捕获一份 runlua 依赖快照。
+    pub(super) fn from_engine(
+        engine: &LuaEngine,
+        skills: Arc<HashMap<String, LoadedSkill>>,
+        entry_registry: Arc<BTreeMap<String, ResolvedEntryTarget>>,
+    ) -> Self {
+        Self {
+            runlua_pool: engine.runlua_pool.clone(),
+            skills,
+            entry_registry,
+            host_options: engine.host_options.clone(),
+            skill_config_store: engine.skill_config_store.clone(),
+            runtime_skill_roots: engine.runtime_skill_roots.clone(),
+            lancedb_host: engine.lancedb_host.clone(),
+            sqlite_host: engine.sqlite_host.clone(),
+        }
+    }
+}
+
 /// Return the default timeout for runlua execution in milliseconds.
 /// 返回 runlua 执行的默认超时时间（毫秒）。
 pub(super) fn default_runlua_timeout_ms() -> u64 {
@@ -42,6 +93,24 @@ pub(super) fn default_runlua_timeout_ms() -> u64 {
 pub(super) fn runlua_cwd_guard() -> &'static Mutex<()> {
     static RUNLUA_CWD_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
     RUNLUA_CWD_GUARD.get_or_init(|| Mutex::new(()))
+}
+
+/// Acquire the process-wide runlua current-directory guard, recovering after lock poisoning.
+/// 获取进程级 runlua 当前目录保护锁；如果锁已 poison，则恢复继续使用。
+pub(super) fn lock_runlua_cwd_guard() -> std::sync::MutexGuard<'static, ()> {
+    runlua_cwd_guard()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Acquire one runlua print-capture buffer and return its guard, recovering after lock poisoning.
+/// 获取并返回单个 runlua print 捕获缓冲区保护对象；如果锁已 poison，则恢复继续使用。
+pub(super) fn lock_runlua_print_capture(
+    captured_output: &Arc<Mutex<Vec<String>>>,
+) -> std::sync::MutexGuard<'_, Vec<String>> {
+    captured_output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Build the restricted simulated request context used by internal luaexec tool calls.
@@ -359,6 +428,25 @@ pub(super) struct ExecResult {
     /// Byte-preserving stderr payload when available.
     /// 可用时的 stderr 字节保留载荷。
     stderr_base64: Option<String>,
+}
+
+/// Captured bytes and any failure observed while draining one child process pipe.
+/// 子进程单个管道读取过程中捕获的字节以及观察到的失败。
+struct PipeCapture {
+    /// Bytes captured before EOF or the first read failure.
+    /// 在 EOF 或首次读取失败前已经捕获的字节。
+    bytes: Vec<u8>,
+    /// Explicit pipe read or reader-thread failure, if one occurred.
+    /// 发生管道读取或读取线程失败时的显式错误。
+    error: Option<String>,
+}
+
+/// Result emitted by the child process stdin writer thread.
+/// 子进程 stdin 写入线程产出的结果。
+struct StdinWriteResult {
+    /// Explicit write or flush failure, if one occurred.
+    /// 发生写入或 flush 失败时的显式错误。
+    error: Option<String>,
 }
 
 /// Require a scalar text-like value for exec arguments and environment values.
@@ -807,29 +895,81 @@ pub(super) fn parse_exec_request(
     }
 }
 
-/// Spawn a background reader for a child process output pipe as raw bytes.
-/// 为子进程输出管道启动后台读取线程，并以原始字节形式返回。
-fn spawn_pipe_reader<R>(mut reader: R) -> thread::JoinHandle<Vec<u8>>
+/// Spawn a background reader for a named child process output pipe.
+/// 为具名子进程输出管道启动后台读取线程。
+fn spawn_pipe_reader<R>(stream_name: &'static str, mut reader: R) -> thread::JoinHandle<PipeCapture>
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
+        // Buffer keeps partial output so capture failures do not discard already-read bytes.
+        // 缓冲区保留部分输出，确保捕获失败不会丢弃已经读取到的字节。
         let mut buffer = Vec::new();
-        let _ = reader.read_to_end(&mut buffer);
-        buffer
+        // Read error is recorded instead of being converted into an empty output stream.
+        // 读取错误会被记录下来，而不是被转换为空输出流。
+        let read_error = reader
+            .read_to_end(&mut buffer)
+            .err()
+            .map(|error| format!("failed to read process {}: {}", stream_name, error));
+        PipeCapture {
+            bytes: buffer,
+            error: read_error,
+        }
     })
+}
+
+/// Join one optional pipe reader and convert reader panics into explicit capture failures.
+/// 等待一个可选管道读取线程，并将读取线程 panic 转换为显式捕获失败。
+fn join_pipe_reader(
+    handle: Option<thread::JoinHandle<PipeCapture>>,
+    stream_name: &'static str,
+) -> PipeCapture {
+    match handle {
+        Some(handle) => match handle.join() {
+            Ok(capture) => capture,
+            Err(_) => PipeCapture {
+                bytes: Vec::new(),
+                error: Some(format!("process {} reader thread panicked", stream_name)),
+            },
+        },
+        None => PipeCapture {
+            bytes: Vec::new(),
+            error: None,
+        },
+    }
 }
 
 /// Spawn a background writer for a child process stdin pipe.
 /// 为子进程标准输入管道启动后台写入线程。
-fn spawn_stdin_writer<W>(mut writer: W, input: Vec<u8>) -> thread::JoinHandle<()>
+fn spawn_stdin_writer<W>(mut writer: W, input: Vec<u8>) -> thread::JoinHandle<StdinWriteResult>
 where
     W: Write + Send + 'static,
 {
     thread::spawn(move || {
-        let _ = writer.write_all(&input);
-        let _ = writer.flush();
+        if let Err(error) = writer.write_all(&input) {
+            return StdinWriteResult {
+                error: Some(format!("failed to write process stdin: {}", error)),
+            };
+        }
+        if let Err(error) = writer.flush() {
+            return StdinWriteResult {
+                error: Some(format!("failed to flush process stdin: {}", error)),
+            };
+        }
+        StdinWriteResult { error: None }
     })
+}
+
+/// Join one optional stdin writer and convert writer panics into explicit execution failures.
+/// 等待一个可选 stdin 写入线程，并将写入线程 panic 转换为显式执行失败。
+fn join_stdin_writer(handle: Option<thread::JoinHandle<StdinWriteResult>>) -> Option<String> {
+    match handle {
+        Some(handle) => match handle.join() {
+            Ok(result) => result.error,
+            Err(_) => Some("process stdin writer thread panicked".to_string()),
+        },
+        None => None,
+    }
 }
 
 /// Build a structured process error result before stdout/stderr bytes are available.
@@ -905,15 +1045,24 @@ pub(super) fn execute_exec_request(request: ExecRequest) -> ExecResult {
         }
     };
 
-    let stdout_handle = child.stdout.take().map(spawn_pipe_reader);
-    let stderr_handle = child.stderr.take().map(spawn_pipe_reader);
+    let stdout_handle = child
+        .stdout
+        .take()
+        .map(|stdout| spawn_pipe_reader("stdout", stdout));
+    let stderr_handle = child
+        .stderr
+        .take()
+        .map(|stderr| spawn_pipe_reader("stderr", stderr));
     let stdin_handle = match (stdin_bytes, child.stdin.take()) {
         (Some(input), Some(stdin)) => Some(spawn_stdin_writer(stdin, input)),
         _ => None,
     };
 
-    let mut timed_out = false;
-    let timeout = request.timeout_ms.map(Duration::from_millis);
+    // Timeout duration that actually triggered child termination, when a timeout occurs.
+    // 实际触发子进程终止的超时时长；仅在发生超时时存在。
+    let mut timed_out_after_ms = None;
+    // Process start instant used to compare elapsed runtime with the requested timeout.
+    // 用于将已运行时间与请求超时时长比较的进程启动时间点。
     let started_at = Instant::now();
 
     let final_status = loop {
@@ -922,37 +1071,52 @@ pub(super) fn execute_exec_request(request: ExecRequest) -> ExecResult {
                 break Some(status);
             }
             Ok(None) => {
-                if let Some(limit) = timeout {
-                    if started_at.elapsed() >= limit {
-                        timed_out = true;
-                        let _ = child.kill();
-                        break child.wait().ok();
-                    }
+                if let Some(timeout_ms) = request.timeout_ms
+                    && started_at.elapsed() >= Duration::from_millis(timeout_ms)
+                {
+                    timed_out_after_ms = Some(timeout_ms);
+                    let _ = child.kill();
+                    break child.wait().ok();
                 }
                 thread::sleep(Duration::from_millis(10));
             }
             Err(error) => {
                 let error_text = format!("failed to wait for process: {}", error);
-                return exec_error_result(error_text, &request, timed_out);
+                return exec_error_result(error_text, &request, timed_out_after_ms.is_some());
             }
         }
     };
 
-    if let Some(handle) = stdin_handle {
-        let _ = handle.join();
-    }
+    // Stdin write errors are execution-boundary failures when the caller requested stdin input.
+    // 当调用方请求 stdin 输入时，stdin 写入错误属于执行边界失败。
+    let stdin_error = join_stdin_writer(stdin_handle);
 
-    let stdout_bytes = stdout_handle
-        .map(|handle| handle.join().unwrap_or_default())
-        .unwrap_or_default();
-    let stderr_bytes = stderr_handle
-        .map(|handle| handle.join().unwrap_or_default())
-        .unwrap_or_default();
+    // Stdout capture carries both partial bytes and an explicit capture error.
+    // stdout 捕获结果同时携带部分字节与显式捕获错误。
+    let PipeCapture {
+        bytes: stdout_bytes,
+        error: stdout_error,
+    } = join_pipe_reader(stdout_handle, "stdout");
+    // Stderr capture carries both partial bytes and an explicit capture error.
+    // stderr 捕获结果同时携带部分字节与显式捕获错误。
+    let PipeCapture {
+        bytes: stderr_bytes,
+        error: stderr_error,
+    } = join_pipe_reader(stderr_handle, "stderr");
+    // IO boundary errors are kept until bytes have been decoded for the final result envelope.
+    // IO 边界错误会保留到字节解码完成后再写入最终结果包络。
+    let capture_errors = [stdin_error, stdout_error, stderr_error]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     let decoded_stdout = decode_runtime_text(&stdout_bytes, request.stdout_encoding);
     let decoded_stderr = decode_runtime_text(&stderr_bytes, request.stderr_encoding);
     let stdout = decoded_stdout.text;
     let mut stderr = decoded_stderr.text;
 
+    // Whether this execution crossed the explicit timeout boundary.
+    // 本次执行是否越过了显式超时边界。
+    let timed_out = timed_out_after_ms.is_some();
     let status = match final_status {
         Some(status) => status,
         None => {
@@ -976,21 +1140,38 @@ pub(super) fn execute_exec_request(request: ExecRequest) -> ExecResult {
     };
 
     let code = status.code();
-    let success = !timed_out && status.success();
+    // Process success only reflects timeout and exit status, not pipe capture health.
+    // 进程自身成功只反映超时与退出状态，不混入管道捕获健康状态。
+    let process_success = !timed_out && status.success();
+    // Overall success also requires stdin/stdout/stderr IO boundaries to complete without errors.
+    // 整体成功还要求 stdin/stdout/stderr IO 边界没有错误。
+    let success = process_success && capture_errors.is_empty();
     let mut error = None;
 
-    if timed_out {
-        let timeout_value = request.timeout_ms.unwrap_or_default();
+    if let Some(timeout_value) = timed_out_after_ms {
         let timeout_text = format!("process execution timed out after {} ms", timeout_value);
         if !stderr.is_empty() {
             stderr.push('\n');
         }
         stderr.push_str(&timeout_text);
         error = Some(timeout_text);
-    } else if !success {
+    } else if !process_success {
         error = Some(match code {
             Some(exit_code) => format!("process exited with code {}", exit_code),
             None => "process terminated without an exit code".to_string(),
+        });
+    }
+    if !capture_errors.is_empty() {
+        // IO boundary errors are appended to stderr because they explain why the envelope failed.
+        // IO 边界错误会追加到 stderr，因为它们解释了结果包络失败的原因。
+        let capture_error_text = capture_errors.join("; ");
+        if !stderr.is_empty() {
+            stderr.push('\n');
+        }
+        stderr.push_str(&capture_error_text);
+        error = Some(match error {
+            Some(existing_error) => format!("{}; {}", existing_error, capture_error_text),
+            None => capture_error_text,
         });
     }
 
@@ -1048,14 +1229,7 @@ impl LuaEngine {
     /// 为普通 skill 虚拟机注入 `vulcan.runtime.lua.exec` 桥接函数。
     pub(super) fn populate_vulcan_luaexec_bridge(
         lua: &Lua,
-        host_options: Arc<LuaRuntimeHostOptions>,
-        runlua_pool: Arc<LuaVmPool>,
-        skill_config_store: Arc<SkillConfigStore>,
-        skills: Arc<HashMap<String, LoadedSkill>>,
-        entry_registry: Arc<BTreeMap<String, ResolvedEntryTarget>>,
-        runtime_skill_roots: Vec<RuntimeSkillRoot>,
-        lancedb_host: Option<Arc<LanceDbSkillHost>>,
-        sqlite_host: Option<Arc<SqliteSkillHost>>,
+        runtime_context: RunLuaRuntimeContext,
     ) -> Result<(), String> {
         let runtime_lua = get_vulcan_runtime_lua_table(lua)?;
 
@@ -1077,14 +1251,7 @@ impl LuaEngine {
                     .filter(|value| !value.is_empty());
                 let rendered = LuaEngine::execute_runlua_request_inline_with_runtime(
                     &request,
-                    runlua_pool.clone(),
-                    skills.clone(),
-                    entry_registry.clone(),
-                    host_options.clone(),
-                    skill_config_store.clone(),
-                    runtime_skill_roots.clone(),
-                    lancedb_host.clone(),
-                    sqlite_host.clone(),
+                    runtime_context.clone(),
                 )
                 .map_err(mlua::Error::runtime)?;
                 Ok(LuaValue::String(
@@ -1108,16 +1275,18 @@ impl LuaEngine {
         invocation_context: Option<&LuaInvocationContext>,
     ) -> Result<Value, String> {
         let scope_guard = LuaVmRequestScopeGuard::new(lease, self.host_options.as_ref())?;
-        let lua = scope_guard.lua();
-        Self::populate_vulcan_request_context(lua, invocation_context)?;
-        populate_vulcan_internal_execution_context(
+        let lua = scope_guard.lua()?;
+        Self::populate_anonymous_lua_context(
             lua,
-            &VulcanInternalExecutionContext::default(),
+            AnonymousLuaExecutionContext {
+                invocation_context,
+                internal_context: VulcanInternalExecutionContext::default(),
+                entry_file: None,
+                dependency_context: AnonymousLuaDependencyContext::ClearWithHostOptions(
+                    self.host_options.as_ref(),
+                ),
+            },
         )?;
-        populate_vulcan_file_context(lua, None, None)?;
-        populate_vulcan_dependency_context(lua, self.host_options.as_ref(), None, None)?;
-        Self::populate_vulcan_lancedb_context(lua, None, None)?;
-        Self::populate_vulcan_sqlite_context(lua, None, None)?;
 
         // Build a wrapper that passes args as a local variable.
         // 构造包装代码，将 args 作为局部变量传入 Lua 片段。
@@ -1140,16 +1309,7 @@ impl LuaEngine {
 
             lua_value_to_json(&result)
         })();
-        let cleanup_result = scope_guard.finish();
-        match (run_result, cleanup_result) {
-            (Ok(result), Ok(())) => Ok(result),
-            (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
-            (Err(run_error), Ok(())) => Err(run_error),
-            (Err(run_error), Err(cleanup_error)) => Err(format!(
-                "{}; pooled Lua VM cleanup failed: {}",
-                run_error, cleanup_error
-            )),
-        }
+        finish_pooled_vm_request_scope(run_result, scope_guard, "pooled Lua VM cleanup failed")
     }
 
     /// Execute arbitrary Lua code against the current active runtime view and return the result.
@@ -1166,25 +1326,18 @@ impl LuaEngine {
 
     /// Return the effective fixed `system_lua_lib` directory for the current engine.
     /// 返回当前引擎生效的固定 `system_lua_lib` 目录。
-    fn acquire_runlua_vm(
-        runlua_pool: Arc<LuaVmPool>,
-        skills: Arc<HashMap<String, LoadedSkill>>,
-        entry_registry: Arc<BTreeMap<String, ResolvedEntryTarget>>,
-        host_options: Arc<LuaRuntimeHostOptions>,
-        skill_config_store: Arc<SkillConfigStore>,
-        runtime_skill_roots: Vec<RuntimeSkillRoot>,
-        lancedb_host: Option<Arc<LanceDbSkillHost>>,
-        sqlite_host: Option<Arc<SqliteSkillHost>>,
-    ) -> Result<LuaVmLease, String> {
+    fn acquire_runlua_vm(runtime_context: &RunLuaRuntimeContext) -> Result<LuaVmLease, String> {
+        let runlua_pool = runtime_context.runlua_pool.clone();
+        let runtime_context = runtime_context.clone();
         runlua_pool.acquire(move || {
             Self::create_runlua_vm(
-                skills.as_ref(),
-                entry_registry.as_ref(),
-                host_options.clone(),
-                skill_config_store.clone(),
-                runtime_skill_roots.clone(),
-                lancedb_host.clone(),
-                sqlite_host.clone(),
+                runtime_context.skills.as_ref(),
+                runtime_context.entry_registry.as_ref(),
+                runtime_context.host_options.clone(),
+                runtime_context.skill_config_store.clone(),
+                runtime_context.runtime_skill_roots.clone(),
+                runtime_context.lancedb_host.clone(),
+                runtime_context.sqlite_host.clone(),
             )
         })
     }
@@ -1193,58 +1346,46 @@ impl LuaEngine {
     /// 通过独立的池化运行时执行一次隔离 runlua 请求。
     fn execute_runlua_request_inline_with_runtime(
         request: &RunLuaExecRequest,
-        runlua_pool: Arc<LuaVmPool>,
-        skills: Arc<HashMap<String, LoadedSkill>>,
-        entry_registry: Arc<BTreeMap<String, ResolvedEntryTarget>>,
-        host_options: Arc<LuaRuntimeHostOptions>,
-        skill_config_store: Arc<SkillConfigStore>,
-        runtime_skill_roots: Vec<RuntimeSkillRoot>,
-        lancedb_host: Option<Arc<LanceDbSkillHost>>,
-        sqlite_host: Option<Arc<SqliteSkillHost>>,
+        runtime_context: RunLuaRuntimeContext,
     ) -> Result<String, String> {
         if request.timeout_ms == 0 {
             return Err("luaexec timeout_ms must be greater than 0".to_string());
         }
         let (resolved_code, entry_file) = Self::resolve_runlua_source(request)?;
-        let mut lease = Self::acquire_runlua_vm(
-            runlua_pool,
-            skills,
-            entry_registry,
-            host_options.clone(),
-            skill_config_store,
-            runtime_skill_roots,
-            lancedb_host,
-            sqlite_host,
-        )?;
-        let scope_guard = LuaVmRequestScopeGuard::new(&mut lease, host_options.as_ref())?;
-        let lua = scope_guard.lua();
+        let mut lease = Self::acquire_runlua_vm(&runtime_context)?;
+        let scope_guard =
+            LuaVmRequestScopeGuard::new(&mut lease, runtime_context.host_options.as_ref())?;
+        let lua = scope_guard.lua()?;
         let simulated_request_context = build_luaexec_call_request_context();
         let simulated_invocation_context = LuaInvocationContext::new(
             Some(simulated_request_context),
             Value::Object(serde_json::Map::new()),
             Value::Object(serde_json::Map::new()),
         );
-        Self::populate_vulcan_request_context(lua, Some(&simulated_invocation_context))?;
-        populate_vulcan_internal_execution_context(
+        Self::populate_anonymous_lua_context(
             lua,
-            &VulcanInternalExecutionContext {
-                tool_name: None,
-                skill_name: None,
-                entry_name: None,
-                root_name: None,
-                luaexec_active: true,
-                luaexec_caller_tool_name: request.caller_tool_name.clone(),
+            AnonymousLuaExecutionContext {
+                invocation_context: Some(&simulated_invocation_context),
+                internal_context: VulcanInternalExecutionContext {
+                    tool_name: None,
+                    skill_name: None,
+                    entry_name: None,
+                    root_name: None,
+                    luaexec_active: true,
+                    luaexec_caller_tool_name: request.caller_tool_name.clone(),
+                },
+                entry_file: entry_file.as_deref(),
+                // Preserve the cleared dependency context installed by the request scope reset.
+                // 保留请求作用域 reset 已安装的清空依赖上下文。
+                dependency_context: AnonymousLuaDependencyContext::PreserveCurrent,
             },
         )?;
-        populate_vulcan_file_context(lua, None, entry_file.as_deref())?;
-        Self::populate_vulcan_lancedb_context(lua, None, None)?;
-        Self::populate_vulcan_sqlite_context(lua, None, None)?;
 
         let captured_output: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         Self::configure_runlua_execution_environment(
             lua,
             captured_output.clone(),
-            host_options.as_ref(),
+            runtime_context.host_options.as_ref(),
         )?;
 
         let args_table = json_to_lua_table(lua, &request.args)?;
@@ -1261,10 +1402,7 @@ impl LuaEngine {
             .map_err(|error| error.to_string())?;
         let execution_result = Self::execute_runlua_wrapper(lua, &wrapper, entry_file.as_deref());
         Self::remove_runlua_timeout_guard(lua);
-        let printed_output = captured_output
-            .lock()
-            .map_err(|_| "Failed to lock runlua output capture".to_string())?
-            .clone();
+        let printed_output = lock_runlua_print_capture(&captured_output).clone();
 
         let render_result = match execution_result {
             Ok(returned_values) => {
@@ -1281,32 +1419,22 @@ impl LuaEngine {
                 error.to_string().as_str(),
             )),
         };
-        let cleanup_result = scope_guard.finish();
-        match (render_result, cleanup_result) {
-            (Ok(rendered), Ok(())) => Ok(rendered),
-            (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
-            (Err(render_error), Ok(())) => Err(render_error),
-            (Err(render_error), Err(cleanup_error)) => Err(format!(
-                "{}; pooled runlua VM cleanup failed: {}",
-                render_error, cleanup_error
-            )),
-        }
+        finish_pooled_vm_request_scope(
+            render_result,
+            scope_guard,
+            "pooled runlua VM cleanup failed",
+        )
     }
 
     /// Execute one isolated runlua request using the current engine snapshots.
     /// 使用当前引擎快照执行一次隔离 runlua 请求。
     fn execute_runlua_request_inline(&self, request: &RunLuaExecRequest) -> Result<String, String> {
-        Self::execute_runlua_request_inline_with_runtime(
-            request,
-            self.runlua_pool.clone(),
+        let runtime_context = RunLuaRuntimeContext::from_engine(
+            self,
             Arc::new(self.skills.clone()),
             Arc::new(self.entry_registry.clone()),
-            self.host_options.clone(),
-            self.skill_config_store.clone(),
-            self.runtime_skill_roots.clone(),
-            self.lancedb_host.clone(),
-            self.sqlite_host.clone(),
-        )
+        );
+        Self::execute_runlua_request_inline_with_runtime(request, runtime_context)
     }
 
     /// Resolve one runlua request into concrete source text and optional entry file context.
@@ -1348,9 +1476,8 @@ impl LuaEngine {
                 };
                 let source = std::fs::read_to_string(&file_path).map_err(|error| {
                     format!(
-                        "Failed to read luaexec file {}: {}: {}",
-                        file_path.display(),
-                        error,
+                        "Failed to read luaexec file {}: {}",
+                        render_log_friendly_path(&file_path),
                         error
                     )
                 })?;
@@ -1376,9 +1503,7 @@ impl LuaEngine {
     ) -> Result<Table, mlua::Error> {
         match entry_file.and_then(Path::parent) {
             Some(entry_dir) => {
-                let _cwd_guard = runlua_cwd_guard()
-                    .lock()
-                    .map_err(|_| mlua::Error::runtime("luaexec cwd guard lock poisoned"))?;
+                let _cwd_guard = lock_runlua_cwd_guard();
                 let original_dir = std::env::current_dir()
                     .map_err(|error| mlua::Error::runtime(format!("luaexec cwd: {}", error)))?;
                 std::env::set_current_dir(entry_dir)
@@ -1421,9 +1546,7 @@ impl LuaEngine {
                 for value in args.into_iter() {
                     parts.push(LuaEngine::render_lua_value_inline(&value));
                 }
-                let mut guard = print_capture
-                    .lock()
-                    .map_err(|_| mlua::Error::runtime("runlua print capture lock poisoned"))?;
+                let mut guard = lock_runlua_print_capture(&print_capture);
                 guard.push(parts.join("\t"));
                 Ok(())
             })
@@ -1533,10 +1656,7 @@ end
         match value {
             LuaValue::String(text) => RunLuaRenderedValue {
                 format: "text",
-                content: text
-                    .to_str()
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
+                content: render_lua_print_argument(LuaValue::String(text.clone())),
             },
             _ => match lua_value_to_json(value) {
                 Ok(json_value) => RunLuaRenderedValue {
@@ -1555,17 +1675,7 @@ end
     /// Render one Lua value into a compact single-line textual form.
     /// 将单个 Lua 值渲染为紧凑的单行文本形式。
     fn render_lua_value_inline(value: &LuaValue) -> String {
-        match value {
-            LuaValue::String(text) => text
-                .to_str()
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            LuaValue::Integer(number) => number.to_string(),
-            LuaValue::Number(number) => number.to_string(),
-            LuaValue::Boolean(flag) => flag.to_string(),
-            LuaValue::Nil => "nil".to_string(),
-            _ => format!("{:?}", value),
-        }
+        render_lua_print_argument(value.clone())
     }
 
     /// Render a successful runlua execution result into Markdown text.
@@ -1651,5 +1761,166 @@ end
         }
 
         lines.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Read, Write};
+
+    /// Reader fixture that emits one partial chunk and then fails.
+    /// 先产出一个部分数据块然后失败的读取器夹具。
+    struct FailingPipeReader {
+        /// Whether the partial chunk has already been emitted.
+        /// 部分数据块是否已经产出。
+        emitted_partial_chunk: bool,
+    }
+
+    impl Read for FailingPipeReader {
+        /// Read one partial chunk before returning a deterministic failure.
+        /// 返回确定性失败前读取一个部分数据块。
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.emitted_partial_chunk {
+                // Partial bytes that must survive the later read failure.
+                // 后续读取失败后仍必须保留下来的部分字节。
+                let partial_bytes = b"partial-output";
+                buffer[..partial_bytes.len()].copy_from_slice(partial_bytes);
+                self.emitted_partial_chunk = true;
+                return Ok(partial_bytes.len());
+            }
+            Err(io::Error::other("forced read failure"))
+        }
+    }
+
+    /// Stdin writer fixture that fails on the first write attempt.
+    /// 首次写入时失败的 stdin 写入器夹具。
+    struct FailingStdinWrite;
+
+    impl Write for FailingStdinWrite {
+        /// Fail every stdin write attempt deterministically.
+        /// 以确定性方式让每次 stdin 写入尝试失败。
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("forced stdin write failure"))
+        }
+
+        /// Flush is unreachable after a write failure but remains a valid trait implementation.
+        /// 写入失败后不会触达 flush，但仍提供有效的 trait 实现。
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Stdin writer fixture that accepts writes and fails during flush.
+    /// 接受写入但在 flush 阶段失败的 stdin 写入器夹具。
+    struct FailingStdinFlush;
+
+    impl Write for FailingStdinFlush {
+        /// Accept the full stdin buffer so the writer reaches flush.
+        /// 接受完整 stdin 缓冲区以便写入器进入 flush 阶段。
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        /// Fail flush deterministically after the write succeeds.
+        /// 在写入成功后以确定性方式让 flush 失败。
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("forced stdin flush failure"))
+        }
+    }
+
+    /// Verify pipe read failures preserve partial bytes and report the capture error.
+    /// 验证管道读取失败会保留部分字节并报告捕获错误。
+    #[test]
+    fn pipe_reader_reports_read_error_without_dropping_partial_bytes() {
+        // Reader fixture that deterministically fails after one successful read.
+        // 在一次成功读取后确定性失败的读取器夹具。
+        let reader = FailingPipeReader {
+            emitted_partial_chunk: false,
+        };
+        // Joined capture returned by the background pipe reader.
+        // 后台管道读取器返回的已等待捕获结果。
+        let capture = spawn_pipe_reader("stdout", reader)
+            .join()
+            .expect("pipe reader thread should not panic");
+
+        assert_eq!(capture.bytes, b"partial-output");
+        assert_eq!(
+            capture.error.as_deref(),
+            Some("failed to read process stdout: forced read failure")
+        );
+    }
+
+    /// Verify pipe reader panics are returned as explicit capture errors.
+    /// 验证管道读取线程 panic 会作为显式捕获错误返回。
+    #[test]
+    fn pipe_reader_join_reports_reader_thread_panic() {
+        // Panicking reader handle that mimics an unexpected reader-thread failure.
+        // 模拟读取线程意外失败的 panic 读取句柄。
+        let handle = thread::spawn(|| -> PipeCapture { panic!("forced reader panic") });
+        // Joined capture after converting the panic into a structured error.
+        // 将 panic 转换为结构化错误后的已等待捕获结果。
+        let capture = join_pipe_reader(Some(handle), "stderr");
+
+        assert!(capture.bytes.is_empty());
+        assert_eq!(
+            capture.error.as_deref(),
+            Some("process stderr reader thread panicked")
+        );
+    }
+
+    /// Verify stdin write failures are returned as explicit execution errors.
+    /// 验证 stdin 写入失败会作为显式执行错误返回。
+    #[test]
+    fn stdin_writer_reports_write_error() {
+        // Writer fixture that rejects the first stdin write.
+        // 拒绝首次 stdin 写入的写入器夹具。
+        let writer = FailingStdinWrite;
+        // Joined stdin writer result carrying the write failure.
+        // 携带写入失败的已等待 stdin 写入结果。
+        let result = spawn_stdin_writer(writer, b"payload".to_vec())
+            .join()
+            .expect("stdin writer thread should not panic");
+
+        assert_eq!(
+            result.error.as_deref(),
+            Some("failed to write process stdin: forced stdin write failure")
+        );
+    }
+
+    /// Verify stdin flush failures are returned as explicit execution errors.
+    /// 验证 stdin flush 失败会作为显式执行错误返回。
+    #[test]
+    fn stdin_writer_reports_flush_error() {
+        // Writer fixture that accepts writes and then fails during flush.
+        // 接受写入并在 flush 阶段失败的写入器夹具。
+        let writer = FailingStdinFlush;
+        // Joined stdin writer result carrying the flush failure.
+        // 携带 flush 失败的已等待 stdin 写入结果。
+        let result = spawn_stdin_writer(writer, b"payload".to_vec())
+            .join()
+            .expect("stdin writer thread should not panic");
+
+        assert_eq!(
+            result.error.as_deref(),
+            Some("failed to flush process stdin: forced stdin flush failure")
+        );
+    }
+
+    /// Verify stdin writer panics are returned as explicit execution errors.
+    /// 验证 stdin 写入线程 panic 会作为显式执行错误返回。
+    #[test]
+    fn stdin_writer_join_reports_writer_thread_panic() {
+        // Panicking writer handle that mimics an unexpected stdin writer failure.
+        // 模拟 stdin 写入线程意外失败的 panic 写入句柄。
+        let handle = thread::spawn(|| -> StdinWriteResult { panic!("forced stdin writer panic") });
+        // Structured error returned by the stdin writer join helper.
+        // stdin 写入 join 辅助函数返回的结构化错误。
+        let error = join_stdin_writer(Some(handle));
+
+        assert_eq!(
+            error.as_deref(),
+            Some("process stdin writer thread panicked")
+        );
     }
 }

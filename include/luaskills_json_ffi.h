@@ -49,7 +49,9 @@ Only pass pointers returned by luaskills FFI string-producing helper functions t
 void luaskills_ffi_string_free(char *value);
 /*
 Clone one host-owned string into one luaskills-owned heap string for helper returns.
+The input must be null or valid UTF-8; invalid UTF-8 returns null.
 将宿主拥有的字符串克隆为 luaskills 自主管理的堆字符串，供辅助返回值使用。
+输入必须为空指针或有效 UTF-8；非法 UTF-8 会返回空指针。
 */
 char *luaskills_ffi_string_clone(const char *value);
 

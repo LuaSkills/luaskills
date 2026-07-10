@@ -1,8 +1,10 @@
 use super::*;
+use crate::ffi::luaskills_ffi_string_free;
 use crate::host::callbacks::{
     RuntimeModelCaller, dispatch_model_embed_request, dispatch_model_llm_request,
     runtime_model_callback_test_guard,
 };
+use crate::runtime::path::render_host_visible_path;
 use crate::runtime_help::{
     RuntimeHelpDetail as RuntimeHelpDetailModel,
     RuntimeHelpNodeDescriptor as RuntimeHelpNodeDescriptorModel,
@@ -12,6 +14,7 @@ use crate::{
     RuntimeEntryDescriptor as RuntimeEntryDescriptorModel,
     RuntimeEntryParameterDescriptor as RuntimeEntryParameterDescriptorModel,
 };
+use std::path::Path;
 
 /// Read one owned UTF-8 buffer into one Rust string without freeing it.
 /// 将一个拥有型 UTF-8 缓冲读取为 Rust 字符串但不执行释放。
@@ -39,6 +42,285 @@ fn make_borrowed_buffer(text: &str) -> (Vec<u8>, FfiBorrowedBuffer) {
         }
     };
     (bytes, buffer)
+}
+
+/// Verify invocation allocation preserves a structured host_result payload.
+/// 验证调用结果分配会保留结构化 host_result 载荷。
+///
+/// This test has no parameters and fails through assertions when the FFI allocation drops host_result data.
+/// 本测试不接收参数；当 FFI 分配丢失 host_result 数据时会通过断言失败。
+///
+/// Return unit after validating the allocated payload and freeing the heap-owned result.
+/// 校验已分配载荷并释放堆拥有结果后返回 unit。
+#[test]
+fn alloc_invocation_result_preserves_host_result_payload() {
+    // Runtime invocation result carrying one structured host_result payload.
+    // 携带单个结构化 host_result 载荷的运行时调用结果。
+    let result = RuntimeInvocationResult::from_content_parts(
+        "content".to_string(),
+        None,
+        None,
+        Some(RuntimeHostResult {
+            kind: "change_set".to_string(),
+            payload: serde_json::json!({
+                "mode": "preview",
+                "files": []
+            }),
+        }),
+    );
+
+    // FFI invocation result allocated from the runtime result.
+    // 从运行时结果分配得到的 FFI 调用结果。
+    let ffi_result =
+        alloc_invocation_result(&result).expect("host_result allocation should succeed");
+
+    assert!(!ffi_result.host_result.is_null());
+    // FFI host_result pointer exposed inside the invocation result.
+    // 调用结果中暴露的 FFI host_result 指针。
+    let host_result = unsafe { &*ffi_result.host_result };
+    assert_eq!(read_owned_buffer_text(&host_result.kind), "change_set");
+
+    // JSON payload copied into the C ABI host_result buffer.
+    // 复制到 C ABI host_result 缓冲中的 JSON 载荷。
+    let payload_json = read_owned_buffer_text(&host_result.payload_json);
+    // Parsed JSON payload used to avoid depending on object key order.
+    // 用于避免依赖对象键顺序的已解析 JSON 载荷。
+    let payload: serde_json::Value =
+        serde_json::from_str(&payload_json).expect("host_result payload should be json");
+
+    assert_eq!(payload["mode"], "preview");
+    assert_eq!(payload["files"], serde_json::json!([]));
+    assert_eq!(host_result.payload_bytes, payload_json.len());
+
+    // Heap-allocated invocation result used only to exercise the public free helper.
+    // 仅用于触发公开释放辅助函数的堆分配调用结果。
+    let result_ptr = Box::into_raw(Box::new(ffi_result));
+    unsafe { luaskills_ffi_invocation_result_free(result_ptr) };
+}
+
+/// Build one CString for a test path using the shared host-visible path renderer.
+/// 使用共享的宿主可见路径渲染器为测试路径构造 CString。
+///
+/// The path parameter is the filesystem path passed into the FFI boundary.
+/// path 参数是传入 FFI 边界的文件系统路径。
+///
+/// The label parameter names the field in panic messages.
+/// label 参数用于在 panic 消息中标识字段名称。
+///
+/// Return a CString whose bytes remain owned by the caller.
+/// 返回字节所有权由调用方持有的 CString。
+fn ffi_test_path_cstring(path: &Path, label: &str) -> CString {
+    CString::new(render_host_visible_path(path))
+        .unwrap_or_else(|_| panic!("{} path should not contain nul bytes", label))
+}
+
+/// Verify the string clone helper copies valid UTF-8 text into LuaSkills-owned memory.
+/// 验证字符串克隆辅助函数会把有效 UTF-8 文本复制到 LuaSkills 拥有的内存中。
+#[test]
+fn ffi_string_clone_copies_valid_utf8_text() {
+    // Host-owned C string passed into the clone helper.
+    // 传入克隆辅助函数的宿主拥有 C 字符串。
+    let input = CString::new("hello").expect("valid clone input cstring");
+    // LuaSkills-owned clone returned by the FFI helper.
+    // FFI 辅助函数返回的 LuaSkills 拥有克隆字符串。
+    let cloned = unsafe { luaskills_ffi_string_clone(input.as_ptr()) };
+
+    assert!(!cloned.is_null());
+    assert_eq!(
+        unsafe { std::ffi::CStr::from_ptr(cloned) }
+            .to_str()
+            .expect("cloned string should be utf-8"),
+        "hello"
+    );
+    unsafe { luaskills_ffi_string_free(cloned) };
+}
+
+/// Verify the string clone helper treats null input as an owned empty C string.
+/// 验证字符串克隆辅助函数会把 null 输入处理为拥有所有权的空 C 字符串。
+#[test]
+fn ffi_string_clone_null_input_returns_owned_empty_string() {
+    // LuaSkills-owned clone returned for null host input.
+    // null 宿主输入对应的 LuaSkills 拥有克隆字符串。
+    let cloned = unsafe { luaskills_ffi_string_clone(ptr::null()) };
+
+    assert!(!cloned.is_null());
+    assert_eq!(
+        unsafe { std::ffi::CStr::from_ptr(cloned) }
+            .to_str()
+            .expect("empty cloned string should be utf-8"),
+        ""
+    );
+    unsafe { luaskills_ffi_string_free(cloned) };
+}
+
+/// Verify the string clone helper rejects invalid UTF-8 input instead of lossy replacement.
+/// 验证字符串克隆辅助函数会拒绝非法 UTF-8 输入，而不是执行有损替换。
+#[test]
+fn ffi_string_clone_rejects_invalid_utf8_text() {
+    // NUL-terminated byte sequence that is not valid UTF-8.
+    // NUL 结尾但不是有效 UTF-8 的字节序列。
+    let invalid_input = [0xff, 0x00];
+    // Clone result returned for invalid UTF-8 input.
+    // 非法 UTF-8 输入对应的克隆结果。
+    let cloned =
+        unsafe { luaskills_ffi_string_clone(invalid_input.as_ptr().cast::<std::ffi::c_char>()) };
+
+    assert!(cloned.is_null());
+}
+
+/// Build one empty standard FFI host-options value with null pointers and disabled optional features.
+/// 构建一个指针为空且可选功能关闭的标准 FFI host-options 空值。
+///
+/// Return a host-options baseline that tests may customize field by field.
+/// 返回测试可逐字段定制的 host-options 基准值。
+fn empty_ffi_runtime_host_options() -> FfiLuaRuntimeHostOptions {
+    FfiLuaRuntimeHostOptions {
+        temp_dir: ptr::null(),
+        resources_dir: ptr::null(),
+        lua_packages_dir: ptr::null(),
+        host_provided_tool_root: ptr::null(),
+        host_provided_lua_root: ptr::null(),
+        host_provided_ffi_root: ptr::null(),
+        system_lua_lib_dir: ptr::null(),
+        download_cache_root: ptr::null(),
+        dependency_dir_name: ptr::null(),
+        state_dir_name: ptr::null(),
+        database_dir_name: ptr::null(),
+        skill_config_file_path: ptr::null(),
+        allow_network_download: 0,
+        github_base_url: ptr::null(),
+        github_api_base_url: ptr::null(),
+        official_skill_hub_base_url: ptr::null(),
+        enable_private_url_skill_install: 0,
+        private_skill_source_allowlist: ptr::null(),
+        private_skill_source_allowlist_len: 0,
+        sqlite_library_path: ptr::null(),
+        sqlite_provider_mode: FFI_PROVIDER_MODE_DYNAMIC_LIBRARY,
+        sqlite_callback_mode: FFI_CALLBACK_MODE_STANDARD,
+        lancedb_library_path: ptr::null(),
+        lancedb_provider_mode: FFI_PROVIDER_MODE_DYNAMIC_LIBRARY,
+        lancedb_callback_mode: FFI_CALLBACK_MODE_STANDARD,
+        space_controller_endpoint: ptr::null(),
+        space_controller_auto_spawn: 0,
+        space_controller_executable_path: ptr::null(),
+        space_controller_process_mode: FFI_SPACE_CONTROLLER_PROCESS_MODE_SERVICE,
+        cache_config: ptr::null(),
+        runlua_pool_config: ptr::null(),
+        reserved_entry_names: ptr::null(),
+        reserved_entry_names_len: 0,
+        ignored_skill_ids: ptr::null(),
+        ignored_skill_ids_len: 0,
+        enable_skill_management_bridge: 0,
+        default_text_encoding: ptr::null(),
+        disable_managed_io_compat: 0,
+    }
+}
+
+/// Owned CString fixture backing one FfiLuaRuntimeHostOptions test value.
+/// 为单个 FfiLuaRuntimeHostOptions 测试值提供 CString 所有权的夹具。
+struct FfiStandardHostOptionsFixture {
+    /// CString backing the temp_dir pointer.
+    /// 支撑 temp_dir 指针的 CString。
+    temp_dir_text: CString,
+    /// CString backing the resources_dir pointer.
+    /// 支撑 resources_dir 指针的 CString。
+    resources_dir_text: CString,
+    /// CString backing the lua_packages_dir and host_provided_lua_root pointers.
+    /// 支撑 lua_packages_dir 与 host_provided_lua_root 指针的 CString。
+    lua_packages_dir_text: CString,
+    /// CString backing the host_provided_tool_root pointer.
+    /// 支撑 host_provided_tool_root 指针的 CString。
+    tool_root_dir_text: CString,
+    /// CString backing the host_provided_ffi_root pointer.
+    /// 支撑 host_provided_ffi_root 指针的 CString。
+    ffi_root_dir_text: CString,
+    /// CString backing the dependency_dir_name pointer.
+    /// 支撑 dependency_dir_name 指针的 CString。
+    dependency_dir_name: CString,
+    /// CString backing the state_dir_name pointer.
+    /// 支撑 state_dir_name 指针的 CString。
+    state_dir_name: CString,
+    /// CString backing the database_dir_name pointer.
+    /// 支撑 database_dir_name 指针的 CString。
+    database_dir_name: CString,
+    /// Optional CString backing the skill_config_file_path pointer.
+    /// 支撑 skill_config_file_path 指针的可选 CString。
+    skill_config_file_path: Option<CString>,
+}
+
+impl FfiStandardHostOptionsFixture {
+    /// Create one fixture using the default standard FFI test directories under a temp root.
+    /// 使用临时根目录下的默认标准 FFI 测试目录创建夹具。
+    ///
+    /// The temp_root parameter is the root directory prepared by the current test.
+    /// temp_root 参数是当前测试准备的根目录。
+    ///
+    /// Return a fixture whose CString fields must outlive the generated options.
+    /// 返回 CString 字段必须比生成的 options 存活更久的夹具。
+    fn new(temp_root: &Path) -> Self {
+        Self::with_skill_config_file_path(temp_root, None)
+    }
+
+    /// Create one fixture and optionally include a skill-config file path.
+    /// 创建夹具，并可选包含 skill-config 文件路径。
+    ///
+    /// The temp_root parameter is the root directory prepared by the current test.
+    /// temp_root 参数是当前测试准备的根目录。
+    ///
+    /// The skill_config_file_path parameter is the optional config file path exposed to the FFI host options.
+    /// skill_config_file_path 参数是暴露给 FFI host options 的可选配置文件路径。
+    ///
+    /// Return a fixture that owns every CString referenced by host_options.
+    /// 返回持有 host_options 所引用全部 CString 的夹具。
+    fn with_skill_config_file_path(
+        temp_root: &Path,
+        skill_config_file_path: Option<&Path>,
+    ) -> Self {
+        Self {
+            temp_dir_text: ffi_test_path_cstring(&temp_root.join("temp"), "temp_dir"),
+            resources_dir_text: ffi_test_path_cstring(
+                &temp_root.join("resources"),
+                "resources_dir",
+            ),
+            lua_packages_dir_text: ffi_test_path_cstring(
+                &temp_root.join("lua_packages"),
+                "lua_packages_dir",
+            ),
+            tool_root_dir_text: ffi_test_path_cstring(
+                &temp_root.join("bin").join("tools"),
+                "tool_root_dir",
+            ),
+            ffi_root_dir_text: ffi_test_path_cstring(&temp_root.join("libs"), "ffi_root"),
+            dependency_dir_name: CString::new("dependencies").expect("dependencies cstring"),
+            state_dir_name: CString::new("state").expect("state cstring"),
+            database_dir_name: CString::new("databases").expect("databases cstring"),
+            skill_config_file_path: skill_config_file_path
+                .map(|path| ffi_test_path_cstring(path, "skill_config_file_path")),
+        }
+    }
+
+    /// Build one borrowed FFI host-options value from the owned CString fixture.
+    /// 从持有 CString 的夹具构建单个借用型 FFI host-options 值。
+    ///
+    /// Return host options whose raw pointers remain valid while this fixture is alive.
+    /// 返回在当前夹具存活期间裸指针保持有效的 host options。
+    fn host_options(&self) -> FfiLuaRuntimeHostOptions {
+        let mut host_options = empty_ffi_runtime_host_options();
+        host_options.temp_dir = self.temp_dir_text.as_ptr();
+        host_options.resources_dir = self.resources_dir_text.as_ptr();
+        host_options.lua_packages_dir = self.lua_packages_dir_text.as_ptr();
+        host_options.host_provided_tool_root = self.tool_root_dir_text.as_ptr();
+        host_options.host_provided_lua_root = self.lua_packages_dir_text.as_ptr();
+        host_options.host_provided_ffi_root = self.ffi_root_dir_text.as_ptr();
+        host_options.dependency_dir_name = self.dependency_dir_name.as_ptr();
+        host_options.state_dir_name = self.state_dir_name.as_ptr();
+        host_options.database_dir_name = self.database_dir_name.as_ptr();
+        host_options.skill_config_file_path = self
+            .skill_config_file_path
+            .as_ref()
+            .map_or(ptr::null(), |path| path.as_ptr());
+        host_options
+    }
 }
 
 /// Verify buffer_clone copies one byte payload into luaskills-owned storage.
@@ -276,7 +558,8 @@ fn entry_list_free_handles_nested_owned_buffers() {
         }),
     };
 
-    let mut items = vec![alloc_entry_descriptor(&runtime_entry)];
+    let mut items =
+        vec![alloc_entry_descriptor(&runtime_entry).expect("entry descriptor should allocate")];
     let list = FfiRuntimeEntryDescriptorList {
         items: items.as_mut_ptr(),
         len: items.len(),
@@ -443,65 +726,12 @@ fn standard_ffi_load_and_list_entries_round_trip() {
     )
     .expect("write runtime lua");
 
-    let temp_dir_text =
-        CString::new(temp_root.join("temp").display().to_string()).expect("temp_dir cstring");
-    let resources_dir_text = CString::new(temp_root.join("resources").display().to_string())
-        .expect("resources_dir cstring");
-    let lua_packages_dir_text = CString::new(temp_root.join("lua_packages").display().to_string())
-        .expect("lua_packages_dir cstring");
-    let tool_root_dir_text =
-        CString::new(temp_root.join("bin").join("tools").display().to_string())
-            .expect("tool_root_dir cstring");
-    let ffi_root_dir_text =
-        CString::new(temp_root.join("libs").display().to_string()).expect("ffi_root cstring");
-    let dependency_dir_name = CString::new("dependencies").expect("dependencies cstring");
-    let state_dir_name = CString::new("state").expect("state cstring");
-    let database_dir_name = CString::new("databases").expect("databases cstring");
+    let host_fixture = FfiStandardHostOptionsFixture::new(&temp_root);
     let root_name = CString::new(" ROOT ").expect("root name cstring");
-    let skills_root_text =
-        CString::new(skills_root.display().to_string()).expect("skills root cstring");
+    let skills_root_text = ffi_test_path_cstring(&skills_root, "skills_root");
     let tool_name = CString::new("demo-skill-ping").expect("tool name cstring");
 
-    let host_options = FfiLuaRuntimeHostOptions {
-        temp_dir: temp_dir_text.as_ptr(),
-        resources_dir: resources_dir_text.as_ptr(),
-        lua_packages_dir: lua_packages_dir_text.as_ptr(),
-        host_provided_tool_root: tool_root_dir_text.as_ptr(),
-        host_provided_lua_root: lua_packages_dir_text.as_ptr(),
-        host_provided_ffi_root: ffi_root_dir_text.as_ptr(),
-        system_lua_lib_dir: ptr::null(),
-        download_cache_root: ptr::null(),
-        dependency_dir_name: dependency_dir_name.as_ptr(),
-        state_dir_name: state_dir_name.as_ptr(),
-        database_dir_name: database_dir_name.as_ptr(),
-        skill_config_file_path: ptr::null(),
-        allow_network_download: 0,
-        github_base_url: ptr::null(),
-        github_api_base_url: ptr::null(),
-        official_skill_hub_base_url: ptr::null(),
-        enable_private_url_skill_install: 0,
-        private_skill_source_allowlist: ptr::null(),
-        private_skill_source_allowlist_len: 0,
-        sqlite_library_path: ptr::null(),
-        sqlite_provider_mode: FFI_PROVIDER_MODE_DYNAMIC_LIBRARY,
-        sqlite_callback_mode: FFI_CALLBACK_MODE_STANDARD,
-        lancedb_library_path: ptr::null(),
-        lancedb_provider_mode: FFI_PROVIDER_MODE_DYNAMIC_LIBRARY,
-        lancedb_callback_mode: FFI_CALLBACK_MODE_STANDARD,
-        space_controller_endpoint: ptr::null(),
-        space_controller_auto_spawn: 0,
-        space_controller_executable_path: ptr::null(),
-        space_controller_process_mode: FFI_SPACE_CONTROLLER_PROCESS_MODE_SERVICE,
-        cache_config: ptr::null(),
-        runlua_pool_config: ptr::null(),
-        reserved_entry_names: ptr::null(),
-        reserved_entry_names_len: 0,
-        ignored_skill_ids: ptr::null(),
-        ignored_skill_ids_len: 0,
-        enable_skill_management_bridge: 0,
-        default_text_encoding: ptr::null(),
-        disable_managed_io_compat: 0,
-    };
+    let host_options = host_fixture.host_options();
     let engine_options = FfiLuaEngineOptions {
         pool: FfiLuaVmPoolConfig {
             min_size: 1,
@@ -755,50 +985,10 @@ fn standard_ffi_runtime_root_only_host_options_round_trip() {
         let _ = std::fs::remove_dir_all(&temp_root);
     }
     std::fs::create_dir_all(&temp_root).expect("create runtime root");
-    let runtime_root_text =
-        CString::new(temp_root.display().to_string()).expect("runtime_root cstring");
+    let runtime_root_text = ffi_test_path_cstring(&temp_root, "runtime_root");
 
     let host_options = FfiLuaRuntimeHostOptionsV2 {
-        base: FfiLuaRuntimeHostOptions {
-            temp_dir: ptr::null(),
-            resources_dir: ptr::null(),
-            lua_packages_dir: ptr::null(),
-            host_provided_tool_root: ptr::null(),
-            host_provided_lua_root: ptr::null(),
-            host_provided_ffi_root: ptr::null(),
-            system_lua_lib_dir: ptr::null(),
-            download_cache_root: ptr::null(),
-            dependency_dir_name: ptr::null(),
-            state_dir_name: ptr::null(),
-            database_dir_name: ptr::null(),
-            skill_config_file_path: ptr::null(),
-            allow_network_download: 0,
-            github_base_url: ptr::null(),
-            github_api_base_url: ptr::null(),
-            official_skill_hub_base_url: ptr::null(),
-            enable_private_url_skill_install: 0,
-            private_skill_source_allowlist: ptr::null(),
-            private_skill_source_allowlist_len: 0,
-            sqlite_library_path: ptr::null(),
-            sqlite_provider_mode: FFI_PROVIDER_MODE_DYNAMIC_LIBRARY,
-            sqlite_callback_mode: FFI_CALLBACK_MODE_STANDARD,
-            lancedb_library_path: ptr::null(),
-            lancedb_provider_mode: FFI_PROVIDER_MODE_DYNAMIC_LIBRARY,
-            lancedb_callback_mode: FFI_CALLBACK_MODE_STANDARD,
-            space_controller_endpoint: ptr::null(),
-            space_controller_auto_spawn: 0,
-            space_controller_executable_path: ptr::null(),
-            space_controller_process_mode: FFI_SPACE_CONTROLLER_PROCESS_MODE_SERVICE,
-            cache_config: ptr::null(),
-            runlua_pool_config: ptr::null(),
-            reserved_entry_names: ptr::null(),
-            reserved_entry_names_len: 0,
-            ignored_skill_ids: ptr::null(),
-            ignored_skill_ids_len: 0,
-            enable_skill_management_bridge: 0,
-            default_text_encoding: ptr::null(),
-            disable_managed_io_compat: 0,
-        },
+        base: empty_ffi_runtime_host_options(),
         runtime_root: runtime_root_text.as_ptr(),
     };
     let engine_options = FfiLuaEngineOptionsV2 {
@@ -868,65 +1058,12 @@ fn standard_ffi_call_skill_accepts_borrowed_json_buffers() {
         )
         .expect("write runtime lua");
 
-    let temp_dir_text =
-        CString::new(temp_root.join("temp").display().to_string()).expect("temp_dir cstring");
-    let resources_dir_text = CString::new(temp_root.join("resources").display().to_string())
-        .expect("resources_dir cstring");
-    let lua_packages_dir_text = CString::new(temp_root.join("lua_packages").display().to_string())
-        .expect("lua_packages_dir cstring");
-    let tool_root_dir_text =
-        CString::new(temp_root.join("bin").join("tools").display().to_string())
-            .expect("tool_root_dir cstring");
-    let ffi_root_dir_text =
-        CString::new(temp_root.join("libs").display().to_string()).expect("ffi_root cstring");
-    let dependency_dir_name = CString::new("dependencies").expect("dependencies cstring");
-    let state_dir_name = CString::new("state").expect("state cstring");
-    let database_dir_name = CString::new("databases").expect("databases cstring");
+    let host_fixture = FfiStandardHostOptionsFixture::new(&temp_root);
     let root_name = CString::new("ROOT").expect("root name cstring");
-    let skills_root_text =
-        CString::new(skills_root.display().to_string()).expect("skills root cstring");
+    let skills_root_text = ffi_test_path_cstring(&skills_root, "skills_root");
     let tool_name = CString::new("demo-skill-ping").expect("tool name cstring");
 
-    let host_options = FfiLuaRuntimeHostOptions {
-        temp_dir: temp_dir_text.as_ptr(),
-        resources_dir: resources_dir_text.as_ptr(),
-        lua_packages_dir: lua_packages_dir_text.as_ptr(),
-        host_provided_tool_root: tool_root_dir_text.as_ptr(),
-        host_provided_lua_root: lua_packages_dir_text.as_ptr(),
-        host_provided_ffi_root: ffi_root_dir_text.as_ptr(),
-        system_lua_lib_dir: ptr::null(),
-        download_cache_root: ptr::null(),
-        dependency_dir_name: dependency_dir_name.as_ptr(),
-        state_dir_name: state_dir_name.as_ptr(),
-        database_dir_name: database_dir_name.as_ptr(),
-        skill_config_file_path: ptr::null(),
-        allow_network_download: 0,
-        github_base_url: ptr::null(),
-        github_api_base_url: ptr::null(),
-        official_skill_hub_base_url: ptr::null(),
-        enable_private_url_skill_install: 0,
-        private_skill_source_allowlist: ptr::null(),
-        private_skill_source_allowlist_len: 0,
-        sqlite_library_path: ptr::null(),
-        sqlite_provider_mode: FFI_PROVIDER_MODE_DYNAMIC_LIBRARY,
-        sqlite_callback_mode: FFI_CALLBACK_MODE_STANDARD,
-        lancedb_library_path: ptr::null(),
-        lancedb_provider_mode: FFI_PROVIDER_MODE_DYNAMIC_LIBRARY,
-        lancedb_callback_mode: FFI_CALLBACK_MODE_STANDARD,
-        space_controller_endpoint: ptr::null(),
-        space_controller_auto_spawn: 0,
-        space_controller_executable_path: ptr::null(),
-        space_controller_process_mode: FFI_SPACE_CONTROLLER_PROCESS_MODE_SERVICE,
-        cache_config: ptr::null(),
-        runlua_pool_config: ptr::null(),
-        reserved_entry_names: ptr::null(),
-        reserved_entry_names_len: 0,
-        ignored_skill_ids: ptr::null(),
-        ignored_skill_ids_len: 0,
-        enable_skill_management_bridge: 0,
-        default_text_encoding: ptr::null(),
-        disable_managed_io_compat: 0,
-    };
+    let host_options = host_fixture.host_options();
     let engine_options = FfiLuaEngineOptions {
         pool: FfiLuaVmPoolConfig {
             min_size: 1,
@@ -1032,61 +1169,8 @@ fn standard_ffi_run_lua_accepts_borrowed_json_buffers() {
     std::fs::create_dir_all(temp_root.join("bin").join("tools")).expect("create tools directory");
     std::fs::create_dir_all(temp_root.join("libs")).expect("create libs directory");
 
-    let temp_dir_text =
-        CString::new(temp_root.join("temp").display().to_string()).expect("temp_dir cstring");
-    let resources_dir_text = CString::new(temp_root.join("resources").display().to_string())
-        .expect("resources_dir cstring");
-    let lua_packages_dir_text = CString::new(temp_root.join("lua_packages").display().to_string())
-        .expect("lua_packages_dir cstring");
-    let tool_root_dir_text =
-        CString::new(temp_root.join("bin").join("tools").display().to_string())
-            .expect("tool_root_dir cstring");
-    let ffi_root_dir_text =
-        CString::new(temp_root.join("libs").display().to_string()).expect("ffi_root cstring");
-    let dependency_dir_name = CString::new("dependencies").expect("dependencies cstring");
-    let state_dir_name = CString::new("state").expect("state cstring");
-    let database_dir_name = CString::new("databases").expect("databases cstring");
-
-    let host_options = FfiLuaRuntimeHostOptions {
-        temp_dir: temp_dir_text.as_ptr(),
-        resources_dir: resources_dir_text.as_ptr(),
-        lua_packages_dir: lua_packages_dir_text.as_ptr(),
-        host_provided_tool_root: tool_root_dir_text.as_ptr(),
-        host_provided_lua_root: lua_packages_dir_text.as_ptr(),
-        host_provided_ffi_root: ffi_root_dir_text.as_ptr(),
-        system_lua_lib_dir: ptr::null(),
-        download_cache_root: ptr::null(),
-        dependency_dir_name: dependency_dir_name.as_ptr(),
-        state_dir_name: state_dir_name.as_ptr(),
-        database_dir_name: database_dir_name.as_ptr(),
-        skill_config_file_path: ptr::null(),
-        allow_network_download: 0,
-        github_base_url: ptr::null(),
-        github_api_base_url: ptr::null(),
-        official_skill_hub_base_url: ptr::null(),
-        enable_private_url_skill_install: 0,
-        private_skill_source_allowlist: ptr::null(),
-        private_skill_source_allowlist_len: 0,
-        sqlite_library_path: ptr::null(),
-        sqlite_provider_mode: FFI_PROVIDER_MODE_DYNAMIC_LIBRARY,
-        sqlite_callback_mode: FFI_CALLBACK_MODE_STANDARD,
-        lancedb_library_path: ptr::null(),
-        lancedb_provider_mode: FFI_PROVIDER_MODE_DYNAMIC_LIBRARY,
-        lancedb_callback_mode: FFI_CALLBACK_MODE_STANDARD,
-        space_controller_endpoint: ptr::null(),
-        space_controller_auto_spawn: 0,
-        space_controller_executable_path: ptr::null(),
-        space_controller_process_mode: FFI_SPACE_CONTROLLER_PROCESS_MODE_SERVICE,
-        cache_config: ptr::null(),
-        runlua_pool_config: ptr::null(),
-        reserved_entry_names: ptr::null(),
-        reserved_entry_names_len: 0,
-        ignored_skill_ids: ptr::null(),
-        ignored_skill_ids_len: 0,
-        enable_skill_management_bridge: 0,
-        default_text_encoding: ptr::null(),
-        disable_managed_io_compat: 0,
-    };
+    let host_fixture = FfiStandardHostOptionsFixture::new(&temp_root);
+    let host_options = host_fixture.host_options();
     let engine_options = FfiLuaEngineOptions {
         pool: FfiLuaVmPoolConfig {
             min_size: 1,
@@ -1179,72 +1263,16 @@ fn standard_ffi_skill_config_round_trip() {
     std::fs::create_dir_all(temp_root.join("bin").join("tools")).expect("create tools directory");
     std::fs::create_dir_all(temp_root.join("libs")).expect("create libs directory");
 
-    let temp_dir_text =
-        CString::new(temp_root.join("temp").display().to_string()).expect("temp_dir cstring");
-    let resources_dir_text = CString::new(temp_root.join("resources").display().to_string())
-        .expect("resources_dir cstring");
-    let lua_packages_dir_text = CString::new(temp_root.join("lua_packages").display().to_string())
-        .expect("lua_packages_dir cstring");
-    let tool_root_dir_text =
-        CString::new(temp_root.join("bin").join("tools").display().to_string())
-            .expect("tool_root_dir cstring");
-    let ffi_root_dir_text =
-        CString::new(temp_root.join("libs").display().to_string()).expect("ffi_root cstring");
-    let dependency_dir_name = CString::new("dependencies").expect("dependencies cstring");
-    let state_dir_name = CString::new("state").expect("state cstring");
-    let database_dir_name = CString::new("databases").expect("databases cstring");
-    let skill_config_file_path = CString::new(
-        temp_root
-            .join("config")
-            .join("skill_config.json")
-            .display()
-            .to_string(),
-    )
-    .expect("skill config file path cstring");
+    let skill_config_file_path = temp_root.join("config").join("skill_config.json");
+    let host_fixture = FfiStandardHostOptionsFixture::with_skill_config_file_path(
+        &temp_root,
+        Some(&skill_config_file_path),
+    );
     let skill_id = CString::new("demo-skill").expect("skill_id cstring");
     let key = CString::new("api_token").expect("key cstring");
     let value = CString::new("sk-standard-ffi").expect("value cstring");
 
-    let host_options = FfiLuaRuntimeHostOptions {
-        temp_dir: temp_dir_text.as_ptr(),
-        resources_dir: resources_dir_text.as_ptr(),
-        lua_packages_dir: lua_packages_dir_text.as_ptr(),
-        host_provided_tool_root: tool_root_dir_text.as_ptr(),
-        host_provided_lua_root: lua_packages_dir_text.as_ptr(),
-        host_provided_ffi_root: ffi_root_dir_text.as_ptr(),
-        system_lua_lib_dir: ptr::null(),
-        download_cache_root: ptr::null(),
-        dependency_dir_name: dependency_dir_name.as_ptr(),
-        state_dir_name: state_dir_name.as_ptr(),
-        database_dir_name: database_dir_name.as_ptr(),
-        skill_config_file_path: skill_config_file_path.as_ptr(),
-        allow_network_download: 0,
-        github_base_url: ptr::null(),
-        github_api_base_url: ptr::null(),
-        official_skill_hub_base_url: ptr::null(),
-        enable_private_url_skill_install: 0,
-        private_skill_source_allowlist: ptr::null(),
-        private_skill_source_allowlist_len: 0,
-        sqlite_library_path: ptr::null(),
-        sqlite_provider_mode: FFI_PROVIDER_MODE_DYNAMIC_LIBRARY,
-        sqlite_callback_mode: FFI_CALLBACK_MODE_STANDARD,
-        lancedb_library_path: ptr::null(),
-        lancedb_provider_mode: FFI_PROVIDER_MODE_DYNAMIC_LIBRARY,
-        lancedb_callback_mode: FFI_CALLBACK_MODE_STANDARD,
-        space_controller_endpoint: ptr::null(),
-        space_controller_auto_spawn: 0,
-        space_controller_executable_path: ptr::null(),
-        space_controller_process_mode: FFI_SPACE_CONTROLLER_PROCESS_MODE_SERVICE,
-        cache_config: ptr::null(),
-        runlua_pool_config: ptr::null(),
-        reserved_entry_names: ptr::null(),
-        reserved_entry_names_len: 0,
-        ignored_skill_ids: ptr::null(),
-        ignored_skill_ids_len: 0,
-        enable_skill_management_bridge: 0,
-        default_text_encoding: ptr::null(),
-        disable_managed_io_compat: 0,
-    };
+    let host_options = host_fixture.host_options();
     let engine_options = FfiLuaEngineOptions {
         pool: FfiLuaVmPoolConfig {
             min_size: 1,
@@ -1435,70 +1463,16 @@ fn standard_ffi_disable_and_enable_skill_round_trip() {
         )
         .expect("write runtime lua");
 
-    let temp_dir_text =
-        CString::new(temp_root.join("temp").display().to_string()).expect("temp_dir cstring");
-    let resources_dir_text = CString::new(temp_root.join("resources").display().to_string())
-        .expect("resources_dir cstring");
-    let lua_packages_dir_text = CString::new(temp_root.join("lua_packages").display().to_string())
-        .expect("lua_packages_dir cstring");
-    let tool_root_dir_text =
-        CString::new(temp_root.join("bin").join("tools").display().to_string())
-            .expect("tool_root_dir cstring");
-    let ffi_root_dir_text =
-        CString::new(temp_root.join("libs").display().to_string()).expect("ffi_root cstring");
-    let dependency_dir_name = CString::new("dependencies").expect("dependencies cstring");
-    let state_dir_name = CString::new("state").expect("state cstring");
-    let database_dir_name = CString::new("databases").expect("databases cstring");
+    let host_fixture = FfiStandardHostOptionsFixture::new(&temp_root);
     let root_name = CString::new("ROOT").expect("root name cstring");
     let user_name = CString::new("USER").expect("user name cstring");
-    let root_skills_root_text =
-        CString::new(root_skills_root.display().to_string()).expect("root skills cstring");
-    let skills_root_text =
-        CString::new(skills_root.display().to_string()).expect("skills root cstring");
+    let root_skills_root_text = ffi_test_path_cstring(&root_skills_root, "root_skills_root");
+    let skills_root_text = ffi_test_path_cstring(&skills_root, "skills_root");
     let skill_id = CString::new("demo-skill").expect("skill_id cstring");
     let tool_name = CString::new("demo-skill-ping").expect("tool_name cstring");
     let disable_reason = CString::new("maintenance").expect("disable reason cstring");
 
-    let host_options = FfiLuaRuntimeHostOptions {
-        temp_dir: temp_dir_text.as_ptr(),
-        resources_dir: resources_dir_text.as_ptr(),
-        lua_packages_dir: lua_packages_dir_text.as_ptr(),
-        host_provided_tool_root: tool_root_dir_text.as_ptr(),
-        host_provided_lua_root: lua_packages_dir_text.as_ptr(),
-        host_provided_ffi_root: ffi_root_dir_text.as_ptr(),
-        system_lua_lib_dir: ptr::null(),
-        download_cache_root: ptr::null(),
-        dependency_dir_name: dependency_dir_name.as_ptr(),
-        state_dir_name: state_dir_name.as_ptr(),
-        database_dir_name: database_dir_name.as_ptr(),
-        skill_config_file_path: ptr::null(),
-        allow_network_download: 0,
-        github_base_url: ptr::null(),
-        github_api_base_url: ptr::null(),
-        official_skill_hub_base_url: ptr::null(),
-        enable_private_url_skill_install: 0,
-        private_skill_source_allowlist: ptr::null(),
-        private_skill_source_allowlist_len: 0,
-        sqlite_library_path: ptr::null(),
-        sqlite_provider_mode: FFI_PROVIDER_MODE_DYNAMIC_LIBRARY,
-        sqlite_callback_mode: FFI_CALLBACK_MODE_STANDARD,
-        lancedb_library_path: ptr::null(),
-        lancedb_provider_mode: FFI_PROVIDER_MODE_DYNAMIC_LIBRARY,
-        lancedb_callback_mode: FFI_CALLBACK_MODE_STANDARD,
-        space_controller_endpoint: ptr::null(),
-        space_controller_auto_spawn: 0,
-        space_controller_executable_path: ptr::null(),
-        space_controller_process_mode: FFI_SPACE_CONTROLLER_PROCESS_MODE_SERVICE,
-        cache_config: ptr::null(),
-        runlua_pool_config: ptr::null(),
-        reserved_entry_names: ptr::null(),
-        reserved_entry_names_len: 0,
-        ignored_skill_ids: ptr::null(),
-        ignored_skill_ids_len: 0,
-        enable_skill_management_bridge: 0,
-        default_text_encoding: ptr::null(),
-        disable_managed_io_compat: 0,
-    };
+    let host_options = host_fixture.host_options();
     let engine_options = FfiLuaEngineOptions {
         pool: FfiLuaVmPoolConfig {
             min_size: 1,

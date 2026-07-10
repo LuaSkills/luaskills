@@ -81,65 +81,122 @@ impl RuntimeHostResultCapability {
     }
 }
 
+/// Return the disabled host-result capability snapshot used when the host does not opt in.
+/// 返回宿主未开启时使用的禁用态 host-result 能力快照。
+fn disabled_host_result_capability() -> RuntimeHostResultCapability {
+    RuntimeHostResultCapability {
+        enabled: false,
+        allowed_kinds: Vec::new(),
+        max_payload_bytes: None,
+    }
+}
+
 /// Resolve one host-result capability snapshot from one optional invocation context.
 /// 从可选调用上下文中解析一份宿主结果能力快照。
+///
+/// The invocation_context parameter is the optional host-provided context for the current call.
+/// invocation_context 参数是当前调用可选的宿主注入上下文。
+///
+/// Returns the resolved host-result capability snapshot.
+/// 返回解析后的 host-result 能力快照。
+///
+/// Returns an error when an explicitly provided host-result capability field is malformed.
+/// 当显式提供的 host-result 能力字段格式错误时返回错误。
 pub(super) fn resolve_host_result_capability(
     invocation_context: Option<&LuaInvocationContext>,
-) -> RuntimeHostResultCapability {
+) -> Result<RuntimeHostResultCapability, String> {
+    // Request context provided by the host for the current invocation.
+    // 宿主为当前调用提供的请求上下文。
     let Some(request_context) =
         invocation_context.and_then(|context| context.request_context.as_ref())
     else {
-        return RuntimeHostResultCapability {
-            enabled: false,
-            allowed_kinds: Vec::new(),
-            max_payload_bytes: None,
-        };
+        return Ok(disabled_host_result_capability());
     };
+    // Raw client capability object that owns the optional host_result capability block.
+    // 拥有可选 host_result 能力块的原始客户端能力对象。
     let Value::Object(capabilities) = &request_context.client_capabilities else {
-        return RuntimeHostResultCapability {
-            enabled: false,
-            allowed_kinds: Vec::new(),
-            max_payload_bytes: None,
-        };
+        return Ok(disabled_host_result_capability());
     };
-    let Value::Object(host_result) = capabilities
-        .get("host_result")
-        .cloned()
-        .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
-    else {
-        return RuntimeHostResultCapability {
-            enabled: false,
-            allowed_kinds: Vec::new(),
-            max_payload_bytes: None,
-        };
+    // Host-result capability value, when the host declares one.
+    // 宿主声明 host-result 能力时提供的能力值。
+    let Some(host_result_value) = capabilities.get("host_result") else {
+        return Ok(disabled_host_result_capability());
     };
-    let enabled = host_result
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let allowed_kinds = host_result
-        .get("allowed_kinds")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(ToString::to_string)
-                .collect::<Vec<String>>()
-        })
-        .unwrap_or_default();
-    let max_payload_bytes = host_result
-        .get("max_payload_bytes")
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .filter(|value| *value > 0);
-    RuntimeHostResultCapability {
+    let Value::Object(host_result) = host_result_value else {
+        return Err(
+            "runtime request client_capabilities.host_result must be an object".to_string(),
+        );
+    };
+    // Host-result enabled flag; absence keeps the bridge disabled.
+    // host-result 开启标记；缺失时保持桥接禁用。
+    let enabled = match host_result.get("enabled") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(
+                "runtime request client_capabilities.host_result.enabled must be a boolean"
+                    .to_string(),
+            );
+        }
+    };
+    // Allowed host-result kind list; absence means the host does not restrict result kinds.
+    // 允许的 host-result 类型列表；缺失表示宿主不限制结果类型。
+    let allowed_kinds = match host_result.get("allowed_kinds") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => {
+            // Parsed allowed kind names after trimming every host-provided list item.
+            // 修剪每个宿主提供列表项后得到的已解析允许类型名称。
+            let mut parsed = Vec::new();
+            for (index, item) in items.iter().enumerate() {
+                // Allowed kind text extracted from one array item.
+                // 从单个数组项提取出的允许类型文本。
+                let kind = item
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        format!(
+                            "runtime request client_capabilities.host_result.allowed_kinds[{}] must be one non-empty string",
+                            index
+                        )
+                    })?;
+                parsed.push(kind.to_string());
+            }
+            parsed
+        }
+        Some(_) => {
+            return Err(
+                "runtime request client_capabilities.host_result.allowed_kinds must be an array of non-empty strings"
+                    .to_string(),
+            );
+        }
+    };
+    // Optional maximum payload byte limit accepted by the host-result bridge.
+    // host-result 桥接接受的可选最大载荷字节上限。
+    let max_payload_bytes = match host_result.get("max_payload_bytes") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(value)) => Some(
+            value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    "runtime request client_capabilities.host_result.max_payload_bytes must be one positive integer"
+                        .to_string()
+                })?,
+        ),
+        Some(_) => {
+            return Err(
+                "runtime request client_capabilities.host_result.max_payload_bytes must be one positive integer"
+                    .to_string(),
+            );
+        }
+    };
+    Ok(RuntimeHostResultCapability {
         enabled,
         allowed_kinds,
         max_payload_bytes,
-    }
+    })
 }
 
 /// Convert one host-result capability snapshot into one Lua helper table payload.
@@ -322,15 +379,15 @@ fn validate_host_result_payload(
             display_name, error
         )
     })?;
-    if let Some(limit) = max_payload_bytes {
-        if payload_json.len() > limit {
-            return Err(format!(
-                "Lua skill '{}' returned host_result payload {} bytes larger than host limit {}",
-                display_name,
-                payload_json.len(),
-                limit
-            ));
-        }
+    if let Some(limit) = max_payload_bytes
+        && payload_json.len() > limit
+    {
+        return Err(format!(
+            "Lua skill '{}' returned host_result payload {} bytes larger than host limit {}",
+            display_name,
+            payload_json.len(),
+            limit
+        ));
     }
     if kind == "change_set" {
         validate_change_set_payload(display_name, payload)?;
@@ -362,13 +419,14 @@ pub(super) fn validate_change_set_payload(
             display_name
         ));
     }
-    if let Some(summary) = object.get("summary") {
-        if !summary.is_string() && !summary.is_null() {
-            return Err(format!(
-                "Lua skill '{}' change_set.summary must be a string when present",
-                display_name
-            ));
-        }
+    if let Some(summary) = object.get("summary")
+        && !summary.is_string()
+        && !summary.is_null()
+    {
+        return Err(format!(
+            "Lua skill '{}' change_set.summary must be a string when present",
+            display_name
+        ));
     }
     let files = object.get("files").ok_or_else(|| {
         format!(
@@ -441,13 +499,14 @@ fn validate_change_set_file_payload(
             display_name, file_index
         )
     })?;
-    if let Some(patch) = file.get("patch") {
-        if !patch.is_string() && !patch.is_null() {
-            return Err(format!(
-                "Lua skill '{}' change_set.files[{}].patch must be a string when present",
-                display_name, file_index
-            ));
-        }
+    if let Some(patch) = file.get("patch")
+        && !patch.is_string()
+        && !patch.is_null()
+    {
+        return Err(format!(
+            "Lua skill '{}' change_set.files[{}].patch must be a string when present",
+            display_name, file_index
+        ));
     }
     match change {
         "modify" => {
@@ -664,7 +723,7 @@ fn normalize_change_set_text(text: &str) -> String {
 
 /// Split normalized delete content into logical lines without treating one trailing newline as an extra line.
 /// 把规范化后的删除内容拆成逻辑行，且不会把结尾换行误算成额外一行。
-fn split_change_set_lines<'a>(text: &'a str) -> Vec<&'a str> {
+fn split_change_set_lines(text: &str) -> Vec<&str> {
     if text.is_empty() {
         Vec::new()
     } else {
@@ -790,7 +849,7 @@ pub(super) fn parse_tool_call_output(
     display_name: &str,
     invocation_context: Option<&LuaInvocationContext>,
 ) -> Result<RuntimeInvocationResult, String> {
-    let host_result_capability = resolve_host_result_capability(invocation_context);
+    let host_result_capability = resolve_host_result_capability(invocation_context)?;
     let values_vec: Vec<LuaValue> = values.into_vec();
     if values_vec.is_empty() {
         return Err(format!(

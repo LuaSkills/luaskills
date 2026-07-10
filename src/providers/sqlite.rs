@@ -3,19 +3,24 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use libloading::Library;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CString, c_char};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use crate::host::controller::{LuaRuntimeSpaceControllerBridge, controller_space_id_for_binding};
+use super::{decode_non_null_ffi_c_string, decode_provider_last_error_message};
+use crate::host::controller::{
+    LuaRuntimeSpaceControllerBindingIds, LuaRuntimeSpaceControllerBridge,
+};
 use crate::host::database::{
     LuaRuntimeDatabaseCallbackMode, LuaRuntimeDatabaseProviderMode, RuntimeDatabaseBindingContext,
     RuntimeDatabaseKind, RuntimeDatabaseProviderCallbacks, RuntimeSqliteProviderAction,
-    RuntimeSqliteProviderRequest,
+    RuntimeSqliteProviderRequest, build_runtime_database_binding_plan,
+    require_database_provider_callback_registration,
 };
 use crate::lua_skill::{SkillSqliteLogLevel, SkillSqliteMeta};
+use crate::runtime::path::render_host_visible_path;
 use crate::runtime_logging::{info as log_info, warn as log_warn};
 use crate::runtime_options::LuaRuntimeHostOptions;
 use vldb_controller_client::{
@@ -414,14 +419,14 @@ impl LoadedSqliteApi {
         if !library_path.exists() {
             return Err(format!(
                 "SQLite dynamic library path does not exist: {}",
-                library_path.display()
+                render_host_visible_path(library_path)
             ));
         }
 
         let library = unsafe { Library::new(library_path) }.map_err(|error| {
             format!(
                 "failed to load {}: {}: {}",
-                library_path.display(),
+                render_host_visible_path(library_path),
                 error,
                 error
             )
@@ -441,7 +446,7 @@ impl LoadedSqliteApi {
                             format!(
                                 "failed to load symbol {} from {}: {}",
                                 $name,
-                                library_path.display(),
+                                render_host_visible_path(&library_path),
                                 error
                             )
                         })?
@@ -669,11 +674,8 @@ impl LoadedSqliteApi {
     fn take_last_error_message(&self) -> String {
         unsafe {
             let ptr = (self.last_error_message)();
-            let text = if ptr.is_null() {
-                "unknown SQLite host error".to_string()
-            } else {
-                CStr::from_ptr(ptr).to_string_lossy().to_string()
-            };
+            let text =
+                decode_provider_last_error_message(ptr, "SQLite", "unknown SQLite host error");
             (self.clear_last_error)();
             text
         }
@@ -687,22 +689,22 @@ impl LoadedSqliteApi {
         }
 
         unsafe {
-            let text = CStr::from_ptr(ptr).to_string_lossy().to_string();
+            let text = decode_non_null_ffi_c_string(ptr);
             (self.string_free)(ptr);
-            Ok(text)
+            text
         }
     }
 
     /// Convert a dynamic-library allocated optional string into Rust `Option<String>`.
     /// 将动态库分配的可选字符串转换成 Rust `Option<String>`。
-    fn take_optional_string(&self, ptr: *mut c_char) -> Option<String> {
+    fn take_optional_string(&self, ptr: *mut c_char) -> Result<Option<String>, String> {
         if ptr.is_null() {
-            return None;
+            return Ok(None);
         }
         unsafe {
-            let text = CStr::from_ptr(ptr).to_string_lossy().to_string();
+            let text = decode_non_null_ffi_c_string(ptr);
             (self.string_free)(ptr);
-            Some(text)
+            text.map(Some)
         }
     }
 
@@ -782,7 +784,7 @@ pub struct SqliteSkillBinding {
 impl SqliteSkillBinding {
     /// Return the stable SQLite status payload for the current skill; the response shape stays stable whether enabled or disabled.
     /// 返回当前 skill 的稳定 SQLite 状态信息；无论启用与否，结构都保持稳定。
-    pub fn status_json(&self) -> Value {
+    pub fn status_json(&self) -> Result<Value, String> {
         let integration_mode = self.integration_mode_name();
         let controller_capabilities = if self.is_space_controller_mode() {
             vec![
@@ -819,46 +821,19 @@ impl SqliteSkillBinding {
                 "search_fts",
             ]
         };
-        let library_info = if let Some(api) = self.api.as_ref() {
-            api.call_json_noarg(api.library_info_json, "library_info_json")
-                .unwrap_or_else(|error| {
-                    json!({
-                        "name": "vldb-sqlite",
-                        "version": "unknown",
-                        "ffi_stage": "unknown",
-                        "capabilities": [],
-                        "warning": error,
-                    })
-                })
-        } else {
-            let provider_name = match self.provider_mode {
-                SqliteBindingMode::HostCallback => "host_callback",
-                SqliteBindingMode::SpaceController => "space_controller",
-                SqliteBindingMode::DynamicLibrary => "vldb-sqlite",
-            };
-            let provider_version = match self.provider_mode {
-                SqliteBindingMode::SpaceController => "controller_managed",
-                _ => "host_managed",
-            };
-            json!({
-                "name": provider_name,
-                "version": provider_version,
-                "ffi_stage": provider_version,
-                "capabilities": controller_capabilities,
-            })
-        };
-        json!({
+        let library_info = self.library_info_json(controller_capabilities)?;
+        Ok(json!({
             "enabled": true,
             "initialized": true,
             "skill_name": self.skill_name,
             "skill_dir_name": self.skill_dir_name,
             "database_path": self.database_path,
             "integration_mode": integration_mode,
-            "library_path": self.api.as_ref().map(|api| api.library_path.to_string_lossy().to_string()).unwrap_or_default(),
-            "library_name": library_info.get("name").cloned().unwrap_or(Value::String("vldb-sqlite".to_string())),
-            "library_version": library_info.get("version").cloned().unwrap_or(Value::String("unknown".to_string())),
-            "ffi_stage": library_info.get("ffi_stage").cloned().unwrap_or(Value::String("unknown".to_string())),
-            "capabilities": library_info.get("capabilities").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+            "library_path": sqlite_library_path_value(self.api.as_deref()),
+            "library_name": required_sqlite_library_info_string(&library_info, "name")?,
+            "library_version": required_sqlite_library_info_string(&library_info, "version")?,
+            "ffi_stage": required_sqlite_library_info_string(&library_info, "ffi_stage")?,
+            "capabilities": required_sqlite_library_info_array(&library_info, "capabilities")?,
             "space_label": self.provider_binding.space_label,
             "root_name": self.provider_binding.root_name,
             "binding_tag": self.provider_binding.binding_tag,
@@ -867,35 +842,58 @@ impl SqliteSkillBinding {
             "log_level": self.config.log_level.as_str(),
             "slow_log_enabled": self.config.slow_log_enabled,
             "slow_log_threshold_ms": self.config.slow_log_threshold_ms,
-        })
+        }))
     }
 
     /// Return basic information about the SQLite binding for the current skill.
     /// 返回当前 skill 所绑定 SQLite 的基础信息。
-    pub fn info_json(&self) -> Value {
-        let mut status = self.status_json();
+    pub fn info_json(&self) -> Result<Value, String> {
+        let mut status = self.status_json()?;
         if let Some(status_object) = status.as_object_mut() {
-            let library_info = if let Some(api) = self.api.as_ref() {
-                api.call_json_noarg(api.library_info_json, "library_info_json")
-                    .unwrap_or_else(|error| {
-                        json!({
-                            "name": "vldb-sqlite",
-                            "version": "unknown",
-                            "ffi_stage": "unknown",
-                            "capabilities": [],
-                            "warning": error,
-                        })
-                    })
-            } else {
-                json!({
-                    "name": "host_callback",
-                    "version": "host_managed",
-                    "ffi_stage": "host_managed",
-                })
-            };
+            let library_info = self.library_info_json(Vec::new())?;
             status_object.insert("library_info".to_string(), library_info);
         }
-        status
+        Ok(status)
+    }
+
+    /// Return validated provider metadata for the active SQLite integration mode.
+    /// 返回当前 SQLite 集成模式对应的已校验 provider 元数据。
+    fn library_info_json(
+        &self,
+        controller_capabilities: Vec<&'static str>,
+    ) -> Result<Value, String> {
+        if let Some(api) = self.api.as_ref() {
+            let library_info = api.call_json_noarg(api.library_info_json, "library_info_json")?;
+            validate_sqlite_library_info(&library_info, "library_info_json")?;
+            return Ok(library_info);
+        }
+        if self.provider_mode == SqliteBindingMode::DynamicLibrary {
+            return Err(self.missing_dynamic_api_error());
+        }
+        let provider_name = match self.provider_mode {
+            SqliteBindingMode::HostCallback => "host_callback",
+            SqliteBindingMode::SpaceController => "space_controller",
+            SqliteBindingMode::DynamicLibrary => "vldb-sqlite",
+        };
+        let provider_version = match self.provider_mode {
+            SqliteBindingMode::SpaceController => "controller_managed",
+            _ => "host_managed",
+        };
+        Ok(json!({
+            "name": provider_name,
+            "version": provider_version,
+            "ffi_stage": provider_version,
+            "capabilities": controller_capabilities,
+        }))
+    }
+
+    /// Return the diagnostic used when a dynamic binding is missing its loaded API table.
+    /// 返回 dynamic binding 缺失已加载 API 表时使用的诊断。
+    fn missing_dynamic_api_error(&self) -> String {
+        format!(
+            "SQLite dynamic-library API is unavailable for {} binding",
+            self.integration_mode_name()
+        )
     }
 
     /// Execute a script or single SQL statement through the non-JSON primary interface.
@@ -904,19 +902,25 @@ impl SqliteSkillBinding {
         if self.is_space_controller_mode() {
             let sql = require_string_field(input, "sql")?;
             let params = parse_single_sql_params(input)?;
-            self.log_info("execute_script", None);
-            let started_at = Instant::now();
-            let bridge = self.controller_bridge()?;
-            let space_id = self.controller_space_id();
-            let binding_id = self.controller_binding_id()?;
             let sql_text = sql.to_string();
             let mapped_params = map_controller_sqlite_params(&params);
-            let result = bridge.run(move |client| async move {
-                client
-                    .execute_sqlite_script_typed(space_id, binding_id, sql_text, mapped_params)
-                    .await
-            })?;
-            self.log_if_slow("execute_script", started_at, None);
+            let result = self.run_controller_binding_operation(
+                "execute_script",
+                None,
+                None,
+                |bridge, ids| {
+                    bridge.run(move |client| async move {
+                        client
+                            .execute_sqlite_script_typed(
+                                ids.space_id,
+                                ids.binding_id,
+                                sql_text,
+                                mapped_params,
+                            )
+                            .await
+                    })
+                },
+            )?;
             return Ok(json!({
                 "success": result.success,
                 "message": result.message,
@@ -928,7 +932,7 @@ impl SqliteSkillBinding {
         if self.is_host_provider_mode() {
             return self.dispatch_host_provider(RuntimeSqliteProviderAction::ExecuteScript, input);
         }
-        let api = self.api_ref();
+        let api = self.api_ref()?;
         let sql = require_string_field(input, "sql")?;
         let params = parse_single_sql_params(input)?;
         let owned_params = build_owned_ffi_values(&params)?;
@@ -949,21 +953,27 @@ impl SqliteSkillBinding {
                 ptr::null(),
             );
             if result_handle.is_null() {
-                drop(guard);
-                let error = api.take_last_error_message();
-                self.log_warning("execute_script", &error);
-                return Err(error);
+                return Err(self.take_ffi_null_handle_error(api, "execute_script", guard));
             }
 
-            let result = json!({
-                "success": u8_to_bool((api.execute_result_success)(result_handle)),
-                "message": api.take_optional_string((api.execute_result_message)(result_handle)).unwrap_or_default(),
-                "rows_changed": (api.execute_result_rows_changed)(result_handle),
-                "last_insert_rowid": (api.execute_result_last_insert_rowid)(result_handle),
-                "statements_executed": (api.execute_result_statements_executed)(result_handle),
-            });
+            let result = (|| -> Result<Value, String> {
+                // Required execution message returned by the dynamic execute-result handle.
+                // 动态执行结果句柄返回的必需执行消息。
+                let message = require_sqlite_dynamic_string(
+                    api.take_optional_string((api.execute_result_message)(result_handle))?,
+                    "execute_result.message",
+                )?;
+                Ok(json!({
+                    "success": u8_to_bool((api.execute_result_success)(result_handle)),
+                    "message": message,
+                    "rows_changed": (api.execute_result_rows_changed)(result_handle),
+                    "last_insert_rowid": (api.execute_result_last_insert_rowid)(result_handle),
+                    "statements_executed": (api.execute_result_statements_executed)(result_handle),
+                }))
+            })();
             (api.execute_result_destroy)(result_handle);
             drop(guard);
+            let result = result?;
             self.log_if_slow("execute_script", started_at, None);
             Ok(result)
         }
@@ -975,22 +985,28 @@ impl SqliteSkillBinding {
         if self.is_space_controller_mode() {
             let sql = require_string_field(input, "sql")?;
             let rows = parse_batch_sql_params(input)?;
-            self.log_info("execute_batch", None);
-            let started_at = Instant::now();
-            let bridge = self.controller_bridge()?;
-            let space_id = self.controller_space_id();
-            let binding_id = self.controller_binding_id()?;
             let sql_text = sql.to_string();
             let mapped_rows = rows
                 .iter()
                 .map(|row| map_controller_sqlite_params(row))
                 .collect();
-            let result = bridge.run(move |client| async move {
-                client
-                    .execute_sqlite_batch_typed(space_id, binding_id, sql_text, mapped_rows)
-                    .await
-            })?;
-            self.log_if_slow("execute_batch", started_at, None);
+            let result = self.run_controller_binding_operation(
+                "execute_batch",
+                None,
+                None,
+                |bridge, ids| {
+                    bridge.run(move |client| async move {
+                        client
+                            .execute_sqlite_batch_typed(
+                                ids.space_id,
+                                ids.binding_id,
+                                sql_text,
+                                mapped_rows,
+                            )
+                            .await
+                    })
+                },
+            )?;
             return Ok(json!({
                 "success": result.success,
                 "message": result.message,
@@ -1002,7 +1018,7 @@ impl SqliteSkillBinding {
         if self.is_host_provider_mode() {
             return self.dispatch_host_provider(RuntimeSqliteProviderAction::ExecuteBatch, input);
         }
-        let api = self.api_ref();
+        let api = self.api_ref()?;
         let sql = require_string_field(input, "sql")?;
         let rows = parse_batch_sql_params(input)?;
         let owned_rows = build_owned_ffi_value_matrix(&rows)?;
@@ -1018,21 +1034,27 @@ impl SqliteSkillBinding {
                 owned_rows.len_u64(),
             );
             if result_handle.is_null() {
-                drop(guard);
-                let error = api.take_last_error_message();
-                self.log_warning("execute_batch", &error);
-                return Err(error);
+                return Err(self.take_ffi_null_handle_error(api, "execute_batch", guard));
             }
 
-            let result = json!({
-                "success": u8_to_bool((api.execute_result_success)(result_handle)),
-                "message": api.take_optional_string((api.execute_result_message)(result_handle)).unwrap_or_default(),
-                "rows_changed": (api.execute_result_rows_changed)(result_handle),
-                "last_insert_rowid": (api.execute_result_last_insert_rowid)(result_handle),
-                "statements_executed": (api.execute_result_statements_executed)(result_handle),
-            });
+            let result = (|| -> Result<Value, String> {
+                // Required batch execution message returned by the dynamic execute-result handle.
+                // 动态执行结果句柄返回的必需批处理执行消息。
+                let message = require_sqlite_dynamic_string(
+                    api.take_optional_string((api.execute_result_message)(result_handle))?,
+                    "execute_batch_result.message",
+                )?;
+                Ok(json!({
+                    "success": u8_to_bool((api.execute_result_success)(result_handle)),
+                    "message": message,
+                    "rows_changed": (api.execute_result_rows_changed)(result_handle),
+                    "last_insert_rowid": (api.execute_result_last_insert_rowid)(result_handle),
+                    "statements_executed": (api.execute_result_statements_executed)(result_handle),
+                }))
+            })();
             (api.execute_result_destroy)(result_handle);
             drop(guard);
+            let result = result?;
             self.log_if_slow("execute_batch", started_at, None);
             Ok(result)
         }
@@ -1046,14 +1068,17 @@ impl SqliteSkillBinding {
             let params = parse_single_sql_params(input)?;
             self.log_info("query_json", None);
             let started_at = Instant::now();
-            let bridge = self.controller_bridge()?;
-            let space_id = self.controller_space_id();
-            let binding_id = self.controller_binding_id()?;
+            let (bridge, controller_ids) = self.controller_call_context()?;
             let sql_text = sql.to_string();
             let mapped_params = map_controller_sqlite_params(&params);
             let result = bridge.run(move |client| async move {
                 client
-                    .query_sqlite_json_typed(space_id, binding_id, sql_text, mapped_params)
+                    .query_sqlite_json_typed(
+                        controller_ids.space_id,
+                        controller_ids.binding_id,
+                        sql_text,
+                        mapped_params,
+                    )
                     .await
             })?;
             let rows = serde_json::from_str::<Value>(&result.json_data).map_err(|error| {
@@ -1074,7 +1099,7 @@ impl SqliteSkillBinding {
         if self.is_host_provider_mode() {
             return self.dispatch_host_provider(RuntimeSqliteProviderAction::QueryJson, input);
         }
-        let api = self.api_ref();
+        let api = self.api_ref()?;
         let sql = require_string_field(input, "sql")?;
         let params = parse_single_sql_params(input)?;
         let owned_params = build_owned_ffi_values(&params)?;
@@ -1095,19 +1120,18 @@ impl SqliteSkillBinding {
                 ptr::null(),
             );
             if result_handle.is_null() {
-                drop(guard);
-                let error = api.take_last_error_message();
-                self.log_warning("query_json", &error);
-                return Err(error);
+                return Err(self.take_ffi_null_handle_error(api, "query_json", guard));
             }
 
             let row_count = (api.query_json_result_row_count)(result_handle);
-            let json_data =
-                api.take_owned_string((api.query_json_result_json_data)(result_handle))?;
-            let rows = serde_json::from_str::<Value>(&json_data)
-                .map_err(|error| format!("query_json returned invalid json_data: {}", error))?;
+            // Store the string extraction result so the native result handle is always destroyed first.
+            // 先保存字符串提取结果，确保原生结果句柄总会先被销毁。
+            let json_data = api.take_owned_string((api.query_json_result_json_data)(result_handle));
             (api.query_json_result_destroy)(result_handle);
             drop(guard);
+            let json_data = json_data?;
+            let rows = serde_json::from_str::<Value>(&json_data)
+                .map_err(|error| format!("query_json returned invalid json_data: {}", error))?;
             self.log_if_slow(
                 "query_json",
                 started_at,
@@ -1134,16 +1158,14 @@ impl SqliteSkillBinding {
                 .and_then(Value::as_u64);
             self.log_info("query_stream", None);
             let started_at = Instant::now();
-            let bridge = self.controller_bridge()?;
-            let space_id = self.controller_space_id();
-            let binding_id = self.controller_binding_id()?;
+            let (bridge, controller_ids) = self.controller_call_context()?;
             let sql_text = sql.to_string();
             let mapped_params = map_controller_sqlite_params(&params);
             let result = bridge.run(move |client| async move {
                 client
                     .open_sqlite_query_stream_typed(
-                        space_id,
-                        binding_id,
+                        controller_ids.space_id,
+                        controller_ids.binding_id,
                         sql_text,
                         mapped_params,
                         chunk_bytes,
@@ -1167,7 +1189,7 @@ impl SqliteSkillBinding {
         if self.is_host_provider_mode() {
             return self.dispatch_host_provider(RuntimeSqliteProviderAction::QueryStream, input);
         }
-        let api = self.api_ref();
+        let api = self.api_ref()?;
         let sql = require_string_field(input, "sql")?;
         let params = parse_single_sql_params(input)?;
         let owned_params = build_owned_ffi_values(&params)?;
@@ -1194,10 +1216,7 @@ impl SqliteSkillBinding {
                 chunk_bytes,
             );
             if result_handle.is_null() {
-                drop(guard);
-                let error = api.take_last_error_message();
-                self.log_warning("query_stream", &error);
-                return Err(error);
+                return Err(self.take_ffi_null_handle_error(api, "query_stream", guard));
             }
 
             let stream_id = guard.next_stream_id;
@@ -1254,7 +1273,7 @@ impl SqliteSkillBinding {
                 input,
             );
         }
-        let api = self.api_ref();
+        let api = self.api_ref()?;
         let stream_id = input
             .get("stream_id")
             .and_then(Value::as_u64)
@@ -1332,7 +1351,7 @@ impl SqliteSkillBinding {
             return self
                 .dispatch_host_provider(RuntimeSqliteProviderAction::QueryStreamChunk, input);
         }
-        let api = self.api_ref();
+        let api = self.api_ref()?;
         let stream_id = input
             .get("stream_id")
             .and_then(Value::as_u64)
@@ -1405,7 +1424,7 @@ impl SqliteSkillBinding {
             return self
                 .dispatch_host_provider(RuntimeSqliteProviderAction::QueryStreamClose, input);
         }
-        let api = self.api_ref();
+        let api = self.api_ref()?;
         let stream_id = input
             .get("stream_id")
             .and_then(Value::as_u64)
@@ -1449,31 +1468,29 @@ impl SqliteSkillBinding {
                 .get("search_mode")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            self.log_info(
+            let text_value = text.to_string();
+            let result = self.run_controller_binding_operation(
                 "tokenize_text",
                 Some(format!(
                     "tokenizer_mode={} search_mode={}",
                     controller_tokenizer_mode_name(tokenizer_mode),
                     search_mode
                 )),
-            );
-            let started_at = Instant::now();
-            let bridge = self.controller_bridge()?;
-            let space_id = self.controller_space_id();
-            let binding_id = self.controller_binding_id()?;
-            let text_value = text.to_string();
-            let result = bridge.run(move |client| async move {
-                client
-                    .tokenize_sqlite_text(
-                        space_id,
-                        binding_id,
-                        tokenizer_mode,
-                        text_value,
-                        search_mode,
-                    )
-                    .await
-            })?;
-            self.log_if_slow("tokenize_text", started_at, None);
+                None,
+                |bridge, ids| {
+                    bridge.run(move |client| async move {
+                        client
+                            .tokenize_sqlite_text(
+                                ids.space_id,
+                                ids.binding_id,
+                                tokenizer_mode,
+                                text_value,
+                                search_mode,
+                            )
+                            .await
+                    })
+                },
+            )?;
             return Ok(json!({
                 "success": true,
                 "tokenizer_mode": result.tokenizer_mode,
@@ -1485,7 +1502,7 @@ impl SqliteSkillBinding {
         if self.is_host_provider_mode() {
             return self.dispatch_host_provider(RuntimeSqliteProviderAction::TokenizeText, input);
         }
-        let api = self.api_ref();
+        let api = self.api_ref()?;
         let tokenizer_mode = parse_tokenizer_mode(
             input
                 .get("tokenizer_mode")
@@ -1518,26 +1535,29 @@ impl SqliteSkillBinding {
                 bool_to_u8(search_mode),
             );
             if handle.is_null() {
-                drop(guard);
-                let error = api.take_last_error_message();
-                self.log_warning("tokenize_text", &error);
-                return Err(error);
+                return Err(self.take_ffi_null_handle_error(api, "tokenize_text", guard));
             }
 
-            let normalized_text =
-                api.take_owned_string((api.tokenize_result_normalized_text)(handle))?;
-            let fts_query = api.take_owned_string((api.tokenize_result_fts_query)(handle))?;
-            let token_count = (api.tokenize_result_token_count)(handle);
-            let mut tokens = Vec::with_capacity(token_count as usize);
-            for index in 0..token_count {
-                if let Some(token) =
-                    api.take_optional_string((api.tokenize_result_get_token)(handle, index))
-                {
-                    tokens.push(Value::String(token));
+            // Extract tokenization fields as one fallible payload so the native handle is destroyed on every path.
+            // 将分词字段作为一个可失败载荷提取，确保所有路径都会销毁原生句柄。
+            let tokenized = (|| -> Result<(String, String, Vec<Value>), String> {
+                let normalized_text =
+                    api.take_owned_string((api.tokenize_result_normalized_text)(handle))?;
+                let fts_query = api.take_owned_string((api.tokenize_result_fts_query)(handle))?;
+                let token_count = (api.tokenize_result_token_count)(handle);
+                let mut tokens = Vec::with_capacity(token_count as usize);
+                for index in 0..token_count {
+                    if let Some(token) =
+                        api.take_optional_string((api.tokenize_result_get_token)(handle, index))?
+                    {
+                        tokens.push(Value::String(token));
+                    }
                 }
-            }
+                Ok((normalized_text, fts_query, tokens))
+            })();
             (api.tokenize_result_destroy)(handle);
             drop(guard);
+            let (normalized_text, fts_query, tokens) = tokenized?;
             self.log_if_slow("tokenize_text", started_at, None);
             Ok(json!({
                 "success": true,
@@ -1555,19 +1575,25 @@ impl SqliteSkillBinding {
         if self.is_space_controller_mode() {
             let word = require_string_field(input, "word")?;
             let weight = input.get("weight").and_then(Value::as_u64).unwrap_or(1);
-            self.log_info("upsert_custom_word", Some(format!("word={}", word)));
-            let started_at = Instant::now();
-            let bridge = self.controller_bridge()?;
-            let space_id = self.controller_space_id();
-            let binding_id = self.controller_binding_id()?;
             let word_value = word.to_string();
             let weight_value = u32::try_from(weight).unwrap_or(u32::MAX);
-            let result = bridge.run(move |client| async move {
-                client
-                    .upsert_sqlite_custom_word(space_id, binding_id, word_value, weight_value)
-                    .await
-            })?;
-            self.log_if_slow("upsert_custom_word", started_at, None);
+            let result = self.run_controller_binding_operation(
+                "upsert_custom_word",
+                Some(format!("word={}", word)),
+                None,
+                |bridge, ids| {
+                    bridge.run(move |client| async move {
+                        client
+                            .upsert_sqlite_custom_word(
+                                ids.space_id,
+                                ids.binding_id,
+                                word_value,
+                                weight_value,
+                            )
+                            .await
+                    })
+                },
+            )?;
             return Ok(json!({
                 "success": result.success,
                 "message": result.message,
@@ -1580,7 +1606,7 @@ impl SqliteSkillBinding {
             return self
                 .dispatch_host_provider(RuntimeSqliteProviderAction::UpsertCustomWord, input);
         }
-        let api = self.api_ref();
+        let api = self.api_ref()?;
         let word = require_string_field(input, "word")?;
         let weight = input.get("weight").and_then(Value::as_u64).unwrap_or(1);
         self.log_info("upsert_custom_word", Some(format!("word={}", word)));
@@ -1615,18 +1641,19 @@ impl SqliteSkillBinding {
     pub fn remove_custom_word_json(&self, input: &Value) -> Result<Value, String> {
         if self.is_space_controller_mode() {
             let word = require_string_field(input, "word")?;
-            self.log_info("remove_custom_word", Some(format!("word={}", word)));
-            let started_at = Instant::now();
-            let bridge = self.controller_bridge()?;
-            let space_id = self.controller_space_id();
-            let binding_id = self.controller_binding_id()?;
             let word_value = word.to_string();
-            let result = bridge.run(move |client| async move {
-                client
-                    .remove_sqlite_custom_word(space_id, binding_id, word_value)
-                    .await
-            })?;
-            self.log_if_slow("remove_custom_word", started_at, None);
+            let result = self.run_controller_binding_operation(
+                "remove_custom_word",
+                Some(format!("word={}", word)),
+                None,
+                |bridge, ids| {
+                    bridge.run(move |client| async move {
+                        client
+                            .remove_sqlite_custom_word(ids.space_id, ids.binding_id, word_value)
+                            .await
+                    })
+                },
+            )?;
             return Ok(json!({
                 "success": result.success,
                 "message": result.message,
@@ -1638,7 +1665,7 @@ impl SqliteSkillBinding {
             return self
                 .dispatch_host_provider(RuntimeSqliteProviderAction::RemoveCustomWord, input);
         }
-        let api = self.api_ref();
+        let api = self.api_ref()?;
         let word = require_string_field(input, "word")?;
         self.log_info("remove_custom_word", Some(format!("word={}", word)));
         let started_at = Instant::now();
@@ -1667,11 +1694,11 @@ impl SqliteSkillBinding {
         if self.is_space_controller_mode() {
             self.log_info("list_custom_words", None);
             let started_at = Instant::now();
-            let bridge = self.controller_bridge()?;
-            let space_id = self.controller_space_id();
-            let binding_id = self.controller_binding_id()?;
+            let (bridge, controller_ids) = self.controller_call_context()?;
             let result = bridge.run(move |client| async move {
-                client.list_sqlite_custom_words(space_id, binding_id).await
+                client
+                    .list_sqlite_custom_words(controller_ids.space_id, controller_ids.binding_id)
+                    .await
             })?;
             self.log_if_slow(
                 "list_custom_words",
@@ -1694,33 +1721,38 @@ impl SqliteSkillBinding {
                 &Value::Object(Default::default()),
             );
         }
-        let api = self.api_ref();
+        let api = self.api_ref()?;
         self.log_info("list_custom_words", None);
         let started_at = Instant::now();
         let guard = self.lock_handles()?;
         unsafe {
             let list_handle = (api.database_list_custom_words)(guard.database);
             if list_handle.is_null() {
-                drop(guard);
-                let error = api.take_last_error_message();
-                self.log_warning("list_custom_words", &error);
-                return Err(error);
+                return Err(self.take_ffi_null_handle_error(api, "list_custom_words", guard));
             }
 
             let len = (api.custom_word_list_len)(list_handle);
-            let mut words = Vec::with_capacity(len as usize);
-            for index in 0..len {
-                let word = api
-                    .take_optional_string((api.custom_word_list_get_word)(list_handle, index))
-                    .unwrap_or_default();
-                let weight = (api.custom_word_list_get_weight)(list_handle, index);
-                words.push(json!({
-                    "word": word,
-                    "weight": weight,
-                }));
-            }
+            let words = (|| -> Result<Vec<Value>, String> {
+                let mut words = Vec::with_capacity(len as usize);
+                for index in 0..len {
+                    let word = require_sqlite_dynamic_string(
+                        api.take_optional_string((api.custom_word_list_get_word)(
+                            list_handle,
+                            index,
+                        ))?,
+                        "custom_word.word",
+                    )?;
+                    let weight = (api.custom_word_list_get_weight)(list_handle, index);
+                    words.push(json!({
+                        "word": word,
+                        "weight": weight,
+                    }));
+                }
+                Ok(words)
+            })();
             (api.custom_word_list_destroy)(list_handle);
             drop(guard);
+            let words = words?;
             self.log_if_slow(
                 "list_custom_words",
                 started_at,
@@ -1746,21 +1778,24 @@ impl SqliteSkillBinding {
                     .and_then(Value::as_str)
                     .unwrap_or("none"),
             )?);
-            self.log_info(
+            let index_name_value = index_name.to_string();
+            let result = self.run_controller_binding_operation(
                 "ensure_fts_index",
                 Some(format!("index_name={}", index_name)),
-            );
-            let started_at = Instant::now();
-            let bridge = self.controller_bridge()?;
-            let space_id = self.controller_space_id();
-            let binding_id = self.controller_binding_id()?;
-            let index_name_value = index_name.to_string();
-            let result = bridge.run(move |client| async move {
-                client
-                    .ensure_sqlite_fts_index(space_id, binding_id, index_name_value, tokenizer_mode)
-                    .await
-            })?;
-            self.log_if_slow("ensure_fts_index", started_at, None);
+                None,
+                |bridge, ids| {
+                    bridge.run(move |client| async move {
+                        client
+                            .ensure_sqlite_fts_index(
+                                ids.space_id,
+                                ids.binding_id,
+                                index_name_value,
+                                tokenizer_mode,
+                            )
+                            .await
+                    })
+                },
+            )?;
             return Ok(json!({
                 "success": result.success,
                 "message": result.message,
@@ -1771,7 +1806,7 @@ impl SqliteSkillBinding {
         if self.is_host_provider_mode() {
             return self.dispatch_host_provider(RuntimeSqliteProviderAction::EnsureFtsIndex, input);
         }
-        let api = self.api_ref();
+        let api = self.api_ref()?;
         let index_name = require_string_field(input, "index_name")?;
         let tokenizer_mode = parse_tokenizer_mode(
             input
@@ -1821,26 +1856,24 @@ impl SqliteSkillBinding {
                     .and_then(Value::as_str)
                     .unwrap_or("none"),
             )?);
-            self.log_info(
+            let index_name_value = index_name.to_string();
+            let result = self.run_controller_binding_operation(
                 "rebuild_fts_index",
                 Some(format!("index_name={}", index_name)),
-            );
-            let started_at = Instant::now();
-            let bridge = self.controller_bridge()?;
-            let space_id = self.controller_space_id();
-            let binding_id = self.controller_binding_id()?;
-            let index_name_value = index_name.to_string();
-            let result = bridge.run(move |client| async move {
-                client
-                    .rebuild_sqlite_fts_index(
-                        space_id,
-                        binding_id,
-                        index_name_value,
-                        tokenizer_mode,
-                    )
-                    .await
-            })?;
-            self.log_if_slow("rebuild_fts_index", started_at, None);
+                None,
+                |bridge, ids| {
+                    bridge.run(move |client| async move {
+                        client
+                            .rebuild_sqlite_fts_index(
+                                ids.space_id,
+                                ids.binding_id,
+                                index_name_value,
+                                tokenizer_mode,
+                            )
+                            .await
+                    })
+                },
+            )?;
             return Ok(json!({
                 "success": result.success,
                 "message": result.message,
@@ -1853,7 +1886,7 @@ impl SqliteSkillBinding {
             return self
                 .dispatch_host_provider(RuntimeSqliteProviderAction::RebuildFtsIndex, input);
         }
-        let api = self.api_ref();
+        let api = self.api_ref()?;
         let index_name = require_string_field(input, "index_name")?;
         let tokenizer_mode = parse_tokenizer_mode(
             input
@@ -1907,42 +1940,34 @@ impl SqliteSkillBinding {
             )?);
             let id = require_string_field(input, "id")?;
             let file_path = require_string_field(input, "file_path")?;
-            let title = input
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let content = input
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            self.log_info(
-                "upsert_fts_document",
-                Some(format!("index_name={} id={}", index_name, id)),
-            );
-            let started_at = Instant::now();
-            let bridge = self.controller_bridge()?;
-            let space_id = self.controller_space_id();
-            let binding_id = self.controller_binding_id()?;
+            let title = require_present_string_field(input, "title")?;
+            let content = require_present_string_field(input, "content")?;
             let index_name_value = index_name.to_string();
             let id_value = id.to_string();
             let file_path_value = file_path.to_string();
             let title_value = title.to_string();
             let content_value = content.to_string();
-            let result = bridge.run(move |client| async move {
-                client
-                    .upsert_sqlite_fts_document(
-                        space_id,
-                        binding_id,
-                        index_name_value,
-                        tokenizer_mode,
-                        id_value,
-                        file_path_value,
-                        title_value,
-                        content_value,
-                    )
-                    .await
-            })?;
-            self.log_if_slow("upsert_fts_document", started_at, None);
+            let result = self.run_controller_binding_operation(
+                "upsert_fts_document",
+                Some(format!("index_name={} id={}", index_name, id)),
+                None,
+                |bridge, ids| {
+                    bridge.run(move |client| async move {
+                        client
+                            .upsert_sqlite_fts_document(
+                                ids.space_id,
+                                ids.binding_id,
+                                index_name_value,
+                                tokenizer_mode,
+                                id_value,
+                                file_path_value,
+                                title_value,
+                                content_value,
+                            )
+                            .await
+                    })
+                },
+            )?;
             return Ok(json!({
                 "success": result.success,
                 "message": result.message,
@@ -1955,7 +1980,7 @@ impl SqliteSkillBinding {
             return self
                 .dispatch_host_provider(RuntimeSqliteProviderAction::UpsertFtsDocument, input);
         }
-        let api = self.api_ref();
+        let api = self.api_ref()?;
         let index_name = require_string_field(input, "index_name")?;
         let tokenizer_mode = parse_tokenizer_mode(
             input
@@ -1966,8 +1991,8 @@ impl SqliteSkillBinding {
         )?;
         let id = require_string_field(input, "id")?;
         let file_path = require_string_field(input, "file_path")?;
-        let title = input.get("title").and_then(Value::as_str).unwrap_or("");
-        let content = input.get("content").and_then(Value::as_str).unwrap_or("");
+        let title = require_present_string_field(input, "title")?;
+        let content = require_present_string_field(input, "content")?;
         self.log_info(
             "upsert_fts_document",
             Some(format!("index_name={} id={}", index_name, id)),
@@ -2012,22 +2037,25 @@ impl SqliteSkillBinding {
         if self.is_space_controller_mode() {
             let index_name = require_string_field(input, "index_name")?;
             let id = require_string_field(input, "id")?;
-            self.log_info(
-                "delete_fts_document",
-                Some(format!("index_name={} id={}", index_name, id)),
-            );
-            let started_at = Instant::now();
-            let bridge = self.controller_bridge()?;
-            let space_id = self.controller_space_id();
-            let binding_id = self.controller_binding_id()?;
             let index_name_value = index_name.to_string();
             let id_value = id.to_string();
-            let result = bridge.run(move |client| async move {
-                client
-                    .delete_sqlite_fts_document(space_id, binding_id, index_name_value, id_value)
-                    .await
-            })?;
-            self.log_if_slow("delete_fts_document", started_at, None);
+            let result = self.run_controller_binding_operation(
+                "delete_fts_document",
+                Some(format!("index_name={} id={}", index_name, id)),
+                None,
+                |bridge, ids| {
+                    bridge.run(move |client| async move {
+                        client
+                            .delete_sqlite_fts_document(
+                                ids.space_id,
+                                ids.binding_id,
+                                index_name_value,
+                                id_value,
+                            )
+                            .await
+                    })
+                },
+            )?;
             return Ok(json!({
                 "success": result.success,
                 "message": result.message,
@@ -2040,7 +2068,7 @@ impl SqliteSkillBinding {
             return self
                 .dispatch_host_provider(RuntimeSqliteProviderAction::DeleteFtsDocument, input);
         }
-        let api = self.api_ref();
+        let api = self.api_ref()?;
         let index_name = require_string_field(input, "index_name")?;
         let id = require_string_field(input, "id")?;
         self.log_info(
@@ -2100,9 +2128,7 @@ impl SqliteSkillBinding {
                 )),
             );
             let started_at = Instant::now();
-            let bridge = self.controller_bridge()?;
-            let space_id = self.controller_space_id();
-            let binding_id = self.controller_binding_id()?;
+            let (bridge, controller_ids) = self.controller_call_context()?;
             let index_name_value = index_name.to_string();
             let query_value = query.to_string();
             let limit_value = u32::try_from(limit).unwrap_or(u32::MAX);
@@ -2110,8 +2136,8 @@ impl SqliteSkillBinding {
             let result = bridge.run(move |client| async move {
                 client
                     .search_sqlite_fts(
-                        space_id,
-                        binding_id,
+                        controller_ids.space_id,
+                        controller_ids.binding_id,
                         index_name_value,
                         tokenizer_mode,
                         query_value,
@@ -2150,7 +2176,7 @@ impl SqliteSkillBinding {
         if self.is_host_provider_mode() {
             return self.dispatch_host_provider(RuntimeSqliteProviderAction::SearchFts, input);
         }
-        let api = self.api_ref();
+        let api = self.api_ref()?;
         let index_name = require_string_field(input, "index_name")?;
         let tokenizer_mode = parse_tokenizer_mode(
             input
@@ -2186,45 +2212,93 @@ impl SqliteSkillBinding {
                 offset,
             );
             if result_handle.is_null() {
-                drop(guard);
-                let error = api.take_last_error_message();
-                self.log_warning("search_fts", &error);
-                return Err(error);
+                return Err(self.take_ffi_null_handle_error(api, "search_fts", guard));
             }
 
-            let total = (api.search_result_total)(result_handle);
-            let len = (api.search_result_len)(result_handle);
-            let source = api
-                .take_optional_string((api.search_result_source)(result_handle))
-                .unwrap_or_else(|| "sqlite_fts".to_string());
-            let query_mode = api
-                .take_optional_string((api.search_result_query_mode)(result_handle))
-                .unwrap_or_else(|| "fts".to_string());
-            let mut hits = Vec::with_capacity(len as usize);
-            for index in 0..len {
-                hits.push(json!({
-                    "id": api.take_optional_string((api.search_result_get_id)(result_handle, index)).unwrap_or_default(),
-                    "file_path": api.take_optional_string((api.search_result_get_file_path)(result_handle, index)).unwrap_or_default(),
-                    "title": api.take_optional_string((api.search_result_get_title)(result_handle, index)).unwrap_or_default(),
-                    "title_highlight": api.take_optional_string((api.search_result_get_title_highlight)(result_handle, index)).unwrap_or_default(),
-                    "content_snippet": api.take_optional_string((api.search_result_get_content_snippet)(result_handle, index)).unwrap_or_default(),
-                    "score": (api.search_result_get_score)(result_handle, index),
-                    "rank": (api.search_result_get_rank)(result_handle, index),
-                    "raw_score": (api.search_result_get_raw_score)(result_handle, index),
-                }));
-            }
+            let result = (|| -> Result<Value, String> {
+                let total = (api.search_result_total)(result_handle);
+                let len = (api.search_result_len)(result_handle);
+                let source = api
+                    .take_optional_string((api.search_result_source)(result_handle))?
+                    .unwrap_or_else(|| "sqlite_fts".to_string());
+                let query_mode = api
+                    .take_optional_string((api.search_result_query_mode)(result_handle))?
+                    .unwrap_or_else(|| "fts".to_string());
+                let mut hits = Vec::with_capacity(len as usize);
+                for index in 0..len {
+                    // Required hit identifier returned by the dynamic search result handle.
+                    // 动态检索结果句柄返回的必需命中标识。
+                    let id = require_sqlite_dynamic_string(
+                        api.take_optional_string((api.search_result_get_id)(result_handle, index))?,
+                        "fts_hit.id",
+                    )?;
+                    // Required hit file or logical path returned by the dynamic search result handle.
+                    // 动态检索结果句柄返回的必需命中文件路径或逻辑路径。
+                    let file_path = require_sqlite_dynamic_string(
+                        api.take_optional_string((api.search_result_get_file_path)(
+                            result_handle,
+                            index,
+                        ))?,
+                        "fts_hit.file_path",
+                    )?;
+                    // Required raw title returned by the dynamic search result handle.
+                    // 动态检索结果句柄返回的必需原始标题。
+                    let title = require_sqlite_dynamic_string(
+                        api.take_optional_string((api.search_result_get_title)(
+                            result_handle,
+                            index,
+                        ))?,
+                        "fts_hit.title",
+                    )?;
+                    // Required highlighted title returned by the dynamic search result handle.
+                    // 动态检索结果句柄返回的必需高亮标题。
+                    let title_highlight = require_sqlite_dynamic_string(
+                        api.take_optional_string((api.search_result_get_title_highlight)(
+                            result_handle,
+                            index,
+                        ))?,
+                        "fts_hit.title_highlight",
+                    )?;
+                    // Required highlighted content snippet returned by the dynamic search result handle.
+                    // 动态检索结果句柄返回的必需高亮正文片段。
+                    let content_snippet = require_sqlite_dynamic_string(
+                        api.take_optional_string((api.search_result_get_content_snippet)(
+                            result_handle,
+                            index,
+                        ))?,
+                        "fts_hit.content_snippet",
+                    )?;
+                    hits.push(json!({
+                        "id": id,
+                        "file_path": file_path,
+                        "title": title,
+                        "title_highlight": title_highlight,
+                        "content_snippet": content_snippet,
+                        "score": (api.search_result_get_score)(result_handle, index),
+                        "rank": (api.search_result_get_rank)(result_handle, index),
+                        "raw_score": (api.search_result_get_raw_score)(result_handle, index),
+                    }));
+                }
+                Ok(json!({
+                    "success": true,
+                    "index_name": index_name,
+                    "tokenizer_mode": tokenizer_mode_name(tokenizer_mode),
+                    "source": source,
+                    "query_mode": query_mode,
+                    "total": total,
+                    "hits": hits,
+                }))
+            })();
             (api.search_result_destroy)(result_handle);
             drop(guard);
-            self.log_if_slow("search_fts", started_at, Some(format!("hits={}", len)));
-            Ok(json!({
-                "success": true,
-                "index_name": index_name,
-                "tokenizer_mode": tokenizer_mode_name(tokenizer_mode),
-                "source": source,
-                "query_mode": query_mode,
-                "total": total,
-                "hits": hits,
-            }))
+            let result = result?;
+            let hit_count = result
+                .get("hits")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            self.log_if_slow("search_fts", started_at, Some(format!("hits={hit_count}")));
+            Ok(result)
         }
     }
 
@@ -2281,6 +2355,34 @@ impl SqliteSkillBinding {
         }
     }
 
+    /// Release one held SQLite handle lock, read the native last error, and log it for a failed FFI handle allocation.
+    /// 释放一个已持有的 SQLite 句柄锁，读取原生 last error，并为失败的 FFI handle 分配记录告警。
+    ///
+    /// The api parameter owns the loaded dynamic-library symbols used to read the native last error.
+    /// api 参数持有读取原生 last error 所需的动态库符号。
+    ///
+    /// The operation parameter is the stable operation name used by warning logs.
+    /// operation 参数是告警日志使用的稳定操作名称。
+    ///
+    /// The guard parameter is consumed so the native handle lock is released before the last-error call.
+    /// guard 参数会被消费，确保在读取 last-error 前释放原生句柄锁。
+    ///
+    /// Return the native error message that should be returned to the caller.
+    /// 返回应传递给调用方的原生错误消息。
+    fn take_ffi_null_handle_error(
+        &self,
+        api: &LoadedSqliteApi,
+        operation: &str,
+        guard: std::sync::MutexGuard<'_, SkillHandleState>,
+    ) -> String {
+        drop(guard);
+        // Capture the native last-error message after the handle lock has been released.
+        // 在句柄锁释放后捕获原生 last-error 消息。
+        let error = api.take_last_error_message();
+        self.log_warning(operation, &error);
+        error
+    }
+
     /// Acquire the handle lock so SQLite FFI calls for the same skill execute serially.
     /// 获取句柄锁，确保同一个 skill 的 SQLite FFI 调用按顺序串行执行。
     fn lock_handles(&self) -> Result<std::sync::MutexGuard<'_, SkillHandleState>, String> {
@@ -2305,12 +2407,15 @@ impl SqliteSkillBinding {
         self.provider_mode == SqliteBindingMode::SpaceController
     }
 
-    /// Return the loaded dynamic-library API for dynamic mode bindings.
-    /// 返回动态模式绑定所对应的已加载动态库 API。
-    fn api_ref(&self) -> &LoadedSqliteApi {
-        self.api
-            .as_ref()
-            .expect("SQLite dynamic-library API missing in host provider mode")
+    /// Return the loaded dynamic-library API for dynamic mode bindings, or an explicit binding-state error.
+    /// 返回动态模式绑定所对应的已加载动态库 API；若绑定状态不一致则返回显式错误。
+    fn api_ref(&self) -> Result<&LoadedSqliteApi, String> {
+        self.api.as_deref().ok_or_else(|| {
+            format!(
+                "SQLite dynamic-library API is unavailable for {} binding",
+                self.integration_mode_name()
+            )
+        })
     }
 
     /// Return the stable integration mode name for diagnostics and Lua status payloads.
@@ -2353,18 +2458,58 @@ impl SqliteSkillBinding {
             .ok_or_else(|| "SQLite space-controller bridge is unavailable".to_string())
     }
 
-    /// Return the shared controller runtime-space identifier for the current skill binding.
-    /// 返回当前 skill 绑定对应的共享控制器运行时空间标识。
-    fn controller_space_id(&self) -> String {
-        controller_space_id_for_binding(&self.provider_binding)
+    /// Return the controller bridge and identifiers required by one controller operation.
+    /// 返回一次控制器操作所需的控制器桥接与标识集合。
+    fn controller_call_context(
+        &self,
+    ) -> Result<
+        (
+            &Arc<LuaRuntimeSpaceControllerBridge>,
+            LuaRuntimeSpaceControllerBindingIds,
+        ),
+        String,
+    > {
+        let bridge = self.controller_bridge()?;
+        let ids = bridge.binding_ids_for_binding(&self.provider_binding);
+        Ok((bridge, ids))
     }
 
-    /// Return the client-scoped controller database-binding identifier for the current skill binding.
-    /// 返回当前 skill 绑定对应的客户端隔离控制器数据库绑定标识。
-    fn controller_binding_id(&self) -> Result<String, String> {
-        Ok(self
-            .controller_bridge()?
-            .controller_binding_id_for_binding(&self.provider_binding))
+    /// Run one SQLite controller operation with shared logging, timing, and binding identifiers.
+    /// 使用共享日志、计时与绑定标识执行一次 SQLite 控制器操作。
+    ///
+    /// The operation parameter is the stable operation name used by normal and slow logs.
+    /// operation 参数是普通日志与慢日志使用的稳定操作名称。
+    ///
+    /// The log_extra parameter is the optional detail emitted before the controller call.
+    /// log_extra 参数是控制器调用前输出的可选细节。
+    ///
+    /// The slow_extra parameter is the optional detail emitted when the slow-log threshold is reached.
+    /// slow_extra 参数是达到慢日志阈值时输出的可选细节。
+    ///
+    /// The invoke parameter performs the provider-specific controller SDK call.
+    /// invoke 参数执行 provider 专属的控制器 SDK 调用。
+    ///
+    /// Return the provider-specific controller response returned by the invoke closure.
+    /// 返回 invoke 闭包产出的 provider 专属控制器响应。
+    fn run_controller_binding_operation<T, F>(
+        &self,
+        operation: &str,
+        log_extra: Option<String>,
+        slow_extra: Option<String>,
+        invoke: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce(
+            &Arc<LuaRuntimeSpaceControllerBridge>,
+            LuaRuntimeSpaceControllerBindingIds,
+        ) -> Result<T, String>,
+    {
+        self.log_info(operation, log_extra);
+        let started_at = Instant::now();
+        let (bridge, controller_ids) = self.controller_call_context()?;
+        let result = invoke(bridge, controller_ids)?;
+        self.log_if_slow(operation, started_at, slow_extra);
+        Ok(result)
     }
 }
 
@@ -2408,40 +2553,69 @@ pub struct SqliteSkillHost {
     host_options: LuaRuntimeHostOptions,
 }
 
+/// Resolve the optional SQLite dynamic-library API for the selected provider mode.
+/// 根据选定的 provider 模式解析可选 SQLite 动态库 API。
+///
+/// The host_options parameter carries the provider mode and dynamic-library path selected by the host.
+/// host_options 参数携带宿主选择的 provider 模式与动态库路径。
+///
+/// The provider_callbacks parameter is the engine-captured provider callback snapshot used by host-callback mode.
+/// provider_callbacks 参数是 host-callback 模式使用的引擎级 provider 回调快照。
+///
+/// Return a loaded dynamic-library API only when SQLite runs in dynamic-library mode.
+/// 仅当 SQLite 运行在 dynamic-library 模式时返回已加载的动态库 API。
+fn resolve_sqlite_skill_host_api(
+    host_options: &LuaRuntimeHostOptions,
+    provider_callbacks: &RuntimeDatabaseProviderCallbacks,
+) -> Result<Option<Arc<LoadedSqliteApi>>, String> {
+    match host_options.sqlite_provider_mode {
+        LuaRuntimeDatabaseProviderMode::DynamicLibrary => {
+            let library_path = host_options.sqlite_library_path.clone().ok_or_else(|| {
+                "SQLite dynamic-library mode requires host_options.sqlite_library_path".to_string()
+            })?;
+            Ok(Some(Arc::new(LoadedSqliteApi::load(&library_path)?)))
+        }
+        LuaRuntimeDatabaseProviderMode::HostCallback => {
+            require_database_provider_callback_registration(
+                "SQLite",
+                host_options.sqlite_callback_mode,
+                provider_callbacks
+                    .has_sqlite_provider_callback_for_mode(host_options.sqlite_callback_mode),
+            )?;
+            Ok(None)
+        }
+        LuaRuntimeDatabaseProviderMode::SpaceController => Ok(None),
+    }
+}
+
+/// Resolve the optional SQLite space-controller bridge for the selected provider mode.
+/// 根据选定的 provider 模式解析可选 SQLite space-controller 桥接。
+///
+/// The host_options parameter carries the provider mode and controller connection settings.
+/// host_options 参数携带 provider 模式与控制器连接设置。
+///
+/// Return a controller bridge only when SQLite runs in space-controller mode.
+/// 仅当 SQLite 运行在 space-controller 模式时返回控制器桥接。
+fn resolve_sqlite_skill_host_controller(
+    host_options: &LuaRuntimeHostOptions,
+) -> Result<Option<Arc<LuaRuntimeSpaceControllerBridge>>, String> {
+    match host_options.sqlite_provider_mode {
+        LuaRuntimeDatabaseProviderMode::SpaceController => Ok(Some(
+            LuaRuntimeSpaceControllerBridge::new(host_options, "sqlite")?,
+        )),
+        _ => Ok(None),
+    }
+}
+
 impl SqliteSkillHost {
-    /// Create the host-side SQLite skill manager and load the dynamic library immediately.
-    /// 创建宿主级 SQLite 技能管理器，并立即加载动态库。
+    /// Create the host-side SQLite skill manager and resolve resources for the selected provider mode.
+    /// 创建宿主级 SQLite 技能管理器，并解析所选 provider 模式需要的资源。
     pub fn new(
         host_options: LuaRuntimeHostOptions,
         provider_callbacks: Arc<RuntimeDatabaseProviderCallbacks>,
     ) -> Result<Self, String> {
-        let api = match host_options.sqlite_provider_mode {
-            LuaRuntimeDatabaseProviderMode::DynamicLibrary => {
-                let library_path = host_options.sqlite_library_path.clone().ok_or_else(|| {
-                    "SQLite dynamic-library mode requires host_options.sqlite_library_path"
-                        .to_string()
-                })?;
-                Some(Arc::new(LoadedSqliteApi::load(&library_path)?))
-            }
-            LuaRuntimeDatabaseProviderMode::HostCallback => {
-                if !provider_callbacks
-                    .has_sqlite_provider_callback_for_mode(host_options.sqlite_callback_mode)
-                {
-                    return Err(format!(
-                        "SQLite host-callback mode is enabled but no {} callback is registered",
-                        callback_mode_name(host_options.sqlite_callback_mode)
-                    ));
-                }
-                None
-            }
-            LuaRuntimeDatabaseProviderMode::SpaceController => None,
-        };
-        let controller = match host_options.sqlite_provider_mode {
-            LuaRuntimeDatabaseProviderMode::SpaceController => Some(
-                LuaRuntimeSpaceControllerBridge::new(&host_options, "sqlite")?,
-            ),
-            _ => None,
-        };
+        let api = resolve_sqlite_skill_host_api(&host_options, provider_callbacks.as_ref())?;
+        let controller = resolve_sqlite_skill_host_controller(&host_options)?;
         Ok(Self {
             api,
             controller,
@@ -2460,58 +2634,30 @@ impl SqliteSkillHost {
         skill_dir: &Path,
         config: SkillSqliteMeta,
     ) -> Result<Arc<SqliteSkillBinding>, String> {
-        let mut guard = self
-            .skills
-            .lock()
-            .map_err(|_| "failed to acquire SQLite skill registry lock".to_string())?;
+        let mut guard = self.lock_skills();
         if let Some(existing) = guard.get(skill_name) {
             return Ok(existing.clone());
         }
 
-        let skill_dir_name = skill_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                format!(
-                    "invalid skill directory name for {}: {}",
-                    skill_name,
-                    skill_dir.display()
-                )
-            })?
-            .to_string();
-        let skills_root = skill_dir.parent().ok_or_else(|| {
-            format!(
-                "invalid skill root for {}: {}",
-                skill_name,
-                skill_dir.display()
-            )
-        })?;
-        let sidecar_root = skills_root
-            .parent()
-            .unwrap_or(skills_root)
-            .join(self.host_options.database_dir_name.as_str());
-        let db_dir = sidecar_root.join("sqlite").join(skill_name);
-        let db_path = db_dir.join(format!("{}.sqlite3", skill_name));
-        let database_path = db_path.to_string_lossy().to_string();
-        let binding_context = RuntimeDatabaseBindingContext::new(
+        let binding_plan = build_runtime_database_binding_plan(
             root_name,
             skill_name,
-            root_name,
-            sidecar_root.to_string_lossy().to_string(),
-            skill_dir.to_string_lossy().to_string(),
-            skill_dir_name.clone(),
+            skill_dir,
+            self.host_options.database_dir_name.as_str(),
             RuntimeDatabaseKind::Sqlite,
-            database_path.clone(),
-        );
+        )?;
+        let skill_dir_name = binding_plan.skill_dir_name;
+        let db_dir = binding_plan.provider_storage_dir;
+        let database_path = binding_plan.default_database_path;
+        let binding_context = binding_plan.context;
 
         let (resolved_path, handles, provider_mode, controller) = if let Some(api) =
             self.api.as_ref()
         {
             std::fs::create_dir_all(&db_dir).map_err(|error| {
                 format!(
-                    "failed to create SQLite directory {}: {}: {}",
-                    db_dir.display(),
-                    error,
+                    "failed to create SQLite directory {}: {}",
+                    render_host_visible_path(&db_dir),
                     error
                 )
             })?;
@@ -2552,16 +2698,13 @@ impl SqliteSkillHost {
                 .as_ref()
                 .ok_or_else(|| "SQLite space-controller bridge is unavailable".to_string())?
                 .clone();
-            let controller_space_id = controller_space_id_for_binding(&binding_context);
-            let controller_binding_id =
-                controller.controller_binding_id_for_binding(&binding_context);
+            let controller_ids = controller.attach_binding_with_ids(&binding_context)?;
             let controller_database_path = database_path.clone();
-            controller.attach_binding(&binding_context)?;
             controller.run(move |client| async move {
                 client
                     .enable_sqlite(ControllerSqliteEnableRequest {
-                        space_id: controller_space_id,
-                        binding_id: controller_binding_id,
+                        space_id: controller_ids.space_id,
+                        binding_id: controller_ids.binding_id,
                         db_path: controller_database_path,
                         // Controller mode already centralizes ownership in one dedicated process.
                         // 控制器模式已经把数据库所有权集中到单独控制进程，不再额外启用文件锁。
@@ -2608,11 +2751,16 @@ impl SqliteSkillHost {
         &self,
         skill_name: &str,
     ) -> Result<Option<Arc<SqliteSkillBinding>>, String> {
-        let skills = self
-            .skills
-            .lock()
-            .map_err(|_| "SQLite skill binding registry lock poisoned".to_string())?;
+        let skills = self.lock_skills();
         Ok(skills.get(skill_name).cloned())
+    }
+
+    /// Acquire the SQLite skill binding registry and return its guard, recovering after registry lock poisoning.
+    /// 获取并返回 SQLite skill binding 注册表保护对象；如果注册表锁已 poison，则恢复继续使用。
+    fn lock_skills(&self) -> MutexGuard<'_, HashMap<String, Arc<SqliteSkillBinding>>> {
+        self.skills
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -2626,6 +2774,51 @@ pub fn disabled_skill_status_json(skill_name: Option<&str>) -> Value {
         "integration_mode": "dynamic_library",
         "reason": "current skill has not enabled sqlite"
     })
+}
+
+/// Return the Lua-facing SQLite library path value without inventing an empty placeholder.
+/// 返回面向 Lua 的 SQLite library path 值，不制造空字符串占位。
+fn sqlite_library_path_value(api: Option<&LoadedSqliteApi>) -> Value {
+    api.map(|api| Value::String(render_host_visible_path(&api.library_path)))
+        .unwrap_or(Value::Null)
+}
+
+/// Validate the dynamic SQLite library metadata shape returned by `vldb_sqlite_library_info_json`.
+/// 校验 `vldb_sqlite_library_info_json` 返回的动态 SQLite 库元数据结构。
+fn validate_sqlite_library_info(value: &Value, context: &str) -> Result<(), String> {
+    if !value.is_object() {
+        return Err(format!("SQLite dynamic {context} must be a JSON object"));
+    }
+    required_sqlite_library_info_string(value, "name").map(|_| ())?;
+    required_sqlite_library_info_string(value, "version").map(|_| ())?;
+    required_sqlite_library_info_string(value, "ffi_stage").map(|_| ())?;
+    required_sqlite_library_info_array(value, "capabilities").map(|_| ())?;
+    Ok(())
+}
+
+/// Return one required non-empty string field from dynamic SQLite library metadata.
+/// 从动态 SQLite 库元数据返回一个必填非空字符串字段。
+fn required_sqlite_library_info_string(value: &Value, field_name: &str) -> Result<Value, String> {
+    value
+        .get(field_name)
+        .and_then(Value::as_str)
+        .filter(|field| !field.trim().is_empty())
+        .map(|field| Value::String(field.to_string()))
+        .ok_or_else(|| {
+            format!("SQLite dynamic library_info_json field `{field_name}` is missing or empty")
+        })
+}
+
+/// Return one required array field from dynamic SQLite library metadata.
+/// 从动态 SQLite 库元数据返回一个必填数组字段。
+fn required_sqlite_library_info_array(value: &Value, field_name: &str) -> Result<Value, String> {
+    value
+        .get(field_name)
+        .filter(|field| field.is_array())
+        .cloned()
+        .ok_or_else(|| {
+            format!("SQLite dynamic library_info_json field `{field_name}` must be an array")
+        })
 }
 
 /// Parse a tokenizer-mode text label into the FFI enum.
@@ -2673,15 +2866,6 @@ fn tokenizer_mode_name_from_u32(mode: u32) -> &'static str {
     match mode {
         1 => "jieba",
         _ => "none",
-    }
-}
-
-/// Return the stable callback-mode display name used in host callback error messages.
-/// 返回宿主回调错误消息中使用的稳定回调模式显示名称。
-fn callback_mode_name(mode: LuaRuntimeDatabaseCallbackMode) -> &'static str {
-    match mode {
-        LuaRuntimeDatabaseCallbackMode::Standard => "standard",
-        LuaRuntimeDatabaseCallbackMode::Json => "json",
     }
 }
 
@@ -3042,6 +3226,42 @@ fn require_string_field<'a>(input: &'a Value, field_name: &str) -> Result<&'a st
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("missing or empty field `{}`", field_name))
+}
+
+/// Ensure that a required JSON string field exists while preserving explicit empty text.
+/// 确保必需 JSON 字符串字段存在，同时保留显式空文本。
+///
+/// The input parameter is the JSON object that owns the requested field.
+/// input 参数是持有所请求字段的 JSON 对象。
+///
+/// The field_name parameter identifies the required field in diagnostics.
+/// field_name 参数用于在诊断中标识必需字段。
+///
+/// Return the string value when the field is present and typed as a JSON string.
+/// 字段存在且类型为 JSON 字符串时返回该字符串值。
+fn require_present_string_field<'a>(input: &'a Value, field_name: &str) -> Result<&'a str, String> {
+    input
+        .get(field_name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing or non-string field `{}`", field_name))
+}
+
+/// Require one dynamic-library string field that is mandatory in a returned SQLite record.
+/// 要求动态库返回的单条 SQLite 记录中必须存在的字符串字段。
+///
+/// The value parameter is the optional string decoded from the dynamic-library pointer.
+/// value 参数是从动态库指针解码得到的可选字符串。
+///
+/// The field_name parameter identifies the returned field in diagnostics.
+/// field_name 参数用于在诊断中标识返回字段。
+///
+/// Return the string when present, or an explicit missing-field error.
+/// 字符串存在时返回该字符串；否则返回显式字段缺失错误。
+fn require_sqlite_dynamic_string(
+    value: Option<String>,
+    field_name: &str,
+) -> Result<String, String> {
+    value.ok_or_else(|| format!("SQLite dynamic result field `{field_name}` is missing"))
 }
 
 /// Convert a Rust string into a C string while uniformly validating interior NUL bytes.

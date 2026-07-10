@@ -4,6 +4,8 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::fs;
 use std::path::Path;
 
+use crate::runtime::path::render_host_visible_path;
+
 // ============================================================
 // Lua Skill metadata (loaded from skill.yaml only)
 // ============================================================
@@ -372,6 +374,20 @@ fn validate_tool_schema_type_field(
     Ok(())
 }
 
+/// Validate one JSON Schema `description` annotation when it is present.
+/// 校验单个 JSON Schema `description` 注解存在时的类型。
+fn validate_tool_schema_description_field(
+    object: &JsonMap<String, JsonValue>,
+    field_label: &str,
+) -> Result<(), String> {
+    if let Some(description) = object.get("description")
+        && !description.is_string()
+    {
+        return Err(format!("{field_label}.description must be one string"));
+    }
+    Ok(())
+}
+
 /// Validate one JSON Schema string-name array such as `required`.
 /// 校验单个 JSON Schema 字符串名称数组，例如 `required`。
 fn validate_tool_schema_name_array(value: &JsonValue, field_label: &str) -> Result<(), String> {
@@ -429,6 +445,7 @@ fn validate_tool_schema_node(schema: &JsonValue, field_label: &str) -> Result<()
         .ok_or_else(|| format!("{field_label} must be one JSON object schema"))?;
 
     validate_tool_schema_type_field(object, field_label)?;
+    validate_tool_schema_description_field(object, field_label)?;
 
     if let Some(properties) = object.get("properties") {
         validate_tool_schema_object_map(properties, &format!("{field_label}.properties"))?;
@@ -650,7 +667,7 @@ fn load_entry_input_schema_file(
         format!(
             "skill entry {} input_schema_file {} read failed: {}",
             entry_name,
-            schema_path.display(),
+            render_host_visible_path(&schema_path),
             error
         )
     })?;
@@ -658,7 +675,7 @@ fn load_entry_input_schema_file(
         format!(
             "skill entry {} input_schema_file {} parse failed: {}",
             entry_name,
-            schema_path.display(),
+            render_host_visible_path(&schema_path),
             error
         )
     })
@@ -794,10 +811,16 @@ impl SkillToolMeta {
 
     /// Return the resolved AI-facing input schema for one entry.
     /// 返回单个入口已解析完成、面向 AI 的输入 schema。
-    pub fn resolved_input_schema(&self) -> &JsonValue {
-        self.input_schema
-            .as_ref()
-            .expect("entry input schema must be resolved before use")
+    ///
+    /// Returns the schema when `resolve_input_schema` has already populated it, otherwise an explicit lifecycle error.
+    /// 当 `resolve_input_schema` 已填充 schema 时返回该 schema，否则返回显式生命周期错误。
+    pub fn resolved_input_schema(&self) -> Result<&JsonValue, String> {
+        self.input_schema.as_ref().ok_or_else(|| {
+            format!(
+                "skill entry {} input_schema has not been resolved",
+                self.name.trim()
+            )
+        })
     }
 }
 
@@ -808,6 +831,7 @@ mod tests {
         derive_legacy_parameters_from_input_schema, is_valid_luaskills_identifier,
         validate_luaskills_identifier, validate_luaskills_version,
     };
+    use crate::runtime::path::render_host_visible_path;
     use serde_json::json;
     use std::fs;
 
@@ -961,13 +985,103 @@ entries:
         let tool = meta
             .find_tool_by_local_name("search")
             .expect("search entry");
-        assert_eq!(tool.resolved_input_schema()["type"], "object");
-        assert_eq!(tool.resolved_input_schema()["required"], json!(["nodes"]));
+        // Resolved schema returned by the accessor after the manifest resolution lifecycle has run.
+        // manifest 解析生命周期执行后由访问器返回的已解析 schema。
+        let resolved_input_schema = tool
+            .resolved_input_schema()
+            .expect("entry schema should resolve");
+        assert_eq!(resolved_input_schema["type"], "object");
+        assert_eq!(resolved_input_schema["required"], json!(["nodes"]));
         assert_eq!(tool.parameters.len(), 1);
         assert_eq!(tool.parameters[0].name, "nodes");
         assert_eq!(tool.parameters[0].param_type, "array");
 
         fs::remove_dir_all(&skill_dir).expect("cleanup schema file test dir");
+    }
+
+    /// Verify unresolved entry input schema access returns an explicit lifecycle error instead of panicking.
+    /// 验证未解析的入口输入 schema 访问会返回显式生命周期错误，而不是 panic。
+    #[test]
+    fn skill_tool_meta_unresolved_input_schema_returns_error() {
+        // Skill metadata intentionally left before `resolve_entry_input_schemas` to exercise the lifecycle guard.
+        // 有意让技能元数据停留在 `resolve_entry_input_schemas` 之前，以覆盖生命周期保护逻辑。
+        let meta: SkillMeta = serde_yaml::from_str(
+            r#"
+name: demo-skill
+version: 0.1.0
+enable: true
+entries:
+  - name: search
+    description: Demo search.
+    lua_entry: runtime/search.lua
+    lua_module: demo_search
+"#,
+        )
+        .expect("parse manifest");
+        // Entry metadata whose schema has not passed through manifest resolution yet.
+        // 尚未经过 manifest 解析流程的入口元数据。
+        let tool = meta
+            .find_tool_by_local_name("search")
+            .expect("search entry");
+        // Explicit lifecycle error returned by the accessor.
+        // 访问器返回的显式生命周期错误。
+        let error = tool
+            .resolved_input_schema()
+            .expect_err("unresolved schema should return an error");
+
+        assert_eq!(
+            error,
+            "skill entry search input_schema has not been resolved"
+        );
+    }
+
+    /// Verify external schema parse errors render paths through the host-visible formatter.
+    /// 验证外部 schema 解析错误会通过宿主可见路径渲染器输出路径。
+    #[test]
+    fn skill_meta_schema_parse_error_uses_host_visible_path() {
+        // Skill directory that isolates the invalid schema fixture.
+        // 隔离非法 schema 夹具的 skill 目录。
+        let skill_dir = make_manifest_test_dir("schema_parse_error_path");
+        fs::create_dir_all(skill_dir.join("schemas")).expect("create schemas dir");
+        // Schema path referenced by the entry input_schema_file field.
+        // entry input_schema_file 字段引用的 schema 路径。
+        let schema_path = skill_dir.join("schemas/broken.schema.json");
+        fs::write(&schema_path, "{not-json").expect("invalid schema file should be written");
+        // Skill metadata that resolves the external schema through the real manifest path.
+        // 通过真实 manifest 路径解析外部 schema 的技能元数据。
+        let mut meta: SkillMeta = serde_yaml::from_str(
+            r#"
+name: demo-skill
+version: 0.1.0
+entries:
+  - name: search
+    lua_entry: runtime/search.lua
+    lua_module: demo_search
+    input_schema_file: schemas/broken.schema.json
+"#,
+        )
+        .expect("parse manifest");
+        meta.bind_directory_skill_id("demo-skill".to_string());
+        // Error returned by the real external-schema resolver.
+        // 真实外部 schema 解析器返回的错误。
+        let error = meta
+            .resolve_entry_input_schemas(&skill_dir)
+            .expect_err("invalid schema JSON should fail");
+        // Expected diagnostic prefix rendered with the shared host-visible path formatter.
+        // 使用共享宿主可见路径渲染器生成的期望诊断前缀。
+        let expected_prefix = format!(
+            "skill entry search input_schema_file {} parse failed:",
+            render_host_visible_path(&schema_path)
+        );
+
+        assert!(
+            error.starts_with(&expected_prefix),
+            "unexpected error: {}",
+            error
+        );
+        // Cleanup result is intentionally ignored for best-effort temporary test artifacts.
+        // 对临时测试产物的清理结果按最佳努力原则有意忽略。
+        let _ = fs::remove_dir_all(skill_dir);
     }
 
     /// Verify invalid root input schema types are rejected during resolution.
@@ -999,5 +1113,48 @@ entries:
         assert!(error.contains("input_schema.type must be \"object\""));
 
         fs::remove_dir_all(&skill_dir).expect("cleanup invalid schema dir");
+    }
+
+    /// Verify non-string schema descriptions are rejected before legacy parameter projection.
+    /// 验证非字符串 schema 描述会在旧版参数投影前被拒绝。
+    #[test]
+    fn skill_meta_rejects_non_string_input_schema_description() {
+        // Skill directory used only to satisfy the manifest resolver interface.
+        // 仅用于满足 manifest 解析器接口的技能目录。
+        let skill_dir = make_manifest_test_dir("invalid_schema_description");
+        fs::create_dir_all(&skill_dir).expect("create invalid schema description dir");
+        // Manifest with a property description that cannot be projected to a legacy text description.
+        // 包含无法投影为旧版文本描述的属性 description 的清单。
+        let mut meta: SkillMeta = serde_yaml::from_str(
+            r#"
+name: demo-skill
+version: 0.1.0
+enable: true
+entries:
+  - name: search
+    lua_entry: runtime/search.lua
+    lua_module: demo_search
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: 42
+"#,
+        )
+        .expect("parse invalid description manifest");
+        meta.bind_directory_skill_id("demo-skill".to_string());
+        // Error produced by the schema validator before any legacy parameter fallback is derived.
+        // 在派生任何旧版参数兜底前由 schema 校验器产生的错误。
+        let error = meta
+            .resolve_entry_input_schemas(&skill_dir)
+            .expect_err("non-string description should fail");
+
+        assert_eq!(
+            error,
+            "skill entry search input_schema.properties.query.description must be one string"
+        );
+
+        fs::remove_dir_all(&skill_dir).expect("cleanup invalid schema description dir");
     }
 }

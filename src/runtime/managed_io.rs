@@ -1,9 +1,9 @@
 use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, MutexGuard,
     atomic::{AtomicU64, Ordering},
 };
 use std::thread;
@@ -128,7 +128,23 @@ impl ManagedIoFile {
         let buffer = match (mode.kind, mode.update) {
             (ManagedIoModeKind::Read, _) => fs::read(&path)
                 .map_err(|error| mlua::Error::runtime(format!("vulcan.io.open: {error}")))?,
-            (ManagedIoModeKind::Append, true) => fs::read(&path).unwrap_or_default(),
+            (ManagedIoModeKind::Append, true) => match fs::read(&path) {
+                Ok(bytes) => {
+                    // Existing file content that update-capable append mode must preserve before new writes.
+                    // 支持更新的追加模式在新写入前必须保留的已有文件内容。
+                    bytes
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    // Missing append-update target starts as an empty new file buffer.
+                    // 缺失的追加更新目标会从空的新文件缓冲区开始。
+                    Vec::new()
+                }
+                Err(error) => {
+                    // Non-missing read failures are real open errors and must not become empty content.
+                    // 非缺失类读取失败是真实打开错误，不能变成空内容。
+                    return Err(mlua::Error::runtime(format!("vulcan.io.open: {error}")));
+                }
+            },
             (ManagedIoModeKind::Write, _) | (ManagedIoModeKind::Append, false) => Vec::new(),
         };
         Ok(Self {
@@ -196,7 +212,7 @@ impl ManagedIoFile {
     /// Return whether the managed file handle is closed.
     /// 返回托管文件句柄是否已经关闭。
     fn is_closed(&self) -> mlua::Result<bool> {
-        let state = self.lock_state("io.type")?;
+        let state = self.lock_state();
         Ok(state.closed)
     }
 
@@ -246,7 +262,7 @@ impl ManagedIoFile {
     /// Read all remaining content from the current cursor.
     /// 从当前游标读取全部剩余内容。
     fn read_all(&self, lua: &Lua) -> mlua::Result<LuaValue> {
-        let mut state = self.lock_state("file:read")?;
+        let mut state = self.lock_state();
         ensure_file_is_open(&state, "file:read")?;
         ensure_file_is_readable(&state, "file:read")?;
         let bytes = state.buffer[state.cursor..].to_vec();
@@ -257,7 +273,7 @@ impl ManagedIoFile {
     /// Read one line from the current cursor.
     /// 从当前游标读取一行。
     fn read_one_line(&self, lua: &Lua) -> mlua::Result<LuaValue> {
-        let mut state = self.lock_state("file:read")?;
+        let mut state = self.lock_state();
         ensure_file_is_open(&state, "file:read")?;
         ensure_file_is_readable(&state, "file:read")?;
         if state.cursor >= state.buffer.len() {
@@ -283,7 +299,7 @@ impl ManagedIoFile {
     /// Read a fixed number of bytes from the current cursor.
     /// 从当前游标读取固定数量的字节。
     fn read_byte_count(&self, lua: &Lua, size: usize) -> mlua::Result<LuaValue> {
-        let mut state = self.lock_state("file:read")?;
+        let mut state = self.lock_state();
         ensure_file_is_open(&state, "file:read")?;
         ensure_file_is_readable(&state, "file:read")?;
         if size == 0 {
@@ -301,7 +317,7 @@ impl ManagedIoFile {
     /// Write one or more Lua values into the managed file handle.
     /// 将一个或多个 Lua 值写入托管文件句柄。
     fn write_values(&self, values: MultiValue) -> mlua::Result<bool> {
-        let mut state = self.lock_state("file:write")?;
+        let mut state = self.lock_state();
         ensure_file_is_open(&state, "file:write")?;
         ensure_file_is_writable(&state, "file:write")?;
         for value in values {
@@ -329,7 +345,7 @@ impl ManagedIoFile {
     /// Flush pending buffered writes to disk.
     /// 将挂起的缓冲写入刷新到磁盘。
     fn flush(&self) -> mlua::Result<bool> {
-        let mut state = self.lock_state("file:flush")?;
+        let mut state = self.lock_state();
         ensure_file_is_open(&state, "file:flush")?;
         flush_state(&mut state)?;
         Ok(true)
@@ -338,7 +354,7 @@ impl ManagedIoFile {
     /// Close this managed file handle and flush pending writes.
     /// 关闭此托管文件句柄并刷新挂起写入。
     fn close(&self) -> mlua::Result<bool> {
-        let mut state = self.lock_state("file:close")?;
+        let mut state = self.lock_state();
         if state.closed {
             return Ok(true);
         }
@@ -356,7 +372,7 @@ impl ManagedIoFile {
     /// Seek within the managed read buffer and return the new offset.
     /// 在托管读取缓冲区中移动游标并返回新偏移。
     fn seek(&self, whence: Option<String>, offset: Option<i64>) -> mlua::Result<i64> {
-        let mut state = self.lock_state("file:seek")?;
+        let mut state = self.lock_state();
         ensure_file_is_open(&state, "file:seek")?;
         let base = match whence.as_deref().unwrap_or("cur") {
             "set" => 0_i64,
@@ -385,15 +401,12 @@ impl ManagedIoFile {
         lua.create_function_mut(move |lua, ()| file.read_one_line(lua))
     }
 
-    /// Lock the shared file state and convert poisoning into a Lua runtime error.
-    /// 锁定共享文件状态，并将锁污染转换为 Lua 运行时错误。
-    fn lock_state(
-        &self,
-        operation_name: &str,
-    ) -> mlua::Result<std::sync::MutexGuard<'_, ManagedIoFileState>> {
-        self.state.lock().map_err(|_| {
-            mlua::Error::runtime(format!("{operation_name}: managed file lock poisoned"))
-        })
+    /// Lock the shared file state and return its guard, recovering after state lock poisoning.
+    /// 锁定并返回共享文件状态保护对象；如果状态锁已 poison，则恢复继续使用。
+    fn lock_state(&self) -> MutexGuard<'_, ManagedIoFileState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -558,11 +571,7 @@ fn set_or_get_compat_input(
 ) -> mlua::Result<LuaValue> {
     match value {
         LuaValue::Nil => {
-            let current = state
-                .lock()
-                .map_err(|_| mlua::Error::runtime("io.input: compat state lock poisoned"))?
-                .current_input
-                .clone();
+            let current = lock_compat_state(&state).current_input.clone();
             managed_file_to_lua_value(lua, current)
         }
         LuaValue::String(path) => {
@@ -576,10 +585,7 @@ fn set_or_get_compat_input(
                 },
                 options.default_encoding,
             )?;
-            state
-                .lock()
-                .map_err(|_| mlua::Error::runtime("io.input: compat state lock poisoned"))?
-                .current_input = Some(file.clone());
+            lock_compat_state(&state).current_input = Some(file.clone());
             Ok(LuaValue::UserData(lua.create_userdata(file)?))
         }
         LuaValue::UserData(userdata) if userdata.is::<ManagedIoFile>() => {
@@ -587,10 +593,7 @@ fn set_or_get_compat_input(
                 let borrowed = userdata.borrow::<ManagedIoFile>()?;
                 borrowed.clone()
             };
-            state
-                .lock()
-                .map_err(|_| mlua::Error::runtime("io.input: compat state lock poisoned"))?
-                .current_input = Some(file);
+            lock_compat_state(&state).current_input = Some(file);
             Ok(LuaValue::UserData(userdata))
         }
         other => Err(mlua::Error::runtime(format!(
@@ -610,11 +613,7 @@ fn set_or_get_compat_output(
 ) -> mlua::Result<LuaValue> {
     match value {
         LuaValue::Nil => {
-            let current = state
-                .lock()
-                .map_err(|_| mlua::Error::runtime("io.output: compat state lock poisoned"))?
-                .current_output
-                .clone();
+            let current = lock_compat_state(&state).current_output.clone();
             managed_file_to_lua_value(lua, current)
         }
         LuaValue::String(path) => {
@@ -628,10 +627,7 @@ fn set_or_get_compat_output(
                 },
                 options.default_encoding,
             )?;
-            state
-                .lock()
-                .map_err(|_| mlua::Error::runtime("io.output: compat state lock poisoned"))?
-                .current_output = Some(file.clone());
+            lock_compat_state(&state).current_output = Some(file.clone());
             Ok(LuaValue::UserData(lua.create_userdata(file)?))
         }
         LuaValue::UserData(userdata) if userdata.is::<ManagedIoFile>() => {
@@ -639,10 +635,7 @@ fn set_or_get_compat_output(
                 let borrowed = userdata.borrow::<ManagedIoFile>()?;
                 borrowed.clone()
             };
-            state
-                .lock()
-                .map_err(|_| mlua::Error::runtime("io.output: compat state lock poisoned"))?
-                .current_output = Some(file);
+            lock_compat_state(&state).current_output = Some(file);
             Ok(LuaValue::UserData(userdata))
         }
         other => Err(mlua::Error::runtime(format!(
@@ -659,9 +652,7 @@ fn read_from_compat_input(
     state: Arc<Mutex<ManagedIoCompatState>>,
     args: MultiValue,
 ) -> mlua::Result<MultiValue> {
-    let file = state
-        .lock()
-        .map_err(|_| mlua::Error::runtime("io.read: compat state lock poisoned"))?
+    let file = lock_compat_state(&state)
         .current_input
         .clone()
         .ok_or_else(|| {
@@ -676,11 +667,7 @@ fn write_to_compat_output(
     state: Arc<Mutex<ManagedIoCompatState>>,
     values: MultiValue,
 ) -> mlua::Result<bool> {
-    let file = state
-        .lock()
-        .map_err(|_| mlua::Error::runtime("io.write: compat state lock poisoned"))?
-        .current_output
-        .clone();
+    let file = lock_compat_state(&state).current_output.clone();
     if let Some(file) = file {
         return file.write_values(values);
     }
@@ -695,11 +682,7 @@ fn write_to_compat_output(
 /// Flush the current managed default output handle when one is configured.
 /// 在已配置默认输出句柄时刷新它。
 fn flush_compat_output(state: Arc<Mutex<ManagedIoCompatState>>) -> mlua::Result<bool> {
-    let file = state
-        .lock()
-        .map_err(|_| mlua::Error::runtime("io.flush: compat state lock poisoned"))?
-        .current_output
-        .clone();
+    let file = lock_compat_state(&state).current_output.clone();
     match file {
         Some(file) => file.flush(),
         None => Ok(true),
@@ -714,11 +697,7 @@ fn close_compat_file(
 ) -> mlua::Result<bool> {
     match value {
         LuaValue::Nil => {
-            let file = state
-                .lock()
-                .map_err(|_| mlua::Error::runtime("io.close: compat state lock poisoned"))?
-                .current_output
-                .take();
+            let file = lock_compat_state(&state).current_output.take();
             match file {
                 Some(file) => file.close(),
                 None => Ok(true),
@@ -733,6 +712,14 @@ fn close_compat_file(
             lua_value_type_name(&other)
         ))),
     }
+}
+
+/// Lock the managed IO compatibility state and return its guard, recovering after state lock poisoning.
+/// 锁定并返回托管 IO 兼容状态保护对象；如果状态锁已 poison，则恢复继续使用。
+fn lock_compat_state(state: &Mutex<ManagedIoCompatState>) -> MutexGuard<'_, ManagedIoCompatState> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Convert an optional managed file into a Lua userdata value.
@@ -1232,11 +1219,20 @@ fn lua_value_to_output_bytes(
     }
 }
 
-/// Convert one Lua value into display text for managed `io.write`.
-/// 将一个 Lua 值转换为托管 `io.write` 使用的展示文本。
+/// Convert one Lua value into strict UTF-8 stdout text for managed `io.write`.
+/// 将单个 Lua 值转换为托管 `io.write` 使用的严格 UTF-8 stdout 文本。
 fn lua_value_to_display_text(value: LuaValue) -> mlua::Result<String> {
     match value {
-        LuaValue::String(text) => Ok(text.to_string_lossy()),
+        LuaValue::String(text) => {
+            // Stdout logging is textual, so invalid Lua byte strings must fail instead of being replaced.
+            // stdout 日志是文本语义，因此无效 Lua 字节字符串必须报错而不是被替换。
+            let text = text.to_str().map_err(|_| {
+                mlua::Error::runtime(
+                    "io.write string must be valid UTF-8 when no output file is selected",
+                )
+            })?;
+            Ok(text.as_ref().to_string())
+        }
         LuaValue::Integer(number) => Ok(number.to_string()),
         LuaValue::Number(number) => Ok(number.to_string()),
         LuaValue::Boolean(flag) => Ok(flag.to_string()),

@@ -1,7 +1,7 @@
 #[cfg(windows)]
 use super::runlua::has_invalid_windows_path_syntax;
 use super::runlua::{
-    default_runlua_timeout_ms, resolve_host_default_text_encoding, runlua_cwd_guard,
+    default_runlua_timeout_ms, lock_runlua_cwd_guard, resolve_host_default_text_encoding,
 };
 use super::*;
 
@@ -228,12 +228,49 @@ struct RuntimeSessionEntry {
     /// Locked runtime session state and retained VM.
     /// 已加锁的运行时会话状态与保留 VM。
     session: Arc<Mutex<RuntimeSession>>,
+    /// Stable session identifier copied from the runtime session at insertion time.
+    /// 插入时从运行时会话复制出的稳定会话标识。
+    sid: String,
+    /// Opaque lease identifier copied from the runtime session at insertion time.
+    /// 插入时从运行时会话复制出的不透明租约标识。
+    lease_id: String,
+    /// SID-local generation copied from the runtime session at insertion time.
+    /// 插入时从运行时会话复制出的 SID 内 generation。
+    generation: u64,
+    /// Stable lease profile copied from the runtime session at insertion time.
+    /// 插入时从运行时会话复制出的稳定租约类型。
+    profile: RuntimeLeaseProfile,
     /// Shared terminal-state marker that can be flipped without taking the session VM lock.
     /// 可在不获取会话 VM 锁的前提下切换的共享终态状态标记。
     terminal_state: Arc<AtomicU8>,
     /// Lock-free snapshot used by list operations.
     /// 供列表操作使用的无锁快照。
     snapshot: Value,
+}
+
+impl RuntimeSessionEntry {
+    /// Return the active-list payload with typed lease identity restored over the display snapshot.
+    /// 返回 active list 载荷，并用 typed 租约身份覆盖展示快照中的身份字段。
+    fn list_payload(&self) -> Result<Value, RuntimeSessionError> {
+        let mut snapshot = self.snapshot.clone();
+        let Some(object) = snapshot.as_object_mut() else {
+            return Err(RuntimeSessionError {
+                code: "lease_snapshot_corrupted",
+                message: format!(
+                    "runtime session lease `{}` active snapshot is not a JSON object",
+                    self.lease_id
+                ),
+            });
+        };
+        object.insert("sid".to_string(), Value::String(self.sid.clone()));
+        object.insert("lease_id".to_string(), Value::String(self.lease_id.clone()));
+        object.insert("generation".to_string(), json!(self.generation));
+        object.insert(
+            "profile".to_string(),
+            Value::String(self.profile.as_str().to_string()),
+        );
+        Ok(snapshot)
+    }
 }
 
 /// Stable runtime-session terminal states stored in the shared atomic marker.
@@ -348,29 +385,8 @@ impl RuntimeSessionManager {
                 .get(&existing_lease_id)
                 .map(|entry| Arc::clone(&entry.session))
             {
-                match existing_session.try_lock() {
-                    Ok(existing_session) => {
-                        if let Some(error) = existing_session.inactive_error() {
-                            Self::retire_active_lease_locked(
-                                &mut state,
-                                &existing_lease_id,
-                                error.code,
-                            );
-                        } else if !replace {
-                            return Err(RuntimeSessionError {
-                                code: "lease_exists",
-                                message: format!(
-                                    "runtime session SID `{sid}` already has lease `{existing_lease_id}`"
-                                ),
-                            });
-                        } else {
-                            Self::retire_active_lease_locked(
-                                &mut state,
-                                &existing_lease_id,
-                                "lease_replaced",
-                            );
-                        }
-                    }
+                let existing_session = match existing_session.try_lock() {
+                    Ok(existing_session) => existing_session,
                     Err(TryLockError::WouldBlock) => {
                         if replace {
                             return Err(RuntimeSessionError {
@@ -387,14 +403,23 @@ impl RuntimeSessionManager {
                             ),
                         });
                     }
-                    Err(TryLockError::Poisoned(_)) => {
-                        return Err(RuntimeSessionError {
-                            code: "lease_busy",
-                            message: format!(
-                                "runtime session lease `{existing_lease_id}` is unavailable because its lock is poisoned"
-                            ),
-                        });
-                    }
+                    Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                };
+                if let Some(error) = existing_session.inactive_error() {
+                    Self::retire_active_lease_locked(&mut state, &existing_lease_id, error.code);
+                } else if !replace {
+                    return Err(RuntimeSessionError {
+                        code: "lease_exists",
+                        message: format!(
+                            "runtime session SID `{sid}` already has lease `{existing_lease_id}`"
+                        ),
+                    });
+                } else {
+                    Self::retire_active_lease_locked(
+                        &mut state,
+                        &existing_lease_id,
+                        "lease_replaced",
+                    );
                 }
             } else {
                 state.sid_index.remove(&sid);
@@ -438,6 +463,10 @@ impl RuntimeSessionManager {
             lease_id.clone(),
             RuntimeSessionEntry {
                 session: Arc::new(Mutex::new(session)),
+                sid: sid.clone(),
+                lease_id: lease_id.clone(),
+                generation,
+                profile,
                 terminal_state,
                 snapshot,
             },
@@ -475,10 +504,7 @@ impl RuntimeSessionManager {
         Self::prune_inactive_locked(&mut state);
         if let Some(entry) = state.leases.get(lease_id) {
             let session = Arc::clone(&entry.session);
-            let session_guard = session.try_lock().map_err(|_| RuntimeSessionError {
-                code: "lease_busy",
-                message: format!("runtime session lease `{lease_id}` is busy"),
-            })?;
+            let session_guard = Self::try_lock_session(&session, lease_id)?;
             Self::validate_session_identity(&session_guard, expected_sid, expected_generation)?;
             Self::validate_session_profile(&session_guard, expected_profile)?;
             drop(session_guard);
@@ -510,10 +536,7 @@ impl RuntimeSessionManager {
             expected_generation,
             expected_profile,
         )?;
-        let session = session.try_lock().map_err(|_| RuntimeSessionError {
-            code: "lease_busy",
-            message: format!("runtime session lease `{lease_id}` is busy"),
-        })?;
+        let session = Self::try_lock_session(&session, lease_id)?;
         if let Some(error) = session.inactive_error() {
             return Err(error);
         }
@@ -529,21 +552,21 @@ impl RuntimeSessionManager {
     ) -> Result<Value, RuntimeSessionError> {
         let mut state = self.lock_state()?;
         Self::prune_inactive_locked(&mut state);
-        let mut leases = Vec::new();
+        let mut entries = Vec::new();
         for entry in state.leases.values() {
-            if sid.is_some_and(|expected_sid| entry.snapshot["sid"].as_str() != Some(expected_sid))
-            {
+            if sid.is_some_and(|expected_sid| entry.sid != expected_sid) {
                 continue;
             }
-            if expected_profile.is_some_and(|expected_profile| {
-                entry.snapshot.get("profile").and_then(Value::as_str)
-                    != Some(expected_profile.as_str())
-            }) {
+            if expected_profile.is_some_and(|expected_profile| entry.profile != expected_profile) {
                 continue;
             }
-            leases.push(entry.snapshot.clone());
+            entries.push(entry);
         }
-        leases.sort_by(compare_runtime_session_payloads);
+        entries.sort_by(|left, right| compare_runtime_session_entries(left, right));
+        let mut leases = Vec::with_capacity(entries.len());
+        for entry in entries {
+            leases.push(entry.list_payload()?);
+        }
         Ok(json!({
             "ok": true,
             "leases": leases,
@@ -577,10 +600,7 @@ impl RuntimeSessionManager {
                 message: format!("runtime session lease `{lease_id}` was not found"),
             });
         };
-        let mut session = session.try_lock().map_err(|_| RuntimeSessionError {
-            code: "lease_busy",
-            message: format!("runtime session lease `{lease_id}` is busy"),
-        })?;
+        let mut session = Self::try_lock_session(&session, lease_id)?;
         Self::validate_session_identity(&session, expected_sid, expected_generation)?;
         Self::validate_session_profile(&session, expected_profile)?;
         terminal_state.store(RuntimeSessionTerminalState::Closed as u8, Ordering::Release);
@@ -615,15 +635,45 @@ impl RuntimeSessionManager {
         Ok(())
     }
 
+    /// Replace one active snapshot for tests that verify typed lease identity remains authoritative.
+    /// 为验证 typed 租约身份仍为权威来源的测试替换单个活跃快照。
+    #[cfg(test)]
+    pub(super) fn replace_active_snapshot_for_test(&self, lease_id: &str, snapshot: Value) {
+        // Test-only state mutation used to simulate a corrupted display snapshot.
+        // 仅用于测试的状态修改，用来模拟损坏的展示快照。
+        let mut state = self
+            .lock_state()
+            .expect("runtime session manager state should be available in tests");
+        if let Some(entry) = state.leases.get_mut(lease_id) {
+            entry.snapshot = snapshot;
+        }
+    }
+
     /// Lock the manager state with a stable runtime error.
     /// 使用稳定运行时错误锁定管理器状态。
     fn lock_state(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, RuntimeSessionManagerState>, RuntimeSessionError> {
-        self.state.lock().map_err(|_| RuntimeSessionError {
-            code: "lease_manager_poisoned",
-            message: "runtime session manager lock poisoned".to_string(),
-        })
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+
+    /// Try to acquire one runtime session lock, keeping busy sessions distinct from poisoned sessions.
+    /// 尝试获取单个运行时会话锁，同时区分真正忙碌的会话与已 poison 但可恢复的会话。
+    fn try_lock_session<'a>(
+        session: &'a Arc<Mutex<RuntimeSession>>,
+        lease_id: &str,
+    ) -> Result<std::sync::MutexGuard<'a, RuntimeSession>, RuntimeSessionError> {
+        match session.try_lock() {
+            Ok(session) => Ok(session),
+            Err(TryLockError::WouldBlock) => Err(RuntimeSessionError {
+                code: "lease_busy",
+                message: format!("runtime session lease `{lease_id}` is busy"),
+            }),
+            Err(TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+        }
     }
 
     /// Remove expired or closed sessions from the active indexes.
@@ -636,7 +686,13 @@ impl RuntimeSessionManager {
                 .session
                 .try_lock()
                 .map(|session| session.expires_at.is_some() && session.is_expired())
-                .unwrap_or(false);
+                .unwrap_or_else(|error| match error {
+                    TryLockError::WouldBlock => false,
+                    TryLockError::Poisoned(poisoned) => {
+                        let session = poisoned.into_inner();
+                        session.expires_at.is_some() && session.is_expired()
+                    }
+                });
             if should_remove {
                 removed.push(lease_id.clone());
             }
@@ -666,7 +722,7 @@ impl RuntimeSessionManager {
         let Some(entry) = state.leases.remove(lease_id) else {
             return;
         };
-        let tombstone = RuntimeSessionTombstone::from_snapshot(&entry.snapshot, code);
+        let tombstone = RuntimeSessionTombstone::from_entry(&entry, code);
         if state
             .sid_index
             .get(&tombstone.sid)
@@ -715,18 +771,18 @@ impl RuntimeSessionManager {
         session: &RuntimeSession,
         expected_profile: Option<RuntimeLeaseProfile>,
     ) -> Result<(), RuntimeSessionError> {
-        if let Some(expected_profile) = expected_profile {
-            if session.profile != expected_profile {
-                return Err(RuntimeSessionError {
-                    code: "lease_profile_mismatch",
-                    message: format!(
-                        "runtime session lease `{}` belongs to profile `{}`, not `{}`",
-                        session.lease_id,
-                        session.profile.as_str(),
-                        expected_profile.as_str()
-                    ),
-                });
-            }
+        if let Some(expected_profile) = expected_profile
+            && session.profile != expected_profile
+        {
+            return Err(RuntimeSessionError {
+                code: "lease_profile_mismatch",
+                message: format!(
+                    "runtime session lease `{}` belongs to profile `{}`, not `{}`",
+                    session.lease_id,
+                    session.profile.as_str(),
+                    expected_profile.as_str()
+                ),
+            });
         }
         Ok(())
     }
@@ -737,18 +793,18 @@ impl RuntimeSessionManager {
         tombstone: &RuntimeSessionTombstone,
         expected_profile: Option<RuntimeLeaseProfile>,
     ) -> Result<(), RuntimeSessionError> {
-        if let Some(expected_profile) = expected_profile {
-            if tombstone.profile != expected_profile {
-                return Err(RuntimeSessionError {
-                    code: "lease_profile_mismatch",
-                    message: format!(
-                        "runtime session lease `{}` belongs to profile `{}`, not `{}`",
-                        tombstone.lease_id,
-                        tombstone.profile.as_str(),
-                        expected_profile.as_str()
-                    ),
-                });
-            }
+        if let Some(expected_profile) = expected_profile
+            && tombstone.profile != expected_profile
+        {
+            return Err(RuntimeSessionError {
+                code: "lease_profile_mismatch",
+                message: format!(
+                    "runtime session lease `{}` belongs to profile `{}`, not `{}`",
+                    tombstone.lease_id,
+                    tombstone.profile.as_str(),
+                    expected_profile.as_str()
+                ),
+            });
         }
         Ok(())
     }
@@ -762,25 +818,25 @@ impl RuntimeSessionManager {
         expected_sid: Option<&str>,
         expected_generation: Option<u64>,
     ) -> Result<(), RuntimeSessionError> {
-        if let Some(expected_sid) = expected_sid {
-            if actual_sid != expected_sid {
-                return Err(RuntimeSessionError {
-                    code: "lease_sid_mismatch",
-                    message: format!(
-                        "runtime session lease `{lease_id}` belongs to sid `{actual_sid}`, not `{expected_sid}`"
-                    ),
-                });
-            }
+        if let Some(expected_sid) = expected_sid
+            && actual_sid != expected_sid
+        {
+            return Err(RuntimeSessionError {
+                code: "lease_sid_mismatch",
+                message: format!(
+                    "runtime session lease `{lease_id}` belongs to sid `{actual_sid}`, not `{expected_sid}`"
+                ),
+            });
         }
-        if let Some(expected_generation) = expected_generation {
-            if actual_generation != expected_generation {
-                return Err(RuntimeSessionError {
-                    code: "lease_generation_mismatch",
-                    message: format!(
-                        "runtime session lease `{lease_id}` generation mismatch: expected {expected_generation}, actual {actual_generation}"
-                    ),
-                });
-            }
+        if let Some(expected_generation) = expected_generation
+            && actual_generation != expected_generation
+        {
+            return Err(RuntimeSessionError {
+                code: "lease_generation_mismatch",
+                message: format!(
+                    "runtime session lease `{lease_id}` generation mismatch: expected {expected_generation}, actual {actual_generation}"
+                ),
+            });
         }
         Ok(())
     }
@@ -890,32 +946,14 @@ impl RuntimeSessionTombstone {
         }
     }
 
-    /// Build one terminal tombstone from one cached active snapshot.
-    /// 基于一份缓存的活跃快照构建终态墓碑。
-    fn from_snapshot(snapshot: &Value, code: &'static str) -> Self {
+    /// Build one terminal tombstone from one active manager entry without parsing display JSON.
+    /// 基于单个活跃管理器条目构建终态墓碑，不反解析展示 JSON。
+    fn from_entry(entry: &RuntimeSessionEntry, code: &'static str) -> Self {
         Self {
-            sid: snapshot
-                .get("sid")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            lease_id: snapshot
-                .get("lease_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            generation: snapshot
-                .get("generation")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            profile: match snapshot
-                .get("profile")
-                .and_then(Value::as_str)
-                .unwrap_or("public")
-            {
-                "system_lua_lib" => RuntimeLeaseProfile::SystemLuaLib,
-                _ => RuntimeLeaseProfile::Public,
-            },
+            sid: entry.sid.clone(),
+            lease_id: entry.lease_id.clone(),
+            generation: entry.generation,
+            profile: entry.profile,
             code,
             retired_at: Instant::now(),
         }
@@ -1016,30 +1054,16 @@ fn runtime_session_terminal_code_from_state(state: u8) -> Option<&'static str> {
     }
 }
 
-/// Compare two runtime-session payloads for stable host-visible listing order.
-/// 比较两个运行时会话载荷以生成稳定的宿主可见列表顺序。
-fn compare_runtime_session_payloads(left: &Value, right: &Value) -> std::cmp::Ordering {
-    let left_sid = left.get("sid").and_then(Value::as_str).unwrap_or_default();
-    let right_sid = right.get("sid").and_then(Value::as_str).unwrap_or_default();
-    left_sid
-        .cmp(right_sid)
-        .then_with(|| {
-            left.get("generation")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                .cmp(&right.get("generation").and_then(Value::as_u64).unwrap_or(0))
-        })
-        .then_with(|| {
-            left.get("lease_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .cmp(
-                    right
-                        .get("lease_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                )
-        })
+/// Compare two runtime-session entries for stable host-visible listing order.
+/// 比较两个运行时会话条目以生成稳定的宿主可见列表顺序。
+fn compare_runtime_session_entries(
+    left: &RuntimeSessionEntry,
+    right: &RuntimeSessionEntry,
+) -> std::cmp::Ordering {
+    left.sid
+        .cmp(&right.sid)
+        .then_with(|| left.generation.cmp(&right.generation))
+        .then_with(|| left.lease_id.cmp(&right.lease_id))
 }
 
 /// Build one stable human-readable message for one terminal runtime-session state.
@@ -1181,7 +1205,7 @@ impl LuaEngine {
             std::fs::create_dir_all(&system_dir).map_err(|error| {
                 format!(
                     "failed to create system_lua_lib_dir {}: {}",
-                    system_dir.display(),
+                    render_host_visible_path(&system_dir),
                     error
                 )
             })?;
@@ -1195,6 +1219,29 @@ impl LuaEngine {
         }
         Ok(context)
     }
+    /// Decode one existing Lua package search path before prepending lease module roots.
+    /// 在前置租约模块根目录前，解码单个已有 Lua package 搜索路径。
+    ///
+    /// Parameters: `value` is the Lua string read from `package.path` or `package.cpath`.
+    /// 参数说明：`value` 是从 `package.path` 或 `package.cpath` 读取的 Lua 字符串。
+    ///
+    /// Parameters: `field_name` is the package field name included in diagnostics.
+    /// 参数说明：`field_name` 是诊断信息中使用的 package 字段名。
+    ///
+    /// Returns the decoded UTF-8 path text or a descriptive runtime lease initialization error.
+    /// 返回解码后的 UTF-8 路径文本，或描述性的运行时租约初始化错误。
+    fn runtime_lease_package_search_path_text(
+        value: &mlua::String,
+        field_name: &str,
+    ) -> Result<String, String> {
+        value
+            .to_str()
+            .map(|text| text.to_string())
+            .map_err(|error| {
+                format!("runtime lease package.{field_name} is not valid UTF-8: {error}")
+            })
+    }
+
     /// Prepend one set of host-owned Lua and native module roots to one lease VM.
     /// 将一组宿主拥有的 Lua 与原生模块根目录前置到单个租约虚拟机上。
     fn configure_runtime_lease_vm(
@@ -1260,10 +1307,9 @@ impl LuaEngine {
             }
         }
         if !cpath_prefix.is_empty() {
-            let old_cpath_text = old_cpath
-                .to_str()
-                .map(|value| value.to_string())
-                .unwrap_or_default();
+            // Existing native module search path must survive prefixing unless Lua exposes invalid bytes.
+            // 已有原生模块搜索路径必须在前置拼接后保留，除非 Lua 暴露了非法字节。
+            let old_cpath_text = Self::runtime_lease_package_search_path_text(&old_cpath, "cpath")?;
             let new_cpath = format!("{}{}", cpath_prefix, old_cpath_text);
             package
                 .set(
@@ -1275,10 +1321,9 @@ impl LuaEngine {
                 .map_err(|error| format!("Failed to set runtime lease package.cpath: {}", error))?;
         }
         if !path_prefix.is_empty() {
-            let old_path_text = old_path
-                .to_str()
-                .map(|value| value.to_string())
-                .unwrap_or_default();
+            // Existing Lua module search path must survive prefixing unless Lua exposes invalid bytes.
+            // 已有 Lua 模块搜索路径必须在前置拼接后保留，除非 Lua 暴露了非法字节。
+            let old_path_text = Self::runtime_lease_package_search_path_text(&old_path, "path")?;
             let new_path = format!("{}{}", path_prefix, old_path_text);
             package
                 .set(
@@ -1300,16 +1345,14 @@ impl LuaEngine {
     ) -> Result<LuaValue, mlua::Error> {
         match cwd {
             Some(cwd) => {
-                let _cwd_guard = runlua_cwd_guard()
-                    .lock()
-                    .map_err(|_| mlua::Error::runtime("runtime lease cwd guard lock poisoned"))?;
+                let _cwd_guard = lock_runlua_cwd_guard();
                 let original_dir = std::env::current_dir().map_err(|error| {
                     mlua::Error::runtime(format!("runtime lease cwd: {}", error))
                 })?;
                 std::env::set_current_dir(cwd).map_err(|error| {
                     mlua::Error::runtime(format!(
                         "runtime lease set cwd {}: {}",
-                        cwd.display(),
+                        render_host_visible_path(cwd),
                         error
                     ))
                 })?;
@@ -1403,13 +1446,11 @@ impl LuaEngine {
                 );
             }
         };
-        let mut session = match session.try_lock() {
+        let mut session = match RuntimeSessionManager::try_lock_session(&session, &request.lease_id)
+        {
             Ok(session) => session,
-            Err(_) => {
-                let payload = runtime_session_error_payload(RuntimeSessionError {
-                    code: "lease_busy",
-                    message: format!("runtime session lease `{}` is busy", request.lease_id),
-                });
+            Err(error) => {
+                let payload = runtime_session_error_payload(error);
                 return serde_json::to_string(&payload).map_err(|error| {
                     format!("Runtime session eval JSON encode failed: {}", error)
                 });
@@ -1617,27 +1658,24 @@ impl LuaEngine {
     ) -> Result<Value, String> {
         reset_pooled_vm_request_scope(&session.vm.lua, self.host_options.as_ref())?;
         let invocation_context = request.to_invocation_context();
-        Self::populate_vulcan_request_context(&session.vm.lua, Some(&invocation_context))?;
-        populate_vulcan_internal_execution_context(
+        Self::populate_anonymous_lua_context(
             &session.vm.lua,
-            &VulcanInternalExecutionContext {
-                tool_name: None,
-                skill_name: None,
-                entry_name: None,
-                root_name: None,
-                luaexec_active: true,
-                luaexec_caller_tool_name: None,
+            AnonymousLuaExecutionContext {
+                invocation_context: Some(&invocation_context),
+                internal_context: VulcanInternalExecutionContext {
+                    tool_name: None,
+                    skill_name: None,
+                    entry_name: None,
+                    root_name: None,
+                    luaexec_active: true,
+                    luaexec_caller_tool_name: None,
+                },
+                entry_file: None,
+                dependency_context: AnonymousLuaDependencyContext::ClearWithHostOptions(
+                    self.host_options.as_ref(),
+                ),
             },
         )?;
-        populate_vulcan_file_context(&session.vm.lua, None, None)?;
-        populate_vulcan_dependency_context(
-            &session.vm.lua,
-            self.host_options.as_ref(),
-            None,
-            None,
-        )?;
-        Self::populate_vulcan_lancedb_context(&session.vm.lua, None, None)?;
-        Self::populate_vulcan_sqlite_context(&session.vm.lua, None, None)?;
         let args_table = json_to_lua_table(&session.vm.lua, &request.args)?;
         session
             .vm
@@ -1665,5 +1703,133 @@ impl LuaEngine {
         let json_result = lua_value_to_json(&result)?;
         clear_runlua_args_global(&session.vm.lua)?;
         Ok(json_result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeSessionManager;
+    use crate::runtime::path::render_host_visible_path;
+    use std::panic::{self, AssertUnwindSafe};
+
+    /// Verify runtime lease package search paths keep valid UTF-8 text unchanged.
+    /// 验证运行时租约 package 搜索路径会原样保留合法 UTF-8 文本。
+    #[test]
+    fn runtime_lease_package_search_path_text_preserves_valid_utf8() {
+        // Lua VM used only to allocate a package search path string.
+        // 仅用于分配 package 搜索路径字符串的 Lua 虚拟机。
+        let lua = mlua::Lua::new();
+        // Existing search path fixture that should survive decoding unchanged.
+        // 解码后应保持不变的已有搜索路径夹具。
+        let search_path = lua
+            .create_string("?.lua;?/init.lua;")
+            .expect("valid package search path string should be created");
+        // Decoded search path returned by the runtime lease helper.
+        // 运行时租约辅助函数返回的已解码搜索路径。
+        let decoded =
+            super::LuaEngine::runtime_lease_package_search_path_text(&search_path, "path")
+                .expect("valid package search path should decode");
+
+        assert_eq!(decoded, "?.lua;?/init.lua;");
+    }
+
+    /// Verify runtime lease package search paths reject invalid UTF-8 instead of dropping old paths.
+    /// 验证运行时租约 package 搜索路径会拒绝非法 UTF-8，而不是丢弃旧路径。
+    #[test]
+    fn runtime_lease_package_search_path_text_rejects_invalid_utf8() {
+        // Lua VM used only to allocate an invalid package search path string.
+        // 仅用于分配非法 package 搜索路径字符串的 Lua 虚拟机。
+        let lua = mlua::Lua::new();
+        // Invalid search path bytes that cannot be represented as UTF-8 text.
+        // 无法表示为 UTF-8 文本的非法搜索路径字节。
+        let search_path = lua
+            .create_string([0xff])
+            .expect("invalid package search path bytes should be created");
+        // Error returned when the runtime lease helper refuses to erase the existing path.
+        // 运行时租约辅助函数拒绝擦除已有路径时返回的错误。
+        let error = super::LuaEngine::runtime_lease_package_search_path_text(&search_path, "cpath")
+            .expect_err("invalid package search path should be rejected");
+
+        assert!(
+            error.contains("runtime lease package.cpath is not valid UTF-8"),
+            "unexpected error: {}",
+            error
+        );
+    }
+
+    /// Verify the runtime session manager state remains accessible after its lock is poisoned.
+    /// 验证运行时会话管理器状态锁 poison 后仍可继续访问。
+    #[test]
+    fn runtime_session_manager_state_recovers_after_poisoned_lock() {
+        // Manager whose internal state lock is intentionally poisoned and then recovered.
+        // 内部状态锁会被故意制造 poison 并随后恢复的管理器。
+        let manager = RuntimeSessionManager::new();
+        // Captured panic result from a holder that poisons only the manager state lock.
+        // 单个管理器状态锁持有者制造 poison 后被捕获的 panic 结果。
+        let poison_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            // Guard used only to poison the runtime session manager state lock.
+            // 仅用于制造运行时会话管理器状态锁 poison 的保护对象。
+            let _guard = manager
+                .state
+                .lock()
+                .expect("initial runtime session manager lock");
+            panic!("poison runtime session manager state for recovery test");
+        }));
+
+        assert!(poison_result.is_err());
+
+        // Recovered manager state guard used to prove the lease indexes remain reachable.
+        // 用于证明租约索引仍可访问的已恢复管理器状态保护对象。
+        let state = manager
+            .lock_state()
+            .expect("recover runtime session manager state");
+        assert!(state.leases.is_empty());
+        assert!(state.sid_index.is_empty());
+    }
+
+    /// Verify runtime lease cwd errors render paths through the host-visible formatter.
+    /// 验证运行时租约 cwd 错误会通过宿主可见路径渲染器输出路径。
+    #[test]
+    fn runtime_lease_cwd_error_uses_host_visible_path() {
+        // Temporary root that isolates the invalid cwd fixture.
+        // 隔离非法 cwd 夹具的临时根目录。
+        let temp_root = std::env::temp_dir().join(format!(
+            "luaskills_runtime_lease_cwd_test_{}",
+            std::process::id()
+        ));
+        if temp_root.exists() {
+            // Stale fixture cleanup result is intentionally ignored before recreation.
+            // 重建前对陈旧夹具的清理结果有意忽略。
+            let _ = std::fs::remove_dir_all(&temp_root);
+        }
+        std::fs::create_dir_all(&temp_root).expect("temp root should be created");
+        // File path intentionally passed as cwd so set_current_dir fails.
+        // 有意作为 cwd 传入的文件路径，用于触发 set_current_dir 失败。
+        let cwd_path = temp_root.join("not-a-directory.txt");
+        std::fs::write(&cwd_path, b"not a directory").expect("cwd fixture file should be written");
+        // Lua VM used only to call the lease cwd wrapper directly.
+        // 仅用于直接调用租约 cwd 包装器的 Lua 虚拟机。
+        let lua = mlua::Lua::new();
+        // Error returned by the real cwd-switching evaluation path.
+        // 真实 cwd 切换执行路径返回的错误。
+        let error =
+            super::LuaEngine::eval_lua_value_with_optional_cwd(&lua, "return 1", Some(&cwd_path))
+                .expect_err("file cwd should fail")
+                .to_string();
+        // Expected diagnostic fragment rendered with the shared host-visible path formatter.
+        // 使用共享宿主可见路径渲染器生成的期望诊断片段。
+        let expected_fragment = format!(
+            "runtime lease set cwd {}:",
+            render_host_visible_path(&cwd_path)
+        );
+
+        assert!(
+            error.contains(&expected_fragment),
+            "unexpected error: {}",
+            error
+        );
+        // Cleanup result is intentionally ignored for best-effort temporary test artifacts.
+        // 对临时测试产物的清理结果按最佳努力原则有意忽略。
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 }

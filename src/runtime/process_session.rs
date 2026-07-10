@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, MutexGuard,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -219,6 +219,60 @@ struct ManagedProcessSession {
     state: Arc<ManagedProcessSessionState>,
 }
 
+/// Acquire one process-session output buffer and return its guard, recovering after lock poisoning.
+/// 获取并返回单个进程会话输出缓冲区保护对象；如果锁已 poison，则恢复继续使用。
+fn lock_session_output_buffer(buffer: &Arc<Mutex<Vec<u8>>>) -> MutexGuard<'_, Vec<u8>> {
+    buffer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Acquire one process-session reader slot and return its guard, recovering after lock poisoning.
+/// 获取并返回单个进程会话 reader 槽位保护对象；如果锁已 poison，则恢复继续使用。
+fn lock_session_reader_slot(
+    handle: &Mutex<Option<SessionPipeReader>>,
+) -> MutexGuard<'_, Option<SessionPipeReader>> {
+    handle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Acquire one process-session stdin pipe slot and return its guard, recovering after lock poisoning.
+/// 获取并返回单个进程会话 stdin 管道槽位保护对象；如果锁已 poison，则恢复继续使用。
+fn lock_session_stdin_pipe(
+    stdin: &Mutex<Option<ChildStdin>>,
+) -> MutexGuard<'_, Option<ChildStdin>> {
+    stdin
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Acquire one process-session closed flag and return its guard, recovering after lock poisoning.
+/// 获取并返回单个进程会话关闭标记保护对象；如果锁已 poison，则恢复继续使用。
+fn lock_session_closed_flag(closed: &Mutex<bool>) -> MutexGuard<'_, bool> {
+    closed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Acquire one process-session final status cache and return its guard, recovering after lock poisoning.
+/// 获取并返回单个进程会话最终状态缓存保护对象；如果锁已 poison，则恢复继续使用。
+fn lock_session_final_status(
+    final_status: &Mutex<Option<ProcessStatusSnapshot>>,
+) -> MutexGuard<'_, Option<ProcessStatusSnapshot>> {
+    final_status
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Acquire one process-session child process and return its guard, recovering after lock poisoning.
+/// 获取并返回单个进程会话子进程保护对象；如果锁已 poison，则恢复继续使用。
+fn lock_session_child(child: &Mutex<Child>) -> MutexGuard<'_, Child> {
+    child
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl ManagedProcessSession {
     /// Spawn a new managed process session from a parsed request.
     /// 根据解析后的请求启动一个新的托管进程会话。
@@ -281,11 +335,7 @@ impl ManagedProcessSession {
     /// Write text to the process stdin using the configured input encoding.
     /// 使用配置的输入编码向进程 stdin 写入文本。
     fn write_values(&self, values: MultiValue) -> mlua::Result<bool> {
-        let mut stdin = self
-            .state
-            .stdin
-            .lock()
-            .map_err(|_| mlua::Error::runtime("process.session.write: stdin lock poisoned"))?;
+        let mut stdin = lock_session_stdin_pipe(&self.state.stdin);
         let stdin = stdin
             .as_mut()
             .ok_or_else(|| mlua::Error::runtime("process.session.write: stdin is closed"))?;
@@ -388,16 +438,8 @@ impl ManagedProcessSession {
     /// Return whether output buffers contain data or the requested marker.
     /// 返回输出缓冲区是否包含数据或请求的标记。
     fn has_readable_output(&self, until_text: &Option<String>) -> mlua::Result<bool> {
-        let stdout = self
-            .state
-            .stdout_buffer
-            .lock()
-            .map_err(|_| mlua::Error::runtime("process.session.read: stdout lock poisoned"))?;
-        let stderr = self
-            .state
-            .stderr_buffer
-            .lock()
-            .map_err(|_| mlua::Error::runtime("process.session.read: stderr lock poisoned"))?;
+        let stdout = lock_session_output_buffer(&self.state.stdout_buffer);
+        let stderr = lock_session_output_buffer(&self.state.stderr_buffer);
         if stdout.is_empty() && stderr.is_empty() {
             return Ok(false);
         }
@@ -454,52 +496,39 @@ impl ManagedProcessSessionState {
     /// Return the cached terminal status if one explicit teardown already reaped this session.
     /// 返回已缓存的终态状态；当显式清理已经回收该会话时生效。
     fn cached_final_status(&self) -> Result<Option<ProcessStatusSnapshot>, String> {
-        self.final_status
-            .lock()
-            .map(|guard| *guard)
-            .map_err(|_| "final_status lock poisoned".to_string())
+        let final_status = lock_session_final_status(&self.final_status);
+        Ok(*final_status)
     }
 
     /// Cache one terminal status snapshot after direct-child reaping completes.
     /// 在直接子进程完成回收后缓存一份终态状态快照。
     fn store_final_status(&self, status: ProcessStatusSnapshot) -> Result<(), String> {
-        let mut final_status = self
-            .final_status
-            .lock()
-            .map_err(|_| "final_status lock poisoned".to_string())?;
+        let mut final_status = lock_session_final_status(&self.final_status);
         *final_status = Some(status);
         Ok(())
     }
 
     /// Return whether one optional reader has already signaled completion.
     /// 返回某个可选读取器是否已经发出完成信号。
-    fn reader_completed(
-        handle: &Mutex<Option<SessionPipeReader>>,
-        stream_name: &'static str,
-    ) -> Result<bool, String> {
-        let reader_slot = handle
-            .lock()
-            .map_err(|_| format!("{stream_name} reader lock poisoned"))?;
-        Ok(reader_slot
+    fn reader_completed(handle: &Mutex<Option<SessionPipeReader>>) -> bool {
+        let reader_slot = lock_session_reader_slot(handle);
+        reader_slot
             .as_ref()
             .map(|reader| reader.done.load(Ordering::Acquire))
-            .unwrap_or(true))
+            .unwrap_or(true)
     }
 
     /// Return whether all output readers have already finished draining their pipes.
     /// 返回全部输出读取器是否都已经完成并排空各自管道。
     fn output_readers_drained(&self) -> Result<bool, String> {
-        Ok(Self::reader_completed(&self.stdout_reader, "stdout")?
-            && Self::reader_completed(&self.stderr_reader, "stderr")?)
+        Ok(Self::reader_completed(&self.stdout_reader)
+            && Self::reader_completed(&self.stderr_reader))
     }
 
     /// Drop the session stdin pipe so the child can observe EOF.
     /// 丢弃会话的 stdin 管道，让子进程可以观察到 EOF。
     fn close_stdin_pipe(&self) -> Result<(), String> {
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| "stdin lock poisoned".to_string())?;
+        let mut stdin = lock_session_stdin_pipe(&self.stdin);
         stdin.take();
         Ok(())
     }
@@ -507,10 +536,7 @@ impl ManagedProcessSessionState {
     /// Mark the shared session state as closed.
     /// 将共享会话状态标记为已关闭。
     fn mark_closed(&self) -> Result<(), String> {
-        let mut closed = self
-            .closed
-            .lock()
-            .map_err(|_| "closed lock poisoned".to_string())?;
+        let mut closed = lock_session_closed_flag(&self.closed);
         *closed = true;
         Ok(())
     }
@@ -523,10 +549,7 @@ impl ManagedProcessSessionState {
         }
         #[cfg(unix)]
         {
-            let child = self
-                .child
-                .lock()
-                .map_err(|_| "child lock poisoned".to_string())?;
+            let child = lock_session_child(&self.child);
             let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
             let result = unsafe {
                 libc::waitid(
@@ -574,18 +597,12 @@ impl ManagedProcessSessionState {
         }
         #[cfg(windows)]
         {
-            let child = self
-                .child
-                .lock()
-                .map_err(|_| "child lock poisoned".to_string())?;
-            return peek_windows_process_status(child.as_raw_handle() as HANDLE);
+            let child = lock_session_child(&self.child);
+            peek_windows_process_status(child.as_raw_handle() as HANDLE)
         }
         #[cfg(all(not(unix), not(windows)))]
         {
-            let mut child = self
-                .child
-                .lock()
-                .map_err(|_| "child lock poisoned".to_string())?;
+            let mut child = lock_session_child(&self.child);
             match child.try_wait().map_err(|error| error.to_string())? {
                 Some(status) => Ok(ProcessStatusSnapshot {
                     running: false,
@@ -609,10 +626,7 @@ impl ManagedProcessSessionState {
         if let Some(status) = self.cached_final_status()? {
             return Ok(status);
         }
-        let mut child = self
-            .child
-            .lock()
-            .map_err(|_| "child lock poisoned".to_string())?;
+        let mut child = lock_session_child(&self.child);
         self.process_tree.terminate(&child)?;
         let status = match child.try_wait().map_err(|error| error.to_string())? {
             Some(status) => Some(status),
@@ -630,9 +644,7 @@ impl ManagedProcessSessionState {
         stream_name: &'static str,
     ) -> Result<(), String> {
         let should_take = {
-            let mut reader_slot = handle
-                .lock()
-                .map_err(|_| format!("{stream_name} reader lock poisoned"))?;
+            let mut reader_slot = lock_session_reader_slot(handle);
             let Some(reader) = reader_slot.as_mut() else {
                 return Ok(());
             };
@@ -649,10 +661,7 @@ impl ManagedProcessSessionState {
             }
         };
         if should_take {
-            let reader = handle
-                .lock()
-                .map_err(|_| format!("{stream_name} reader lock poisoned"))?
-                .take();
+            let reader = lock_session_reader_slot(handle).take();
             if let Some(reader) = reader {
                 reader
                     .handle
@@ -850,11 +859,8 @@ where
             match reader.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(count) => {
-                    if let Ok(mut buffer) = target.lock() {
-                        append_bounded(&mut buffer, &chunk[..count], limit_bytes);
-                    } else {
-                        break;
-                    }
+                    let mut buffer = lock_session_output_buffer(&target);
+                    append_bounded(&mut buffer, &chunk[..count], limit_bytes);
                 }
                 Err(error) => {
                     crate::runtime_logging::warn(format!(
@@ -892,7 +898,7 @@ impl ProcessTreeController {
                 CREATE_NEW_PROCESS_GROUP
             };
             command.creation_flags(creation_flags);
-            return Ok(in_job);
+            Ok(in_job)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -939,20 +945,18 @@ impl ProcessTreeController {
         {
             let job = WindowsProcessJob::create()?;
             match job.assign(child) {
-                Ok(()) => {
-                    return Ok(Self {
-                        strategy: WindowsProcessTreeStrategy::Job(job),
-                    });
-                }
+                Ok(()) => Ok(Self {
+                    strategy: WindowsProcessTreeStrategy::Job(job),
+                }),
                 Err(WindowsJobAssignError::AccessDenied(message)) => {
                     crate::runtime_logging::warn(format!(
                         "[LuaSkill:warn] process.session is reusing ToolHelp process-tree fallback because Job Object assignment was denied: {message}"
                     ));
-                    return Ok(Self {
+                    Ok(Self {
                         strategy: WindowsProcessTreeStrategy::Snapshot,
-                    });
+                    })
                 }
-                Err(WindowsJobAssignError::Other(message)) => return Err(message),
+                Err(WindowsJobAssignError::Other(message)) => Err(message),
             }
         }
         #[cfg(not(windows))]
@@ -979,7 +983,7 @@ impl ProcessTreeController {
         }
         #[cfg(windows)]
         {
-            return self.strategy.terminate(_child);
+            self.strategy.terminate(_child)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -1040,10 +1044,9 @@ fn terminate_windows_process_tree_snapshot(child: &Child) -> Result<(), String> 
             let label = format!("process {}", descendant.pid);
             if let Err(error) =
                 terminate_windows_process_handle(handle.as_raw_handle() as HANDLE, &label, false)
+                && first_error.is_none()
             {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
+                first_error = Some(error);
             }
         }
     }
@@ -1051,10 +1054,9 @@ fn terminate_windows_process_tree_snapshot(child: &Child) -> Result<(), String> 
         child.as_raw_handle() as HANDLE,
         "process.session root process",
         true,
-    ) {
-        if first_error.is_none() {
-            first_error = Some(error);
-        }
+    ) && first_error.is_none()
+    {
+        first_error = Some(error);
     }
     if let Some(error) = first_error {
         return Err(error);
@@ -1358,9 +1360,7 @@ fn append_bounded(buffer: &mut Vec<u8>, bytes: &[u8], limit_bytes: usize) {
 /// Drain up to a maximum number of bytes from one shared output buffer.
 /// 从一个共享输出缓冲区取出最多指定数量的字节。
 fn drain_buffer(buffer: &Arc<Mutex<Vec<u8>>>, max_bytes: usize) -> mlua::Result<Vec<u8>> {
-    let mut guard = buffer
-        .lock()
-        .map_err(|_| mlua::Error::runtime("process.session.read: output lock poisoned"))?;
+    let mut guard = lock_session_output_buffer(buffer);
     let count = max_bytes.min(guard.len());
     Ok(guard.drain(0..count).collect())
 }

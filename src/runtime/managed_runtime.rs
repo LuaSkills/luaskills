@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::runtime::path::render_host_visible_path;
 use crate::skill::dependencies::{
     NodeRuntimeDependencySpec, NodeRuntimePackageManager, PythonRuntimeDependencySpec,
     PythonRuntimePackageManager,
@@ -12,6 +13,12 @@ use crate::skill::dependencies::{
 /// Schema version used by managed runtime environment markers.
 /// 受管运行时环境标记文件使用的 schema 版本。
 pub const MANAGED_RUNTIME_ENV_MARKER_SCHEMA_VERSION: u32 = 1;
+
+/// Render one managed runtime filesystem path for user-facing error messages.
+/// 为面向用户的受管运行时错误消息渲染单个文件系统路径。
+fn render_managed_runtime_path(path: &Path) -> String {
+    render_host_visible_path(path)
+}
 
 /// Managed child runtime kind that Lua can invoke through `vulcan.runtime.*`.
 /// Lua 可通过 `vulcan.runtime.*` 调用的受管子运行时类型。
@@ -249,8 +256,13 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// Compute the SHA-256 digest of one file.
 /// 计算单个文件的 SHA-256 摘要。
 pub fn sha256_file(path: &Path) -> Result<String, String> {
-    let bytes =
-        fs::read(path).map_err(|error| format!("Failed to read {}: {}", path.display(), error))?;
+    let bytes = fs::read(path).map_err(|error| {
+        format!(
+            "Failed to read {}: {}",
+            render_managed_runtime_path(path),
+            error
+        )
+    })?;
     Ok(sha256_hex(&bytes))
 }
 
@@ -303,13 +315,76 @@ pub fn managed_env_marker_path(env_dir: &Path) -> PathBuf {
     env_dir.join(".luaskills-env.json")
 }
 
+/// Inspect whether one managed environment marker path is a file without hiding filesystem probe errors.
+/// 检查单个受管环境标记路径是否为文件，同时不隐藏文件系统探测错误。
+///
+/// The marker_path parameter is the concrete `.luaskills-env.json` path for one managed environment.
+/// marker_path 参数是单个受管环境对应的具体 `.luaskills-env.json` 路径。
+///
+/// Return true for an existing marker file, false for a confirmed missing marker, or an explicit probe/type error.
+/// 已存在标记文件返回 true，确认缺失标记返回 false；探测或类型异常时返回显式错误。
+fn managed_env_marker_path_is_file(marker_path: &Path) -> Result<bool, String> {
+    match fs::metadata(marker_path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(format!(
+            "Managed runtime env marker is not a file: {}",
+            render_managed_runtime_path(marker_path)
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect managed runtime env marker {}: {}",
+            render_managed_runtime_path(marker_path),
+            error
+        )),
+    }
+}
+
+/// Inspect whether one managed-runtime directory path is a directory without hiding filesystem probe errors.
+/// 检查单个受管运行时目录路径是否为目录，同时不隐藏文件系统探测错误。
+///
+/// The path parameter is the concrete managed runtime directory path used by an environment lifecycle step.
+/// path 参数是环境生命周期步骤使用的具体受管运行时目录路径。
+///
+/// Return true for an existing directory, false for a confirmed missing directory, or an explicit probe/type error.
+/// 已存在目录返回 true，确认缺失目录返回 false；探测或类型异常时返回显式错误。
+fn managed_runtime_directory_path_is_directory(
+    path: &Path,
+    directory_label: &str,
+) -> Result<bool, String> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(format!(
+            "{} is not a directory: {}",
+            directory_label,
+            render_managed_runtime_path(path)
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect {} {}: {}",
+            directory_label,
+            render_managed_runtime_path(path),
+            error
+        )),
+    }
+}
+
 /// Read one managed runtime environment marker from disk.
 /// 从磁盘读取一个受管运行时环境标记。
 pub fn read_managed_env_marker(path: &Path) -> Result<ManagedRuntimeEnvMarker, String> {
-    let text = fs::read_to_string(path)
-        .map_err(|error| format!("Failed to read {}: {}", path.display(), error))?;
-    serde_json::from_str(&text)
-        .map_err(|error| format!("Failed to parse {}: {}", path.display(), error))
+    let text = fs::read_to_string(path).map_err(|error| {
+        format!(
+            "Failed to read {}: {}",
+            render_managed_runtime_path(path),
+            error
+        )
+    })?;
+    serde_json::from_str(&text).map_err(|error| {
+        format!(
+            "Failed to parse {}: {}",
+            render_managed_runtime_path(path),
+            error
+        )
+    })
 }
 
 /// Return whether an environment marker matches the expected marker exactly.
@@ -337,7 +412,7 @@ pub fn ensure_managed_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
 /// 返回一个受管运行时环境是否已经匹配其期望标记。
 pub fn managed_env_is_ready(plan: &ManagedRuntimeEnvPlan) -> Result<bool, String> {
     let marker_path = managed_env_marker_path(&plan.env_dir);
-    if !marker_path.is_file() {
+    if !managed_env_marker_path_is_file(&marker_path)? {
         return Ok(false);
     }
     let actual = read_managed_env_marker(&marker_path)?;
@@ -375,28 +450,38 @@ fn create_python_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
 /// Create one Node dependency environment and install dependencies from the lockfile.
 /// 创建一个 Node 依赖环境并按锁文件安装依赖。
 fn create_node_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
-    if plan.env_dir.exists() {
-        fs::remove_dir_all(&plan.env_dir)
-            .map_err(|error| format!("Failed to remove {}: {}", plan.env_dir.display(), error))?;
+    if managed_runtime_directory_path_is_directory(&plan.env_dir, "managed env directory")? {
+        fs::remove_dir_all(&plan.env_dir).map_err(|error| {
+            format!(
+                "Failed to remove {}: {}",
+                render_managed_runtime_path(&plan.env_dir),
+                error
+            )
+        })?;
     }
-    fs::create_dir_all(&plan.env_dir)
-        .map_err(|error| format!("Failed to create {}: {}", plan.env_dir.display(), error))?;
+    fs::create_dir_all(&plan.env_dir).map_err(|error| {
+        format!(
+            "Failed to create {}: {}",
+            render_managed_runtime_path(&plan.env_dir),
+            error
+        )
+    })?;
     let package_json = plan.package_manifest_path.as_ref().ok_or_else(|| {
         "node package_json is required to create a managed Node environment".to_string()
     })?;
     fs::copy(package_json, plan.env_dir.join("package.json")).map_err(|error| {
         format!(
             "Failed to copy {} into {}: {}",
-            package_json.display(),
-            plan.env_dir.display(),
+            render_managed_runtime_path(package_json),
+            render_managed_runtime_path(&plan.env_dir),
             error
         )
     })?;
     fs::copy(&plan.lockfile_path, plan.env_dir.join("pnpm-lock.yaml")).map_err(|error| {
         format!(
             "Failed to copy {} into {}: {}",
-            plan.lockfile_path.display(),
-            plan.env_dir.display(),
+            render_managed_runtime_path(&plan.lockfile_path),
+            render_managed_runtime_path(&plan.env_dir),
             error
         )
     })?;
@@ -423,22 +508,37 @@ fn prepare_build_dir(plan: &ManagedRuntimeEnvPlan) -> Result<PathBuf, String> {
     let parent = plan.env_dir.parent().ok_or_else(|| {
         format!(
             "managed env directory has no parent: {}",
-            plan.env_dir.display()
+            render_managed_runtime_path(&plan.env_dir)
         )
     })?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("Failed to create {}: {}", parent.display(), error))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "Failed to create {}: {}",
+            render_managed_runtime_path(parent),
+            error
+        )
+    })?;
     let build_dir = parent.join(format!(
         ".building-{}-{}",
         plan.env_hash,
         std::process::id()
     ));
-    if build_dir.exists() {
-        fs::remove_dir_all(&build_dir)
-            .map_err(|error| format!("Failed to remove {}: {}", build_dir.display(), error))?;
+    if managed_runtime_directory_path_is_directory(&build_dir, "managed build directory")? {
+        fs::remove_dir_all(&build_dir).map_err(|error| {
+            format!(
+                "Failed to remove {}: {}",
+                render_managed_runtime_path(&build_dir),
+                error
+            )
+        })?;
     }
-    fs::create_dir_all(&build_dir)
-        .map_err(|error| format!("Failed to create {}: {}", build_dir.display(), error))?;
+    fs::create_dir_all(&build_dir).map_err(|error| {
+        format!(
+            "Failed to create {}: {}",
+            render_managed_runtime_path(&build_dir),
+            error
+        )
+    })?;
     Ok(build_dir)
 }
 
@@ -446,9 +546,14 @@ fn prepare_build_dir(plan: &ManagedRuntimeEnvPlan) -> Result<PathBuf, String> {
 /// 将一个临时构建目录收尾成稳定环境目录。
 fn finish_build_dir(plan: &ManagedRuntimeEnvPlan, build_dir: PathBuf) -> Result<(), String> {
     write_expected_marker(&build_dir, &plan.expected_marker)?;
-    if plan.env_dir.exists() {
-        fs::remove_dir_all(&plan.env_dir)
-            .map_err(|error| format!("Failed to remove {}: {}", plan.env_dir.display(), error))?;
+    if managed_runtime_directory_path_is_directory(&plan.env_dir, "managed env directory")? {
+        fs::remove_dir_all(&plan.env_dir).map_err(|error| {
+            format!(
+                "Failed to remove {}: {}",
+                render_managed_runtime_path(&plan.env_dir),
+                error
+            )
+        })?;
     }
     fs::rename(&build_dir, &plan.env_dir).or_else(|rename_error| {
         copy_dir_recursive(&build_dir, &plan.env_dir)
@@ -456,7 +561,7 @@ fn finish_build_dir(plan: &ManagedRuntimeEnvPlan, build_dir: PathBuf) -> Result<
                 fs::remove_dir_all(&build_dir).map_err(|cleanup_error| {
                     format!(
                         "Failed to remove {} after copy fallback: {}",
-                        build_dir.display(),
+                        render_managed_runtime_path(&build_dir),
                         cleanup_error
                     )
                 })
@@ -464,8 +569,8 @@ fn finish_build_dir(plan: &ManagedRuntimeEnvPlan, build_dir: PathBuf) -> Result<
             .map_err(|copy_error| {
                 format!(
                     "Failed to move {} to {}: {}; copy fallback also failed: {}",
-                    build_dir.display(),
-                    plan.env_dir.display(),
+                    render_managed_runtime_path(&build_dir),
+                    render_managed_runtime_path(&plan.env_dir),
                     rename_error,
                     copy_error
                 )
@@ -480,8 +585,13 @@ fn write_expected_marker(env_dir: &Path, marker: &ManagedRuntimeEnvMarker) -> Re
     let marker_path = managed_env_marker_path(env_dir);
     let text = serde_json::to_string_pretty(marker)
         .map_err(|error| format!("Failed to serialize managed env marker: {}", error))?;
-    fs::write(&marker_path, format!("{}\n", text))
-        .map_err(|error| format!("Failed to write {}: {}", marker_path.display(), error))
+    fs::write(&marker_path, format!("{}\n", text)).map_err(|error| {
+        format!(
+            "Failed to write {}: {}",
+            render_managed_runtime_path(&marker_path),
+            error
+        )
+    })
 }
 
 /// Run one process command and convert failures into stable error text.
@@ -532,31 +642,56 @@ fn package_store_dir_for_plan(plan: &ManagedRuntimeEnvPlan) -> PathBuf {
 /// Recursively copy one directory tree.
 /// 递归复制一个目录树。
 fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
-    fs::create_dir_all(destination)
-        .map_err(|error| format!("Failed to create {}: {}", destination.display(), error))?;
-    for entry in fs::read_dir(source)
-        .map_err(|error| format!("Failed to read {}: {}", source.display(), error))?
-    {
+    fs::create_dir_all(destination).map_err(|error| {
+        format!(
+            "Failed to create {}: {}",
+            render_managed_runtime_path(destination),
+            error
+        )
+    })?;
+    for entry in fs::read_dir(source).map_err(|error| {
+        format!(
+            "Failed to read {}: {}",
+            render_managed_runtime_path(source),
+            error
+        )
+    })? {
         let entry = entry.map_err(|error| {
             format!(
                 "Failed to read directory entry under {}: {}",
-                source.display(),
+                render_managed_runtime_path(source),
                 error
             )
         })?;
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
-        if source_path.is_dir() {
+        // Entry type read from the directory iterator without following symlinks.
+        // 从目录迭代器读取且不跟随符号链接的目录项类型。
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "Failed to inspect {} under {}: {}",
+                render_managed_runtime_path(&source_path),
+                render_managed_runtime_path(source),
+                error
+            )
+        })?;
+        if file_type.is_dir() {
             copy_dir_recursive(&source_path, &destination_path)?;
-        } else {
+        } else if file_type.is_file() {
             fs::copy(&source_path, &destination_path).map_err(|error| {
                 format!(
                     "Failed to copy {} to {}: {}",
-                    source_path.display(),
-                    destination_path.display(),
+                    render_managed_runtime_path(&source_path),
+                    render_managed_runtime_path(&destination_path),
                     error
                 )
             })?;
+        } else {
+            return Err(format!(
+                "Failed to copy {} to {}: unsupported file type",
+                render_managed_runtime_path(&source_path),
+                render_managed_runtime_path(&destination_path)
+            ));
         }
     }
     Ok(())
@@ -672,13 +807,51 @@ pub fn resolve_node_env_plan(
 /// 从安装目录读取一个受管运行时安装清单。
 pub fn read_install_manifest(install_dir: &Path) -> Result<ManagedRuntimeInstallManifest, String> {
     let manifest_path = install_dir.join("runtime-manifest.json");
-    let text = fs::read_to_string(&manifest_path)
-        .map_err(|error| format!("Failed to read {}: {}", manifest_path.display(), error))?;
+    managed_runtime_install_manifest_path_is_file(&manifest_path)?;
+    let text = fs::read_to_string(&manifest_path).map_err(|error| {
+        format!(
+            "Failed to read {}: {}",
+            render_managed_runtime_path(&manifest_path),
+            error
+        )
+    })?;
     // PowerShell 5.1 may write UTF-8 JSON files with a BOM when Set-Content is used.
     // PowerShell 5.1 使用 Set-Content 写 UTF-8 JSON 时可能带有 BOM。
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    serde_json::from_str(text)
-        .map_err(|error| format!("Failed to parse {}: {}", manifest_path.display(), error))
+    serde_json::from_str(text).map_err(|error| {
+        format!(
+            "Failed to parse {}: {}",
+            render_managed_runtime_path(&manifest_path),
+            error
+        )
+    })
+}
+
+/// Inspect whether one managed-runtime install manifest path is a file without hiding filesystem probe errors.
+/// 检查单个受管运行时安装清单路径是否为文件，同时不隐藏文件系统探测错误。
+///
+/// The manifest_path parameter is the concrete `runtime-manifest.json` path under one install directory.
+/// manifest_path 参数是单个安装目录下的具体 `runtime-manifest.json` 路径。
+///
+/// Return unit for an existing manifest file, or an explicit missing/probe/type error.
+/// 已存在清单文件时返回 unit；缺失、探测或类型异常时返回显式错误。
+fn managed_runtime_install_manifest_path_is_file(manifest_path: &Path) -> Result<(), String> {
+    match fs::metadata(manifest_path) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(format!(
+            "managed runtime install manifest is not a file: {}",
+            render_managed_runtime_path(manifest_path)
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "managed runtime install manifest not found: {}",
+            render_managed_runtime_path(manifest_path)
+        )),
+        Err(error) => Err(format!(
+            "Failed to inspect managed runtime install manifest {}: {}",
+            render_managed_runtime_path(manifest_path),
+            error
+        )),
+    }
 }
 
 /// Build one complete managed runtime environment plan from normalized inputs.
@@ -741,14 +914,14 @@ fn resolve_install_executable(
     if manifest.schema_version != 1 {
         return Err(format!(
             "managed runtime manifest {} uses unsupported schema_version {}",
-            install_dir.display(),
+            render_managed_runtime_path(install_dir),
             manifest.schema_version
         ));
     }
     if manifest.runtime != expected_runtime {
         return Err(format!(
             "managed runtime manifest {} has runtime '{}', expected '{}'",
-            install_dir.display(),
+            render_managed_runtime_path(install_dir),
             manifest.runtime,
             expected_runtime
         ));
@@ -756,7 +929,7 @@ fn resolve_install_executable(
     if manifest.version != expected_version {
         return Err(format!(
             "managed runtime manifest {} has version '{}', expected '{}'",
-            install_dir.display(),
+            render_managed_runtime_path(install_dir),
             manifest.version,
             expected_version
         ));
@@ -764,19 +937,43 @@ fn resolve_install_executable(
     if manifest.platform != expected_platform {
         return Err(format!(
             "managed runtime manifest {} has platform '{}', expected '{}'",
-            install_dir.display(),
+            render_managed_runtime_path(install_dir),
             manifest.platform,
             expected_platform
         ));
     }
     let executable = install_dir.join(manifest.executable);
-    if !executable.is_file() {
+    if !managed_runtime_executable_path_is_file(&executable)? {
         return Err(format!(
             "managed runtime executable not found: {}",
-            executable.display()
+            render_managed_runtime_path(&executable)
         ));
     }
     Ok(executable)
+}
+
+/// Inspect whether one managed-runtime executable path is a file without hiding filesystem probe errors.
+/// 检查单个受管运行时可执行文件路径是否为文件，同时不隐藏文件系统探测错误。
+///
+/// The executable parameter is the install-manifest declared executable path resolved under its install directory.
+/// executable 参数是安装清单声明并在安装目录下解析后的可执行文件路径。
+///
+/// Return true for an existing executable file, false for a confirmed missing executable, or an explicit probe/type error.
+/// 已存在可执行文件返回 true，确认缺失可执行文件返回 false；探测或类型异常时返回显式错误。
+fn managed_runtime_executable_path_is_file(executable: &Path) -> Result<bool, String> {
+    match fs::metadata(executable) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(format!(
+            "managed runtime executable is not a file: {}",
+            render_managed_runtime_path(executable)
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect managed runtime executable {}: {}",
+            render_managed_runtime_path(executable),
+            error
+        )),
+    }
 }
 
 /// Resolve one required file path under a skill directory.
@@ -790,8 +987,12 @@ fn resolve_required_skill_file(
         return Err(format!("{} is required", field_label));
     }
     let path = resolve_skill_file(skill_dir, relative_path, field_label)?;
-    if !path.is_file() {
-        return Err(format!("{} not found: {}", field_label, path.display()));
+    if !managed_runtime_skill_file_path_is_file(&path, field_label)? {
+        return Err(format!(
+            "{} not found: {}",
+            field_label,
+            render_managed_runtime_path(&path)
+        ));
     }
     Ok(path)
 }
@@ -807,10 +1008,40 @@ fn resolve_optional_skill_file(
         return Ok(None);
     }
     let path = resolve_skill_file(skill_dir, relative_path, field_label)?;
-    if !path.is_file() {
-        return Err(format!("{} not found: {}", field_label, path.display()));
+    if !managed_runtime_skill_file_path_is_file(&path, field_label)? {
+        return Err(format!(
+            "{} not found: {}",
+            field_label,
+            render_managed_runtime_path(&path)
+        ));
     }
     Ok(Some(path))
+}
+
+/// Inspect whether one managed-runtime skill file path is a file without hiding filesystem probe errors.
+/// 检查单个受管运行时 skill 文件路径是否为文件，同时不隐藏文件系统探测错误。
+///
+/// The path parameter is the resolved skill-relative file path declared by one runtime dependency field.
+/// path 参数是单个运行时依赖字段声明并解析后的 skill 相对文件路径。
+///
+/// Return true for an existing file, false for a confirmed missing file, or an explicit probe/type error.
+/// 已存在文件返回 true，确认缺失文件返回 false；探测或类型异常时返回显式错误。
+fn managed_runtime_skill_file_path_is_file(path: &Path, field_label: &str) -> Result<bool, String> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(format!(
+            "{} is not a file: {}",
+            field_label,
+            render_managed_runtime_path(path)
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect {} {}: {}",
+            field_label,
+            render_managed_runtime_path(path),
+            error
+        )),
+    }
 }
 
 /// Resolve a skill-relative path and reject parent-directory traversal.
@@ -855,17 +1086,60 @@ fn runtime_prefix(runtime: ManagedRuntimeKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ManagedRuntimeEnvHashInput, ManagedRuntimeEnvMarker, ManagedRuntimeKind,
-        compute_managed_runtime_env_hash, current_managed_runtime_platform_key, managed_env_dir,
-        managed_env_is_ready, managed_env_marker_matches, resolve_node_env_plan,
-        resolve_python_env_plan, sha256_hex, write_expected_marker,
+        ManagedRuntimeEnvHashInput, ManagedRuntimeEnvMarker, ManagedRuntimeEnvPlan,
+        ManagedRuntimeKind, compute_managed_runtime_env_hash, copy_dir_recursive,
+        current_managed_runtime_platform_key, managed_env_dir, managed_env_is_ready,
+        managed_env_marker_matches, managed_env_marker_path, prepare_build_dir,
+        read_install_manifest, resolve_node_env_plan, resolve_python_env_plan, sha256_hex,
+        write_expected_marker,
     };
+    use crate::runtime::path::render_host_visible_path;
     use crate::skill::dependencies::{
         NodeRuntimeDependencySpec, NodeRuntimePackageManager, PythonRuntimeDependencySpec,
         PythonRuntimePackageManager,
     };
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink as create_unix_symlink;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_file as create_windows_file_symlink;
     use std::path::{Path, PathBuf};
+
+    /// Create one test file symlink that points at the requested target path.
+    /// 创建一个指向指定目标路径的测试文件符号链接。
+    #[cfg(unix)]
+    fn create_test_file_symlink(link_path: &Path, target_path: &Path) -> bool {
+        create_unix_symlink(target_path, link_path).expect("create test file symlink");
+        true
+    }
+
+    /// Return whether one Windows symlink-dependent test should be skipped because the host lacks symlink privileges.
+    /// 返回当前 Windows 符号链接相关测试是否应因宿主缺少符号链接权限而跳过。
+    #[cfg(windows)]
+    fn should_skip_windows_symlink_test(error: &std::io::Error) -> bool {
+        /// Windows privilege error returned when symlink creation requires elevation or Developer Mode.
+        /// 当符号链接创建需要管理员权限或开发者模式时 Windows 返回的权限错误码。
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+        error.kind() == std::io::ErrorKind::PermissionDenied
+            || error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD)
+    }
+
+    /// Create one test file symlink that points at the requested target path.
+    /// 创建一个指向指定目标路径的测试文件符号链接。
+    #[cfg(windows)]
+    fn create_test_file_symlink(link_path: &Path, target_path: &Path) -> bool {
+        match create_windows_file_symlink(target_path, link_path) {
+            Ok(()) => true,
+            Err(error) if should_skip_windows_symlink_test(&error) => {
+                eprintln!(
+                    "skip symlink-dependent test because Windows symlink privileges are unavailable: {error}"
+                );
+                false
+            }
+            Err(error) => panic!("create test file symlink: {error}"),
+        }
+    }
 
     /// Verify that environment hashes are stable and include lockfile content changes.
     /// 验证环境哈希保持稳定，并且会纳入锁文件内容变化。
@@ -978,6 +1252,280 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Verify marker readiness checks reject marker paths that exist as directories.
+    /// 验证 marker 就绪检查会拒绝以目录形式存在的 marker 路径。
+    #[test]
+    fn managed_env_ready_rejects_directory_marker() {
+        // Platform key used to create matching runtime install manifests.
+        // 用于创建匹配运行时安装清单的平台键。
+        let platform = current_managed_runtime_platform_key().expect("platform should resolve");
+        // Temporary root that isolates the directory marker fixture.
+        // 隔离目录型 marker 夹具的临时根目录。
+        let root = make_test_root("directory-marker");
+        // Runtime root containing the fake installed runtime manifests.
+        // 包含伪造已安装运行时清单的运行时根目录。
+        let runtime_root = root.join("runtime");
+        // Skill directory containing the Python lockfile fixture.
+        // 包含 Python lockfile 夹具的 skill 目录。
+        let skill_dir = root.join("skill");
+        fs::create_dir_all(skill_dir.join("python")).unwrap();
+        fs::write(
+            skill_dir.join("python/requirements.lock"),
+            b"requests==2.32.3",
+        )
+        .unwrap();
+        write_install_manifest(
+            &runtime_root
+                .join("dependencies/runtimes/python")
+                .join(format!("cpython-3.12.7-{}", platform)),
+            "python",
+            "3.12.7",
+            &platform,
+            platform_executable("python"),
+        );
+        write_install_manifest(
+            &runtime_root
+                .join("dependencies/runtimes/python")
+                .join(format!("uv-0.11.17-{}", platform)),
+            "uv",
+            "0.11.17",
+            &platform,
+            platform_executable("uv"),
+        );
+        // Environment plan whose marker path will be occupied by a directory.
+        // 其 marker 路径将被目录占用的环境计划。
+        let plan = resolve_python_env_plan(
+            &runtime_root,
+            &skill_dir,
+            &PythonRuntimeDependencySpec {
+                version: "3.12.7".to_string(),
+                package_manager: PythonRuntimePackageManager::Uv,
+                package_manager_version: "0.11.17".to_string(),
+                lockfile: "python/requirements.lock".to_string(),
+                required: true,
+            },
+        )
+        .expect("python env plan should resolve");
+        // Directory occupying the exact marker file path.
+        // 占据精确 marker 文件路径的目录。
+        let marker_path = managed_env_marker_path(&plan.env_dir);
+        fs::create_dir_all(&marker_path).expect("directory marker should be created");
+
+        // Error returned before the directory marker can behave like a missing marker.
+        // 在目录型 marker 表现得像缺失 marker 之前返回的错误。
+        let error =
+            managed_env_is_ready(&plan).expect_err("directory marker readiness check should fail");
+
+        assert!(
+            error.contains("Managed runtime env marker is not a file"),
+            "unexpected error: {}",
+            error
+        );
+        assert!(
+            error.contains(&render_host_visible_path(&marker_path)),
+            "unexpected error: {}",
+            error
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verify install manifest readers reject directory manifests before JSON reading.
+    /// 验证安装清单读取器会在 JSON 读取前拒绝目录型清单。
+    #[test]
+    fn read_install_manifest_rejects_directory_manifest() {
+        // Temporary root that isolates the directory install-manifest fixture.
+        // 隔离目录型安装清单夹具的临时根目录。
+        let root = make_test_root("directory-install-manifest");
+        // Install directory whose runtime-manifest path will be occupied by a directory.
+        // 其 runtime-manifest 路径将被目录占用的安装目录。
+        let install_dir = root.join("runtime-install");
+        // Directory occupying the exact runtime-manifest.json path.
+        // 占据精确 runtime-manifest.json 路径的目录。
+        let manifest_path = install_dir.join("runtime-manifest.json");
+        fs::create_dir_all(&manifest_path).expect("directory install manifest should be created");
+
+        // Error returned before the directory manifest can be passed to read_to_string.
+        // 在目录型清单被传递给 read_to_string 之前返回的错误。
+        let error =
+            read_install_manifest(&install_dir).expect_err("directory manifest should fail");
+
+        assert!(
+            error.contains("managed runtime install manifest is not a file"),
+            "unexpected error: {}",
+            error
+        );
+        assert!(
+            error.contains(&render_host_visible_path(&manifest_path)),
+            "unexpected error: {}",
+            error
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verify build preparation rejects file paths before directory cleanup.
+    /// 验证构建准备会在目录清理前拒绝文件路径。
+    #[test]
+    fn prepare_build_dir_rejects_file_build_dir() {
+        // Temporary root that isolates the file-backed build directory fixture.
+        // 隔离文件型构建目录夹具的临时根目录。
+        let root = make_test_root("file-build-dir");
+        // Reproducibility input used to build the expected marker for this synthetic plan.
+        // 用于为这个合成计划构造期望标记的可复现输入。
+        let hash_input = ManagedRuntimeEnvHashInput {
+            runtime: ManagedRuntimeKind::Python,
+            runtime_version: "3.12.7".to_string(),
+            platform: "test-platform".to_string(),
+            package_manager: "uv".to_string(),
+            package_manager_version: "0.11.17".to_string(),
+            lock_hash: "lock".to_string(),
+            package_manifest_hash: None,
+        };
+        // Fixed environment hash that lets the test occupy the exact derived build directory.
+        // 固定环境哈希，便于测试占用精确派生出的构建目录。
+        let env_hash = "file-build-hash".to_string();
+        // Expected marker matching the synthetic environment plan.
+        // 与合成环境计划匹配的期望标记。
+        let expected_marker = ManagedRuntimeEnvMarker::expected(&hash_input, env_hash.clone());
+        // Environment plan whose build directory is deterministic from env_hash and process id.
+        // 其构建目录由 env_hash 与进程号确定的环境计划。
+        let plan = ManagedRuntimeEnvPlan {
+            runtime: ManagedRuntimeKind::Python,
+            platform: hash_input.platform.clone(),
+            runtime_root: root.clone(),
+            runtime_version: hash_input.runtime_version.clone(),
+            runtime_executable: PathBuf::from("python"),
+            package_manager: hash_input.package_manager.clone(),
+            package_manager_version: hash_input.package_manager_version.clone(),
+            package_manager_executable: PathBuf::from("uv"),
+            package_manifest_path: None,
+            lockfile_path: root.join("requirements.lock"),
+            lock_hash: hash_input.lock_hash.clone(),
+            package_manifest_hash: None,
+            env_hash: env_hash.clone(),
+            env_dir: root.join("env"),
+            expected_marker,
+        };
+        // Exact temporary build directory that prepare_build_dir will inspect.
+        // prepare_build_dir 将要检查的精确临时构建目录。
+        let build_dir = root.join(format!(".building-{}-{}", env_hash, std::process::id()));
+        // File occupying the build directory path that must be a directory.
+        // 占据构建目录路径的文件，该路径必须是目录。
+        fs::write(&build_dir, b"not a directory").expect("file build dir should be written");
+
+        // Error returned before remove_dir_all can see a file-backed build path.
+        // 在 remove_dir_all 看到文件型构建路径之前返回的错误。
+        let error = prepare_build_dir(&plan).expect_err("file build dir should fail");
+
+        assert!(
+            error.contains("managed build directory is not a directory"),
+            "unexpected error: {}",
+            error
+        );
+        assert!(
+            error.contains(&render_host_visible_path(&build_dir)),
+            "unexpected error: {}",
+            error
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verify copy fallback rejects symlink entries instead of following them.
+    /// 验证复制降级会拒绝符号链接目录项，而不是跟随它们。
+    #[test]
+    fn copy_dir_recursive_rejects_symlink_entry() {
+        // Temporary root that isolates the symlink copy fixture.
+        // 隔离符号链接复制夹具的临时根目录。
+        let root = make_test_root("copy-symlink-entry");
+        // Source build directory consumed by the recursive copy fallback.
+        // 递归复制降级使用的源构建目录。
+        let source_dir = root.join("source");
+        // Destination env directory consumed by the recursive copy fallback.
+        // 递归复制降级使用的目标环境目录。
+        let destination_dir = root.join("destination");
+        fs::create_dir_all(&source_dir).expect("copy source dir should be created");
+        // Real file target used only to create the symlink fixture.
+        // 仅用于创建符号链接夹具的真实文件目标。
+        let real_file_path = root.join("real-handler.py");
+        fs::write(&real_file_path, b"print('ok')").expect("real file should be written");
+        // Symlink entry inside the source build directory.
+        // 源构建目录内的符号链接目录项。
+        let symlink_path = source_dir.join("handler-link.py");
+        if !create_test_file_symlink(&symlink_path, &real_file_path) {
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+
+        // Error returned before the symlink source entry can be silently followed.
+        // 在符号链接源目录项被静默跟随之前返回的错误。
+        let error = copy_dir_recursive(&source_dir, &destination_dir)
+            .expect_err("symlink entry should fail managed runtime copy");
+
+        assert!(
+            error.contains("unsupported file type"),
+            "unexpected error: {}",
+            error
+        );
+        assert!(
+            error.contains(&render_host_visible_path(&symlink_path)),
+            "unexpected error: {}",
+            error
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verify copy fallback rejects unsupported Unix filesystem entry types explicitly.
+    /// 验证复制降级会显式拒绝不支持的 Unix 文件系统目录项类型。
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_recursive_rejects_unsupported_unix_file_type() {
+        use std::os::unix::fs::FileTypeExt;
+
+        // Temporary root that isolates the unsupported-file-type copy fixture.
+        // 隔离不支持文件类型复制夹具的临时根目录。
+        let root = make_test_root("copy-unsupported-type");
+        // Source build directory consumed by the recursive copy fallback.
+        // 递归复制降级使用的源构建目录。
+        let source_dir = root.join("source");
+        // Destination env directory consumed by the recursive copy fallback.
+        // 递归复制降级使用的目标环境目录。
+        let destination_dir = root.join("destination");
+        fs::create_dir_all(&source_dir).expect("copy source dir should be created");
+        // FIFO path that is neither a regular file nor a directory.
+        // 既不是普通文件也不是目录的 FIFO 路径。
+        let fifo_path = source_dir.join("events.pipe");
+        // Command status returned by mkfifo for the FIFO fixture creation.
+        // mkfifo 为创建 FIFO 夹具返回的命令状态。
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo should run");
+        assert!(status.success(), "mkfifo should create FIFO fixture");
+        assert!(
+            fs::metadata(&fifo_path)
+                .expect("FIFO metadata should be readable")
+                .file_type()
+                .is_fifo(),
+            "fixture should be FIFO"
+        );
+
+        // Error returned before the unsupported entry can reach fs::copy.
+        // 在不支持的目录项进入 fs::copy 之前返回的错误。
+        let error = copy_dir_recursive(&source_dir, &destination_dir)
+            .expect_err("unsupported FIFO entry should fail managed runtime copy");
+
+        assert!(
+            error.contains("unsupported file type"),
+            "unexpected error: {}",
+            error
+        );
+        assert!(
+            error.contains(&render_host_visible_path(&fifo_path)),
+            "unexpected error: {}",
+            error
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     /// Verify that Python environment plans resolve runtime manifests, lockfiles, and env markers.
     /// 验证 Python 环境计划会解析运行时清单、锁文件与环境标记。
     #[test]
@@ -1032,6 +1580,90 @@ mod tests {
             plan.env_dir
                 .starts_with(runtime_root.join("dependencies/envs/python"))
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verify directory executables are reported as type errors instead of missing executables.
+    /// 验证目录型 executable 会被报告为类型错误，而不是缺失可执行文件。
+    #[test]
+    fn python_env_plan_rejects_directory_runtime_executable() {
+        // Platform key used to create matching runtime install manifests.
+        // 用于创建匹配运行时安装清单的平台键。
+        let platform = current_managed_runtime_platform_key().expect("platform should resolve");
+        // Temporary root that isolates the directory executable fixture.
+        // 隔离目录型 executable 夹具的临时根目录。
+        let root = make_test_root("directory-runtime-executable");
+        // Runtime root containing the fake installed runtime manifests.
+        // 包含伪造已安装运行时清单的运行时根目录。
+        let runtime_root = root.join("runtime");
+        // Skill directory containing the Python lockfile fixture.
+        // 包含 Python lockfile 夹具的 skill 目录。
+        let skill_dir = root.join("skill");
+        fs::create_dir_all(skill_dir.join("python")).unwrap();
+        fs::write(
+            skill_dir.join("python/requirements.lock"),
+            b"requests==2.32.3",
+        )
+        .unwrap();
+        // Python runtime install directory whose manifest executable path is occupied by a directory.
+        // 其清单 executable 路径被目录占据的 Python 运行时安装目录。
+        let python_install_dir = runtime_root
+            .join("dependencies")
+            .join("runtimes")
+            .join("python")
+            .join(format!("cpython-3.12.7-{}", platform));
+        // Manifest-declared executable path that must be a file.
+        // 清单声明且必须为文件的 executable 路径。
+        let executable_path = python_install_dir.join(platform_executable("python"));
+        fs::create_dir_all(&executable_path).expect("directory executable should be created");
+        // Runtime manifest declaring the directory-backed executable path.
+        // 声明目录型 executable 路径的运行时清单。
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "runtime": "python",
+            "version": "3.12.7",
+            "platform": platform,
+            "executable": platform_executable("python"),
+        });
+        fs::write(
+            python_install_dir.join("runtime-manifest.json"),
+            serde_json::to_string_pretty(&payload).unwrap(),
+        )
+        .unwrap();
+        write_install_manifest(
+            &runtime_root
+                .join("dependencies/runtimes/python")
+                .join(format!("uv-0.11.17-{}", platform)),
+            "uv",
+            "0.11.17",
+            &platform,
+            platform_executable("uv"),
+        );
+
+        // Error returned by the full Python environment plan resolver.
+        // 完整 Python 环境计划解析器返回的错误。
+        let error = resolve_python_env_plan(
+            &runtime_root,
+            &skill_dir,
+            &PythonRuntimeDependencySpec {
+                version: "3.12.7".to_string(),
+                package_manager: PythonRuntimePackageManager::Uv,
+                package_manager_version: "0.11.17".to_string(),
+                lockfile: "python/requirements.lock".to_string(),
+                required: true,
+            },
+        )
+        .expect_err("directory runtime executable should be rejected");
+        // Error text expected from the shared host-visible path formatter.
+        // 由共享宿主可见路径渲染器生成的期望错误文本。
+        let expected_error = format!(
+            "managed runtime executable is not a file: {}",
+            render_host_visible_path(&executable_path)
+        );
+
+        assert_eq!(error, expected_error);
+        // Cleanup result is intentionally ignored for best-effort temporary test artifacts.
+        // 对临时测试产物的清理结果按最佳努力原则有意忽略。
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1138,6 +1770,137 @@ mod tests {
         .expect_err("path traversal should be rejected");
 
         assert!(error.contains("skill directory"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verify that missing lockfile errors render paths through the host-visible path formatter.
+    /// 验证缺失锁文件错误会通过宿主可见路径渲染器输出路径。
+    #[test]
+    fn python_env_plan_missing_lockfile_error_uses_host_visible_path() {
+        // Platform key used to create matching runtime install manifests.
+        // 用于创建匹配运行时安装清单的平台键。
+        let platform = current_managed_runtime_platform_key().expect("platform should resolve");
+        // Temporary root that isolates all filesystem fixtures for this test.
+        // 隔离当前测试所有文件系统夹具的临时根目录。
+        let root = make_test_root("missing-lockfile-path");
+        // Runtime root containing the fake installed runtime manifests.
+        // 包含伪造已安装运行时清单的运行时根目录。
+        let runtime_root = root.join("runtime");
+        // Skill directory used as the base for the missing relative lockfile.
+        // 作为缺失相对锁文件基准目录的 skill 目录。
+        let skill_dir = root.join("skill");
+        write_install_manifest(
+            &runtime_root
+                .join("dependencies/runtimes/python")
+                .join(format!("cpython-3.12.7-{}", platform)),
+            "python",
+            "3.12.7",
+            &platform,
+            platform_executable("python"),
+        );
+        write_install_manifest(
+            &runtime_root
+                .join("dependencies/runtimes/python")
+                .join(format!("uv-0.11.17-{}", platform)),
+            "uv",
+            "0.11.17",
+            &platform,
+            platform_executable("uv"),
+        );
+
+        // Missing lockfile path expected after skill-relative resolution.
+        // 经过 skill 相对路径解析后期望缺失的锁文件路径。
+        let expected_lockfile = skill_dir.join("python/missing.lock");
+        // Error returned by the full Python environment plan resolver.
+        // 完整 Python 环境计划解析器返回的错误。
+        let error = resolve_python_env_plan(
+            &runtime_root,
+            &skill_dir,
+            &PythonRuntimeDependencySpec {
+                version: "3.12.7".to_string(),
+                package_manager: PythonRuntimePackageManager::Uv,
+                package_manager_version: "0.11.17".to_string(),
+                lockfile: "python/missing.lock".to_string(),
+                required: true,
+            },
+        )
+        .expect_err("missing lockfile should be reported");
+        // Error text expected from the shared host-visible path formatter.
+        // 由共享宿主可见路径渲染器生成的期望错误文本。
+        let expected_error = format!(
+            "python_runtime.lockfile not found: {}",
+            render_host_visible_path(&expected_lockfile)
+        );
+
+        assert_eq!(error, expected_error);
+        // Cleanup result is intentionally ignored for best-effort temporary test artifacts.
+        // 对临时测试产物的清理结果按最佳努力原则有意忽略。
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verify directory lockfiles are reported as type errors instead of missing files.
+    /// 验证目录型 lockfile 会被报告为类型错误，而不是缺失文件。
+    #[test]
+    fn python_env_plan_rejects_directory_lockfile() {
+        // Platform key used to create matching runtime install manifests.
+        // 用于创建匹配运行时安装清单的平台键。
+        let platform = current_managed_runtime_platform_key().expect("platform should resolve");
+        // Temporary root that isolates the directory lockfile fixture.
+        // 隔离目录型 lockfile 夹具的临时根目录。
+        let root = make_test_root("directory-lockfile");
+        // Runtime root containing the fake installed runtime manifests.
+        // 包含伪造已安装运行时清单的运行时根目录。
+        let runtime_root = root.join("runtime");
+        // Skill directory used as the base for the directory lockfile.
+        // 作为目录型 lockfile 基准目录的 skill 目录。
+        let skill_dir = root.join("skill");
+        write_install_manifest(
+            &runtime_root
+                .join("dependencies/runtimes/python")
+                .join(format!("cpython-3.12.7-{}", platform)),
+            "python",
+            "3.12.7",
+            &platform,
+            platform_executable("python"),
+        );
+        write_install_manifest(
+            &runtime_root
+                .join("dependencies/runtimes/python")
+                .join(format!("uv-0.11.17-{}", platform)),
+            "uv",
+            "0.11.17",
+            &platform,
+            platform_executable("uv"),
+        );
+        // Directory occupying the lockfile path declared by the Python runtime dependency.
+        // 占据 Python 运行时依赖声明 lockfile 路径的目录。
+        let lockfile_path = skill_dir.join("python/requirements.lock");
+        fs::create_dir_all(&lockfile_path).expect("directory lockfile should be created");
+
+        // Error returned by the full Python environment plan resolver.
+        // 完整 Python 环境计划解析器返回的错误。
+        let error = resolve_python_env_plan(
+            &runtime_root,
+            &skill_dir,
+            &PythonRuntimeDependencySpec {
+                version: "3.12.7".to_string(),
+                package_manager: PythonRuntimePackageManager::Uv,
+                package_manager_version: "0.11.17".to_string(),
+                lockfile: "python/requirements.lock".to_string(),
+                required: true,
+            },
+        )
+        .expect_err("directory lockfile should be rejected");
+        // Error text expected from the shared host-visible path formatter.
+        // 由共享宿主可见路径渲染器生成的期望错误文本。
+        let expected_error = format!(
+            "python_runtime.lockfile is not a file: {}",
+            render_host_visible_path(&lockfile_path)
+        );
+
+        assert_eq!(error, expected_error);
+        // Cleanup result is intentionally ignored for best-effort temporary test artifacts.
+        // 对临时测试产物的清理结果按最佳努力原则有意忽略。
         let _ = fs::remove_dir_all(root);
     }
 
