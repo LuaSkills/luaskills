@@ -43,7 +43,7 @@ jobs:
       # Missing interpreters are fatal in this native acceptance matrix instead of silent skips.
       # 在该原生验收矩阵中，缺少解释器必须失败而不是静默跳过。
       LUASKILLS_REQUIRE_MANAGED_SESSION_RUNTIMES: "1"
-      MANAGED_RUNTIME_ROOT: ${{ runner.temp }}/luaskills-managed-runtimes
+      MANAGED_RUNTIME_ROOT: ${{ github.workspace }}/target/managed-runtime-ci
     steps:
       - uses: actions/checkout@v4
 
