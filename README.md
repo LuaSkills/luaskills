@@ -241,13 +241,13 @@ examples/
 
 ## Ecosystem Release Order
 
-For one unified ecosystem release such as `0.4.6`, publish in this order:
+For one unified ecosystem release such as `0.5.0`, publish in this order:
 
 1. Release `LuaSkills/luaskills-packages` first so `lua-runtime-packages-*` and `lua-deps-*` already exist for the new compatible series.
-2. Release `LuaSkills/luaskills` next, including the crate version plus the main-repo `luaskills-ffi-sdk-*` and demo assets under tag `v0.4.6`.
-3. Publish the TypeScript SDK `@luaskills/sdk@0.4.6`.
-4. Publish the Python SDK `luaskills-sdk==0.4.6`.
-5. Publish the Go SDK module tag `v0.4.6`.
+2. Release `LuaSkills/luaskills` next, including the crate version plus the main-repo `luaskills-ffi-sdk-*` and demo assets under tag `v0.5.0`.
+3. Publish the TypeScript SDK `@luaskills/sdk@0.5.0`.
+4. Publish the Python SDK `luaskills-sdk==0.5.0`.
+5. Publish the Go SDK module tag `v0.5.0`.
 6. Run the **Examples Release** workflow for each SDK only after its package or module tag is already visible upstream.
 
 This order keeps every installer and examples workflow pointed at already-published packages assets, core assets, and SDK packages.
