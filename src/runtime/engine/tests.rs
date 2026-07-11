@@ -7296,6 +7296,10 @@ fn write_managed_session_install_manifest(
                 .expect("contained executable parent"),
         );
     }
+    #[cfg(target_os = "macos")]
+    if runtime == "python" {
+        install_managed_session_macos_python_companions(source_executable, install_dir);
+    }
     // Manifest mirrors the exact runtime asset contract consumed by plan resolution.
     // Manifest 模拟计划解析所消费的精确运行时资产契约。
     let manifest = json!({
@@ -7310,6 +7314,74 @@ fn write_managed_session_install_manifest(
         serde_json::to_vec_pretty(&manifest).expect("encode managed session install manifest"),
     )
     .expect("write managed session install manifest");
+}
+
+/// Install the macOS CPython dynamic library beside a synthetic managed test prefix.
+/// 在合成受管测试前缀中安装 macOS CPython 动态库。
+///
+/// `source_executable` identifies the uv-managed interpreter whose native `@rpath` resolves
+/// through `../lib`; `destination_root` is the synthetic installation prefix containing `bin`.
+/// `source_executable` 标识原生 `@rpath` 通过 `../lib` 解析的 uv 受管解释器；
+/// `destination_root` 是包含 `bin` 的合成安装前缀。
+///
+/// Returns after every direct `libpython*.dylib` bootstrap image is materialized with its source
+/// filename, matching the prefix relationship provided by production uv assets.
+/// 按源文件名落盘全部直接的 `libpython*.dylib` 启动映像后返回，并保持生产 uv 资产提供的前缀关系。
+#[cfg(target_os = "macos")]
+fn install_managed_session_macos_python_companions(
+    source_executable: &Path,
+    destination_root: &Path,
+) {
+    // SourcePrefix is the real CPython prefix whose executable is located under `bin`.
+    // SourcePrefix 是真实 CPython 前缀，其可执行文件位于 `bin` 下。
+    let source_prefix = source_executable
+        .parent()
+        .and_then(Path::parent)
+        .expect("managed macOS Python installation prefix");
+    // SourceLib is the exact directory encoded by the interpreter's `@rpath` load command.
+    // SourceLib 是解释器 `@rpath` 加载命令编码的精确目录。
+    let source_lib = source_prefix.join("lib");
+    // DestinationLib restores the same `bin/../lib` relationship in the synthetic fixture.
+    // DestinationLib 在合成夹具中恢复相同的 `bin/../lib` 关系。
+    let destination_lib = destination_root.join("lib");
+    fs::create_dir_all(&destination_lib).expect("create managed macOS Python companion directory");
+    // InstalledCount makes a malformed or changed upstream Python layout fail explicitly.
+    // InstalledCount 使格式错误或已变化的上游 Python 布局显式失败。
+    let mut installed_count = 0_usize;
+    for entry in fs::read_dir(&source_lib).expect("read managed macOS Python library directory") {
+        // SourceEntry is one direct child of the trusted uv-managed Python library directory.
+        // SourceEntry 是可信 uv 受管 Python 库目录的一个直接子项。
+        let entry = entry.expect("read managed macOS Python library entry");
+        // FileName preserves the install name expected by the interpreter image.
+        // FileName 保留解释器映像所期望的安装名称。
+        let file_name = entry.file_name();
+        let normalized_name = file_name.to_string_lossy();
+        if !normalized_name.starts_with("libpython") || !normalized_name.ends_with(".dylib") {
+            continue;
+        }
+        // CanonicalSource follows an upstream alias without reproducing an escaping symlink.
+        // CanonicalSource 跟随上游别名，但不会复制可逃逸的符号链接。
+        let canonical_source = fs::canonicalize(entry.path())
+            .expect("canonicalize managed macOS Python companion library");
+        assert!(
+            canonical_source.is_file(),
+            "managed macOS Python companion must be a regular file: {}",
+            canonical_source.display()
+        );
+        // Destination is a contained regular file visible to the executable's native loader.
+        // Destination 是原生加载器可见的受包含约束普通文件。
+        let destination = destination_lib.join(file_name);
+        if fs::hard_link(&canonical_source, &destination).is_err() {
+            fs::copy(&canonical_source, &destination)
+                .expect("copy managed macOS Python companion library");
+        }
+        installed_count += 1;
+    }
+    assert!(
+        installed_count > 0,
+        "managed macOS Python installation contains no libpython dynamic library: {}",
+        source_lib.display()
+    );
 }
 
 /// Copy minimal Windows CPython bootstrap DLLs beside a contained Python test executable.
