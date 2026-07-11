@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::fmt::Display;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,10 +14,181 @@ use crate::host::callbacks::{
 };
 use crate::host::options::RuntimeSkillRoot;
 use crate::lua_skill::{SkillMeta, validate_luaskills_identifier, validate_luaskills_version};
+use crate::runtime::path::render_host_visible_path;
 use crate::skill::resolver::{SkillSourceManifest, parse_skill_source_manifest};
 use crate::skill::source::{
     InstalledSkillRecord, InstalledSkillSourceRecord, SkillInstallSourceType,
 };
+
+/// Render one skill-manager filesystem path for user-facing error messages.
+/// 为面向用户的技能管理器错误消息渲染单个文件系统路径。
+fn render_skill_manager_path(path: &Path) -> String {
+    render_host_visible_path(path)
+}
+
+/// Inspect whether one skill-root path is a directory without hiding filesystem probe errors.
+/// 检查单个技能根路径是否为目录，同时不隐藏文件系统探测错误。
+///
+/// The root parameter is the skill-root path that should be inspected before directory traversal.
+/// root 参数是目录遍历前需要检查的技能根路径。
+///
+/// Return true for an existing directory, false for a confirmed missing path, or an explicit probe/type error.
+/// 已存在目录返回 true，确认缺失路径返回 false；探测或类型失败时返回显式错误。
+fn skill_root_path_is_directory(root: &Path) -> Result<bool, String> {
+    match fs::metadata(root) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(format!(
+            "Skill root is not a directory: {}",
+            render_skill_manager_path(root)
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect skill root {}: {}",
+            render_skill_manager_path(root),
+            error
+        )),
+    }
+}
+
+/// Inspect whether one skill manifest path is a file without hiding filesystem probe errors.
+/// 检查单个技能清单路径是否为文件，同时不隐藏文件系统探测错误。
+///
+/// The skill_yaml parameter is the concrete skill.yaml path derived from one skill directory.
+/// skill_yaml 参数是从单个技能目录派生出的具体 skill.yaml 路径。
+///
+/// Return true for an existing manifest file, false for a confirmed missing manifest, or an explicit probe/type error.
+/// 已存在清单文件返回 true，确认缺失清单返回 false；探测或类型失败时返回显式错误。
+fn skill_manifest_path_is_file(skill_yaml: &Path) -> Result<bool, String> {
+    match fs::metadata(skill_yaml) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(format!(
+            "Skill manifest is not a file: {}",
+            render_skill_manager_path(skill_yaml)
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect skill manifest {}: {}",
+            render_skill_manager_path(skill_yaml),
+            error
+        )),
+    }
+}
+
+/// Inspect whether one disabled-state record path is a file without hiding filesystem probe errors.
+/// 检查单个停用状态记录路径是否为文件，同时不隐藏文件系统探测错误。
+///
+/// The path parameter is the concrete disabled-state record path for one skill id.
+/// path 参数是单个 skill id 对应的具体停用状态记录路径。
+///
+/// Return true for an existing record file, false for a confirmed missing record, or an explicit probe/type error.
+/// 已存在记录文件返回 true，确认缺失记录返回 false；探测或类型失败时返回显式错误。
+fn disabled_record_path_is_file(path: &Path) -> Result<bool, String> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(format!(
+            "Disabled record is not a file: {}",
+            render_skill_manager_path(path)
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect disabled record {}: {}",
+            render_skill_manager_path(path),
+            error
+        )),
+    }
+}
+
+/// Inspect whether one managed install record path is a file without hiding filesystem probe errors.
+/// 检查单个受管安装记录路径是否为文件，同时不隐藏文件系统探测错误。
+///
+/// The path parameter is the concrete install-record path for one skill id.
+/// path 参数是单个 skill id 对应的具体安装记录路径。
+///
+/// Return true for an existing record file, false for a confirmed missing record, or an explicit probe/type error.
+/// 已存在记录文件返回 true，确认缺失记录返回 false；探测或类型失败时返回显式错误。
+fn install_record_path_is_file(path: &Path) -> Result<bool, String> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(format!(
+            "Install record is not a file: {}",
+            render_skill_manager_path(path)
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect install record {}: {}",
+            render_skill_manager_path(path),
+            error
+        )),
+    }
+}
+
+/// Inspect whether one skill package path is a directory without hiding filesystem probe errors.
+/// 检查单个技能包路径是否为目录，同时不隐藏文件系统探测错误。
+///
+/// The skill_dir parameter is the concrete skill package directory used by one lifecycle action.
+/// skill_dir 参数是单个生命周期操作使用的具体技能包目录。
+///
+/// Return true for an existing package directory, false for a confirmed missing package directory, or an explicit probe/type error.
+/// 已存在包目录返回 true，确认缺失包目录返回 false；探测或类型异常时返回显式错误。
+fn skill_package_dir_is_directory(skill_dir: &Path) -> Result<bool, String> {
+    match fs::metadata(skill_dir) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(format!(
+            "Skill package path is not a directory: {}",
+            render_skill_manager_path(skill_dir)
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect skill package directory {}: {}",
+            render_skill_manager_path(skill_dir),
+            error
+        )),
+    }
+}
+
+/// Inspect whether one lifecycle staging temp root is a directory without hiding filesystem probe errors.
+/// 检查单个生命周期暂存临时根是否为目录，同时不隐藏文件系统探测错误。
+///
+/// The temp_root parameter is the concrete install/update staging root created before archive extraction.
+/// temp_root 参数是归档解压前创建的具体安装/更新暂存根目录。
+///
+/// Return true for an existing temp directory, false for a confirmed missing temp directory, or an explicit probe/type error.
+/// 已存在临时目录返回 true，确认缺失临时目录返回 false；探测或类型异常时返回显式错误。
+fn staging_temp_root_is_directory(temp_root: &Path) -> Result<bool, String> {
+    match fs::metadata(temp_root) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(format!(
+            "Skill staging temp root is not a directory: {}",
+            render_skill_manager_path(temp_root)
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect skill staging temp root {}: {}",
+            render_skill_manager_path(temp_root),
+            error
+        )),
+    }
+}
+
+/// Remove one staging directory without first collapsing metadata errors through an existence probe.
+/// 删除单个暂存目录，同时不先通过存在性探测折叠元数据错误。
+///
+/// The path parameter is the concrete staging directory that should be removed.
+/// path 参数是应被删除的具体暂存目录。
+///
+/// Return true when a directory was removed, false when it was already absent, or an explicit cleanup error.
+/// 已删除目录时返回 true，目录原本不存在时返回 false；清理失败时返回显式错误。
+fn remove_staging_dir_if_present(path: &Path) -> Result<bool, String> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to remove staging directory {}: {}",
+            render_skill_manager_path(path),
+            error
+        )),
+    }
+}
 
 /// Lifecycle operations that the LuaSkills manager layer exposes for one skill.
 /// LuaSkills 管理层为单个技能公开的生命周期操作类型。
@@ -317,8 +489,8 @@ impl Drop for TempDirGuard {
     /// Remove the staging directory best-effort when the guard is still armed.
     /// 当守卫仍处于激活状态时，尽力移除暂存目录。
     fn drop(&mut self) {
-        if !self.disarmed && self.path.exists() {
-            let _ = fs::remove_dir_all(&self.path);
+        if !self.disarmed {
+            let _ = remove_staging_dir_if_present(&self.path);
         }
     }
 }
@@ -348,14 +520,14 @@ impl SkillManager {
         fs::create_dir_all(self.disabled_root()).map_err(|error| {
             format!(
                 "Failed to create disabled root {}: {}",
-                self.disabled_root().display(),
+                render_skill_manager_path(&self.disabled_root()),
                 error
             )
         })?;
         fs::create_dir_all(self.install_record_root()).map_err(|error| {
             format!(
                 "Failed to create install-record root {}: {}",
-                self.install_record_root().display(),
+                render_skill_manager_path(&self.install_record_root()),
                 error
             )
         })
@@ -383,7 +555,9 @@ impl SkillManager {
     /// 返回单个技能当前是否处于启用状态。
     pub fn is_skill_enabled(&self, skill_id: &str) -> Result<bool, String> {
         self.ensure_state_layout()?;
-        Ok(!self.disabled_record_path(skill_id).exists())
+        Ok(!disabled_record_path_is_file(
+            &self.disabled_record_path(skill_id),
+        )?)
     }
 
     /// Persist one disabled-state marker for the specified skill.
@@ -407,16 +581,18 @@ impl SkillManager {
             reason: reason
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
-            disabled_at_unix_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
+            disabled_at_unix_ms: current_unix_millis("disabled skill record timestamp")?,
         };
         let path = self.disabled_record_path(skill_id);
         let content = serde_json::to_string_pretty(&record)
             .map_err(|error| format!("Failed to serialize disabled record: {}", error))?;
-        fs::write(&path, content)
-            .map_err(|error| format!("Failed to write {}: {}", path.display(), error))
+        fs::write(&path, content).map_err(|error| {
+            format!(
+                "Failed to write {}: {}",
+                render_skill_manager_path(&path),
+                error
+            )
+        })
     }
 
     /// Remove the disabled-state marker for one skill.
@@ -435,9 +611,14 @@ impl SkillManager {
         self.guard_operation(plane, SkillLifecycleAction::Enable, skill_id)?;
         self.ensure_state_layout()?;
         let path = self.disabled_record_path(skill_id);
-        if path.exists() {
-            fs::remove_file(&path)
-                .map_err(|error| format!("Failed to remove {}: {}", path.display(), error))?;
+        if disabled_record_path_is_file(&path)? {
+            fs::remove_file(&path).map_err(|error| {
+                format!(
+                    "Failed to remove {}: {}",
+                    render_skill_manager_path(&path),
+                    error
+                )
+            })?;
         }
         Ok(())
     }
@@ -446,13 +627,23 @@ impl SkillManager {
     /// 在停用状态记录存在时读取单个技能的停用状态记录。
     pub fn disabled_record(&self, skill_id: &str) -> Result<Option<DisabledSkillRecord>, String> {
         let path = self.disabled_record_path(skill_id);
-        if !path.exists() {
+        if !disabled_record_path_is_file(&path)? {
             return Ok(None);
         }
-        let content = fs::read_to_string(&path)
-            .map_err(|error| format!("Failed to read {}: {}", path.display(), error))?;
-        let record = serde_json::from_str::<DisabledSkillRecord>(&content)
-            .map_err(|error| format!("Failed to parse {}: {}", path.display(), error))?;
+        let content = fs::read_to_string(&path).map_err(|error| {
+            format!(
+                "Failed to read {}: {}",
+                render_skill_manager_path(&path),
+                error
+            )
+        })?;
+        let record = serde_json::from_str::<DisabledSkillRecord>(&content).map_err(|error| {
+            format!(
+                "Failed to parse {}: {}",
+                render_skill_manager_path(&path),
+                error
+            )
+        })?;
         Ok(Some(record))
     }
 
@@ -474,14 +665,12 @@ impl SkillManager {
             self.prepare_uninstall_skill_at_path_in_plane(plane, skill_id, &skill_dir)?;
         self.commit_prepared_skill_uninstall(&prepared)
             .map_err(|error| {
+                // Rollback result from restoring the staged uninstall after commit finalization fails.
+                // 提交收尾失败后恢复已暂存卸载变更得到的回滚结果。
                 let rollback_error = self.rollback_prepared_skill_uninstall(&prepared);
-                let rollback_message = rollback_error
-                    .err()
-                    .map(|rollback| format!(" rollback failed: {}", rollback))
-                    .unwrap_or_default();
-                format!(
-                    "Failed to finalize uninstall: {}.{}",
-                    error, rollback_message
+                format_uninstall_finalization_error(
+                    format!("Failed to finalize uninstall: {}", error),
+                    rollback_error,
                 )
             })
     }
@@ -497,14 +686,12 @@ impl SkillManager {
         let prepared = self.prepare_uninstall_skill_at_path_in_plane(plane, skill_id, skill_dir)?;
         self.commit_prepared_skill_uninstall(&prepared)
             .map_err(|error| {
+                // Rollback result from restoring the staged uninstall after commit finalization fails.
+                // 提交收尾失败后恢复已暂存卸载变更得到的回滚结果。
                 let rollback_error = self.rollback_prepared_skill_uninstall(&prepared);
-                let rollback_message = rollback_error
-                    .err()
-                    .map(|rollback| format!(" rollback failed: {}", rollback))
-                    .unwrap_or_default();
-                format!(
-                    "Failed to finalize uninstall: {}.{}",
-                    error, rollback_message
+                format_uninstall_finalization_error(
+                    format!("Failed to finalize uninstall: {}", error),
+                    rollback_error,
                 )
             })
     }
@@ -521,21 +708,27 @@ impl SkillManager {
         self.ensure_state_layout()?;
         let previous_disabled_record = self.disabled_record(skill_id)?;
         let previous_install_record = self.install_record(skill_id)?;
-        let (skill_removed, backup_dir) = if skill_dir.exists() {
+        let (skill_removed, backup_dir) = if skill_package_dir_is_directory(skill_dir)? {
+            let timestamp = current_unix_millis("uninstall backup directory timestamp")?;
             let backup_dir = self
                 .config
                 .lifecycle_root
                 .join("uninstall_backup")
-                .join(format!("{}-{}", skill_id, current_unix_millis()));
+                .join(format!("{}-{}", skill_id, timestamp));
             if let Some(parent) = backup_dir.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| format!("Failed to create {}: {}", parent.display(), error))?;
+                fs::create_dir_all(parent).map_err(|error| {
+                    format!(
+                        "Failed to create {}: {}",
+                        render_skill_manager_path(parent),
+                        error
+                    )
+                })?;
             }
             fs::rename(skill_dir, &backup_dir).map_err(|error| {
                 format!(
                     "Failed to move current skill {} into uninstall backup {}: {}",
-                    skill_dir.display(),
-                    backup_dir.display(),
+                    render_skill_manager_path(skill_dir),
+                    render_skill_manager_path(&backup_dir),
                     error
                 )
             })?;
@@ -1116,16 +1309,17 @@ impl SkillManager {
             "started",
             Some("extracting skill archive"),
         );
-        let install_temp_root = self.config.lifecycle_root.join("install_tmp").join(format!(
-            "{}-{}",
-            skill_id,
-            current_unix_millis()
-        ));
-        if install_temp_root.exists() {
+        let timestamp = current_unix_millis("install temp directory timestamp")?;
+        let install_temp_root = self
+            .config
+            .lifecycle_root
+            .join("install_tmp")
+            .join(format!("{}-{}", skill_id, timestamp));
+        if staging_temp_root_is_directory(&install_temp_root)? {
             fs::remove_dir_all(&install_temp_root).map_err(|error| {
                 format!(
                     "Failed to remove stale temp install root {}: {}",
-                    install_temp_root.display(),
+                    render_skill_manager_path(&install_temp_root),
                     error
                 )
             })?;
@@ -1133,7 +1327,7 @@ impl SkillManager {
         fs::create_dir_all(&install_temp_root).map_err(|error| {
             format!(
                 "Failed to create temp install root {}: {}",
-                install_temp_root.display(),
+                render_skill_manager_path(&install_temp_root),
                 error
             )
         })?;
@@ -1168,17 +1362,17 @@ impl SkillManager {
             Some("moving skill into target root"),
         );
         let target_dir = self.skill_root().join(skill_id);
-        if target_dir.exists() {
+        if skill_package_dir_is_directory(&target_dir)? {
             return Err(format!(
                 "target skill directory {} already exists",
-                target_dir.display()
+                render_skill_manager_path(&target_dir)
             ));
         }
         fs::rename(&extracted_skill_dir, &target_dir).map_err(|error| {
             format!(
                 "Failed to move extracted skill {} into {}: {}",
-                extracted_skill_dir.display(),
-                target_dir.display(),
+                render_skill_manager_path(&extracted_skill_dir),
+                render_skill_manager_path(&target_dir),
                 error
             )
         })?;
@@ -1192,7 +1386,7 @@ impl SkillManager {
             version: version.to_string(),
             managed: true,
             source,
-            installed_at_unix_ms: current_unix_millis(),
+            installed_at_unix_ms: current_unix_millis("installed skill record timestamp")?,
         };
         Ok(PreparedSkillApply::Install(PreparedSkillInstall {
             result: SkillApplyResult {
@@ -1223,16 +1417,17 @@ impl SkillManager {
             "started",
             Some("extracting skill archive"),
         );
-        let temp_root = self.config.lifecycle_root.join("update_tmp").join(format!(
-            "{}-{}",
-            skill_id,
-            current_unix_millis()
-        ));
-        if temp_root.exists() {
+        let timestamp = current_unix_millis("update temp directory timestamp")?;
+        let temp_root = self
+            .config
+            .lifecycle_root
+            .join("update_tmp")
+            .join(format!("{}-{}", skill_id, timestamp));
+        if staging_temp_root_is_directory(&temp_root)? {
             fs::remove_dir_all(&temp_root).map_err(|error| {
                 format!(
                     "Failed to remove stale temp update root {}: {}",
-                    temp_root.display(),
+                    render_skill_manager_path(&temp_root),
                     error
                 )
             })?;
@@ -1240,7 +1435,7 @@ impl SkillManager {
         fs::create_dir_all(&temp_root).map_err(|error| {
             format!(
                 "Failed to create temp update root {}: {}",
-                temp_root.display(),
+                render_skill_manager_path(&temp_root),
                 error
             )
         })?;
@@ -1273,26 +1468,32 @@ impl SkillManager {
             Some("backing up current skill package"),
         );
         let target_dir = self.skill_root().join(skill_id);
-        if !target_dir.exists() {
+        if !skill_package_dir_is_directory(&target_dir)? {
             return Err(format!(
                 "installed skill directory {} does not exist",
-                target_dir.display()
+                render_skill_manager_path(&target_dir)
             ));
         }
+        let backup_timestamp = current_unix_millis("update backup directory timestamp")?;
         let backup_dir = self
             .config
             .lifecycle_root
             .join("update_backup")
-            .join(format!("{}-{}", skill_id, current_unix_millis()));
+            .join(format!("{}-{}", skill_id, backup_timestamp));
         if let Some(parent) = backup_dir.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("Failed to create {}: {}", parent.display(), error))?;
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "Failed to create {}: {}",
+                    render_skill_manager_path(parent),
+                    error
+                )
+            })?;
         }
         fs::rename(&target_dir, &backup_dir).map_err(|error| {
             format!(
                 "Failed to move current skill {} into backup {}: {}",
-                target_dir.display(),
-                backup_dir.display(),
+                render_skill_manager_path(&target_dir),
+                render_skill_manager_path(&backup_dir),
                 error
             )
         })?;
@@ -1305,8 +1506,8 @@ impl SkillManager {
             let _ = fs::rename(&backup_dir, &target_dir);
             return Err(format!(
                 "Failed to move updated skill {} into {}: {}",
-                extracted_skill_dir.display(),
-                target_dir.display(),
+                render_skill_manager_path(&extracted_skill_dir),
+                render_skill_manager_path(&target_dir),
                 error
             ));
         }
@@ -1320,7 +1521,7 @@ impl SkillManager {
             version: version.to_string(),
             managed: true,
             source,
-            installed_at_unix_ms: current_unix_millis(),
+            installed_at_unix_ms: current_unix_millis("updated skill record timestamp")?,
         };
         Ok(PreparedSkillApply::Update(PreparedSkillUpdate {
             result: SkillApplyResult {
@@ -1383,13 +1584,23 @@ impl SkillManager {
     pub fn install_record(&self, skill_id: &str) -> Result<Option<InstalledSkillRecord>, String> {
         validate_luaskills_identifier(skill_id, "skill_id")?;
         let path = self.install_record_path(skill_id);
-        if !path.exists() {
+        if !install_record_path_is_file(&path)? {
             return Ok(None);
         }
-        let yaml = fs::read_to_string(&path)
-            .map_err(|error| format!("Failed to read {}: {}", path.display(), error))?;
-        let record: InstalledSkillRecord = serde_yaml::from_str(&yaml)
-            .map_err(|error| format!("Failed to parse {}: {}", path.display(), error))?;
+        let yaml = fs::read_to_string(&path).map_err(|error| {
+            format!(
+                "Failed to read {}: {}",
+                render_skill_manager_path(&path),
+                error
+            )
+        })?;
+        let record: InstalledSkillRecord = serde_yaml::from_str(&yaml).map_err(|error| {
+            format!(
+                "Failed to parse {}: {}",
+                render_skill_manager_path(&path),
+                error
+            )
+        })?;
         Ok(Some(record))
     }
 
@@ -1400,8 +1611,13 @@ impl SkillManager {
         let path = self.install_record_path(&record.skill_id);
         let yaml = serde_yaml::to_string(record)
             .map_err(|error| format!("Failed to serialize install record: {}", error))?;
-        fs::write(&path, yaml)
-            .map_err(|error| format!("Failed to write {}: {}", path.display(), error))
+        fs::write(&path, yaml).map_err(|error| {
+            format!(
+                "Failed to write {}: {}",
+                render_skill_manager_path(&path),
+                error
+            )
+        })
     }
 
     /// Remove one managed install record from disk and report whether it existed.
@@ -1409,11 +1625,16 @@ impl SkillManager {
     fn remove_install_record(&self, skill_id: &str) -> Result<bool, String> {
         validate_luaskills_identifier(skill_id, "skill_id")?;
         let path = self.install_record_path(skill_id);
-        if !path.exists() {
+        if !install_record_path_is_file(&path)? {
             return Ok(false);
         }
-        fs::remove_file(&path)
-            .map_err(|error| format!("Failed to remove {}: {}", path.display(), error))?;
+        fs::remove_file(&path).map_err(|error| {
+            format!(
+                "Failed to remove {}: {}",
+                render_skill_manager_path(&path),
+                error
+            )
+        })?;
         Ok(true)
     }
 
@@ -1424,8 +1645,13 @@ impl SkillManager {
         let path = self.disabled_record_path(&record.skill_id);
         let content = serde_json::to_string_pretty(record)
             .map_err(|error| format!("Failed to serialize disabled record: {}", error))?;
-        fs::write(&path, content)
-            .map_err(|error| format!("Failed to write {}: {}", path.display(), error))
+        fs::write(&path, content).map_err(|error| {
+            format!(
+                "Failed to write {}: {}",
+                render_skill_manager_path(&path),
+                error
+            )
+        })
     }
 
     /// Remove one disabled-state record from disk and report whether it existed.
@@ -1434,11 +1660,16 @@ impl SkillManager {
         validate_luaskills_identifier(skill_id, "skill_id")?;
         self.ensure_state_layout()?;
         let path = self.disabled_record_path(skill_id);
-        if !path.exists() {
+        if !disabled_record_path_is_file(&path)? {
             return Ok(false);
         }
-        fs::remove_file(&path)
-            .map_err(|error| format!("Failed to remove {}: {}", path.display(), error))?;
+        fs::remove_file(&path).map_err(|error| {
+            format!(
+                "Failed to remove {}: {}",
+                render_skill_manager_path(&path),
+                error
+            )
+        })?;
         Ok(true)
     }
 
@@ -1488,24 +1719,40 @@ impl SkillManager {
             }
             PreparedSkillApply::Update(prepared_update) => {
                 self.persist_install_record(&prepared_update.install_record)?;
-                if prepared_update.backup_dir.exists() {
-                    fs::remove_dir_all(&prepared_update.backup_dir).map_err(|error| {
-                        let restore_error =
-                            self.persist_install_record(&prepared_update.previous_install_record);
-                        match restore_error {
-                            Ok(()) => format!(
-                                "Failed to remove update backup {}: previous install record was restored: {}",
-                                prepared_update.backup_dir.display(),
-                                error
-                            ),
-                            Err(restore_error) => format!(
-                                "Failed to remove update backup {}: {}. Failed to restore previous install record: {}",
-                                prepared_update.backup_dir.display(),
-                                error,
-                                restore_error
-                            ),
-                        }
-                    })?;
+                match skill_package_dir_is_directory(&prepared_update.backup_dir) {
+                    Ok(true) => {
+                        fs::remove_dir_all(&prepared_update.backup_dir).map_err(|error| {
+                            let restore_error =
+                                self.persist_install_record(&prepared_update.previous_install_record);
+                            match restore_error {
+                                Ok(()) => format!(
+                                    "Failed to remove update backup {}: previous install record was restored: {}",
+                                    render_skill_manager_path(&prepared_update.backup_dir),
+                                    error
+                                ),
+                                Err(restore_error) => format!(
+                                    "Failed to remove update backup {}: {}. Failed to restore previous install record: {}",
+                                    render_skill_manager_path(&prepared_update.backup_dir),
+                                    error,
+                                    restore_error
+                                ),
+                            }
+                        })?;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        return match self
+                            .persist_install_record(&prepared_update.previous_install_record)
+                        {
+                            Ok(()) => {
+                                Err(format!("{}: previous install record was restored", error))
+                            }
+                            Err(restore_error) => Err(format!(
+                                "{}. Failed to restore previous install record: {}",
+                                error, restore_error
+                            )),
+                        };
+                    }
                 }
                 Ok(prepared_update.result.clone())
             }
@@ -1521,11 +1768,11 @@ impl SkillManager {
         match prepared {
             PreparedSkillApply::Immediate(_) => Ok(()),
             PreparedSkillApply::Install(prepared_install) => {
-                if prepared_install.target_dir.exists() {
+                if skill_package_dir_is_directory(&prepared_install.target_dir)? {
                     fs::remove_dir_all(&prepared_install.target_dir).map_err(|error| {
                         format!(
                             "Failed to roll back installed skill directory {}: {}",
-                            prepared_install.target_dir.display(),
+                            render_skill_manager_path(&prepared_install.target_dir),
                             error
                         )
                     })?;
@@ -1533,22 +1780,30 @@ impl SkillManager {
                 Ok(())
             }
             PreparedSkillApply::Update(prepared_update) => {
-                if prepared_update.target_dir.exists() {
+                // Probe both rollback directories before deleting anything so a broken backup path cannot strand the staged target.
+                // 在删除任何内容前先探测两个回滚目录，避免备份路径异常时让暂存目标处于不可恢复状态。
+                let target_dir_exists =
+                    skill_package_dir_is_directory(&prepared_update.target_dir)?;
+                // Whether the previous package backup is available before rollback starts.
+                // 回滚开始前旧包备份目录是否可用。
+                let backup_dir_exists =
+                    skill_package_dir_is_directory(&prepared_update.backup_dir)?;
+                if target_dir_exists {
                     fs::remove_dir_all(&prepared_update.target_dir).map_err(|error| {
                         format!(
                             "Failed to remove staged updated skill directory {}: {}",
-                            prepared_update.target_dir.display(),
+                            render_skill_manager_path(&prepared_update.target_dir),
                             error
                         )
                     })?;
                 }
-                if prepared_update.backup_dir.exists() {
+                if backup_dir_exists {
                     fs::rename(&prepared_update.backup_dir, &prepared_update.target_dir).map_err(
                         |error| {
                             format!(
                                 "Failed to restore backup {} into {}: {}",
-                                prepared_update.backup_dir.display(),
-                                prepared_update.target_dir.display(),
+                                render_skill_manager_path(&prepared_update.backup_dir),
+                                render_skill_manager_path(&prepared_update.target_dir),
                                 error
                             )
                         },
@@ -1583,7 +1838,7 @@ impl SkillManager {
                 );
                 let mut message = format!(
                     "Failed to remove uninstall backup {}: {}",
-                    backup_dir.display(),
+                    render_skill_manager_path(backup_dir),
                     error
                 );
                 if let Err(restore_error) = disabled_restore_error {
@@ -1611,21 +1866,27 @@ impl SkillManager {
         prepared: &PreparedSkillUninstall,
     ) -> Result<(), String> {
         if let Some(backup_dir) = &prepared.backup_dir {
-            if prepared.target_dir.exists() {
+            // Probe both uninstall rollback directories before deleting anything so a broken backup path cannot strand the staged target.
+            // 在删除任何内容前先探测两个卸载回滚目录，避免备份路径异常时让暂存目标处于不可恢复状态。
+            let target_dir_exists = skill_package_dir_is_directory(&prepared.target_dir)?;
+            // Whether the previous package backup is available before uninstall rollback starts.
+            // 卸载回滚开始前旧包备份目录是否可用。
+            let backup_dir_exists = skill_package_dir_is_directory(backup_dir)?;
+            if target_dir_exists {
                 fs::remove_dir_all(&prepared.target_dir).map_err(|error| {
                     format!(
                         "Failed to remove staged uninstall target directory {}: {}",
-                        prepared.target_dir.display(),
+                        render_skill_manager_path(&prepared.target_dir),
                         error
                     )
                 })?;
             }
-            if backup_dir.exists() {
+            if backup_dir_exists {
                 fs::rename(backup_dir, &prepared.target_dir).map_err(|error| {
                     format!(
                         "Failed to restore uninstall backup {} into {}: {}",
-                        backup_dir.display(),
-                        prepared.target_dir.display(),
+                        render_skill_manager_path(backup_dir),
+                        render_skill_manager_path(&prepared.target_dir),
                         error
                     )
                 })?;
@@ -1787,17 +2048,43 @@ pub(crate) fn resolve_requested_skill_id(request: &SkillInstallRequest) -> Resul
 
 /// Normalize one GitHub repository locator into `owner/repo` form.
 /// 将单个 GitHub 仓库定位值规范化为 `owner/repo` 形式。
+///
+/// The source parameter is the caller-provided GitHub repository locator.
+/// source 参数是调用方提供的 GitHub 仓库定位值。
+///
+/// Returns the normalized `owner/repo` locator.
+/// 返回规范化后的 `owner/repo` 定位值。
+///
+/// Returns an error when the locator is not exactly one owner and one repository segment.
+/// 当定位值不是准确的一个 owner 段和一个 repo 段时返回错误。
 fn normalize_github_repo_locator(source: &str) -> Result<String, String> {
+    // Repository locator after trimming supported GitHub URL prefixes and surrounding separators.
+    // 去除受支持 GitHub URL 前缀与外围分隔符后的仓库定位值。
     let normalized = source
         .trim()
         .trim_start_matches("https://github.com/")
         .trim_start_matches("http://github.com/")
         .trim_matches('/')
         .to_string();
+    // Slash-separated repository locator segments used to enforce exact owner/repo structure.
+    // 用于强制准确 owner/repo 结构的斜杠分隔仓库定位值片段。
     let mut segments = normalized.split('/');
-    let owner = segments.next().unwrap_or_default().trim();
-    let repo = segments.next().unwrap_or_default().trim();
-    if owner.is_empty() || repo.is_empty() || segments.next().is_some() {
+    // Owner segment from the normalized repository locator.
+    // 规范化仓库定位值中的 owner 段。
+    let owner = segments.next().map(str::trim);
+    // Repository segment from the normalized repository locator.
+    // 规范化仓库定位值中的 repo 段。
+    let repo = segments.next().map(str::trim);
+    // Third segment, if present, proves the locator contains an unsupported nested path.
+    // 如果存在第三段，则证明定位值包含不受支持的嵌套路径。
+    let extra_segment = segments.next();
+    let (Some(owner), Some(repo), None) = (owner, repo, extra_segment) else {
+        return Err(format!(
+            "github source '{}' must be one repository locator in owner/repo form",
+            source
+        ));
+    };
+    if owner.is_empty() || repo.is_empty() {
         return Err(format!(
             "github source '{}' must be one repository locator in owner/repo form",
             source
@@ -1808,15 +2095,58 @@ fn normalize_github_repo_locator(source: &str) -> Result<String, String> {
 
 /// Derive one skill id from the repository segment of a GitHub locator.
 /// 从 GitHub 定位值的仓库段派生单个技能标识符。
+///
+/// The repo parameter is the normalized GitHub repository locator.
+/// repo 参数是规范化后的 GitHub 仓库定位值。
+///
+/// Returns the skill id derived from the repository segment.
+/// 返回从仓库段派生出的技能标识符。
+///
+/// Returns an error when the locator does not contain an owner/repo separator.
+/// 当定位值不包含 owner/repo 分隔符时返回错误。
 fn github_repo_skill_id(repo: &str) -> Result<String, String> {
-    let skill_id = repo
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    // Repository segment extracted from the normalized owner/repo locator.
+    // 从规范化 owner/repo 定位值中提取出的仓库段。
+    let (_, repo_segment) = repo.rsplit_once('/').ok_or_else(|| {
+        format!(
+            "github repository '{}' must be one repository locator in owner/repo form",
+            repo
+        )
+    })?;
+    // Skill id candidate derived from the repository segment before identifier validation.
+    // 在标识符校验前从仓库段派生出的技能标识符候选值。
+    let skill_id = repo_segment.trim().to_string();
     validate_luaskills_identifier(&skill_id, "derived github skill_id")?;
     Ok(skill_id)
+}
+
+/// Format one uninstall finalization failure with rollback diagnostics.
+/// 将单个卸载收尾失败与回滚诊断一起格式化。
+///
+/// The base_message parameter is the primary uninstall finalization failure text.
+/// base_message 参数是主要的卸载收尾失败文本。
+///
+/// The rollback_result parameter is the result of restoring the staged uninstall mutation.
+/// rollback_result 参数是恢复已暂存卸载变更的结果。
+///
+/// Returns one complete human-readable uninstall finalization failure message.
+/// 返回一条完整的人类可读卸载收尾失败信息。
+fn format_uninstall_finalization_error<R>(
+    base_message: String,
+    rollback_result: Result<(), R>,
+) -> String
+where
+    R: Display,
+{
+    // Mutable failure message that receives rollback diagnostics only when rollback fails.
+    // 可变失败消息，仅在回滚失败时追加回滚诊断。
+    let mut message = base_message;
+    // Rollback failure is appended only when the rollback operation returned a concrete error.
+    // 只有当回滚操作返回具体错误时，才追加回滚失败信息。
+    if let Err(error) = rollback_result {
+        message.push_str(&format!(". rollback failed: {}", error));
+    }
+    message
 }
 
 /// Build one stable download-cache key for a managed skill package.
@@ -1825,13 +2155,23 @@ fn managed_skill_cache_key(skill_id: &str, version: &str) -> String {
     format!("skill-{}-{}", skill_id, version)
 }
 
-/// Return the current Unix timestamp in milliseconds.
-/// 返回当前 Unix 毫秒时间戳。
-fn current_unix_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
+/// Return the current Unix timestamp in milliseconds for one named lifecycle operation.
+/// 返回单个具名生命周期操作使用的当前 Unix 毫秒时间戳。
+fn current_unix_millis(context: &str) -> Result<u128, String> {
+    unix_millis_from_system_time(SystemTime::now(), context)
+}
+
+/// Convert one system time into Unix milliseconds without silently accepting pre-epoch clocks.
+/// 将单个系统时间转换为 Unix 毫秒，且不会静默接受早于 epoch 的时钟。
+fn unix_millis_from_system_time(time: SystemTime, context: &str) -> Result<u128, String> {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .map_err(|error| {
+            format!(
+                "System clock is before Unix epoch while computing {}: {}",
+                context, error
+            )
+        })
 }
 
 /// Read one extracted skill manifest from disk and bind the directory-derived skill id.
@@ -1843,17 +2183,27 @@ fn read_skill_manifest_from_directory(skill_dir: &Path) -> Result<SkillMeta, Str
         .ok_or_else(|| {
             format!(
                 "Failed to resolve skill id from directory {}",
-                skill_dir.display()
+                render_skill_manager_path(skill_dir)
             )
         })?
         .trim()
         .to_string();
     validate_luaskills_identifier(&skill_id, "skill_id")?;
     let skill_yaml_path = skill_dir.join("skill.yaml");
-    let yaml_text = fs::read_to_string(&skill_yaml_path)
-        .map_err(|error| format!("Failed to read {}: {}", skill_yaml_path.display(), error))?;
-    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&yaml_text)
-        .map_err(|error| format!("Failed to parse {}: {}", skill_yaml_path.display(), error))?;
+    let yaml_text = fs::read_to_string(&skill_yaml_path).map_err(|error| {
+        format!(
+            "Failed to read {}: {}",
+            render_skill_manager_path(&skill_yaml_path),
+            error
+        )
+    })?;
+    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&yaml_text).map_err(|error| {
+        format!(
+            "Failed to parse {}: {}",
+            render_skill_manager_path(&skill_yaml_path),
+            error
+        )
+    })?;
     if yaml_value
         .as_mapping()
         .and_then(|mapping| mapping.get(serde_yaml::Value::String("skill_id".to_string())))
@@ -1861,18 +2211,23 @@ fn read_skill_manifest_from_directory(skill_dir: &Path) -> Result<SkillMeta, Str
     {
         return Err(format!(
             "skill {} must not declare skill_id in skill.yaml; directory name is the only skill_id",
-            skill_dir.display()
+            render_skill_manager_path(skill_dir)
         ));
     }
-    let mut meta: SkillMeta = serde_yaml::from_value(yaml_value)
-        .map_err(|error| format!("Failed to decode {}: {}", skill_yaml_path.display(), error))?;
+    let mut meta: SkillMeta = serde_yaml::from_value(yaml_value).map_err(|error| {
+        format!(
+            "Failed to decode {}: {}",
+            render_skill_manager_path(&skill_yaml_path),
+            error
+        )
+    })?;
     meta.bind_directory_skill_id(skill_id.clone());
     meta.resolve_entry_input_schemas(skill_dir)?;
     validate_luaskills_version(meta.version(), "skill.yaml version")?;
     if meta.effective_skill_id() != skill_id {
         return Err(format!(
             "skill manifest in {} resolved to skill_id '{}' instead of '{}'",
-            skill_yaml_path.display(),
+            render_skill_manager_path(&skill_yaml_path),
             meta.effective_skill_id(),
             skill_id
         ));
@@ -1988,12 +2343,16 @@ fn collect_named_skill_dirs(
     root: &Path,
 ) -> Result<std::collections::BTreeMap<String, PathBuf>, String> {
     let mut output = std::collections::BTreeMap::new();
-    if !root.exists() {
+    if !skill_root_path_is_directory(root)? {
         return Ok(output);
     }
-    for entry in fs::read_dir(root)
-        .map_err(|error| format!("Failed to read {}: {}", root.display(), error))?
-    {
+    for entry in fs::read_dir(root).map_err(|error| {
+        format!(
+            "Failed to read {}: {}",
+            render_skill_manager_path(root),
+            error
+        )
+    })? {
         let entry = entry.map_err(|error| format!("Failed to read skill entry: {}", error))?;
         let file_type = entry
             .file_type()
@@ -2020,7 +2379,7 @@ fn is_effective_disable_override(skill_dir: &Path) -> Result<bool, String> {
         .map_err(|error| {
             format!(
                 "Failed to read override dir {}: {}",
-                skill_dir.display(),
+                render_skill_manager_path(skill_dir),
                 error
             )
         })?
@@ -2032,19 +2391,29 @@ fn is_effective_disable_override(skill_dir: &Path) -> Result<bool, String> {
 /// 返回单个已解析技能目录是否在其清单中启用。
 fn is_skill_manifest_enabled(skill_dir: &Path) -> Result<bool, String> {
     let skill_yaml = skill_dir.join("skill.yaml");
-    if !skill_yaml.exists() {
+    if !skill_manifest_path_is_file(&skill_yaml)? {
         return Ok(true);
     }
-    let yaml_text = fs::read_to_string(&skill_yaml)
-        .map_err(|error| format!("Failed to read {}: {}", skill_yaml.display(), error))?;
-    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&yaml_text)
-        .map_err(|error| format!("Failed to parse {}: {}", skill_yaml.display(), error))?;
+    let yaml_text = fs::read_to_string(&skill_yaml).map_err(|error| {
+        format!(
+            "Failed to read {}: {}",
+            render_skill_manager_path(&skill_yaml),
+            error
+        )
+    })?;
+    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&yaml_text).map_err(|error| {
+        format!(
+            "Failed to parse {}: {}",
+            render_skill_manager_path(&skill_yaml),
+            error
+        )
+    })?;
     if yaml_value.as_mapping().is_some_and(|mapping| {
         mapping.contains_key(serde_yaml::Value::String("skill_id".to_string()))
     }) {
         return Err(format!(
             "skill manifest {} must not declare skill_id; directory name is the only skill_id",
-            skill_yaml.display()
+            render_skill_manager_path(&skill_yaml)
         ));
     }
     #[derive(Debug, Deserialize)]
@@ -2059,8 +2428,13 @@ fn is_skill_manifest_enabled(skill_dir: &Path) -> Result<bool, String> {
     fn default_skill_enable() -> bool {
         true
     }
-    let probe: SkillEnableProbe = serde_yaml::from_value(yaml_value)
-        .map_err(|error| format!("Failed to parse {}: {}", skill_yaml.display(), error))?;
+    let probe: SkillEnableProbe = serde_yaml::from_value(yaml_value).map_err(|error| {
+        format!(
+            "Failed to parse {}: {}",
+            render_skill_manager_path(&skill_yaml),
+            error
+        )
+    })?;
     Ok(probe.enable)
 }
 

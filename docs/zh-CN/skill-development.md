@@ -843,7 +843,242 @@ ROOT -> PROJECT -> USER
 - `install/update/uninstall/enable/disable` 的 `input` / 返回值结构是宿主桥接契约的一部分，运行时只负责分发，不负责替你定义业务字段。
 - 如果 payload 显式试图操作 `ROOT` 层，运行时会直接拒绝调用。
 
-### 5.9 `vulcan.config.*`
+### 5.9 受管 Python 与 Node 子运行时
+
+Lua 仍然是一等调度层。受管 Python 与 Node.js 只是由 Lua 通过 `vulcan.runtime.python.*` 和 `vulcan.runtime.node.*` 调用的子执行面，不替代 skill entry 模型、不替代 Lua VM 池，也不改变宿主 SDK 契约。
+
+普通 Skill 调用与专用 System Plugin 租约都会携带一份可信包上下文。System 租约必须使用严格的 `system_package = { id, root, dependencies_file }` 描述符创建；`root` 必须是引擎 `system_lua_lib` 目录下的绝对严格子目录，不能包含 Lua 搜索路径元字符，并会在每次 eval 前重新校验。`dependencies_file` 必须解析为包内相对路径指向的普通文件，不能通过路径或符号链接逃逸。可选 `workspace_root` 必须是既有绝对目录，`cwd` 必须解析到包根或该授权工作区内。包根是该 System Plugin 唯一的 Lua 模块根，因此兄弟插件不会共享 `require(...)` 作用域或受管依赖身份。
+
+在 System Plugin 租约内，运行时还会暴露：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `vulcan.runtime.system_plugin` | 递归只读 userdata 视图 | 绑定包租约的 `id`、规范 `root`、`lease_id`、`sid` 与 `generation` |
+| `vulcan.runtime.workspace_root` | `string \| nil` | 宿主显式授权的规范工作区根 |
+| `vulcan.runtime.mounts` | 递归只读 userdata 视图 | 宿主拥有的结构化挂载元数据 |
+
+两个 userdata 视图支持索引、`pairs` / `ipairs`、长度与普通 JSON 结果序列化，三个宿主所有的根字段也不能被赋值或替换。专用 System VM 会移除全局 `rawset` 与 Lua `debug` 库，阻止绕过元表边界。这取代了“System 运行时上下文全部缺失或恒为 `nil`”的旧假设；入口专属的 `vulcan.context.skill_dir / entry_dir / entry_file` 仍是另一组语义，在租约 eval 不是 Skill 入口调用时仍可能为 `nil`。
+
+正常调用链为：
+
+1. skill 在 `dependencies.yaml` 声明 Python 或 Node.js 需求。
+2. 运行时根目录先通过受管运行时拉取脚本准备好主程序。
+3. Lua 通过 `vulcan.runtime.python.invoke(...)` 或 `vulcan.runtime.node.invoke(...)` 调用 Python / Node.js 文件。
+4. 运行时按需创建带版本的依赖环境，复用常驻 worker，并把结构化结果返回给 Lua。
+
+调用声明了受管子运行时的 skill 前，需要先准备运行时：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deps/fetch_managed_runtimes.ps1 -RuntimeRoot <runtime_root> -Target all
+```
+
+```bash
+RUNTIME_ROOT=<runtime_root> scripts/deps/fetch_managed_runtimes.sh all
+```
+
+拉取脚本会把可携带的运行时放入 `<runtime_root>/dependencies/runtimes/...`。运行时创建的包环境位于 `<runtime_root>/dependencies/envs/...`，并按运行时版本、平台、包管理器版本与 lockfile 内容生成稳定 hash。
+
+最小 `dependencies.yaml`：
+
+```yaml
+python_runtime:
+  version: "3.12.7"
+  package_manager: uv
+  package_manager_version: "0.11.17"
+  lockfile: python/requirements.lock
+node_runtime:
+  version: "22.11.0"
+  package_manager: pnpm
+  package_manager_version: "9.15.0"
+  package_json: node/package.json
+  lockfile: node/pnpm-lock.yaml
+```
+
+`node_runtime.version` 必须是一个精确语义版本，不能使用版本范围、标签或不完整版本。受管异步 ESM Worker 协议要求 Node.js 不低于 `22.0.0`；无效 SemVer 或更低版本会在解析环境或启动 Worker 前被拒绝。
+
+Lua 调用示例：
+
+```lua
+local python_result = vulcan.runtime.python.invoke({
+    file = "python/handler.py",
+    handler = "main",
+    timeout_ms = 30000,
+    args = {
+        text = "hello",
+    },
+})
+
+if not python_result.ok then
+    error("python failed: " .. tostring(python_result.error))
+end
+
+local node_result = vulcan.runtime.node.invoke({
+    file = "node/handler.mjs",
+    handler = "main",
+    timeout_ms = 30000,
+    args = python_result.value,
+})
+
+if not node_result.ok then
+    error("node failed: " .. tostring(node_result.error))
+end
+```
+
+Python handler 接收 JSON 兼容参数与上下文：
+
+```python
+def main(args, ctx):
+    return {
+        "text": args.get("text", ""),
+        "ctx_is_dict": isinstance(ctx, dict),
+    }
+```
+
+Node.js handler 使用 ESM 模块。未传 `handler` 时默认查找 `default`，并以 `main` 作为 fallback；显式 `handler = "main"` 会调用命名导出：
+
+```javascript
+export async function main(args, ctx) {
+  return {
+    text: args.text || "",
+    ctxIsObject: ctx && typeof ctx === "object",
+  };
+}
+```
+
+状态 API：
+
+| API | 返回值 | 说明 |
+| --- | --- | --- |
+| `vulcan.runtime.python.status()` | table | 当前 skill 的 `python_runtime` 声明状态 |
+| `vulcan.runtime.node.status()` | table | 当前 skill 的 `node_runtime` 声明状态 |
+
+稳定状态字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `available` | `boolean` | 声明是否能解析到已准备好的运行时 |
+| `configured` | `boolean` | skill 是否在 `dependencies.yaml` 声明了该运行时 |
+| `ready` | `boolean` | 包环境是否已经创建 |
+| `runtime` | `"python" \| "node"` | 子运行时类型 |
+| `runtime_version` | `string?` | 解析成功后的运行时版本 |
+| `runtime_executable` | `string?` | 解析成功后的子运行时可执行文件路径 |
+| `package_manager` | `string?` | `uv` 或 `pnpm` |
+| `package_manager_version` | `string?` | 声明的包管理器版本 |
+| `package_manager_executable` | `string?` | 解析成功后的包管理器可执行文件路径 |
+| `env_hash` | `string?` | 稳定包环境 hash |
+| `env_dir` | `string?` | 解析成功后的包环境目录 |
+| `message` | `string?` | 可读状态说明 |
+| `error` | `string?` | 无法从 available/configured 进入 ready 时的解析错误 |
+
+调用输入：
+
+| 字段 | 类型 | 是否必填 | 说明 |
+| --- | --- | --- | --- |
+| `file` | `string` | 是 | 当前 skill 目录内的安全相对路径 |
+| `handler` | `string` | 否 | Python 默认 `main`；Node 默认 `default`，并 fallback 到 `main` |
+| `args` | JSON 兼容 Lua 值 | 否 | 传给子 handler |
+| `timeout_ms` | 正整数 | 否 | 单次调用超时；超时 worker 会被丢弃 |
+
+调用返回：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `ok` | `boolean` | 子 handler 是否成功完成 |
+| `value` | JSON 兼容值 | handler 返回值；失败时为 `nil` / `null` |
+| `stdout` | `string` | 捕获到的 Python stdout 或 Node `console.log/info` 输出 |
+| `stderr` | `string` | 捕获到的 Python stderr 或 Node `console.warn/error` 输出 |
+| `error` | `string?` | 子运行时错误信息 |
+| `trace` | `string?` | 可用时返回 Python traceback 或 Node stack trace |
+| `status` | `string?` | worker 层失败状态，例如 timeout 或输出损坏 |
+| `timed_out` | `boolean?` | 调用超过 `timeout_ms` 时为 true |
+| `worker_reused` | `boolean` | 本次调用是否复用了已有常驻 worker |
+| `env_hash` | `string` | 本次调用使用的包环境 hash |
+| `env_dir` | `string` | 本次调用使用的包环境目录 |
+
+行为注意事项：
+
+- 新环境 hash 的第一次 invoke 会创建包环境；后续调用复用环境 marker，并通常复用常驻 worker。
+- 每个存活 Worker 或持久会话快照都会持有跨进程共享环境生命周期租约。环境最终发布或替换使用非阻塞独占租约；只要仍有 Worker 或会话存活，操作就会立即返回稳定的 `managed runtime environment is busy with active lifecycle leases` 错误，而不会等待或替换使用方脚下的文件。
+- Python 模块按文件路径加载，并在 Python Worker 内缓存。每个 Worker 会把唯一快照根固定在 `sys.path` 首位，移除由 cwd 派生的空入口，并拒绝后续请求更换该根。
+- Node.js 模块按原生 Node ESM 行为导入。只要依赖写进 `package.json` 并由 `pnpm-lock.yaml` 锁定，default import、named import、namespace import、relative import、side-effect import 与 dynamic import 都应遵守 Node 原生规则。
+- 对 Node.js，运行时会先把当前 skill 目录复制进受管环境的 import root，再执行导入。这样可以让 bare dependency 解析停留在受管 `node_modules` 内，同时避免 Windows 符号链接权限问题。
+- 在 Unix 上，池化 Worker 会在 `exec` 前进入已固定的快照目录；每个请求的相对入口都会通过描述符相对、逐组件且不跟随链接的 `openat` 校验。在 Windows 上，Worker 接收由共享锁保护的绝对快照源码路径，并使用快照所在的短驱动器根或 UNC 共享根作为中立 cwd，因此既不会继承宿主 cwd，也不会把长快照路径作为 `CreateProcessW.lpCurrentDirectory` 传入。
+- 受管 `status`、池化 `invoke` 与 System Plugin 持久会话支持 Windows x86_64、Linux x86_64/aarch64、macOS x86_64/aarch64；Windows ARM/aarch64 是持久会话唯一明确例外。
+- 子代码应返回 JSON 可序列化值。不可序列化结果会作为结构化子错误返回，而不是让 Lua skill VM 崩溃。
+- `stdout` 与 `stderr` 会进入调用结果，由 Lua 决定是否展示、脱敏或记录。
+- skill 不应依赖系统 Python、系统 Node.js、外部 `node_modules` 或未声明包。
+
+#### 持久 `session.open(...)`
+
+只有专用 System Plugin 租约可在子进程需要跨同一租约 VM 的多次执行持续存活时使用 `vulcan.runtime.python.session.open(...)` 或 `vulcan.runtime.node.session.open(...)`。持久受管会话在 Windows x86_64、Linux x86_64/aarch64、macOS x86_64/aarch64 上保持相同的包快照、依赖、事件与进程树清理规则。Windows ARM/aarch64 会在创建环境、创建快照或预留会话前返回 `persistent_session.supported=false` 与稳定原因 `windows_arm_is_not_supported`。普通 Skill 保留受支持的 `status` 与 `invoke` 操作，但不能打开持久受管会话。每个受管运行时 `status()` 响应都包含 `persistent_session.supported`、`target_os`、`target_arch`，不支持时还包含 `reason`。返回的 userdata 复用 `vulcan.process.session` 文档中的 `write`、`read`、`status`、`close` 与 `kill` 方法，但可执行文件与依赖环境只能来自当前可信包声明。
+
+严格打开参数：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `file` | `string` | 是 | 已存在的包相对 Python 或 Node 源文件；拒绝目录穿越与符号链接逃逸 |
+| `args` | 稠密 `string[]` | 否 | 直接传给子进程的参数；不执行 shell 展开 |
+| `cwd` | `string` | 否 | 位于包根或 System 宿主显式授权工作区根内的包相对/绝对目录；默认包根 |
+| `stdout_encoding` | `string` | 否 | stdout 解码；默认使用宿主运行时编码 |
+| `stderr_encoding` | `string` | 否 | stderr 解码；默认使用宿主运行时编码 |
+| `stdin_encoding` | `string` | 否 | stdin 编码；默认使用宿主运行时编码 |
+| `buffer_limit_bytes` | 正整数 | 否 | 每个输出流的保留字节上限；默认 1 MiB |
+
+未知字段会被拒绝。Python 与 Node 都从每会话唯一的不可变包快照执行；快照通过固定且不跟随链接的文件系统对象复制。Python 使用包声明对应的受管虚拟环境，并移除继承的 `PYTHONHOME`、`PYTHONPATH` 与用户 site-packages；Node 从精确受管 `node_modules` 解析裸依赖。复制的包目录树会拒绝符号链接与不支持的对象，进程创建期间还会固定已授权的 `cwd` 对象。子代码通过 `LUASKILLS_MANAGED_CONTEXT_JSON` 获取受控的包与租约元数据，而不是任意复制宿主请求状态。
+
+最小跨 eval System Plugin 流程：
+
+```lua
+-- 第一次 eval：把 userdata 保存在持久租约 VM 中。
+managed = vulcan.runtime.python.session.open({
+    file = "python/sidecar.py",
+    args = { "--stdio" },
+    cwd = "python",
+    stdout_encoding = "utf-8",
+    stderr_encoding = "utf-8",
+    stdin_encoding = "utf-8",
+    buffer_limit_bytes = 1024 * 1024,
+})
+local status = managed:status()
+return { managed_session_id = status.managed_session_id }
+```
+
+```lua
+-- 同一 lease_id 的后续 eval：复用同一个 userdata 与进程。
+managed:write(vulcan.json.encode(args.message) .. "\n")
+local output = managed:read({ timeout_ms = 2000, max_bytes = 65536 })
+return {
+    managed_session_id = managed:status().managed_session_id,
+    stdout = output.stdout,
+    stderr = output.stderr,
+    stdout_total_bytes = output.stdout_total_bytes,
+    stdout_dropped_bytes = output.stdout_dropped_bytes,
+}
+```
+
+只有受管 Python/Node 会话的状态 table 包含 `managed_session_id`；普通 `vulcan.process.session` 状态 table 不包含该字段。该标识用于把 Lua userdata 与宿主侧 `RuntimeManagedSessionEvent.managed_session_id` 精确关联。
+
+生命周期规则是确定的：
+
+- 租约 eval 失败时，会回滚并终止该次 eval 新开的全部受管会话，即使 Lua 在抛错前已经把 userdata 保存到全局变量。
+- 显式关闭租约、同 SID 替换、租约过期、VM 销毁与引擎销毁都会终止完整子进程树，并退役包拥有的 worker。
+- 普通 Skill 根重载不会替换专用 System 租约管理器，因此活跃 System Plugin session 会跨无关 Skill 重载继续存活，直至自身租约生命周期结束。
+- userdata 被丢弃或回收也会终止进程树；Python/Node 包快照只会在进程清理完成后删除。
+- 快照会在进程清理与自身删除完成前持续持有环境共享生命周期租约，因此环境替换无法与仍存活的会话或 Worker 竞态。
+- `session:close(...)` 与 `session:kill()` 会同时终止直接子进程及其后代。
+- 后台 stdout、stderr、退出与失败观察器绝不会调用 Lua。System Plugin 会话只向宿主发布有界引擎事件；宿主 wake callback 只能唤醒或调度宿主工作，不能同步进入 Lua。
+
+完整 System 租约、持久会话、宿主事件与清理流程见 [System Plugin 受管运行时使用指南](system-plugin-managed-runtime.md)。[Managed Runtime Example](../../examples/managed_runtime/README.md) 是覆盖池化 `status` / `invoke` 路径的可运行普通 Skill 包。仓库开发阶段可以用布局检查器与隔离冒烟脚本做端到端验证：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/debug-tools/managed_runtime_smoke.ps1
+```
+
+```bash
+bash scripts/debug-tools/managed_runtime_smoke.sh
+```
+
+### 5.10 `vulcan.config.*`
 
 这组能力用于读取和维护**当前 skill 自己的字符串配置**。
 
@@ -1401,7 +1636,7 @@ local deleted = vulcan.cache.delete(cache_id)
 
 - 在普通 skill 调用中，这三个值通常都可用。
 - 在某些 runlua / help / 非 skill 文件场景里，可能为 `nil`。
-- 在 `system_runtime_lease` / `system_lua_lib` 这类宿主 LuaRuntime 场景里，这三个值默认也应视为 `nil`，因为这时不存在“当前 skill 文件”语义。
+- 在 System Plugin 租约 eval 中，这三个**入口专属**字段仍为 `nil`，因为该 eval 不是 Skill 入口调用。这不表示包上下文缺失：包身份应读取递归只读的 `vulcan.runtime.system_plugin` 视图，宿主授权上下文应读取 `vulcan.runtime.workspace_root / mounts`。
 - 当前实现会自动把 Windows verbatim 路径前缀去掉，保证 Lua 侧拿到的是正常系统路径。
 
 ### 12.8 `vulcan.context.host_result`
@@ -1550,7 +1785,7 @@ local ffi_root = vulcan.deps.ffi_path
 
 - 这三项依赖当前 skill 所在根目录和宿主依赖布局。
 - 如果当前没有有效 skill 上下文，它们会是 `nil`。
-- 在 `system_runtime_lease` / `system_lua_lib` 场景里，它们也应默认视为 `nil`，因为这时没有当前 skill 依赖根语义。
+- 在 System Plugin 租约 eval 中，这组旧 Skill 依赖根字段仍为 `nil`。受管 Python/Node 的 status、invoke 与 session API 会改为解析 `system_package` 绑定的精确 `dependencies_file`；不要用 `vulcan.deps.*` 判断 System 包是否声明了依赖。
 - skill 应当只依赖这些协议暴露出的路径，不要自己猜宿主物理目录结构。
 
 ## 14. `vulcan.sqlite.*`

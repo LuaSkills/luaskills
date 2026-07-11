@@ -160,6 +160,7 @@ static void print_entry_preview(const FfiRuntimeEntryDescriptorList *entry_list)
     print_nested_text("First canonical entry: ", first_entry->canonical_name);
     print_nested_text("First entry skill id: ", first_entry->skill_id);
     print_nested_text("First entry description: ", first_entry->description);
+    print_nested_text("First entry input schema: ", first_entry->input_schema_json);
     printf("First entry parameter count: %zu\n", first_entry->parameters_len);
 
     if (first_entry->parameters_len == 0 || first_entry->parameters == NULL) {

@@ -319,6 +319,96 @@ pub(super) struct RuntimeSessionCreateJsonRequest {
     pub(super) authority: Option<SkillManagementAuthority>,
 }
 
+/// Trusted System Plugin package descriptor used by the System lease JSON surface.
+/// System 租约 JSON 接口使用的可信 System Plugin 包描述符。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SystemRuntimePackageJsonRequest {
+    /// Stable System Plugin package identifier.
+    /// 稳定的 System Plugin 包标识符。
+    pub(super) id: String,
+    /// Absolute package root under the configured System Lua trust root.
+    /// 位于已配置 System Lua 信任根下的绝对包根目录。
+    pub(super) root: String,
+    /// Package-relative dependency manifest file.
+    /// 包相对依赖清单文件。
+    pub(super) dependencies_file: String,
+}
+
+/// Strict high-level JSON request used to create one System runtime lease.
+/// 用于创建单个 System 运行时租约的严格高层 JSON 请求。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SystemRuntimeSessionCreateJsonRequest {
+    /// Stable numeric FFI handle id of the target engine.
+    /// 目标引擎的稳定数值 FFI 句柄标识。
+    pub(super) engine_id: u64,
+    /// Stable System session identifier supplied by the host.
+    /// 宿主提供的稳定 System 会话标识。
+    pub(super) sid: String,
+    /// Requested lease TTL in seconds; zero means infinite.
+    /// 请求的租约有效期秒数；零表示无限期。
+    #[serde(default)]
+    pub(super) ttl_sec: Option<u64>,
+    /// Whether an existing System lease with the same SID should be replaced.
+    /// 是否替换同一 SID 下已有的 System 租约。
+    #[serde(default)]
+    pub(super) replace: bool,
+    /// Optional host-controlled lease cwd.
+    /// 可选的宿主控制租约 cwd。
+    #[serde(default)]
+    pub(super) cwd: Option<String>,
+    /// Optional workspace root exposed through the package context.
+    /// 通过包上下文暴露的可选工作区根目录。
+    #[serde(default)]
+    pub(super) workspace_root: Option<String>,
+    /// Host-owned structured mount metadata.
+    /// 宿主拥有的结构化挂载元数据。
+    #[serde(default = "default_json_object")]
+    pub(super) mounts: Value,
+    /// Required trusted System Plugin package descriptor.
+    /// 必需的可信 System Plugin 包描述符。
+    pub(super) system_package: SystemRuntimePackageJsonRequest,
+    /// Explicit authority required by the high-level System entrypoint.
+    /// 高层 System 入口必需的显式权限等级。
+    pub(super) authority: Option<SkillManagementAuthority>,
+}
+
+/// Strict high-level JSON request used to poll managed-session events without waiting.
+/// 用于无等待轮询受管会话事件的严格高层 JSON 请求。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ManagedSessionEventsPollJsonRequest {
+    /// Stable numeric FFI handle id of the target engine.
+    /// 目标引擎的稳定数值 FFI 句柄标识。
+    pub(super) engine_id: u64,
+    /// Positive maximum number of events removed by this destructive poll.
+    /// 本次破坏性轮询最多移除的正数事件数量。
+    pub(super) max_events: usize,
+    /// Explicit host-injected authority required by the managed-session event surface.
+    /// 受管会话事件接口要求的显式宿主注入权限等级。
+    pub(super) authority: Option<SkillManagementAuthority>,
+}
+
+/// Strict high-level JSON request used to wait for managed-session events.
+/// 用于等待受管会话事件的严格高层 JSON 请求。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ManagedSessionEventsWaitJsonRequest {
+    /// Stable numeric FFI handle id of the target engine.
+    /// 目标引擎的稳定数值 FFI 句柄标识。
+    pub(super) engine_id: u64,
+    /// Positive maximum number of events removed by this destructive wait.
+    /// 本次破坏性等待最多移除的正数事件数量。
+    pub(super) max_events: usize,
+    /// Finite wait timeout in milliseconds; zero performs a true nonblocking poll.
+    /// 有限等待超时毫秒数；零表示真正的非阻塞轮询。
+    pub(super) timeout_ms: u64,
+    /// Explicit host-injected authority required by the managed-session event surface.
+    /// 受管会话事件接口要求的显式宿主注入权限等级。
+    pub(super) authority: Option<SkillManagementAuthority>,
+}
+
 /// One JSON request used to evaluate code in a persistent runtime session.
 /// 用于在持久运行时会话中执行代码的 JSON 请求。
 #[derive(Debug, Serialize, Deserialize)]

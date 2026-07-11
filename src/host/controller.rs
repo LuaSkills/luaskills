@@ -1,11 +1,11 @@
 use crate::host::database::RuntimeDatabaseBindingContext;
 use crate::host::options::{LuaRuntimeHostOptions, LuaRuntimeSpaceControllerProcessMode};
+use crate::runtime::path::render_host_visible_path;
 use sha2::{Digest, Sha256};
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Handle, Runtime};
 use vldb_controller_client::{
     BoxError, ClientRegistration, ControllerClient, ControllerClientConfig, ControllerProcessMode,
@@ -18,6 +18,26 @@ pub struct LuaRuntimeSpaceControllerBridge {
     client: ControllerClient,
     runtime: Mutex<Runtime>,
     binding_scope_id: String,
+}
+
+/// Acquire one controller bridge runtime and return its guard, recovering after lock poisoning.
+/// 获取并返回单个控制器桥接运行时保护对象；如果锁已 poison，则恢复继续使用。
+fn lock_controller_runtime(runtime: &Mutex<Runtime>) -> MutexGuard<'_, Runtime> {
+    runtime
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Controller identifiers resolved after one runtime database binding has been attached.
+/// 一个运行时数据库绑定完成 attach 后解析得到的控制器标识集合。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LuaRuntimeSpaceControllerBindingIds {
+    /// Stable controller space identifier derived from the host binding context.
+    /// 基于宿主绑定上下文派生出的稳定控制器空间标识。
+    pub(crate) space_id: String,
+    /// Client-scoped controller binding identifier derived from the host binding tag.
+    /// 基于宿主绑定标签派生出的客户端隔离控制器绑定标识。
+    pub(crate) binding_id: String,
 }
 
 impl LuaRuntimeSpaceControllerBridge {
@@ -33,10 +53,12 @@ impl LuaRuntimeSpaceControllerBridge {
             .clone()
             .unwrap_or_else(|| "http://127.0.0.1:19801".to_string());
         let process_id = std::process::id();
-        let started_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default();
+        // Wall-clock registration timestamp included in the controller client name.
+        // 包含在控制器客户端名称中的墙钟注册时间戳。
+        let started_at_ms = system_time_to_controller_start_unix_millis(
+            SystemTime::now(),
+            "space controller client registration timestamp",
+        )?;
         let registration = ClientRegistration {
             client_name: format!(
                 "luaskills-{}-{}-{}",
@@ -53,7 +75,7 @@ impl LuaRuntimeSpaceControllerBridge {
             spawn_executable: controller_options
                 .executable_path
                 .as_ref()
-                .map(|path| path.to_string_lossy().to_string()),
+                .map(|path| render_host_visible_path(path)),
             spawn_process_mode: map_process_mode(controller_options.process_mode),
             minimum_uptime_secs: controller_options.minimum_uptime_secs,
             idle_timeout_secs: controller_options.idle_timeout_secs,
@@ -92,10 +114,7 @@ impl LuaRuntimeSpaceControllerBridge {
         Fut: Future<Output = Result<T, BoxError>> + Send + 'static,
         T: Send + 'static,
     {
-        let runtime = self
-            .runtime
-            .lock()
-            .map_err(|_| "controller runtime lock poisoned".to_string())?;
+        let runtime = lock_controller_runtime(&self.runtime);
         run_controller_operation_with_client(&runtime, &self.client, operation)
             .map_err(|error| format!("space controller request failed: {}", error))
     }
@@ -111,6 +130,41 @@ impl LuaRuntimeSpaceControllerBridge {
         };
         self.run(move |client| async move { client.attach_space(registration).await })
             .map(|_| ())
+    }
+
+    /// Attach one database binding and return the controller identifiers needed by backend enable calls.
+    /// 附着一个数据库绑定，并返回后端启用调用所需的控制器标识。
+    ///
+    /// The binding parameter is the stable host-facing database binding context.
+    /// binding 参数是稳定的宿主侧数据库绑定上下文。
+    ///
+    /// Return the runtime-space id and client-scoped binding id resolved for this bridge session.
+    /// 返回为当前桥接会话解析出的运行时空间标识与客户端隔离绑定标识。
+    pub(crate) fn attach_binding_with_ids(
+        &self,
+        binding: &RuntimeDatabaseBindingContext,
+    ) -> Result<LuaRuntimeSpaceControllerBindingIds, String> {
+        let ids = self.binding_ids_for_binding(binding);
+        self.attach_binding(binding)?;
+        Ok(ids)
+    }
+
+    /// Resolve controller identifiers for one database binding without attaching it again.
+    /// 为一个数据库绑定解析控制器标识，但不再次执行 attach。
+    ///
+    /// The binding parameter is the stable host-facing database binding context.
+    /// binding 参数是稳定的宿主侧数据库绑定上下文。
+    ///
+    /// Return the runtime-space id and client-scoped binding id for this bridge session.
+    /// 返回当前桥接会话中的运行时空间标识与客户端隔离绑定标识。
+    pub(crate) fn binding_ids_for_binding(
+        &self,
+        binding: &RuntimeDatabaseBindingContext,
+    ) -> LuaRuntimeSpaceControllerBindingIds {
+        LuaRuntimeSpaceControllerBindingIds {
+            space_id: controller_space_id_for_binding(binding),
+            binding_id: self.controller_binding_id_for_binding(binding),
+        }
     }
 
     /// Build one client-scoped controller binding identifier while preserving the stable host binding tag for diagnostics.
@@ -248,6 +302,35 @@ fn build_controller_binding_id(binding_tag: &str, binding_scope_id: &str) -> Str
     format!("{}@{}", binding_tag, binding_scope_id)
 }
 
+/// Convert one system time into the Unix millisecond component used by controller registrations.
+/// 将单个系统时间转换为控制器注册使用的 Unix 毫秒组成部分。
+///
+/// The time parameter is the wall-clock timestamp to encode into the registration name.
+/// time 参数是要编码进注册名称的墙钟时间戳。
+///
+/// The context parameter names the caller for precise error diagnostics.
+/// context 参数命名调用方，用于精确错误诊断。
+///
+/// Returns the Unix millisecond timestamp used in the controller registration name.
+/// 返回控制器注册名称使用的 Unix 毫秒时间戳。
+///
+/// Returns an error when the timestamp is before the Unix epoch.
+/// 当时间戳早于 Unix epoch 时返回错误。
+fn system_time_to_controller_start_unix_millis(
+    time: SystemTime,
+    context: &str,
+) -> Result<u128, String> {
+    // Duration measured from the Unix epoch for the controller registration timestamp.
+    // 控制器注册时间戳相对于 Unix epoch 的持续时间。
+    let duration = time.duration_since(UNIX_EPOCH).map_err(|error| {
+        format!(
+            "{} is before Unix epoch and cannot be used for a controller registration name: {}",
+            context, error
+        )
+    })?;
+    Ok(duration.as_millis())
+}
+
 /// Normalize one host-provided space label into a controller-safe identifier prefix.
 /// 将宿主提供的空间标签标准化为控制器安全的标识符前缀。
 fn normalize_controller_space_label(space_label: &str) -> String {
@@ -271,7 +354,13 @@ fn normalize_controller_space_label(space_label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_controller_binding_id, run_future_on_bridge_runtime};
+    use super::{
+        build_controller_binding_id, lock_controller_runtime, run_future_on_bridge_runtime,
+        system_time_to_controller_start_unix_millis,
+    };
+    use std::panic::{self, AssertUnwindSafe};
+    use std::sync::Mutex;
+    use std::time::{Duration, UNIX_EPOCH};
     use tokio::runtime::{Builder, Runtime};
     use vldb_controller_client::BoxError;
 
@@ -279,6 +368,49 @@ mod tests {
     /// 构建一个供桥接执行测试使用的控制器运行时。
     fn build_bridge_runtime() -> Runtime {
         Runtime::new().expect("bridge runtime should build")
+    }
+
+    /// Verify controller registration timestamps accept normal post-epoch system times.
+    /// 验证控制器注册时间戳会接受正常的 epoch 之后系统时间。
+    #[test]
+    fn controller_start_unix_millis_accepts_post_epoch_time() {
+        // Timestamp one millisecond after the Unix epoch.
+        // Unix epoch 之后一毫秒的时间戳。
+        let timestamp = UNIX_EPOCH + Duration::from_millis(1);
+
+        assert_eq!(
+            system_time_to_controller_start_unix_millis(
+                timestamp,
+                "test controller registration timestamp"
+            )
+            .expect("post-epoch timestamp should convert"),
+            1
+        );
+    }
+
+    /// Verify controller registration timestamps reject pre-epoch system times.
+    /// 验证控制器注册时间戳会拒绝早于 epoch 的系统时间。
+    #[test]
+    fn controller_start_unix_millis_rejects_pre_epoch_time() {
+        // Timestamp one millisecond before the Unix epoch.
+        // Unix epoch 之前一毫秒的时间戳。
+        let timestamp = UNIX_EPOCH - Duration::from_millis(1);
+
+        // Error returned for a pre-epoch controller registration timestamp conversion attempt.
+        // 早于 epoch 的控制器注册时间戳转换尝试返回的错误。
+        let error = system_time_to_controller_start_unix_millis(
+            timestamp,
+            "test controller registration timestamp",
+        )
+        .expect_err("pre-epoch timestamp should fail");
+
+        assert!(
+            error.starts_with(
+                "test controller registration timestamp is before Unix epoch and cannot be used for a controller registration name:"
+            ),
+            "unexpected error: {}",
+            error
+        );
     }
 
     /// Verify bridge-owned futures still execute correctly for synchronous callers outside Tokio.
@@ -310,6 +442,35 @@ mod tests {
         .expect("current-thread host runtime path should not panic");
 
         assert_eq!(result, 11);
+    }
+
+    /// Verify the controller bridge runtime remains usable after its mutex is poisoned.
+    /// 验证控制器桥接运行时互斥锁 poison 后仍可继续使用。
+    #[test]
+    fn controller_runtime_lock_recovers_after_poisoned_lock() {
+        // Runtime mutex used to mimic the bridge-owned controller runtime slot.
+        // 用于模拟桥接持有的控制器运行时槽位的运行时互斥锁。
+        let runtime = Mutex::new(build_bridge_runtime());
+        // Captured panic result from a holder that poisons only the runtime mutex.
+        // 单个运行时互斥锁持有者制造 poison 后被捕获的 panic 结果。
+        let poison_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            // Guard used only to poison the controller runtime lock.
+            // 仅用于制造控制器运行时锁 poison 的保护对象。
+            let _guard = runtime.lock().expect("initial controller runtime lock");
+            panic!("poison controller runtime for recovery test");
+        }));
+
+        assert!(poison_result.is_err());
+
+        // Recovered runtime guard used to execute one bridge-owned future.
+        // 用于执行单个桥接 future 的已恢复运行时保护对象。
+        let recovered_runtime = lock_controller_runtime(&runtime);
+        // Future result proving the recovered runtime still executes work.
+        // 用于证明已恢复运行时仍可执行任务的 future 结果。
+        let result =
+            run_future_on_bridge_runtime(&recovered_runtime, async { Ok::<_, BoxError>(13usize) })
+                .expect("recovered controller runtime should execute future");
+        assert_eq!(result, 13);
     }
 
     /// Verify controller binding ids preserve the stable host tag while adding one client-scoped suffix.

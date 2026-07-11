@@ -445,6 +445,37 @@ pub struct ClientBudgetSnapshot {
     pub tool_config: Value,
 }
 
+impl LuaInvocationContext {
+    /// Construct one invocation context and normalize non-object JSON payloads into empty objects.
+    /// 构造一次调用上下文，并把非对象类型的 JSON 载荷归一化为空对象。
+    pub fn new(
+        request_context: Option<RuntimeRequestContext>,
+        client_budget: Value,
+        tool_config: Value,
+    ) -> Self {
+        Self {
+            request_context,
+            client_budget: normalize_context_object(client_budget),
+            tool_config: normalize_context_object(tool_config),
+        }
+    }
+
+    /// Return an empty invocation context with stable empty-object payloads.
+    /// 返回一个空调用上下文，并使用稳定的空对象载荷。
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
+/// Normalize one host context payload so the runtime always sees an object.
+/// 归一化单个宿主上下文载荷，确保运行时始终看到对象结构。
+fn normalize_context_object(value: Value) -> Value {
+    match value {
+        Value::Object(_) => value,
+        _ => Value::Object(Map::new()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{LuaRuntimeCapabilityOptions, LuaRuntimeHostOptions};
@@ -505,36 +536,5 @@ mod tests {
         assert_eq!(options.dependency_dir_name, "dependencies");
         assert_eq!(options.state_dir_name, "state");
         assert_eq!(options.database_dir_name, "databases");
-    }
-}
-
-impl LuaInvocationContext {
-    /// Construct one invocation context and normalize non-object JSON payloads into empty objects.
-    /// 构造一次调用上下文，并把非对象类型的 JSON 载荷归一化为空对象。
-    pub fn new(
-        request_context: Option<RuntimeRequestContext>,
-        client_budget: Value,
-        tool_config: Value,
-    ) -> Self {
-        Self {
-            request_context,
-            client_budget: normalize_context_object(client_budget),
-            tool_config: normalize_context_object(tool_config),
-        }
-    }
-
-    /// Return an empty invocation context with stable empty-object payloads.
-    /// 返回一个空调用上下文，并使用稳定的空对象载荷。
-    pub fn empty() -> Self {
-        Self::default()
-    }
-}
-
-/// Normalize one host context payload so the runtime always sees an object.
-/// 归一化单个宿主上下文载荷，确保运行时始终看到对象结构。
-fn normalize_context_object(value: Value) -> Value {
-    match value {
-        Value::Object(_) => value,
-        _ => Value::Object(Map::new()),
     }
 }

@@ -10,6 +10,7 @@
 如果您需要完整背景说明，请继续阅读：
 
 - [FFI 对接文档](integration-guide.md)
+- [System Plugin 受管运行时使用指南](../system-plugin-managed-runtime.md)
 - [宿主数据库 Provider 对接说明](../providers/host-database-provider-guide.md)
 - [宿主工具结果桥接、宿主 LuaRuntime（`system_lua_lib`）与执行平面设计稿](../architecture/host-tooling-result-bridge-design.md)
 
@@ -77,7 +78,8 @@
   - `host_callback`
   - `space_controller`
 - 如果要用 callback：
-  - callback 必须先注册，再创建 engine
+  - 全局 provider/service callback 必须先注册，再创建 engine
+  - 按 engine 绑定的受管会话 wake callback 必须在 engine 创建后注册
   - TypeScript / Python 宿主优先使用 SDK 的 `set_*_provider_json_callback`，不要在业务代码里手写 buffer clone
   - 若要让 Lua 调用宿主工具，需注册 `luaskills_ffi_set_host_tool_json_callback`
 - 如果要用 `space_controller`：
@@ -86,7 +88,11 @@
   - 必须关闭 `auto_spawn`
 - 如果宿主准备接 `system_runtime_lease`：
   - 已接受固定的 `runtime_root/system_lua_lib` 作为默认 system Lua 库目录
-  - 只有维护旧版兼容路径时才继续显式传入 `system_lua_lib_dir`
+  - 每次 `create` 都会传入严格 `system_package = { id, root, dependencies_file }`
+  - `system_package.root` 是 `system_lua_lib` 下的绝对严格子目录，`dependencies_file` 是不能逃逸包根的包相对普通文件
+  - 不再向 System `create` 传 `lua_roots / c_roots`；这两个字段只属于公共租约请求，System 请求遇到未知字段会直接拒绝
+  - 已确认包根是专用 System VM 唯一新增的 Lua 模块根，兄弟插件与其 Python/Node 依赖环境互相隔离
+  - 只有维护旧版引擎配置路径时才继续显式传入 `system_lua_lib_dir`
 - 如果宿主准备消费结构化结果：
   - 已决定 `request_context.client_capabilities.host_result` 的注入策略
   - 已明确默认关闭，只有显式开启时才允许 skill 第四返回值进入宿主结果
@@ -148,7 +154,8 @@ ROOT -> PROJECT -> USER
 6. `render_skill_help_detail`
 7. `runtime_lease create / eval / status / list / close`
 8. `system_runtime_lease create / eval / status / list / close`
-9. `host_result` 关闭与开启两条链路
+9. `managed_session_events poll / wait` 与标准 ABI wake callback
+10. `host_result` 关闭与开启两条链路
 
 这样更容易定位问题，不会把“运行时主链问题”和“辅助接口问题”混在一起。
 
@@ -189,9 +196,13 @@ ROOT -> PROJECT -> USER
 
 如果宿主要接 callback，请对照下面几条：
 
-- callback 必须在 `engine_new` 前注册
+- 全局 provider/service callback 必须在 `engine_new` 前注册；按 engine 绑定的受管会话 wake callback 必须在 `engine_new` 后注册
 - callback 不能跨 C ABI 抛异常
 - 同一线程内，不支持在一个 engine 调用尚未返回时再次重入同一个 engine
+- 受管会话 wake callback 在每个 engine 的单个串行后台调度线程执行，只能唤醒/投递宿主任务；不得调用 Lua 或同步执行租约 eval
+- wake callback 是事件队列由空转为非空时的边沿通知，不携带事件正文；宿主随后使用 poll/wait 破坏性读取事件
+- wake callback 返回非零时，同一待处理边沿会通过封顶指数退避自动重试，不会阻塞 stdout/stderr 事件发布线程
+- 替换或清除 wake callback 返回后，旧 callback 与 `user_data` 才保证不再在途，此后才能释放宿主状态
 - `vulcan.host.*` 的 host-tool callback 只接收 JSON 请求并返回完整 JSON 结果，不支持 stream
 - host-tool callback 内部必须自行处理工具 allowlist、权限、超时、审计与 secret 管理
 - 如果一个进程里需要多套数据库 provider callback 逻辑：
@@ -258,8 +269,14 @@ ROOT -> PROJECT -> USER
 - 普通技能管理工具不会把 `ROOT` 暴露给用户安装、更新或卸载
 - 若存在 ROOT 级系统 skill，已确认 PROJECT / USER 同名 skill 不会被加载
 - `runtime_lease` 的同一 `lease_id` 多次 `eval` 会保留 Lua 全局状态
-- `system_runtime_lease` 在宿主显式传入 `cwd` 时会稳定保留该目录，而不是回退覆盖到默认 `skills`
-- `system_runtime_lease` 在宿主未显式传入 `cwd` 时会按预期回落到 `system_lua_lib_dir` 或默认 `skills`
+- `system_runtime_lease` 缺少 `system_package`，或携带 `lua_roots / c_roots` 等未知字段时会被严格拒绝
+- `system_runtime_lease` 在宿主显式传入 `cwd` 时只接受包根或已授权 `workspace_root` 内的规范目录
+- `system_runtime_lease` 未传 `cwd` 时默认使用 `system_package.root`，不会回落到整个 `system_lua_lib` 或 `skills`
+- `vulcan.runtime.system_plugin` 与 `vulcan.runtime.mounts` 是可索引、可迭代、可 JSON 返回的递归只读 userdata 视图；三个宿主所有根字段不能替换，专用 System VM 会移除全局 `rawset` 与 Lua `debug` 库
+- Python/Node `session.open(...)` 保存到 Lua 全局后可跨同一租约多次 eval 复用，`session:status().managed_session_id` 与宿主事件精确对应
+- eval 失败、租约 close/replace/过期、VM/引擎销毁都会终止新开或仍存活的完整子进程树，Python/Node 不可变快照在进程清理后删除
+- poll/wait 返回 `events / remaining / timed_out`，`max_events` 必须为正数；只有 wait 无事件到期时 `timed_out=true`
+- wake callback 只调度宿主工作、不进入 Lua，宿主在后续任务中读取事件并按 `system_lease_id + sid + generation` 执行受控 eval/read
 - 宿主未开启 `host_result` 时，skill 第四返回值会被忽略
 - 宿主开启 `host_result` 时，支持的 skill 可以返回 `change_set` 等结构化结果，且宿主能独立读取
 - `change_set` 的 `modify` 结果会稳定返回 `before + delete[] + insert[] + after` 形式的 hunk，而不是只给模糊 summary 或可选 patch

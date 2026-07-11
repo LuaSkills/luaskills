@@ -9,10 +9,16 @@
 
 ## 1. 安装依赖
 
-从当前目录执行：
+示例要求 Node.js `22.11.0` 或更高版本，并使用 Node 原生 TypeScript 类型剥离执行，不依赖额外的开发服务器或转译运行器。从当前目录执行：
 
 ```powershell
 npm install
+```
+
+提交前执行独立类型检查：
+
+```powershell
+npm run typecheck
 ```
 
 ## 2. 运行前准备

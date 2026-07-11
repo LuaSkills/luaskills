@@ -6,6 +6,7 @@ Reusable JSON FFI runtime helpers for Python host demos.
 import ctypes
 import json
 from pathlib import Path
+from typing import Literal, TypedDict, cast
 
 from demo import FfiBorrowedBuffer, FfiOwnedBuffer, ensure_standard_fixture_layout
 
@@ -14,12 +15,75 @@ JsonMap = dict[str, object]
 JsonValue = object
 
 
+class SystemRuntimePackageDescriptor(TypedDict):
+    """
+    Strict System Plugin package descriptor required by system lease creation.
+    system 租约创建所必需的严格 System Plugin 包描述符。
+    """
+
+    # Stable package identifier selected by the host.
+    # 宿主选择的稳定包标识符。
+    id: str
+    # Absolute package root strictly below the engine's system_lua_lib directory.
+    # 严格位于引擎 system_lua_lib 目录下的绝对包根目录。
+    root: str
+    # Package-relative dependency manifest path.
+    # 包相对依赖清单路径。
+    dependencies_file: str
+
+
+class ManagedSessionEvent(TypedDict):
+    """
+    One sequenced host-visible event for a System managed child session.
+    单个带序号、宿主可见的 System 受管子会话事件。
+    """
+
+    # Opaque System lease id that owns the child session.
+    # 拥有子会话的不透明 System 租约标识。
+    system_lease_id: str
+    # Stable host-selected System lease SID.
+    # 宿主选择的稳定 System 租约 SID。
+    sid: str
+    # SID-local lease generation.
+    # SID 内部的租约代际。
+    generation: int
+    # Engine-local id returned by the managed session status.
+    # 由受管会话状态返回的引擎内局部标识。
+    managed_session_id: int
+    # Coalesced readiness or terminal event kind.
+    # 合并后的就绪或终止事件类型。
+    kind: Literal["stdout_readable", "stderr_readable", "exited", "failed"]
+    # Engine event-center-global monotonic sequence.
+    # 引擎事件中心全局单调序号。
+    sequence: int
+
+
+class ManagedSessionEventBatch(TypedDict):
+    """
+    One bounded destructive event-drain result.
+    单次有界破坏性事件排空结果。
+    """
+
+    # Events removed in sequence order.
+    # 按序号顺序移除的事件。
+    events: list[ManagedSessionEvent]
+    # Pending logical events after this drain.
+    # 本次排空后仍待处理的逻辑事件数。
+    remaining: int
+    # Whether wait returned because its deadline expired without an event.
+    # wait 是否因截止时间到期且没有事件而返回。
+    timed_out: bool
+
+
 # Full host-system authority label for system JSON FFI wrappers.
 # system JSON FFI 包装层使用的完整宿主系统权限标签。
 SKILL_AUTHORITY_SYSTEM = "system"
 # Delegated-tool authority label for user-facing system JSON FFI wrappers.
 # 面向用户的 system JSON FFI 包装层使用的委托工具权限标签。
 SKILL_AUTHORITY_DELEGATED_TOOL = "delegated_tool"
+# Stable package id used only by the repository's standard FFI fixture.
+# 仅供仓库标准 FFI 夹具使用的稳定包标识。
+STANDARD_FIXTURE_SYSTEM_PACKAGE_ID = "ffi-demo-system-plugin"
 
 
 class JsonFfiClient:
@@ -67,6 +131,19 @@ class JsonFfiClient:
         )
         return self._decode_owned_json_buffer(ffi_function(input_buffer))
 
+    def call_without_input_value(self, function_name: str) -> JsonValue:
+        """
+        Call one no-argument JSON FFI function and return its decoded result value.
+        调用一个无参数 JSON FFI 函数并返回其解码后的结果值。
+        """
+
+        # Exact no-argument prototype required by descriptor-style exports.
+        # 描述符类导出所要求的精确无参数原型。
+        ffi_function = getattr(self.library, function_name)
+        ffi_function.argtypes = []
+        ffi_function.restype = FfiOwnedBuffer
+        return self._decode_owned_json_buffer(ffi_function())
+
     def _decode_owned_json_buffer(self, buffer: FfiOwnedBuffer) -> JsonValue:
         """
         Decode one owned JSON buffer returned by one `_json` FFI call and free it.
@@ -94,7 +171,12 @@ class JsonFfiClient:
         """
 
         if self._describe_cache is None:
-            self._describe_cache = self.call("luaskills_ffi_describe_json", {})
+            # Descriptor export has a `void` parameter list, unlike request-taking `_json` calls.
+            # 描述符导出使用 `void` 参数列表，不同于接收请求的 `_json` 调用。
+            described = self.call_without_input_value("luaskills_ffi_describe_json")
+            if not isinstance(described, dict):
+                raise RuntimeError("JSON FFI descriptor body must be one object")
+            self._describe_cache = described
         return self._describe_cache
 
 
@@ -113,6 +195,17 @@ class StandardFixtureRuntimeClient:
         self.client = client
         self.runtime_root = runtime_root
         ensure_standard_fixture_layout(runtime_root)
+        # Canonical System Plugin package root used by system lease demos.
+        # system 租约示例使用的规范 System Plugin 包根目录。
+        package_root = (
+            runtime_root / "system_lua_lib" / STANDARD_FIXTURE_SYSTEM_PACKAGE_ID
+        )
+        package_root.mkdir(parents=True, exist_ok=True)
+        # Required package-relative manifest kept deliberately empty for the generic fixture.
+        # 通用夹具所需的包相对清单，内容刻意保持为空依赖。
+        dependencies_file = package_root / "dependencies.yaml"
+        if not dependencies_file.exists():
+            dependencies_file.write_text("{}\n", encoding="utf-8")
 
     def create_engine(
         self,
@@ -190,7 +283,30 @@ class StandardFixtureRuntimeClient:
             self.client,
             engine_id,
             system_tool_authority=authority,
+            system_package=self.fixture_system_package(),
         )
+
+    def managed_session_events(
+        self,
+        engine_id: int,
+        authority: str = SKILL_AUTHORITY_DELEGATED_TOOL,
+    ) -> "ManagedSessionEventsClient":
+        """
+        Build one authority-bound managed-session event client for the target engine.
+        为目标引擎构造一个绑定 authority 的受管会话事件客户端。
+
+        Args:
+            engine_id: Stable numeric FFI engine handle.
+            engine_id：稳定数值 FFI 引擎句柄。
+            authority: Host-injected authority forwarded to every event request.
+            authority：转发到每个事件请求的宿主注入权限。
+
+        Returns:
+            One authority-bound managed-session event client.
+            一个绑定权限的受管会话事件客户端。
+        """
+
+        return ManagedSessionEventsClient(self.client, engine_id, authority)
 
     def fixture_skill_roots(self, root_name: str = "ROOT") -> list[JsonMap]:
         """
@@ -221,7 +337,27 @@ class StandardFixtureRuntimeClient:
             engine_id,
             authority,
             default_skill_roots=self.fixture_skill_roots(root_name=root_name),
+            default_system_package=self.fixture_system_package(),
         )
+
+    def fixture_system_package(self) -> SystemRuntimePackageDescriptor:
+        """
+        Build the strict System Plugin descriptor used by repository fixture leases.
+        构造仓库夹具租约使用的严格 System Plugin 描述符。
+        """
+
+        # Canonical fixture package directory created during wrapper initialization.
+        # 在包装器初始化期间创建的规范夹具包目录。
+        package_root = (
+            self.runtime_root
+            / "system_lua_lib"
+            / STANDARD_FIXTURE_SYSTEM_PACKAGE_ID
+        )
+        return {
+            "id": STANDARD_FIXTURE_SYSTEM_PACKAGE_ID,
+            "root": normalized_path(package_root),
+            "dependencies_file": "dependencies.yaml",
+        }
 
     def _build_engine_request(
         self,
@@ -252,6 +388,9 @@ class StandardFixtureRuntimeClient:
                     ),
                     "host_provided_ffi_root": normalized_path(
                         self.runtime_root / "libs"
+                    ),
+                    "system_lua_lib_dir": normalized_path(
+                        self.runtime_root / "system_lua_lib"
                     ),
                     "download_cache_root": normalized_path(
                         self.runtime_root / "temp" / "downloads"
@@ -294,6 +433,7 @@ class RuntimeLeaseClient:
         client: JsonFfiClient,
         engine_id: int,
         system_tool_authority: str | None = None,
+        system_package: SystemRuntimePackageDescriptor | None = None,
     ) -> None:
         """
         Bind one JSON client to one existing engine id.
@@ -303,6 +443,7 @@ class RuntimeLeaseClient:
         self.client = client
         self.engine_id = engine_id
         self.system_tool_authority = system_tool_authority
+        self.system_package = system_package
 
     def call_raw(self, action: str, payload: JsonMap) -> JsonMap:
         """
@@ -321,21 +462,44 @@ class RuntimeLeaseClient:
             request_payload,
         )
 
-    def create(self, sid: str, ttl_sec: int = 600, replace: bool = False) -> JsonMap:
+    def create(
+        self,
+        sid: str,
+        ttl_sec: int = 600,
+        replace: bool = False,
+        *,
+        cwd: str | None = None,
+        workspace_root: str | None = None,
+        mounts: JsonMap | None = None,
+    ) -> JsonMap:
         """
         Create or replace one persistent runtime lease.
         创建或替换一个持久运行时租约。
         """
 
+        # Base fields shared by public and System lease creation.
+        # 公共与 System 租约创建共享的基础字段。
+        request: JsonMap = {
+            "sid": sid,
+            "ttl_sec": ttl_sec,
+            "replace": replace,
+        }
+        if self.system_tool_authority is not None:
+            if self.system_package is None:
+                raise RuntimeError(
+                    "system runtime lease creation requires system_package"
+                )
+            request["system_package"] = self.system_package
+        if mounts is not None:
+            request["mounts"] = mounts
+        elif self.system_tool_authority is not None:
+            request["mounts"] = {}
+        if cwd is not None:
+            request["cwd"] = cwd
+        if workspace_root is not None:
+            request["workspace_root"] = workspace_root
         return require_runtime_lease_ok(
-            self.call_raw(
-                "create",
-                {
-                    "sid": sid,
-                    "ttl_sec": ttl_sec,
-                    "replace": replace,
-                },
-            ),
+            self.call_raw("create", request),
             "runtime lease create",
         )
 
@@ -344,6 +508,10 @@ class RuntimeLeaseClient:
         sid: str,
         ttl_sec: int = 600,
         replace: bool = False,
+        *,
+        cwd: str | None = None,
+        workspace_root: str | None = None,
+        mounts: JsonMap | None = None,
     ) -> "RuntimeLeaseHandle":
         """
         Create one runtime-lease handle object from a fresh create response.
@@ -352,7 +520,14 @@ class RuntimeLeaseClient:
 
         return RuntimeLeaseHandle.from_payload(
             self,
-            self.create(sid, ttl_sec=ttl_sec, replace=replace),
+            self.create(
+                sid,
+                ttl_sec=ttl_sec,
+                replace=replace,
+                cwd=cwd,
+                workspace_root=workspace_root,
+                mounts=mounts,
+            ),
         )
 
     def bind_handle(self, payload: JsonMap) -> "RuntimeLeaseHandle":
@@ -487,6 +662,92 @@ class RuntimeLeaseClient:
         return self.system_tool_authority is not None
 
 
+class ManagedSessionEventsClient:
+    """
+    Authority-bound JSON client for engine-level System managed-session events.
+    面向引擎级 System 受管会话事件、绑定 authority 的 JSON 客户端。
+    """
+
+    def __init__(self, client: JsonFfiClient, engine_id: int, authority: str) -> None:
+        """
+        Bind one JSON client, engine id, and host-injected authority.
+        绑定一个 JSON 客户端、引擎标识与宿主注入的 authority。
+
+        Args:
+            client: Low-level JSON FFI transport.
+            client：底层 JSON FFI 传输器。
+            engine_id: Stable numeric FFI engine handle.
+            engine_id：稳定数值 FFI 引擎句柄。
+            authority: Host-injected authority required by the event surface.
+            authority：事件接口要求的宿主注入权限。
+
+        Returns:
+            None.
+            无返回值。
+        """
+
+        self.client = client
+        self.engine_id = engine_id
+        self.authority = authority
+
+    def poll(self, max_events: int = 64) -> ManagedSessionEventBatch:
+        """
+        Destructively poll at most max_events ready events without waiting.
+        无等待地破坏性轮询最多 max_events 个就绪事件。
+
+        Args:
+            max_events: Positive maximum number of events removed from the queue.
+            max_events：从队列移除的正数事件数量上限。
+
+        Returns:
+            One validated immediate event batch.
+            一个经过校验的即时事件批次。
+        """
+
+        return require_managed_session_event_batch(
+            self.client.call(
+                "luaskills_ffi_managed_session_events_poll_json",
+                {
+                    "engine_id": self.engine_id,
+                    "max_events": max_events,
+                    "authority": self.authority,
+                },
+            )
+        )
+
+    def wait(
+        self,
+        max_events: int = 64,
+        timeout_ms: int = 1_000,
+    ) -> ManagedSessionEventBatch:
+        """
+        Destructively wait for at most max_events events until timeout_ms expires.
+        破坏性等待最多 max_events 个事件，直至 timeout_ms 到期。
+
+        Args:
+            max_events: Positive maximum number of events removed from the queue.
+            max_events：从队列移除的正数事件数量上限。
+            timeout_ms: Finite wait duration in milliseconds; zero is nonblocking.
+            timeout_ms：有限等待毫秒数；零表示非阻塞。
+
+        Returns:
+            One validated event or timeout batch.
+            一个经过校验的事件批次或超时批次。
+        """
+
+        return require_managed_session_event_batch(
+            self.client.call(
+                "luaskills_ffi_managed_session_events_wait_json",
+                {
+                    "engine_id": self.engine_id,
+                    "max_events": max_events,
+                    "timeout_ms": timeout_ms,
+                    "authority": self.authority,
+                },
+            )
+        )
+
+
 class SystemEngineJsonClient:
     """
     Authority-bound helper that wraps one engine's system JSON FFI entrypoints.
@@ -499,6 +760,7 @@ class SystemEngineJsonClient:
         engine_id: int,
         authority: str,
         default_skill_roots: list[JsonMap] | None = None,
+        default_system_package: SystemRuntimePackageDescriptor | None = None,
     ) -> None:
         """
         Bind one JSON client, engine id, authority, and optional default skill-root chain.
@@ -509,6 +771,7 @@ class SystemEngineJsonClient:
         self.engine_id = engine_id
         self.authority = authority
         self.default_skill_roots = list(default_skill_roots or [])
+        self.default_system_package = default_system_package
 
     def call(self, function_name: str, payload: JsonMap | None = None) -> JsonMap:
         """
@@ -538,10 +801,29 @@ class SystemEngineJsonClient:
         在当前引擎包装器下构造一个绑定 authority 的运行时租约辅助器。
         """
 
+        if self.default_system_package is None:
+            raise RuntimeError("system runtime lease helper requires system_package")
         return RuntimeLeaseClient(
             self.client,
             self.engine_id,
             system_tool_authority=self.authority,
+            system_package=self.default_system_package,
+        )
+
+    def managed_session_events(self) -> ManagedSessionEventsClient:
+        """
+        Build one event helper whose poll and wait requests reuse the bound authority.
+        构造一个让 poll 与 wait 请求复用当前 authority 的事件辅助器。
+
+        Returns:
+            One event client bound to this engine and authority.
+            一个绑定当前引擎与权限的事件客户端。
+        """
+
+        return ManagedSessionEventsClient(
+            self.client,
+            self.engine_id,
+            self.authority,
         )
 
     def list_entries(self) -> list[JsonMap]:
@@ -929,4 +1211,80 @@ def require_runtime_lease_int_field(payload: JsonMap, field_name: str) -> int:
         return value
     raise RuntimeError(
         f"runtime lease payload is missing required integer field: {field_name}"
+    )
+
+
+def require_managed_session_event_batch(payload: JsonMap) -> ManagedSessionEventBatch:
+    """
+    Validate and return one managed-session event batch from the JSON FFI result.
+    校验并返回 JSON FFI 结果中的单个受管会话事件批次。
+
+    Args:
+        payload: Decoded `_json` result object.
+        payload：已解码的 `_json` 结果对象。
+
+    Returns:
+        One fully shape-validated managed-session event batch.
+        一个已完成全部结构校验的受管会话事件批次。
+    """
+
+    # Raw event list validated before exposure through the typed wrapper.
+    # 在通过类型化包装层暴露前完成校验的原始事件列表。
+    events = payload.get("events")
+    # Queue depth remaining after the destructive drain.
+    # 破坏性排空后剩余的队列深度。
+    remaining = payload.get("remaining")
+    # Explicit wait-timeout marker distinguished from an ordinary empty poll.
+    # 与普通空轮询区分的显式等待超时标记。
+    timed_out = payload.get("timed_out")
+    if (
+        not isinstance(events, list)
+        or not isinstance(remaining, int)
+        or isinstance(remaining, bool)
+        or remaining < 0
+        or not isinstance(timed_out, bool)
+    ):
+        raise RuntimeError("managed-session event result has an invalid batch shape")
+    for event in events:
+        if not isinstance(event, dict) or not is_managed_session_event(event):
+            raise RuntimeError(
+                "managed-session event result contains an invalid event"
+            )
+    return {
+        "events": cast(list[ManagedSessionEvent], events),
+        "remaining": remaining,
+        "timed_out": timed_out,
+    }
+
+
+def is_managed_session_event(event: JsonMap) -> bool:
+    """
+    Return whether one JSON object satisfies the stable managed-session event shape.
+    返回一个 JSON 对象是否满足稳定的受管会话事件结构。
+
+    Args:
+        event: Decoded candidate event object.
+        event：已解码的候选事件对象。
+
+    Returns:
+        True only when every identity, kind, and sequence field is valid.
+        仅当全部身份、类型与序号字段均有效时返回 True。
+    """
+
+    # Stable event kinds admitted by the Rust event protocol.
+    # Rust 事件协议允许的稳定事件类型。
+    kinds = {"stdout_readable", "stderr_readable", "exited", "failed"}
+    # Numeric protocol fields that must be non-negative integers rather than booleans.
+    # 必须是非负整数而非布尔值的数值协议字段。
+    numeric_fields = ("generation", "managed_session_id", "sequence")
+    return (
+        isinstance(event.get("system_lease_id"), str)
+        and isinstance(event.get("sid"), str)
+        and all(
+            isinstance(event.get(field), int)
+            and not isinstance(event.get(field), bool)
+            and cast(int, event.get(field)) >= 0
+            for field in numeric_fields
+        )
+        and event.get("kind") in kinds
     )

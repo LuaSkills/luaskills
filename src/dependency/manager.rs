@@ -1,7 +1,9 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::dependency::platform::current_platform_key;
@@ -11,12 +13,19 @@ use crate::dependency::types::{
 };
 use crate::download::archive::install_downloaded_payload;
 use crate::download::manager::{DownloadManager, DownloadManagerConfig, DownloadRequest};
+use crate::runtime::path::render_host_visible_path;
 use crate::runtime_logging::{info as log_info, warn as log_warn};
 use crate::runtime_options::RuntimeSkillRoot;
 use crate::skill::dependencies::{
-    DependencyExportSpec, FfiDependencySpec, LuaDependencySpec, SkillDependencyManifest,
+    DependencyExportSpec, FfiDependencySpec, LuaDependencySpec, PackageDependencyManifest,
     SkillListIndexFile, ToolDependencySpec,
 };
+
+/// Render one dependency-manager filesystem path for user-facing error messages.
+/// 为面向用户的依赖管理器错误消息渲染单个文件系统路径。
+fn render_dependency_manager_path(path: &Path) -> String {
+    render_host_visible_path(path)
+}
 
 /// Dependency-manager configuration shared by dependency resolution and installation phases.
 /// 供依赖解析与安装阶段共享使用的依赖管理配置。
@@ -79,7 +88,7 @@ impl DependencyManager {
     pub fn ensure_skill_dependencies(
         &self,
         skill_id: &str,
-        manifest: &SkillDependencyManifest,
+        manifest: &PackageDependencyManifest,
     ) -> Result<(), String> {
         let platform_key = current_platform_key();
         if platform_key == "unknown" {
@@ -295,8 +304,10 @@ impl DependencyManager {
                         "[LuaSkills:dependency] Dependency '{}' install from cached archive failed once, retrying after cache cleanup: {}",
                         dependency_name, first_error
                     ));
-                    let _ = fs::remove_file(&download_path);
-                    let _ = fs::remove_dir_all(&resolved_request.install_root);
+                    cleanup_failed_dependency_install_attempt(
+                        &download_path,
+                        &resolved_request.install_root,
+                    )?;
                     let redownloaded_path = self.downloader.download(&DownloadRequest {
                         source_type,
                         source_locator: resolved_request.download_url.clone(),
@@ -432,35 +443,67 @@ impl DependencyManager {
             DependencyScope::Host => install_root.join(normalized_name),
             DependencyScope::Skill => install_root.join(skill_id).join(normalized_name),
         };
-        let Ok(version_entries) = fs::read_dir(&dependency_root) else {
-            return Vec::new();
+        let version_entries = match fs::read_dir(&dependency_root) {
+            Ok(version_entries) => version_entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(error) => {
+                log_warn(format!(
+                    "[LuaSkills:dependency] Failed to scan local dependency versions under {}: {}",
+                    render_dependency_manager_path(&dependency_root),
+                    error
+                ));
+                return Vec::new();
+            }
         };
 
         let normalized_platform = normalize_dependency_path_component(platform_key);
-        version_entries
-            .filter_map(Result::ok)
-            .flat_map(|entry| {
-                let file_type = entry.file_type().ok()?;
-                if !file_type.is_dir() {
-                    return None;
+        let mut requests = Vec::new();
+        for entry in version_entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    log_warn(format!(
+                        "[LuaSkills:dependency] Failed to read local dependency version entry under {}: {}",
+                        render_dependency_manager_path(&dependency_root),
+                        error
+                    ));
+                    continue;
                 }
-                let version_component = entry.file_name().to_string_lossy().to_string();
-                let candidate_root = entry.path().join(&normalized_platform);
-                if !candidate_root.is_dir() {
-                    return None;
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    log_warn(format!(
+                        "[LuaSkills:dependency] Failed to inspect local dependency version entry {}: {}",
+                        render_dependency_manager_path(&entry.path()),
+                        error
+                    ));
+                    continue;
                 }
-                Some(local_dependency_probe_request_variants_for_root(
-                    kind,
-                    dependency_name,
-                    Some(version_component.as_str()),
-                    scope,
-                    platform_key,
-                    candidate_root,
-                    package,
-                ))
-            })
-            .flatten()
-            .collect()
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let Some(version_component) =
+                local_dependency_version_component_from_file_name(entry.file_name())
+            else {
+                continue;
+            };
+            let candidate_root = entry.path().join(&normalized_platform);
+            if !candidate_root.is_dir() {
+                continue;
+            }
+            requests.extend(local_dependency_probe_request_variants_for_root(
+                kind,
+                dependency_name,
+                Some(version_component.as_str()),
+                scope,
+                platform_key,
+                candidate_root,
+                package,
+            ));
+        }
+        requests
     }
 
     /// Resolve one dependency declaration into a concrete install request.
@@ -582,7 +625,7 @@ impl DependencyManager {
         base_dir: &Path,
         override_dir: Option<&Path>,
         removed_skill_id: &str,
-        removed_manifest: Option<&SkillDependencyManifest>,
+        removed_manifest: Option<&PackageDependencyManifest>,
     ) -> Result<(), String> {
         let mut roots = vec![RuntimeSkillRoot {
             name: "ROOT".to_string(),
@@ -607,7 +650,7 @@ impl DependencyManager {
         &self,
         skill_roots: &[RuntimeSkillRoot],
         removed_skill_id: &str,
-        removed_manifest: Option<&SkillDependencyManifest>,
+        removed_manifest: Option<&PackageDependencyManifest>,
     ) -> Result<(), String> {
         self.remove_skill_private_dependency_roots(removed_skill_id)?;
         let _ = (skill_roots, removed_manifest);
@@ -619,8 +662,8 @@ impl DependencyManager {
     pub fn cleanup_updated_skill_dependencies(
         &self,
         skill_id: &str,
-        previous_manifest: Option<&SkillDependencyManifest>,
-        current_manifest: Option<&SkillDependencyManifest>,
+        previous_manifest: Option<&PackageDependencyManifest>,
+        current_manifest: Option<&PackageDependencyManifest>,
     ) -> Result<(), String> {
         let platform_key = current_platform_key();
         if platform_key == "unknown" {
@@ -633,15 +676,7 @@ impl DependencyManager {
             self.collect_skill_local_dependency_roots(skill_id, current_manifest, platform_key)?;
 
         for stale_root in previous_roots.difference(&current_roots) {
-            if stale_root.exists() {
-                fs::remove_dir_all(stale_root).map_err(|error| {
-                    format!(
-                        "Failed to remove stale dependency root {}: {}",
-                        stale_root.display(),
-                        error
-                    )
-                })?;
-            }
+            remove_stale_dependency_root(stale_root)?;
         }
         Ok(())
     }
@@ -654,10 +689,7 @@ impl DependencyManager {
             self.config.lua_root.join(skill_id),
             self.config.ffi_root.join(skill_id),
         ] {
-            if root.exists() {
-                fs::remove_dir_all(&root)
-                    .map_err(|error| format!("Failed to remove {}: {}", root.display(), error))?;
-            }
+            remove_skill_private_dependency_root(&root)?;
         }
         Ok(())
     }
@@ -667,7 +699,7 @@ impl DependencyManager {
     fn collect_skill_local_dependency_roots(
         &self,
         skill_id: &str,
-        manifest: Option<&SkillDependencyManifest>,
+        manifest: Option<&PackageDependencyManifest>,
         platform_key: &str,
     ) -> Result<BTreeSet<PathBuf>, String> {
         let mut roots = BTreeSet::new();
@@ -757,21 +789,18 @@ impl DependencyManager {
             ));
         }
 
-        let all_present = request.exports.iter().all(|export| {
-            request
-                .install_root
-                .join(
-                    export
-                        .target_path
-                        .replace('/', std::path::MAIN_SEPARATOR_STR),
-                )
-                .exists()
-        });
-        Ok(if all_present {
-            DependencyDetectionStatus::Present
-        } else {
-            DependencyDetectionStatus::Missing
-        })
+        for export in &request.exports {
+            let target_path = request.install_root.join(
+                export
+                    .target_path
+                    .replace('/', std::path::MAIN_SEPARATOR_STR),
+            );
+            if !dependency_export_target_exists(request.name.as_str(), &target_path)? {
+                return Ok(DependencyDetectionStatus::Missing);
+            }
+        }
+
+        Ok(DependencyDetectionStatus::Present)
     }
 
     /// Fetch and parse one remote skilllist index file.
@@ -790,8 +819,13 @@ impl DependencyManager {
 /// Ensure one root directory exists before it is used by the dependency manager.
 /// 在依赖管理器使用某个根目录前确保其已经存在。
 pub fn ensure_directory(root: &Path) -> Result<(), String> {
-    fs::create_dir_all(root)
-        .map_err(|error| format!("Failed to create {}: {}", root.display(), error))
+    fs::create_dir_all(root).map_err(|error| {
+        format!(
+            "Failed to create {}: {}",
+            render_dependency_manager_path(root),
+            error
+        )
+    })
 }
 
 /// Build the final install root of one dependency according to its scope, name, version, and platform.
@@ -860,6 +894,185 @@ fn local_dependency_tag_candidates(version: Option<&str>) -> Vec<Option<String>>
 fn push_unique_optional_candidate(candidates: &mut Vec<Option<String>>, candidate: Option<String>) {
     if !candidates.iter().any(|value| value == &candidate) {
         candidates.push(candidate);
+    }
+}
+
+/// Parse one local dependency version directory name into a valid version component.
+/// 将单个本地依赖版本目录名解析为有效版本片段。
+///
+/// The file_name parameter is the raw OS directory name returned by directory scanning.
+/// file_name 参数是目录扫描返回的原始 OS 目录名。
+///
+/// Return a UTF-8 version component, or None when the directory name cannot be represented safely.
+/// 返回 UTF-8 版本片段；当目录名无法安全表示时返回 None。
+fn local_dependency_version_component_from_file_name(file_name: OsString) -> Option<String> {
+    file_name.into_string().ok()
+}
+
+/// Inspect whether one declared dependency export target exists without hiding probe errors.
+/// 检查单个依赖声明导出目标是否存在，同时不隐藏探测错误。
+///
+/// The dependency_name parameter identifies the dependency whose export target is being checked.
+/// dependency_name 参数标识当前正在检查导出目标的依赖。
+///
+/// The target_path parameter is the concrete installed export path resolved from the request.
+/// target_path 参数是从请求中解析出的具体已安装导出路径。
+///
+/// Return true for an existing export, false for a confirmed missing export, or an explicit probe error.
+/// 导出已存在返回 true，确认缺失返回 false；探测失败时返回显式错误。
+fn dependency_export_target_exists(
+    dependency_name: &str,
+    target_path: &Path,
+) -> Result<bool, String> {
+    target_path.try_exists().map_err(|error| {
+        format!(
+            "Failed to inspect dependency export target '{}' at {}: {}",
+            dependency_name,
+            render_dependency_manager_path(target_path),
+            error
+        )
+    })
+}
+
+/// Remove one stale dependency root while treating an already-missing root as cleaned.
+/// 删除单个过期依赖根目录；根目录已不存在时视为已经清理完成。
+fn remove_stale_dependency_root(stale_root: &Path) -> Result<(), String> {
+    if !stale_dependency_root_is_directory(stale_root)? {
+        return Ok(());
+    }
+    fs::remove_dir_all(stale_root).map_err(|error| {
+        format!(
+            "Failed to remove stale dependency root {}: {}",
+            render_dependency_manager_path(stale_root),
+            error
+        )
+    })
+}
+
+/// Inspect whether one stale dependency root is a directory before update cleanup.
+/// 在更新清理前检查单个过期依赖根是否为目录。
+///
+/// The stale_root parameter is the concrete outdated dependency root derived from the previous manifest.
+/// stale_root 参数是从旧清单派生出的具体过期依赖根目录。
+///
+/// Return true for an existing directory, false for a confirmed missing root, or an explicit probe/type error.
+/// 已存在目录返回 true，确认缺失根目录返回 false；探测或类型异常时返回显式错误。
+fn stale_dependency_root_is_directory(stale_root: &Path) -> Result<bool, String> {
+    match fs::metadata(stale_root) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(format!(
+            "Stale dependency root is not a directory before update cleanup: {}",
+            render_dependency_manager_path(stale_root)
+        )),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect stale dependency root {} before update cleanup: {}",
+            render_dependency_manager_path(stale_root),
+            error
+        )),
+    }
+}
+
+/// Remove one skill-private dependency root while treating an already-missing root as cleaned.
+/// 删除单个技能私有依赖根目录；根目录已不存在时视为已经清理完成。
+fn remove_skill_private_dependency_root(root: &Path) -> Result<(), String> {
+    if !skill_private_dependency_root_is_directory(root)? {
+        return Ok(());
+    }
+    fs::remove_dir_all(root).map_err(|error| {
+        format!(
+            "Failed to remove skill-private dependency root {} before uninstall cleanup: {}",
+            render_dependency_manager_path(root),
+            error
+        )
+    })
+}
+
+/// Inspect whether one skill-private dependency root is a directory before uninstall cleanup.
+/// 在卸载清理前检查单个技能私有依赖根是否为目录。
+///
+/// The root parameter is one concrete private dependency root derived from the removed skill identifier.
+/// root 参数是从已移除技能标识符派生出的单个具体私有依赖根目录。
+///
+/// Return true for an existing directory, false for a confirmed missing root, or an explicit probe/type error.
+/// 已存在目录返回 true，确认缺失根目录返回 false；探测或类型异常时返回显式错误。
+fn skill_private_dependency_root_is_directory(root: &Path) -> Result<bool, String> {
+    match fs::metadata(root) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(format!(
+            "Skill-private dependency root is not a directory before uninstall cleanup: {}",
+            render_dependency_manager_path(root)
+        )),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect skill-private dependency root {} before uninstall cleanup: {}",
+            render_dependency_manager_path(root),
+            error
+        )),
+    }
+}
+
+/// Remove failed dependency-install artifacts before one redownload and reinstall attempt.
+/// 在重新下载与重新安装前移除失败依赖安装留下的产物。
+fn cleanup_failed_dependency_install_attempt(
+    download_path: &Path,
+    install_root: &Path,
+) -> Result<(), String> {
+    remove_failed_dependency_download(download_path)?;
+    remove_failed_dependency_install_root(install_root)?;
+    Ok(())
+}
+
+/// Remove one failed dependency download payload, treating an already-missing file as cleaned.
+/// 移除单个失败的依赖下载载荷；文件已不存在时视为已经清理完成。
+fn remove_failed_dependency_download(download_path: &Path) -> Result<(), String> {
+    match fs::remove_file(download_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Failed to remove failed dependency download {} before redownload: {}",
+            render_dependency_manager_path(download_path),
+            error
+        )),
+    }
+}
+
+/// Remove one failed dependency install root, treating an already-missing root as cleaned.
+/// 移除单个失败的依赖安装根目录；根目录已不存在时视为已经清理完成。
+fn remove_failed_dependency_install_root(install_root: &Path) -> Result<(), String> {
+    if !failed_dependency_install_root_is_directory(install_root)? {
+        return Ok(());
+    }
+    fs::remove_dir_all(install_root).map_err(|error| {
+        format!(
+            "Failed to remove failed dependency install root {} before reinstall: {}",
+            render_dependency_manager_path(install_root),
+            error
+        )
+    })
+}
+
+/// Inspect whether one failed dependency install root is a directory before cleanup.
+/// 在清理前检查单个失败依赖安装根是否为目录。
+///
+/// The install_root parameter is the concrete dependency install root that may be removed before reinstall.
+/// install_root 参数是重新安装前可能被删除的具体依赖安装根目录。
+///
+/// Return true for an existing directory, false for a confirmed missing root, or an explicit probe/type error.
+/// 已存在目录返回 true，确认缺失根目录返回 false；探测或类型异常时返回显式错误。
+fn failed_dependency_install_root_is_directory(install_root: &Path) -> Result<bool, String> {
+    match fs::metadata(install_root) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(format!(
+            "Failed dependency install root is not a directory before reinstall: {}",
+            render_dependency_manager_path(install_root)
+        )),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect failed dependency install root {} before reinstall: {}",
+            render_dependency_manager_path(install_root),
+            error
+        )),
     }
 }
 

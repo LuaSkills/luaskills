@@ -137,7 +137,8 @@
 
 - 公共 `runtime_lease_*_json`
 - 带 authority 的 `system_runtime_lease_*_json`
-- `system_lua_lib_dir` 与 system 租约路径语义
+- 严格 `system_package { id, root, dependencies_file }`、包/依赖隔离与专用 System VM
+- 受管 Python/Node `session.open(...)`、引擎事件 poll/wait 与标准 ABI wake callback
 - `host_result` 第四返回值桥接
 - `change_set` 这一类结构化宿主结果
 
@@ -500,6 +501,8 @@ FFI 不直接暴露 `LuaEngine` 指针，而是通过内部注册表分配一个
 - 对动态语言宿主，应优先从 JSON callback 模式接入，因为所有权模型更简单，误用面更小
 - `vulcan.host.*` 宿主工具桥接使用进程级 host-tool callback，并在 Lua 调用时读取当前全局 callback；正式接入仍建议在 `engine_new` 前完成注册，避免初始化顺序不稳定
 - 若一个进程内需要多套 host-tool 逻辑，应由宿主在 callback 内自行路由，或避免在同一进程内混用
+- 受管会话 wake callback 属于引擎级边沿通知，由每个引擎的单个串行后台调度线程调用；它只能唤醒或调度宿主任务，不能执行 Lua 或同步重入租约 eval
+- 替换或清除 wake callback 会等待旧代际的在途调用收敛，宿主只能在调用成功返回后释放旧 `user_data`
 
 ## 7. 启动条件与前置要求
 
@@ -529,6 +532,22 @@ FFI 不直接暴露 `LuaEngine` 指针，而是通过内部注册表分配一个
 - `dependencies`、`state`、`databases`：依赖、状态与数据库目录
 - `config/skill_config.json`：统一 skill 配置文件
 - `system_lua_lib`：宿主自有 system Lua 库目录
+
+System Plugin 租约不把整个 `system_lua_lib` 当成一个共享包。每次 System `create` 必须额外提交：
+
+```json
+{
+  "system_package": {
+    "id": "host-indexer",
+    "root": "D:/runtime/system_lua_lib/host-indexer",
+    "dependencies_file": "dependencies.yaml"
+  }
+}
+```
+
+其中 `root` 必须是规范 `system_lua_lib` 下的绝对严格子目录；`dependencies_file` 是包相对路径，必须解析为包内普通文件，目录穿越和符号链接逃逸都会失败。该包根是专用 System VM 唯一新增的 Lua 模块根，兄弟插件不会共享 `require` 搜索域；Python/Node 环境也按精确包身份、清单和锁文件隔离。`node_runtime.version` 必须是精确 SemVer，且 Node.js 最低版本为 `22.0.0`；范围、标签、不完整版本及更旧版本都会在创建环境前失败。
+
+每个存活 Worker 或持久会话快照都会持有对应受管环境的跨进程共享生命周期租约。环境最终发布或替换只尝试一次非阻塞独占租约；存在活动 Worker 或会话时立即返回稳定的 busy 错误，不会等待、强退使用方或原地替换环境。
 
 旧字段 `temp_dir`、`resources_dir`、`lua_packages_dir`、`host_provided_tool_root`、`host_provided_lua_root`、`host_provided_ffi_root`、`download_cache_root`、`dependency_dir_name`、`state_dir_name`、`database_dir_name` 与 `skill_config_file_path` 仍保留为兼容字段，但不再建议作为新宿主集成的配置入口。JSON FFI 直接在 host options 里传 `runtime_root`；标准 C ABI 为保持 `FfiLuaRuntimeHostOptions` 的 v1 布局兼容，需使用 `FfiLuaRuntimeHostOptionsV2` 与 `luaskills_ffi_engine_new_v2` 传入 `runtime_root`。若同时传入 `runtime_root`，运行时会按固定布局重写这些派生字段。
 
@@ -952,6 +971,11 @@ runtime-config(action, skill_id?, key?, value?)
 
 - `luaskills_ffi_call_skill`
 - `luaskills_ffi_run_lua`
+- `luaskills_ffi_runtime_lease_create / eval / status / list / close`
+- `luaskills_ffi_system_runtime_lease_create / eval / status / list / close`
+- `luaskills_ffi_managed_session_events_poll`
+- `luaskills_ffi_managed_session_events_wait`
+- `luaskills_ffi_set_managed_session_wake_callback`
 
 公共 `_json` FFI 接口：
 
@@ -967,6 +991,8 @@ runtime-config(action, skill_id?, key?, value?)
 - `luaskills_ffi_system_runtime_lease_status_json`
 - `luaskills_ffi_system_runtime_lease_list_json`
 - `luaskills_ffi_system_runtime_lease_close_json`
+- `luaskills_ffi_managed_session_events_poll_json`
+- `luaskills_ffi_managed_session_events_wait_json`
 
 说明：
 
@@ -975,7 +1001,8 @@ runtime-config(action, skill_id?, key?, value?)
 - `run_lua` 执行当前运行时环境中的 Lua 代码；如果宿主不希望普通用户执行任意 Lua，应在工具封装层单独限制或不暴露该接口。
 - `runtime_lease_*_json` 与 `system_runtime_lease_*_json` 都是持久运行时租约接口，同一 `lease_id` 的多次 `eval` 会复用同一个 Lua VM 并保留全局状态；宿主应使用稳定的 `sid` 绑定对话、任务或工作区，并在不需要时显式 close。
 - `system_runtime_lease_*_json` 必须由宿主注入 `authority`；当前接受 `"system"` 与 `"delegated_tool"` 两种值，推荐对外 wrapper 固定注入 `"delegated_tool"`，把公共 `runtime_lease_*_json` 留给可信宿主内部链路。
-- `create` 现在支持宿主拥有的路径上下文字段：`cwd`、`workspace_root`、`lua_roots`、`c_roots`、`mounts`。对于 `system_runtime_lease_*_json`，如果宿主未显式传入 `cwd`，运行时会回落到 `system_lua_lib_dir` 或默认 `skills` 目录。
+- 公共租约 `create` 支持 `cwd`、`workspace_root`、`lua_roots`、`c_roots`、`mounts`。System `create` 是另一套严格请求：只接受 `cwd`、`workspace_root`、`mounts` 与必填 `system_package { id, root, dependencies_file }`，传入 `lua_roots / c_roots` 或其他未知字段会直接失败；`workspace_root` 必须是既有绝对目录，`cwd` 必须规范化到包根或该授权工作区内，未传时默认使用 `system_package.root`。
+- System VM 不加载普通 Skill/entry 注册表，只把当前包根加入 Lua 模块路径，并在每次 eval 前重新验证该根。`vulcan.runtime.system_plugin` 与 `vulcan.runtime.mounts` 是支持索引、`pairs/ipairs`、长度和 JSON 返回序列化的递归只读 userdata 视图，三个宿主所有根字段都不能替换；专用 System VM 会移除全局 `rawset` 与 Lua `debug` 库，阻止绕过元表边界。`workspace_root` 是宿主明确授权的规范路径或 `nil`。
 - `eval / status / close` 请求可选回传 `sid` 与 `generation`；推荐宿主 wrapper 始终把 `create` 返回的两项一并带回，提前发现串线或陈旧句柄。
 - 推荐宿主把 `lease_id + sid + generation` 物化成一个本地 session handle 对象，而不是在业务代码中散落传递三个字段。
 - `runtime_lease_list_json` 仅列出当前仍然活跃的租约；已 `close`、已过期或已被同 SID 新租约替换的旧 `lease_id` 不会出现在列表中。
@@ -993,6 +1020,121 @@ runtime-config(action, skill_id?, key?, value?)
   "replace": false
 }
 ```
+
+System Plugin 创建示例：
+
+```json
+{
+  "engine_id": 1,
+  "sid": "host-indexer/session-123",
+  "ttl_sec": 0,
+  "replace": false,
+  "cwd": "D:/runtime/system_lua_lib/host-indexer",
+  "workspace_root": "D:/projects/current",
+  "mounts": { "project": { "root": "D:/projects/current" } },
+  "system_package": {
+    "id": "host-indexer",
+    "root": "D:/runtime/system_lua_lib/host-indexer",
+    "dependencies_file": "dependencies.yaml"
+  },
+  "authority": "system"
+}
+```
+
+上例是公共 `_json` 导出的完整外层请求。标准 C ABI
+`luaskills_ffi_system_runtime_lease_create(engine_id, request_json, ...)` 的 `request_json`
+只接收严格 System 创建正文：`engine_id` 已由第一个 C 参数传入，标准 ABI 也不在 JSON
+正文中接收 `authority`。对应载荷应写为：
+
+```json
+{
+  "sid": "host-indexer/session-123",
+  "ttl_sec": 0,
+  "replace": false,
+  "cwd": "D:/runtime/system_lua_lib/host-indexer",
+  "workspace_root": "D:/projects/current",
+  "mounts": { "project": { "root": "D:/projects/current" } },
+  "system_package": {
+    "id": "host-indexer",
+    "root": "D:/runtime/system_lua_lib/host-indexer",
+    "dependencies_file": "dependencies.yaml"
+  }
+}
+```
+
+在 Windows x86_64、Linux x86_64/aarch64、macOS x86_64/aarch64 上，同一 System `lease_id` 的第一次 eval 可以把 `vulcan.runtime.python.session.open(...)` 或 `vulcan.runtime.node.session.open(...)` 返回的 userdata 保存到 Lua 全局变量，后续 eval 继续 `write/read/status/close/kill`。Windows ARM/aarch64 是唯一明确不支持目标，会在环境、快照或进程预留前通过 `persistent_session.supported=false` 与稳定原因 `windows_arm_is_not_supported` 拒绝，且不会回退系统解释器。每个受管运行时 `status()` 都包含 `persistent_session.target_os` 与 `target_arch`。只有这两种受管 session 的 userdata `status()` 返回 `managed_session_id`；普通 `vulcan.process.session` 不返回该字段。该 id 与宿主事件的 `managed_session_id` 精确对应。
+
+池化 Worker 的源码路径不依赖宿主 cwd：Unix 会通过固定快照目录描述符逐组件执行不跟随链接的 `openat` 校验，再以该固定快照作为 cwd 执行相对入口；Windows 使用由共享锁保护的绝对快照源码，并把短驱动器根或 UNC 共享根设为中立 cwd。Python Worker 还会把唯一 `snapshot_root` 固定到 `sys.path` 首位，并拒绝同一 Worker 内更换该根。
+
+事件 wait 请求：
+
+```json
+{
+  "engine_id": 1,
+  "max_events": 64,
+  "timeout_ms": 1000,
+  "authority": "delegated_tool"
+}
+```
+
+调用 `luaskills_ffi_managed_session_events_wait_json` 后，`result` 固定为：
+
+```json
+{
+  "events": [
+    {
+      "system_lease_id": "rt_...",
+      "sid": "host-indexer/session-123",
+      "generation": 1,
+      "managed_session_id": 7,
+      "kind": "stdout_readable",
+      "sequence": 12
+    }
+  ],
+  "remaining": 0,
+  "timed_out": false
+}
+```
+
+`poll` 与 `wait` 都是破坏性、有界读取，`max_events` 必须为正数；`events` 按全局单调 `sequence` 排序，`remaining` 是排空后仍待处理的逻辑事件数。只有 `wait` 在截止时间前没有事件时返回 `timed_out=true`；普通空 `poll` 返回 `false`。同一 session 的同类 readiness 事件会合并，但 stdout/stderr 数据继续保存在有界 session 缓冲中，宿主应在后续受控 eval 内调用对应 userdata 的 `read(...)`。
+
+标准 ABI wake callback 只负责告诉宿主“事件队列已经从空变为非空”，不会替代 poll/wait，也不携带事件正文。callback 由每个引擎的单个串行后台调度线程执行，禁止调用 Lua、同步进入租约 eval 或跨 ABI 抛异常；返回非零会在同一边沿仍待处理时通过封顶指数退避自动重试，且不会阻塞事件发布线程。正确流程是 callback 投递宿主任务，任务再 poll/wait，并按事件里的 `system_lease_id + sid + generation` 调用受控 eval。替换/清除 callback 会取消待处理重试并等待在途调用，成功返回后旧 `user_data` 才可释放。
+
+```c
+// Wake the host dispatcher without entering Lua from this background callback.
+// 从该后台回调唤醒宿主调度器，不在这里进入 Lua。
+static int managed_session_wake(
+    uint64_t engine_id,
+    void *user_data,
+    FfiOwnedBuffer *error_out
+) {
+    // This example cannot fail, so the diagnostic slot remains empty.
+    // 此示例不会失败，因此诊断输出槽保持为空。
+    (void)error_out;
+    host_enqueue_managed_session_drain(user_data, engine_id);
+    return 0;
+}
+
+// LuaSkills-owned diagnostic returned only when registration fails.
+// 仅在注册失败时返回的 LuaSkills 所有诊断缓冲。
+FfiOwnedBuffer callback_error = {0};
+int callback_status = luaskills_ffi_set_managed_session_wake_callback(
+    engine_id,
+    managed_session_wake,
+    host_dispatcher,
+    &callback_error
+);
+if (callback_status != 0) {
+    // Copy the diagnostic before releasing the LuaSkills-owned buffer.
+    // 先复制诊断文本，再释放 LuaSkills 所有缓冲。
+    host_log_owned_buffer(callback_error);
+    luaskills_ffi_buffer_free(callback_error);
+}
+```
+
+宿主队列任务随后调用 `luaskills_ffi_managed_session_events_poll` 或 `wait`；标准 ABI 在 `result_json_out` 中直接返回批次 JSON，而 `_json` 入口在统一包络的 `result` 中返回同一批次。关闭引擎或释放 `host_dispatcher` 前，先用 `callback = NULL` 清除注册，并在函数返回后再释放 `user_data`。
+
+生命周期清理是强制的：eval 出错会回滚并终止本次 eval 新开的受管 session；租约 close、同 SID replace、过期、VM drop 与 engine free 会终止仍存活的完整子进程树并退役包 worker；Python/Node 每会话不可变快照在进程清理完成后删除，并在此之前持续持有共享环境生命周期租约。环境发布或替换需要非阻塞独占租约，仍有活动使用方时会返回 busy，而不会与存活进程竞态。
 
 后续执行：
 
@@ -2082,6 +2224,8 @@ Go 宿主如果希望用 Go module 封装主链，建议优先使用独立仓库
 只是它更偏易用性与跨语言接入，不偏极致性能。
 
 ## 19. 对接建议结论
+
+如果目标是接入严格 `system_package`、持久 Python/Node 会话、受管会话事件与 wake callback，请先按本篇完成基础 FFI 生命周期，再按 [System Plugin 受管运行时使用指南](../system-plugin-managed-runtime.md) 完成端到端链路与关闭验收。
 
 如果宿主：
 

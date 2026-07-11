@@ -214,6 +214,26 @@ pub type FfiLanceDbProviderCallback = unsafe extern "C" fn(
     error_out: *mut FfiOwnedBuffer,
 ) -> i32;
 
+/// C ABI edge-triggered wake callback for engine-level managed-session events.
+/// 用于引擎级受管会话事件的 C ABI 边沿触发唤醒回调。
+///
+/// `engine_id` identifies the event source and `user_data` is the opaque host registration value.
+/// `engine_id` 标识事件来源，`user_data` 是不透明的宿主注册值。
+///
+/// `error_out` may receive one LuaSkills-owned diagnostic buffer when the callback returns failure.
+/// 回调返回失败时，`error_out` 可以接收一段 LuaSkills 所有的诊断缓冲。
+///
+/// The callback and `user_data` must be safe to use from arbitrary background threads.
+/// 回调与 `user_data` 必须能够从任意后台线程安全使用。
+///
+/// Return zero after scheduling host work, or nonzero after filling `error_out`.
+/// 成功调度宿主工作后返回零；填充 `error_out` 后返回非零。
+pub type FfiManagedSessionWakeCallback = unsafe extern "C" fn(
+    engine_id: u64,
+    user_data: *mut c_void,
+    error_out: *mut FfiOwnedBuffer,
+) -> i32;
+
 /// Plain C ABI engine options used by standard non-JSON engine creation.
 /// 标准非 JSON 引擎创建使用的原生 C ABI 引擎选项。
 #[repr(C)]

@@ -93,7 +93,7 @@ fn host_tool_args_table_to_json(args_table: Table) -> Result<Value, String> {
 /// 创建面向 Lua 的 `vulcan.host.list` 函数。
 pub(super) fn create_host_tool_list_fn(lua: &Lua) -> mlua::Result<Function> {
     lua.create_function(move |lua, ()| {
-        if !try_has_host_tool_callback().map_err(mlua::Error::runtime)? {
+        if !try_has_host_tool_callback() {
             return Ok(LuaValue::Table(lua.create_table()?));
         }
         let result = dispatch_host_tool_request(&RuntimeHostToolRequest {
@@ -111,7 +111,7 @@ pub(super) fn create_host_tool_list_fn(lua: &Lua) -> mlua::Result<Function> {
 pub(super) fn create_host_tool_has_fn(lua: &Lua) -> mlua::Result<Function> {
     lua.create_function(move |_, tool_name: LuaValue| {
         let tool_name = require_string_arg(tool_name, "host.has", "tool_name", false)?;
-        if !try_has_host_tool_callback().map_err(mlua::Error::runtime)? {
+        if !try_has_host_tool_callback() {
             return Ok(false);
         }
         let result = dispatch_host_tool_request(&RuntimeHostToolRequest {
@@ -134,7 +134,7 @@ pub(super) fn create_host_tool_call_fn(lua: &Lua) -> mlua::Result<Function> {
         let args_value = host_tool_args_table_to_json(args_table).map_err(|error| {
             mlua::Error::runtime(format!("vulcan.host.call: invalid args table: {}", error))
         })?;
-        let result = if try_has_host_tool_callback().map_err(mlua::Error::runtime)? {
+        let result = if try_has_host_tool_callback() {
             match dispatch_host_tool_request(&RuntimeHostToolRequest {
                 action: RuntimeHostToolAction::Call,
                 tool_name: Some(tool_name.clone()),
@@ -317,10 +317,8 @@ fn current_runtime_model_caller(lua: &Lua) -> Result<RuntimeModelCaller, String>
         .map_err(|error| format!("Failed to read vulcan.context.request: {}", error))?;
     let request_json = lua_value_to_json(&request_value)
         .map_err(|error| format!("Failed to convert request context to JSON: {}", error))?;
-    let request_context = match &request_json {
-        Value::Object(object) if object.is_empty() => None,
-        _ => serde_json::from_value::<RuntimeRequestContext>(request_json).ok(),
-    };
+    let request_context =
+        parse_runtime_request_context_json(request_json, "vulcan.context.request")?;
     let client_name = request_context
         .as_ref()
         .and_then(|context| context.client_name.clone())
@@ -373,8 +371,8 @@ pub(super) fn create_model_status_fn(lua: &Lua) -> mlua::Result<Function> {
         let result = json!({
             "ok": true,
             "capabilities": {
-                "embed": try_has_model_embed_callback().unwrap_or(false),
-                "llm": try_has_model_llm_callback().unwrap_or(false),
+                "embed": try_has_model_embed_callback(),
+                "llm": try_has_model_llm_callback(),
             },
         });
         json_value_to_lua(lua, &result)
@@ -394,8 +392,8 @@ pub(super) fn create_model_has_fn(lua: &Lua) -> mlua::Result<Function> {
             _ => None,
         };
         let available = match capability.as_deref() {
-            Some("embed") => try_has_model_embed_callback().unwrap_or(false),
-            Some("llm") => try_has_model_llm_callback().unwrap_or(false),
+            Some("embed") => try_has_model_embed_callback(),
+            Some("llm") => try_has_model_llm_callback(),
             _ => false,
         };
         Ok(available)

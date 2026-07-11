@@ -1,0 +1,11 @@
+python_runtime:
+  version: "3.12.7"
+  package_manager: uv
+  package_manager_version: "0.11.17"
+  lockfile: python/requirements.lock
+node_runtime:
+  version: "22.11.0"
+  package_manager: pnpm
+  package_manager_version: "9.15.0"
+  package_json: node/package.json
+  lockfile: node/pnpm-lock.yaml

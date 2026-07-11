@@ -1,0 +1,9 @@
+name: managed-child-runtime-debug
+version: 0.1.0
+enable: true
+debug: true
+entries:
+  - name: smoke
+    description: Run one managed Python and Node runtime smoke test.
+    lua_entry: runtime/smoke.lua
+    lua_module: managed_child_runtime_debug.smoke

@@ -15,8 +15,10 @@
 | 想了解产品定位与能力边界 | [为什么是 LuaSkills](product/why-luaskills.md) |
 | Skill 作者 | [Lua Skill 开发手册](skill-development.md) |
 | 从 0.4.4 升级到 0.4.6 | [LuaSkills 0.4.6 升级说明](../upgrade-0.4.6.md) |
+| 从 0.4.6 升级到 0.5.0 | [LuaSkills 0.5.0 破坏性升级说明](../upgrade-0.5.0.md) |
 | 第一次做 FFI 联调 | [FFI 宿主接入检查清单](ffi/host-checklist.md) |
 | 需要完整 FFI 参数、内存和生命周期规则 | [FFI 对接文档](ffi/integration-guide.md) |
+| 需要接入 System Plugin 受管 Python/Node 长期会话 | [System Plugin 受管运行时使用指南](system-plugin-managed-runtime.md) |
 | 需要参考历史 beta 发布边界 | [FFI Beta 发布说明](ffi/beta-release-notes.md) |
 | 需要做 `runtime_lease`、`system_runtime_lease` 或 `host_result` 联调 | [FFI 对接文档](ffi/integration-guide.md) |
 | 需要接管 SQLite / LanceDB | [宿主数据库 Provider 对接说明](providers/host-database-provider-guide.md) |
@@ -37,6 +39,7 @@
 ## Skill 开发
 
 - [Lua Skill 开发手册](skill-development.md)
+- [System Plugin 受管运行时使用指南](system-plugin-managed-runtime.md)
 - [Skill Root 层级与管理边界](architecture/skill-root-layer-policy.md)
 - [Skill 配置系统设计稿](architecture/skill-config-system-design.md)
 - [宿主工具结果桥接、宿主 LuaRuntime（`system_lua_lib`）与执行平面设计稿](architecture/host-tooling-result-bridge-design.md)
@@ -51,8 +54,10 @@ Skill 作者最应该记住的边界是：skill 应依赖 `vulcan.context.*` 和
 
 - [FFI Beta 发布说明](ffi/beta-release-notes.md)
 - [LuaSkills 0.4.6 升级说明](../upgrade-0.4.6.md)
+- [LuaSkills 0.5.0 破坏性升级说明](../upgrade-0.5.0.md)
 - [FFI 宿主接入检查清单](ffi/host-checklist.md)
 - [FFI 对接文档](ffi/integration-guide.md)
+- [System Plugin 受管运行时使用指南](system-plugin-managed-runtime.md)
 - [宿主数据库 Provider 对接说明](providers/host-database-provider-guide.md)
 
 第一次接入时建议先跑通 `version -> engine_new -> load_from_roots -> list_entries -> call_skill -> run_lua -> engine_free`，再继续接 lifecycle、query helper、install/update/uninstall、provider callback 或 `space_controller`。
@@ -77,6 +82,7 @@ Skill 作者最应该记住的边界是：skill 应依赖 `vulcan.context.*` 和
 - [FFI Demo Runtime](../../examples/ffi/demo_runtime/README.md)
 - [Host Callback Demo](../../examples/ffi/host_provider_demo/README.md)
 - [LuaSkills Rust Demo](../../examples/demo-rust/README.md)：Rust crate 直连宿主示例，覆盖 `call_skill` 与 `vulcan.host.*`。
+- [受管 Python/Node 运行时示例](../../examples/managed_runtime/README.md)：Lua 一等调度，调用受管 Python 与 Node.js 子运行时。
 - `cargo run --bin luaskills-debug -- inspect --runtime-root <目录> --skill-path <目录>`：仓库内单 skill 调试 bin，会先把 skill 同步进真实 `runtime_root` 再完成加载。
 - 新宿主集成应只传 `runtime_root` 作为 LuaSkills 运行时布局入口。LuaSkills 会从该根目录推导 `bin`、`libs`、`lua_packages`、`resources`、`skills`、`temp`、`dependencies`、`state`、`databases`、`config` 与 `system_lua_lib`。
 - [LuaSkills FFI Demo](../../examples/demo-ffi/README.md)

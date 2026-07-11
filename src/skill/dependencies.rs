@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::dependency::types::{DependencyScope, DependencySourceType};
+use crate::runtime::path::render_host_visible_path;
 
 /// Supported archive formats used by LuaSkills dependency packages.
 /// LuaSkills 依赖包支持的归档格式。
@@ -197,10 +198,80 @@ pub struct FfiDependencySpec {
     pub packages: BTreeMap<String, DependencyPackageSpec>,
 }
 
-/// Full dependencies.yaml payload loaded from one skill package.
-/// 从单个 skill 包加载的完整 dependencies.yaml 载荷。
+/// Package manager used by one managed Python runtime declaration.
+/// 单个受管 Python 运行时声明使用的包管理器。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PythonRuntimePackageManager {
+    /// Use the uv package manager and environment synchronizer.
+    /// 使用 uv 包管理器与环境同步器。
+    Uv,
+}
+
+/// Package manager used by one managed Node.js runtime declaration.
+/// 单个受管 Node.js 运行时声明使用的包管理器。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRuntimePackageManager {
+    /// Use pnpm with one host-managed content-addressed package store.
+    /// 使用 pnpm 与宿主管理的内容寻址包存储。
+    Pnpm,
+}
+
+/// Managed Python runtime dependency declared by one runtime package.
+/// 单个运行时包声明的受管 Python 运行时依赖。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PythonRuntimeDependencySpec {
+    /// Exact Python runtime version requested by the package.
+    /// 当前包请求的精确 Python 运行时版本。
+    pub version: String,
+    /// Python package manager selected for environment creation.
+    /// 用于创建环境的 Python 包管理器。
+    pub package_manager: PythonRuntimePackageManager,
+    /// Exact package-manager version requested by the skill.
+    /// 当前 skill 请求的精确包管理器版本。
+    pub package_manager_version: String,
+    /// Lockfile path under the current package root.
+    /// 当前包根目录下的锁文件路径。
+    #[serde(default)]
+    pub lockfile: String,
+    /// Whether this managed runtime is required for the package to load.
+    /// 当前受管运行时是否为包加载所必需。
+    #[serde(default = "default_required_dependency")]
+    pub required: bool,
+}
+
+/// Managed Node.js runtime dependency declared by one runtime package.
+/// 单个运行时包声明的受管 Node.js 运行时依赖。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeRuntimeDependencySpec {
+    /// Exact Node.js runtime version requested by the package.
+    /// 当前包请求的精确 Node.js 运行时版本。
+    pub version: String,
+    /// Node.js package manager selected for environment creation.
+    /// 用于创建环境的 Node.js 包管理器。
+    pub package_manager: NodeRuntimePackageManager,
+    /// Exact package-manager version requested by the skill.
+    /// 当前 skill 请求的精确包管理器版本。
+    pub package_manager_version: String,
+    /// Optional package.json path under the current package root.
+    /// 当前包根目录下的可选 package.json 路径。
+    #[serde(default)]
+    pub package_json: String,
+    /// Lockfile path under the current package root.
+    /// 当前包根目录下的锁文件路径。
+    #[serde(default)]
+    pub lockfile: String,
+    /// Whether this managed runtime is required for the package to load.
+    /// 当前受管运行时是否为包加载所必需。
+    #[serde(default = "default_required_dependency")]
+    pub required: bool,
+}
+
+/// Full dependencies.yaml payload loaded from one managed runtime package.
+/// 从单个受管运行时包加载的完整 dependencies.yaml 载荷。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct SkillDependencyManifest {
+pub struct PackageDependencyManifest {
     /// Tool dependencies such as rg or ast-grep.
     /// 例如 rg 或 ast-grep 一类的工具依赖。
     #[serde(default)]
@@ -213,6 +284,14 @@ pub struct SkillDependencyManifest {
     /// 安装到宿主管理 FFI 根目录下的原生库依赖。
     #[serde(default)]
     pub ffi_dependencies: Vec<FfiDependencySpec>,
+    /// Optional managed Python runtime declaration used by Lua orchestration.
+    /// 由 Lua 编排调用的可选受管 Python 运行时声明。
+    #[serde(default)]
+    pub python_runtime: Option<PythonRuntimeDependencySpec>,
+    /// Optional managed Node.js runtime declaration used by Lua orchestration.
+    /// 由 Lua 编排调用的可选受管 Node.js 运行时声明。
+    #[serde(default)]
+    pub node_runtime: Option<NodeRuntimeDependencySpec>,
 }
 
 /// One skilllist package manifest downloaded from one remote list file.
@@ -257,14 +336,24 @@ fn default_runtime_library_scope() -> DependencyScope {
     DependencyScope::Skill
 }
 
-impl SkillDependencyManifest {
+impl PackageDependencyManifest {
     /// Load one dependency manifest from `dependencies.yaml`.
     /// 从 `dependencies.yaml` 加载一份依赖清单。
     pub fn load_from_path(path: &Path) -> Result<Self, String> {
-        let yaml_text = fs::read_to_string(path)
-            .map_err(|error| format!("Failed to read {}: {}", path.display(), error))?;
-        serde_yaml::from_str(&yaml_text)
-            .map_err(|error| format!("Failed to parse {}: {}", path.display(), error))
+        let yaml_text = fs::read_to_string(path).map_err(|error| {
+            format!(
+                "Failed to read {}: {}",
+                render_host_visible_path(path),
+                error
+            )
+        })?;
+        serde_yaml::from_str(&yaml_text).map_err(|error| {
+            format!(
+                "Failed to parse {}: {}",
+                render_host_visible_path(path),
+                error
+            )
+        })
     }
 
     /// Return whether the manifest contains any declared dependency.
@@ -273,6 +362,8 @@ impl SkillDependencyManifest {
         self.tool_dependencies.is_empty()
             && self.lua_dependencies.is_empty()
             && self.ffi_dependencies.is_empty()
+            && self.python_runtime.is_none()
+            && self.node_runtime.is_none()
     }
 }
 
@@ -302,7 +393,54 @@ impl FfiDependencySpec {
 
 #[cfg(test)]
 mod tests {
-    use super::SkillDependencyManifest;
+    use super::PackageDependencyManifest;
+    use crate::runtime::path::render_host_visible_path;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Build one unique temporary dependency-manifest test root.
+    /// 构造一个唯一的依赖清单测试临时根目录。
+    fn make_dependency_manifest_test_dir(label: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("luaskills_dependency_manifest_{label}_{nonce}"))
+    }
+
+    /// Verify dependency-manifest parse errors render paths through the host-visible formatter.
+    /// 验证依赖清单解析错误会通过宿主可见路径渲染器输出路径。
+    #[test]
+    fn dependency_manifest_parse_error_uses_host_visible_path() {
+        // Temporary root that isolates the invalid dependency manifest fixture.
+        // 隔离非法依赖清单夹具的临时根目录。
+        let temp_root = make_dependency_manifest_test_dir("parse_error_path");
+        fs::create_dir_all(&temp_root).expect("temp root should be created");
+        // Dependency manifest path used by the real load_from_path entrypoint.
+        // 真实 load_from_path 入口使用的依赖清单路径。
+        let manifest_path = temp_root.join("dependencies.yaml");
+        fs::write(&manifest_path, "tool_dependencies: [")
+            .expect("invalid dependency manifest should be written");
+        // Error returned by the real dependency manifest loader.
+        // 真实依赖清单加载器返回的错误。
+        let error = PackageDependencyManifest::load_from_path(&manifest_path)
+            .expect_err("invalid dependency manifest should fail");
+        // Expected diagnostic prefix rendered with the shared host-visible path formatter.
+        // 使用共享宿主可见路径渲染器生成的期望诊断前缀。
+        let expected_prefix = format!(
+            "Failed to parse {}:",
+            render_host_visible_path(&manifest_path)
+        );
+
+        assert!(
+            error.starts_with(&expected_prefix),
+            "unexpected error: {}",
+            error
+        );
+        // Cleanup result is intentionally ignored for best-effort temporary test artifacts.
+        // 对临时测试产物的清理结果按最佳努力原则有意忽略。
+        let _ = fs::remove_dir_all(&temp_root);
+    }
 
     /// Verify that the new dependency manifest format parses tool/lua/ffi groups correctly.
     /// 验证新的依赖清单格式能正确解析 tool/lua/ffi 三个分组。
@@ -345,7 +483,7 @@ ffi_dependencies:
         url: https://example.com/index.yaml
         package: example-lib
 "#;
-        let manifest: SkillDependencyManifest =
+        let manifest: PackageDependencyManifest =
             serde_yaml::from_str(yaml_text).expect("manifest should parse");
         assert_eq!(manifest.tool_dependencies.len(), 1);
         assert_eq!(manifest.lua_dependencies.len(), 1);
@@ -392,7 +530,7 @@ ffi_dependencies:
       url: {}
     packages: {}
 "#;
-        let manifest: SkillDependencyManifest =
+        let manifest: PackageDependencyManifest =
             serde_yaml::from_str(yaml_text).expect("manifest should parse");
         assert_eq!(
             manifest.tool_dependencies[0].scope,
@@ -405,6 +543,55 @@ ffi_dependencies:
         assert_eq!(
             manifest.ffi_dependencies[0].scope,
             crate::dependency::types::DependencyScope::Skill
+        );
+    }
+
+    /// Verify that managed Python and Node runtime declarations parse from dependencies.yaml.
+    /// 验证受管 Python 与 Node 运行时声明可以从 dependencies.yaml 中解析。
+    #[test]
+    fn parse_managed_runtime_dependency_declarations() {
+        let yaml_text = r#"
+python_runtime:
+  version: "3.12.8"
+  package_manager: uv
+  package_manager_version: "0.11.17"
+  lockfile: python/requirements.lock
+node_runtime:
+  version: "22.11.0"
+  package_manager: pnpm
+  package_manager_version: "9.15.0"
+  package_json: node/package.json
+  lockfile: node/pnpm-lock.yaml
+"#;
+        let manifest: PackageDependencyManifest =
+            serde_yaml::from_str(yaml_text).expect("manifest should parse");
+        let python_runtime = manifest
+            .python_runtime
+            .expect("python runtime should parse");
+        let node_runtime = manifest.node_runtime.expect("node runtime should parse");
+
+        assert_eq!(python_runtime.version, "3.12.8");
+        assert_eq!(
+            python_runtime.package_manager,
+            super::PythonRuntimePackageManager::Uv
+        );
+        assert_eq!(python_runtime.lockfile, "python/requirements.lock");
+        assert!(python_runtime.required);
+        assert_eq!(node_runtime.version, "22.11.0");
+        assert_eq!(
+            node_runtime.package_manager,
+            super::NodeRuntimePackageManager::Pnpm
+        );
+        assert_eq!(node_runtime.package_json, "node/package.json");
+        assert_eq!(node_runtime.lockfile, "node/pnpm-lock.yaml");
+        assert!(node_runtime.required);
+        assert!(
+            !PackageDependencyManifest {
+                python_runtime: Some(python_runtime),
+                node_runtime: Some(node_runtime),
+                ..PackageDependencyManifest::default()
+            }
+            .is_empty()
         );
     }
 }

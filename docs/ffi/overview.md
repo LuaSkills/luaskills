@@ -19,8 +19,10 @@ The goal is to let each host choose the right binding cost without changing the 
 Current stable host-facing features include:
 
 - Public `runtime_lease` endpoints for persistent Lua VM reuse with stable `lease_id + sid + generation` identity.
-- Authority-bound `system_runtime_lease` endpoints for host-owned system leases and `system_lua_lib` directory semantics.
-- Host-owned path context fields on lease creation such as `cwd`, `workspace_root`, `lua_roots`, `c_roots`, and `mounts`.
+- Authority-bound `system_runtime_lease` endpoints for package-isolated System Plugins under `system_lua_lib`.
+- Public leases accept host-owned `cwd`, `workspace_root`, `lua_roots`, `c_roots`, and `mounts`; strict System leases accept `cwd`, `workspace_root`, `mounts`, and required `system_package { id, root, dependencies_file }`, but reject public `lua_roots` / `c_roots` fields.
+- Cross-platform persistent managed Python/Node `session.open(...)` userdata on Windows x86_64, Linux x86_64/aarch64, and macOS x86_64/aarch64 that survives across eval calls on the same lease VM and is deterministically cleaned up on eval rollback, close, replacement, expiration, VM drop, or engine drop; Windows ARM is rejected before resource allocation with `windows_arm_is_not_supported`.
+- Engine-level managed-session event poll/wait APIs plus a standard-ABI edge-triggered wake callback; background threads publish events but never call Lua.
 - Optional `host_result` bridging so one skill may return `content, overflow_mode, template_hint, host_result`.
 - The first canonical structured host result kind: `change_set`, now carrying explicit file lifecycle records plus hunk-level `before + delete[] + insert[] + after` blocks for IDE-grade edit results.
 
@@ -46,6 +48,73 @@ For a new FFI host, stabilize the smallest runtime loop first:
 7. `engine_free`
 
 After that, add lifecycle operations, query helpers, installation/update flows, provider callbacks, host-tool callbacks, or `space_controller`.
+
+## System Plugin Managed-Session Quick Path
+
+System lease creation is a strict package-bound operation:
+
+```json
+{
+  "engine_id": 1,
+  "sid": "system-plugin/demo",
+  "ttl_sec": 0,
+  "replace": false,
+  "cwd": "D:/runtime/system_lua_lib/demo-plugin",
+  "workspace_root": "D:/workspaces/current",
+  "mounts": { "project": { "root": "D:/workspaces/current" } },
+  "system_package": {
+    "id": "demo-plugin",
+    "root": "D:/runtime/system_lua_lib/demo-plugin",
+    "dependencies_file": "dependencies.yaml"
+  },
+  "authority": "system"
+}
+```
+
+`system_package.root` must be an absolute strict descendant of the engine's canonical `system_lua_lib` directory and cannot contain Lua search-path metacharacters. `dependencies_file` is package-relative and must resolve to a contained regular file. `workspace_root`, when present, must be an existing absolute directory; `cwd` resolves under the package root or that authorized workspace. The package root alone is added to the dedicated System VM's Lua module search path and is revalidated before every eval; sibling System Plugins and their managed dependency environments remain isolated.
+
+Managed Node declarations require one exact SemVer and Node.js `22.0.0` or newer; ranges, tags, partial versions, and older releases fail before environment creation. Every live worker or session snapshot retains a shared cross-process environment lifecycle lease. Final publication or replacement attempts a nonblocking exclusive lease and returns a stable busy error while any active worker or session still uses that environment.
+
+Managed Python/Node `status` and pooled `invoke` are supported on Linux, macOS, and Windows; other operating systems return a stable unsupported-platform result. Linux and macOS workers validate relative entries with descriptor-relative no-follow `openat` calls and execute from the pinned snapshot cwd. Windows workers use absolute share-locked snapshot sources plus a short drive or UNC-share root as their neutral cwd. Each Python worker fixes its single snapshot root at the front of `sys.path` and rejects root changes within that worker.
+
+Inside eval, `vulcan.runtime.system_plugin` and `vulcan.runtime.mounts` are recursively read-only userdata views that support indexing, iteration, length, and JSON-result serialization. The three host-owned root fields cannot be replaced. Dedicated System VMs remove global `rawset` and the Lua `debug` library so plugin code cannot bypass those metatables. `vulcan.runtime.workspace_root` is the canonical host-authorized workspace path or `nil`. On Windows x86_64, Linux x86_64/aarch64, and macOS x86_64/aarch64, managed `python.session.open` / `node.session.open` returns process userdata that can be stored in a Lua global and reused by later eval calls on the same `lease_id`; its status includes `managed_session_id` for exact host-event correlation. Managed runtime `status()` exposes the stable `persistent_session` capability object. Windows ARM returns `supported=false` and `reason=windows_arm_is_not_supported` before any environment, snapshot, or process reservation.
+
+System managed sessions emit `stdout_readable`, `stderr_readable`, `exited`, and `failed` events. JSON hosts consume them with strict authority-bound requests:
+
+```json
+{
+  "engine_id": 1,
+  "max_events": 64,
+  "timeout_ms": 1000,
+  "authority": "delegated_tool"
+}
+```
+
+Call `luaskills_ffi_managed_session_events_wait_json` with that payload, or omit `timeout_ms` and call `luaskills_ffi_managed_session_events_poll_json`. A successful raw `_json` response uses the standard envelope below:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "events": [
+      {
+        "system_lease_id": "rt_...",
+        "sid": "system-plugin/demo",
+        "generation": 1,
+        "managed_session_id": 7,
+        "kind": "stdout_readable",
+        "sequence": 12
+      }
+    ],
+    "remaining": 0,
+    "timed_out": false
+  }
+}
+```
+
+Poll and wait destructively drain at most positive `max_events` in sequence order. `timed_out` is true only when `wait` reaches its deadline without an event; an ordinary empty `poll` returns `timed_out=false`. Repeated readiness events of the same kind are coalesced per session while output remains bounded in the session buffer.
+
+The wake callback exists only on the standard C ABI as `luaskills_ffi_set_managed_session_wake_callback`. It runs on one serial per-engine background dispatcher and is edge-triggered for a nonempty event queue, so event publishers never execute host code. It must only signal or schedule host work: it must not unwind across the ABI, call Lua, or synchronously re-enter lease evaluation. A nonzero callback result is retried asynchronously with capped exponential backoff while the same queue edge remains pending. The host should subsequently poll/wait events and schedule a normal eval that calls `session:read(...)`. Clear or replace the callback before releasing its `user_data`; the registration call cancels pending retries and waits for retired callback invocations to quiesce.
 
 ## Managed Identity Field Quick Path
 
@@ -120,6 +189,7 @@ SDK mapping:
 - When projecting entries as tools, follow the conventional `PWD` managed project-path contract instead of forcing every model or user to type host-known project roots manually.
 - Do not throw exceptions across C ABI boundaries.
 - Do not re-enter the same engine from the same thread.
+- Never call Lua or synchronously evaluate a lease from a managed-session wake callback; schedule host work and drain events instead.
 - Free owned buffers with the matching LuaSkills free function.
 - Let the host decide authority and root write policy.
 - Let the host own model provider configuration; LuaSkills only forwards fixed model requests and structured error envelopes.
@@ -127,6 +197,8 @@ SDK mapping:
 
 ## Deep References
 
+- [System Plugin managed runtime guide](../system-plugin-managed-runtime.md)
+- [System Plugin 受管运行时使用指南](../zh-CN/system-plugin-managed-runtime.md)
 - [FFI beta release notes](../zh-CN/ffi/beta-release-notes.md)
 - [FFI host checklist](../zh-CN/ffi/host-checklist.md)
 - [FFI integration guide](../zh-CN/ffi/integration-guide.md)

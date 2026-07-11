@@ -17,12 +17,14 @@ It is designed for applications that want a controlled skill system instead of o
 It provides:
 
 - Skill discovery, loading, entry enumeration, and invocation.
-- Persistent runtime leases through `runtime_lease` and authority-bound `system_runtime_lease` entrypoints.
+- Persistent runtime leases through `runtime_lease` and authority-bound `system_runtime_lease` entrypoints, with strict System Plugin package identity.
 - Strict help trees that hosts can render as docs, command palettes, tools, or UI panels.
 - Standard Lua capability namespaces under `vulcan.*` and system-side helpers under `vulcan.runtime.*`.
 - Runtime context injection for current requests, skill directories, resources, dependency roots, and client metadata.
 - Host-owned structured result bridging through `host_result`, including the first canonical `change_set` result kind.
 - Optional SQLite and LanceDB bindings for stateful or memory-oriented skills.
+- Managed Python and Node.js child runtimes that Lua skills and System Plugins can invoke through `vulcan.runtime.python.*` and `vulcan.runtime.node.*`; persistent cross-eval sessions are restricted to dedicated System Plugin leases.
+- Bounded host-side managed-session events with destructive poll/wait APIs and an edge-triggered wake callback that never executes Lua.
 - Rust API integration for Rust hosts.
 - Standard C ABI and public `_json` FFI for non-Rust hosts.
 - SDK-oriented integration paths for TypeScript, Python, and Go.
@@ -67,9 +69,10 @@ LuaSkills is especially useful when you need a split between runtime truth and h
 | Lua API | Inject `vulcan.call`, `vulcan.fs`, `vulcan.path`, `vulcan.process`, `vulcan.os`, `vulcan.json`, `vulcan.cache`, `vulcan.context`, `vulcan.deps`, `vulcan.sqlite`, `vulcan.lancedb`, and `vulcan.runtime`. |
 | Help model | Parse strict skill help trees and expose structured help for host rendering. |
 | Host boundary | Keep product policy, UI, budgets, and permissions outside the runtime. |
-| Host runtime leases | Support public `runtime_lease` and authority-bound `system_runtime_lease` calls for persistent Lua VM state, host-owned path contexts, and `system_lua_lib`-style execution. |
+| Host runtime leases | Support public `runtime_lease` and authority-bound `system_runtime_lease` calls for persistent Lua VM state; System leases require `system_package { id, root, dependencies_file }` and run in a dedicated package-isolated VM. |
 | Structured host results | Let hosts opt into `host_result` so skills can return a fourth structured payload such as `change_set` without replacing the main text result. |
 | Database providers | Support dynamic-library, host-callback, and space-controller modes for SQLite and LanceDB. |
+| Managed child runtimes | Let Lua skills and System Plugins call versioned Python/Node handlers; dedicated System Plugin leases may also open persistent child sessions with locked package dependencies, bounded output, deterministic process-tree cleanup, and host events. |
 | Multi-language integration | Expose Rust APIs, standard C ABI, and public `_json` FFI for SDKs and host bridges. |
 | Skill roots | Support layered roots such as `ROOT`, `PROJECT`, and `USER` with host-controlled management authority. |
 
@@ -98,6 +101,7 @@ Start here:
 - [Why LuaSkills](docs/product/why-luaskills.md): product narrative, architecture value, and supported integration categories.
 - [Skill development manual](docs/skill-development.md): full English manual for skill authors.
 - [FFI and SDK overview](docs/ffi/overview.md): English overview for host integrators.
+- [System Plugin managed runtime guide](docs/system-plugin-managed-runtime.md): end-to-end package, persistent Python/Node session, event, and cleanup workflow.
 - [Database provider overview](docs/providers/database-providers.md): English overview for SQLite and LanceDB ownership.
 - [Runtime architecture overview](docs/architecture/runtime-model.md): English overview of host/runtime boundaries.
 - [Chinese docs index](docs/zh-CN/index.md): full Chinese technical documentation map.
@@ -106,6 +110,8 @@ Important technical docs:
 
 - [Lua Skill developer manual](docs/skill-development.md)
 - [Chinese Lua Skill developer manual](docs/zh-CN/skill-development.md)
+- [System Plugin managed runtime guide](docs/system-plugin-managed-runtime.md)
+- [System Plugin 受管运行时使用指南](docs/zh-CN/system-plugin-managed-runtime.md)
 - [FFI integration guide](docs/zh-CN/ffi/integration-guide.md)
 - [FFI host checklist](docs/zh-CN/ffi/host-checklist.md)
 - [Host database provider guide](docs/zh-CN/providers/host-database-provider-guide.md)

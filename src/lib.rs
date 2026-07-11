@@ -21,12 +21,12 @@ pub use host::callbacks::{
 };
 pub use host::database::{
     LuaRuntimeDatabaseCallbackMode, LuaRuntimeDatabaseProviderMode, RuntimeDatabaseBindingContext,
-    RuntimeDatabaseKind, RuntimeLanceDbProviderAction, RuntimeLanceDbProviderCallback,
-    RuntimeLanceDbProviderJsonCallback, RuntimeLanceDbProviderRequest,
-    RuntimeLanceDbProviderResult, RuntimeSqliteProviderAction, RuntimeSqliteProviderCallback,
-    RuntimeSqliteProviderJsonCallback, RuntimeSqliteProviderRequest, set_lancedb_provider_callback,
-    set_lancedb_provider_json_callback, set_sqlite_provider_callback,
-    set_sqlite_provider_json_callback,
+    RuntimeDatabaseBindingContextSpec, RuntimeDatabaseKind, RuntimeLanceDbProviderAction,
+    RuntimeLanceDbProviderCallback, RuntimeLanceDbProviderJsonCallback,
+    RuntimeLanceDbProviderRequest, RuntimeLanceDbProviderResult, RuntimeSqliteProviderAction,
+    RuntimeSqliteProviderCallback, RuntimeSqliteProviderJsonCallback, RuntimeSqliteProviderRequest,
+    set_lancedb_provider_callback, set_lancedb_provider_json_callback,
+    set_sqlite_provider_callback, set_sqlite_provider_json_callback,
 };
 pub use host::options::{
     LuaInvocationContext, LuaRuntimeCapabilityOptions, LuaRuntimeHostOptions,
@@ -44,13 +44,28 @@ pub use runtime::help::{RuntimeHelpDetail, RuntimeHelpNodeDescriptor, RuntimeSki
 pub use runtime::logging::{
     RuntimeLogCallback, RuntimeLogEvent, RuntimeLogLevel, set_log_callback,
 };
+pub use runtime::managed_runtime::{
+    MANAGED_RUNTIME_ENV_MARKER_SCHEMA_VERSION, ManagedRuntimeEnvHashInput, ManagedRuntimeEnvMarker,
+    ManagedRuntimeEnvPlan, ManagedRuntimeInstallManifest, ManagedRuntimeKind,
+    ManagedRuntimePersistentSessionCapability, WINDOWS_ARM_PERSISTENT_SESSION_UNSUPPORTED_REASON,
+    compute_managed_runtime_env_hash, current_managed_runtime_persistent_session_capability,
+    current_managed_runtime_platform_key, ensure_managed_env, managed_env_dir,
+    managed_env_is_ready, managed_env_marker_matches, managed_env_marker_path,
+    read_install_manifest, read_managed_env_marker, sha256_file, sha256_hex,
+};
+pub use runtime::managed_session_events::{
+    RuntimeManagedSessionEvent, RuntimeManagedSessionEventBatch, RuntimeManagedSessionEventKind,
+    RuntimeManagedSessionWakeCallback,
+};
 pub use runtime::result::{
     NON_STRING_TOOL_RESULT_ERROR, RuntimeInvocationResult, ToolOverflowMode,
 };
 pub use skill::dependencies::{
     DependencyArchiveType, DependencyExportSpec, DependencyPackageSpec, DependencySourceSpec,
-    FfiDependencySpec, GithubReleaseSourceSpec, LuaDependencySpec, SkillDependencyManifest,
-    SkillListPackageManifest, SkillListSourceSpec, ToolDependencySpec, UrlSourceSpec,
+    FfiDependencySpec, GithubReleaseSourceSpec, LuaDependencySpec, NodeRuntimeDependencySpec,
+    NodeRuntimePackageManager, PackageDependencyManifest, PythonRuntimeDependencySpec,
+    PythonRuntimePackageManager, SkillListPackageManifest, SkillListSourceSpec, ToolDependencySpec,
+    UrlSourceSpec,
 };
 pub use skill::manager::{
     DisabledSkillRecord, ResolvedSkillInstance, SkillApplyResult, SkillInstallRequest,

@@ -1,12 +1,19 @@
 use crate::lua_skill::validate_luaskills_identifier;
+use crate::runtime::path::render_host_visible_path;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+/// Render one skill-config filesystem path for user-facing error messages.
+/// 为面向用户的技能配置错误消息渲染单个文件系统路径。
+fn render_skill_config_path(path: &Path) -> String {
+    render_host_visible_path(path)
+}
 
 /// One flattened skill-config record exposed to hosts and FFI consumers.
 /// 暴露给宿主与 FFI 消费方的单条扁平化技能配置记录。
@@ -67,10 +74,7 @@ impl SkillConfigStore {
     /// Capture the runtime root used by the default config path when no explicit file path exists.
     /// 在不存在显式文件路径时记录默认配置路径所使用的运行时根目录。
     pub fn set_default_runtime_root(&self, runtime_root: &Path) -> Result<(), String> {
-        let mut guard = self
-            .default_runtime_root
-            .lock()
-            .map_err(|_| "skill config runtime-root lock poisoned".to_string())?;
+        let mut guard = self.lock_default_runtime_root();
         *guard = Some(runtime_root.to_path_buf());
         Ok(())
     }
@@ -81,10 +85,7 @@ impl SkillConfigStore {
         if let Some(path) = self.explicit_file_path.as_ref() {
             return Ok(path.clone());
         }
-        let guard = self
-            .default_runtime_root
-            .lock()
-            .map_err(|_| "skill config runtime-root lock poisoned".to_string())?;
+        let guard = self.lock_default_runtime_root();
         let runtime_root = guard.as_ref().ok_or_else(|| {
             "skill config file path is unresolved; set host_options.skill_config_file_path or load at least one skill root first".to_string()
         })?;
@@ -183,10 +184,10 @@ impl SkillConfigStore {
                 .get_mut(&normalized_skill_id)
                 .and_then(|items| items.remove(&normalized_key))
                 .is_some();
-            if let Some(items) = document.skills.get(&normalized_skill_id) {
-                if items.is_empty() {
-                    document.skills.remove(&normalized_skill_id);
-                }
+            if let Some(items) = document.skills.get(&normalized_skill_id)
+                && items.is_empty()
+            {
+                document.skills.remove(&normalized_skill_id);
             }
             Ok(deleted)
         })
@@ -200,9 +201,7 @@ impl SkillConfigStore {
     {
         let file_path = self.file_path()?;
         let path_lock = shared_skill_config_path_lock(&file_path)?;
-        let _path_guard = path_lock
-            .lock()
-            .map_err(|_| "skill config shared io lock poisoned".to_string())?;
+        let _path_guard = lock_shared_skill_config_path(&path_lock);
         let document = self.read_document_from(&file_path)?;
         action(&document)
     }
@@ -215,32 +214,38 @@ impl SkillConfigStore {
     {
         let file_path = self.file_path()?;
         let path_lock = shared_skill_config_path_lock(&file_path)?;
-        let _path_guard = path_lock
-            .lock()
-            .map_err(|_| "skill config shared io lock poisoned".to_string())?;
+        let _path_guard = lock_shared_skill_config_path(&path_lock);
         let mut document = self.read_document_from(&file_path)?;
         let result = action(&mut document)?;
         self.write_document_to(&file_path, &document)?;
         Ok(result)
     }
 
+    /// Acquire the default runtime-root lock and return its guard, recovering after lock poisoning.
+    /// 获取并返回默认 runtime-root 锁保护对象；如果锁已 poison，则恢复继续使用。
+    fn lock_default_runtime_root(&self) -> MutexGuard<'_, Option<PathBuf>> {
+        self.default_runtime_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Load the current persisted document, treating a missing file as one empty config set.
     /// 加载当前持久化文档，并把缺失文件视为一份空配置集合。
     fn read_document_from(&self, file_path: &Path) -> Result<SkillConfigDocument, String> {
-        if !file_path.exists() {
+        if !skill_config_file_is_file(file_path)? {
             return Ok(SkillConfigDocument::default());
         }
-        let text = fs::read_to_string(&file_path).map_err(|error| {
+        let text = fs::read_to_string(file_path).map_err(|error| {
             format!(
                 "failed to read skill config file '{}': {}",
-                file_path.display(),
+                render_skill_config_path(file_path),
                 error
             )
         })?;
         serde_json::from_str::<SkillConfigDocument>(&text).map_err(|error| {
             format!(
                 "failed to parse skill config file '{}': {}",
-                file_path.display(),
+                render_skill_config_path(file_path),
                 error
             )
         })
@@ -256,13 +261,13 @@ impl SkillConfigStore {
         let parent = file_path.parent().ok_or_else(|| {
             format!(
                 "skill config file '{}' has no parent directory",
-                file_path.display()
+                render_skill_config_path(file_path)
             )
         })?;
         fs::create_dir_all(parent).map_err(|error| {
             format!(
                 "failed to create skill config directory '{}': {}",
-                parent.display(),
+                render_skill_config_path(parent),
                 error
             )
         })?;
@@ -273,40 +278,64 @@ impl SkillConfigStore {
             let mut file = fs::File::create(&temp_path).map_err(|error| {
                 format!(
                     "failed to create skill config temp file '{}': {}",
-                    temp_path.display(),
+                    render_skill_config_path(&temp_path),
                     error
                 )
             })?;
             file.write_all(&serialized).map_err(|error| {
                 format!(
                     "failed to write skill config temp file '{}': {}",
-                    temp_path.display(),
+                    render_skill_config_path(&temp_path),
                     error
                 )
             })?;
             file.flush().map_err(|error| {
                 format!(
                     "failed to flush skill config temp file '{}': {}",
-                    temp_path.display(),
+                    render_skill_config_path(&temp_path),
                     error
                 )
             })?;
             file.sync_all().map_err(|error| {
                 format!(
                     "failed to sync skill config temp file '{}': {}",
-                    temp_path.display(),
+                    render_skill_config_path(&temp_path),
                     error
                 )
             })?;
         }
-        replace_file_atomically(&temp_path, &file_path).map_err(|error| {
+        replace_file_atomically(&temp_path, file_path).map_err(|error| {
             format!(
                 "failed to promote skill config temp file '{}' to '{}': {}",
-                temp_path.display(),
-                file_path.display(),
+                render_skill_config_path(&temp_path),
+                render_skill_config_path(file_path),
                 error
             )
         })
+    }
+}
+
+/// Inspect whether one skill-config file path is a file without hiding filesystem metadata errors.
+/// 检查单个技能配置文件路径是否为文件，同时不隐藏文件系统元数据错误。
+///
+/// The file_path parameter is the effective persisted skill-config file path.
+/// file_path 参数是生效的持久化技能配置文件路径。
+///
+/// Return true for an existing config file, false for a confirmed missing config file, or an explicit probe/type error.
+/// 已存在配置文件返回 true，确认缺失配置文件返回 false；探测或类型异常时返回显式错误。
+fn skill_config_file_is_file(file_path: &Path) -> Result<bool, String> {
+    match fs::metadata(file_path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(format!(
+            "skill config file is not a file '{}'",
+            render_skill_config_path(file_path)
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "failed to inspect skill config file '{}': {}",
+            render_skill_config_path(file_path),
+            error
+        )),
     }
 }
 
@@ -315,6 +344,14 @@ impl SkillConfigStore {
 fn skill_config_lock_registry() -> &'static Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>> {
     static REGISTRY: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Acquire the process-wide skill-config lock registry and return its guard, recovering after lock poisoning.
+/// 获取并返回进程级 skill-config 锁注册表保护对象；如果锁已 poison，则恢复继续使用。
+fn lock_skill_config_lock_registry() -> MutexGuard<'static, BTreeMap<PathBuf, Arc<Mutex<()>>>> {
+    skill_config_lock_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Resolve one stable lock key from one effective skill-config file path.
@@ -332,9 +369,10 @@ fn skill_config_lock_key(file_path: &Path) -> Result<PathBuf, String> {
                 )
             })?
     };
-    Ok(normalize_skill_config_lock_identity_path(
-        &normalize_skill_config_lock_path(&resolved_path),
-    ))
+    // Keep lexical normalization separate from platform identity normalization so each boundary can fail explicitly.
+    // 将词法规整与平台身份规整分开，确保每个边界都可以显式失败。
+    let normalized_path = normalize_skill_config_lock_path(&resolved_path);
+    normalize_skill_config_lock_identity_path(&normalized_path)
 }
 
 /// Resolve one explicit host-provided skill-config file path into one fixed absolute path.
@@ -393,43 +431,63 @@ fn normalize_skill_config_lock_path(path: &Path) -> PathBuf {
 
 /// Normalize one lexically folded lock path into one platform-stable lock identity.
 /// 将一个已完成词法规整的锁路径进一步规范为平台稳定的锁标识。
-fn normalize_skill_config_lock_identity_path(path: &Path) -> PathBuf {
+///
+/// The path parameter is the lexically normalized effective skill-config file path.
+/// path 参数是已经完成词法规整的生效技能配置文件路径。
+///
+/// Return the path identity used as the process-wide lock-registry key.
+/// 返回用作进程级锁注册表键的路径身份。
+fn normalize_skill_config_lock_identity_path(path: &Path) -> Result<PathBuf, String> {
     #[cfg(windows)]
     {
-        return normalize_windows_skill_config_lock_identity_path(path);
+        normalize_windows_skill_config_lock_identity_path(path)
     }
     #[cfg(not(windows))]
     {
-        path.to_path_buf()
+        Ok(path.to_path_buf())
     }
 }
 
 /// Normalize one Windows lock path so case aliases and verbatim prefixes collapse to one shared identity.
 /// 规范化单个 Windows 锁路径，使大小写别名与 verbatim 前缀收敛到同一共享标识。
+///
+/// The path parameter is the lexically normalized Windows skill-config file path.
+/// path 参数是已经完成词法规整的 Windows 技能配置文件路径。
+///
+/// Return the Windows-normalized lock identity or an explicit error for non-UTF-8 path text.
+/// 返回 Windows 归一化后的锁身份；如果路径文本不是有效 UTF-8，则返回显式错误。
 #[cfg(windows)]
-fn normalize_windows_skill_config_lock_identity_path(path: &Path) -> PathBuf {
-    let rendered = path.to_string_lossy();
+fn normalize_windows_skill_config_lock_identity_path(path: &Path) -> Result<PathBuf, String> {
+    let rendered = path
+        .to_str()
+        .ok_or_else(|| "skill config lock path must be valid UTF-8 on Windows".to_string())?;
     let without_verbatim = if let Some(stripped) = rendered.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{}", stripped)
     } else if let Some(stripped) = rendered.strip_prefix(r"\\?\") {
         stripped.to_string()
     } else {
-        rendered.into_owned()
+        rendered.to_string()
     };
-    PathBuf::from(without_verbatim.to_lowercase())
+    Ok(PathBuf::from(without_verbatim.to_lowercase()))
 }
 
 /// Return one process-wide shared mutex for the current effective skill-config file path.
 /// 返回当前生效技能配置文件路径对应的进程级共享互斥锁。
 fn shared_skill_config_path_lock(file_path: &Path) -> Result<Arc<Mutex<()>>, String> {
     let lock_key = skill_config_lock_key(file_path)?;
-    let mut registry = skill_config_lock_registry()
-        .lock()
-        .map_err(|_| "skill config lock registry poisoned".to_string())?;
+    let mut registry = lock_skill_config_lock_registry();
     Ok(registry
         .entry(lock_key)
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone())
+}
+
+/// Acquire one shared skill-config file IO lock and return its guard, recovering after lock poisoning.
+/// 获取并返回单个共享 skill-config 文件 IO 锁保护对象；如果锁已 poison，则恢复继续使用。
+fn lock_shared_skill_config_path(path_lock: &Mutex<()>) -> MutexGuard<'_, ()> {
+    path_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Validate one skill identifier used by the unified config store.
@@ -461,7 +519,10 @@ fn replace_file_atomically(
     {
         use std::os::windows::ffi::OsStrExt;
 
-        if !destination_path.exists() {
+        // Destination existence probe kept explicit so metadata errors are not folded into a rename attempt.
+        // 显式探测目标文件是否存在，避免将元数据错误折叠成一次重命名尝试。
+        let destination_exists = destination_path.try_exists()?;
+        if !destination_exists {
             return fs::rename(temp_path, destination_path);
         }
 
@@ -499,10 +560,15 @@ fn replace_file_atomically(
 
 #[cfg(test)]
 mod tests {
-    use super::{SkillConfigEntry, SkillConfigStore, shared_skill_config_path_lock};
+    use super::{
+        SkillConfigEntry, SkillConfigStore, shared_skill_config_path_lock,
+        skill_config_lock_registry,
+    };
+    use crate::runtime::path::render_host_visible_path;
     use std::collections::BTreeMap;
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::panic::{self, AssertUnwindSafe};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -550,6 +616,39 @@ mod tests {
         );
     }
 
+    /// Verify the default runtime-root lock recovers after poisoning.
+    /// 验证默认 runtime-root 锁 poison 后仍可恢复。
+    #[test]
+    fn skill_config_default_runtime_root_recovers_after_poisoned_lock() {
+        // Runtime root installed after poisoning to prove the setter lock path recovered.
+        // poison 后写入的 runtime root，用于证明 setter 锁路径已恢复。
+        let runtime_root = unique_temp_runtime_root("default_root_poison");
+        // Store whose default runtime-root lock is intentionally poisoned for this test.
+        // 本测试中会被故意 poison 默认 runtime-root 锁的存储实例。
+        let store = SkillConfigStore::new(None).expect("create poisoned default-root store");
+
+        // Captured panic result from a writer that poisons the default runtime-root lock.
+        // 默认 runtime-root 写入者制造 poison 后被捕获的 panic 结果。
+        let poison_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            // Guard used only to poison the default runtime-root lock.
+            // 仅用于制造默认 runtime-root 锁 poison 的保护对象。
+            let _guard = store
+                .default_runtime_root
+                .lock()
+                .expect("initial default runtime-root lock");
+            panic!("poison default runtime-root lock for recovery test");
+        }));
+
+        assert!(poison_result.is_err());
+        store
+            .set_default_runtime_root(&runtime_root)
+            .expect("set runtime root after poison");
+        assert_eq!(
+            store.file_path().expect("resolve config path after poison"),
+            runtime_root.join("config").join("skill_config.json")
+        );
+    }
+
     /// Verify config values persist inside one explicit unified file path.
     /// 验证配置值会持久化到单个显式统一文件路径中。
     #[test]
@@ -575,6 +674,120 @@ mod tests {
                 .expect("reload config value"),
             Some("sk-123".to_string())
         );
+    }
+
+    /// Verify skill-config parse errors render paths through the host-visible formatter.
+    /// 验证技能配置解析错误会通过宿主可见路径渲染器输出路径。
+    #[test]
+    fn skill_config_parse_error_uses_host_visible_path() {
+        // Runtime root that isolates the invalid config file fixture.
+        // 隔离非法配置文件夹具的运行时根目录。
+        let runtime_root = unique_temp_runtime_root("parse_error_path");
+        // Explicit config file path used by the store.
+        // 配置存储使用的显式配置文件路径。
+        let file_path = runtime_root.join("custom").join("skill_config.json");
+        // Parent directory created before writing the invalid JSON file.
+        // 写入非法 JSON 文件前创建的父目录。
+        let parent = file_path
+            .parent()
+            .expect("config file path should have a parent");
+        fs::create_dir_all(parent).expect("config parent should be created");
+        fs::write(&file_path, "{not-json").expect("invalid config file should be written");
+        // Store that reads the invalid explicit config file.
+        // 读取非法显式配置文件的配置存储。
+        let store = SkillConfigStore::new(Some(file_path.clone())).expect("create explicit store");
+        // Error returned by the real flattened-entry read path.
+        // 真实扁平化配置读取路径返回的错误。
+        let error = store
+            .list_entries(None)
+            .expect_err("invalid config JSON should fail");
+        // Expected diagnostic prefix rendered with the shared host-visible path formatter.
+        // 使用共享宿主可见路径渲染器生成的期望诊断前缀。
+        let expected_prefix = format!(
+            "failed to parse skill config file '{}':",
+            render_host_visible_path(&file_path)
+        );
+
+        assert!(
+            error.starts_with(&expected_prefix),
+            "unexpected error: {}",
+            error
+        );
+        // Cleanup result is intentionally ignored for best-effort temporary test artifacts.
+        // 对临时测试产物的清理结果按最佳努力原则有意忽略。
+        let _ = fs::remove_dir_all(&runtime_root);
+    }
+
+    /// Verify config file path probe errors fail instead of behaving like missing files.
+    /// 验证配置文件路径探测错误会失败，而不是表现得像文件缺失。
+    ///
+    /// This test has no parameters and fails through assertions when path metadata errors are hidden.
+    /// 本测试不接收参数；当路径元数据错误被隐藏时会通过断言失败。
+    ///
+    /// Return unit after validating the read path reports a file-inspection diagnostic.
+    /// 校验读取路径会报告文件探测诊断后返回 unit。
+    #[test]
+    fn skill_config_store_reports_file_path_probe_errors() {
+        // Runtime root used only to build one deterministic invalid config path.
+        // 仅用于构造确定性非法配置路径的运行时根目录。
+        let runtime_root = unique_temp_runtime_root("probe_error_path");
+        // Explicit config file path containing one embedded NUL that filesystem metadata cannot inspect.
+        // 包含一个内嵌 NUL 的显式配置文件路径，文件系统元数据无法探测该路径。
+        let file_path = runtime_root.join("custom").join("skill_config\0.json");
+        // Store that reads through the explicit invalid path.
+        // 通过显式非法路径读取的配置存储。
+        let store = SkillConfigStore::new(Some(file_path.clone())).expect("create explicit store");
+        // Error returned by the read path before the invalid path can behave like an absent file.
+        // 在非法路径表现得像缺失文件之前，读取路径返回的错误。
+        let error = store
+            .get_value("demo-skill", "api_token")
+            .expect_err("invalid config path probe should fail");
+
+        assert!(error.contains("failed to inspect skill config file"));
+        assert!(
+            error.contains("skill_config"),
+            "unexpected probe error: {}",
+            error
+        );
+        // Cleanup result is intentionally ignored for best-effort temporary test artifacts.
+        // 对临时测试产物的清理结果按最佳努力原则有意忽略。
+        let _ = fs::remove_dir_all(&runtime_root);
+    }
+
+    /// Verify config file paths that exist as directories fail before JSON reading.
+    /// 验证以目录形式存在的配置文件路径会在 JSON 读取前失败。
+    #[test]
+    fn skill_config_store_rejects_directory_config_file() {
+        // Runtime root that isolates the directory-backed config file fixture.
+        // 隔离目录型配置文件夹具的运行时根目录。
+        let runtime_root = unique_temp_runtime_root("directory_config_file");
+        // Explicit config file path that must be a regular JSON file.
+        // 必须是普通 JSON 文件的显式配置文件路径。
+        let file_path = runtime_root.join("custom").join("skill_config.json");
+        fs::create_dir_all(&file_path).expect("directory config file path should be created");
+        // Store that reads through the explicit directory-backed config path.
+        // 通过显式目录型配置路径读取的配置存储。
+        let store = SkillConfigStore::new(Some(file_path.clone())).expect("create explicit store");
+
+        // Error returned before the directory can be passed to read_to_string.
+        // 在目录被传递给 read_to_string 之前返回的错误。
+        let error = store
+            .get_value("demo-skill", "api_token")
+            .expect_err("directory config file should fail");
+
+        assert!(
+            error.contains("skill config file is not a file"),
+            "unexpected error: {}",
+            error
+        );
+        assert!(
+            error.contains(&render_host_visible_path(&file_path)),
+            "unexpected error: {}",
+            error
+        );
+        // Cleanup result is intentionally ignored for best-effort temporary test artifacts.
+        // 对临时测试产物的清理结果按最佳努力原则有意忽略。
+        let _ = fs::remove_dir_all(&runtime_root);
     }
 
     /// Verify the store returns flattened records for hosts that need one cross-skill management view.
@@ -705,6 +918,73 @@ mod tests {
         assert!(Arc::ptr_eq(&first_lock, &second_lock));
     }
 
+    /// Verify the process-wide skill-config lock registry recovers after poisoning.
+    /// 验证进程级 skill-config 锁注册表 poison 后仍可恢复。
+    #[test]
+    fn skill_config_lock_registry_recovers_after_poisoned_lock() {
+        // Config file path used to request a shared lock after registry poisoning.
+        // 注册表 poison 后用于请求共享锁的配置文件路径。
+        let file_path = unique_temp_runtime_root("lock_registry_poison")
+            .join("custom")
+            .join("skill_config.json");
+
+        // Captured panic result from a writer that poisons the global lock registry.
+        // 全局锁注册表写入者制造 poison 后被捕获的 panic 结果。
+        let poison_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            // Guard used only to poison the process-wide skill-config lock registry.
+            // 仅用于制造进程级 skill-config 锁注册表 poison 的保护对象。
+            let _guard = skill_config_lock_registry()
+                .lock()
+                .expect("initial skill config lock registry");
+            panic!("poison skill config lock registry for recovery test");
+        }));
+
+        assert!(poison_result.is_err());
+        let first_lock =
+            shared_skill_config_path_lock(&file_path).expect("resolve shared lock after poison");
+        let second_lock =
+            shared_skill_config_path_lock(&file_path).expect("resolve second shared lock");
+        assert!(Arc::ptr_eq(&first_lock, &second_lock));
+    }
+
+    /// Verify the per-file skill-config IO lock recovers after poisoning.
+    /// 验证单文件 skill-config IO 锁 poison 后仍可恢复。
+    #[test]
+    fn skill_config_shared_io_lock_recovers_after_poisoned_lock() {
+        // Config file path whose shared IO lock is intentionally poisoned for this test.
+        // 本测试中会被故意 poison 共享 IO 锁的配置文件路径。
+        let file_path = unique_temp_runtime_root("shared_io_poison")
+            .join("custom")
+            .join("skill_config.json");
+        // Store that writes to the poisoned per-file IO lock.
+        // 写入已 poison 单文件 IO 锁的配置存储。
+        let store =
+            SkillConfigStore::new(Some(file_path.clone())).expect("create shared-io poison store");
+        // Shared IO lock resolved before poisoning.
+        // poison 前解析出的共享 IO 锁。
+        let path_lock = shared_skill_config_path_lock(&file_path).expect("resolve shared io lock");
+
+        // Captured panic result from an IO actor that poisons the shared file lock.
+        // 共享文件 IO 执行者制造 poison 后被捕获的 panic 结果。
+        let poison_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            // Guard used only to poison the per-file skill-config IO lock.
+            // 仅用于制造单文件 skill-config IO 锁 poison 的保护对象。
+            let _guard = path_lock.lock().expect("initial shared io lock");
+            panic!("poison shared skill config io lock for recovery test");
+        }));
+
+        assert!(poison_result.is_err());
+        store
+            .set_value("demo-skill", "api_token", "sk-recovered")
+            .expect("write config after shared io poison");
+        assert_eq!(
+            store
+                .get_value("demo-skill", "api_token")
+                .expect("read config after shared io poison"),
+            Some("sk-recovered".to_string())
+        );
+    }
+
     /// Verify Windows path aliases that differ only by drive-letter casing or verbatim prefix reuse the same shared lock.
     /// 验证仅在盘符大小写或 verbatim 前缀上存在差异的 Windows 路径别名会复用同一把共享锁。
     #[cfg(windows)]
@@ -712,7 +992,7 @@ mod tests {
     fn skill_config_store_normalizes_windows_aliases_for_shared_lock() {
         let runtime_root = unique_temp_runtime_root("shared_lock_windows_alias");
         let canonical_path = runtime_root.join("custom").join("skill_config.json");
-        let canonical_text = canonical_path.to_string_lossy().into_owned();
+        let canonical_text = crate::runtime::path::render_host_visible_path(&canonical_path);
         let drive_letter = canonical_text
             .chars()
             .next()
@@ -726,7 +1006,7 @@ mod tests {
 
         let first_lock =
             shared_skill_config_path_lock(&canonical_path).expect("resolve canonical shared lock");
-        let second_lock = shared_skill_config_path_lock(Path::new(&verbatim_alias))
+        let second_lock = shared_skill_config_path_lock(std::path::Path::new(&verbatim_alias))
             .expect("resolve windows alias shared lock");
         assert!(Arc::ptr_eq(&first_lock, &second_lock));
     }

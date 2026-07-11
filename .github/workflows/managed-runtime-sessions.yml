@@ -1,0 +1,99 @@
+name: Managed Runtime Sessions
+
+# Validate real persistent Python and Node sessions on every supported native target.
+# 在每个受支持原生目标上验证真实 Python 与 Node 持久会话。
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: managed-runtime-sessions-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-sessions:
+    name: ${{ matrix.platform }} managed sessions
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runner: windows-latest
+          - platform: linux-x64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: macos-x64
+            runner: macos-15-intel
+          - platform: macos-arm64
+            runner: macos-15
+    env:
+      # Missing interpreters are fatal in this native acceptance matrix instead of silent skips.
+      # 在该原生验收矩阵中，缺少解释器必须失败而不是静默跳过。
+      LUASKILLS_REQUIRE_MANAGED_SESSION_RUNTIMES: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust 1.94
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          components: clippy, rustfmt
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.11.0"
+
+      - name: Verify formatting
+        shell: pwsh
+        run: cargo fmt --all -- --check
+
+      - name: Verify lints
+        shell: pwsh
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run native managed-session acceptance suite
+        shell: pwsh
+        run: cargo test --all-targets -- --test-threads=1
+
+  ffi-examples:
+    name: FFI example static checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.11.0"
+
+      - name: Compile Python FFI examples
+        shell: bash
+        run: python -m compileall -q examples/ffi/python
+
+      - name: Install TypeScript example dependencies
+        working-directory: examples/ffi/typescript
+        shell: bash
+        run: npm install
+
+      - name: Type-check TypeScript FFI examples
+        working-directory: examples/ffi/typescript
+        shell: bash
+        run: npm run typecheck

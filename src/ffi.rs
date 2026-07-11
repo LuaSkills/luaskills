@@ -2,13 +2,14 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CString, c_char};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::ffi_standard::{FfiBorrowedBuffer, FfiOwnedBuffer};
+use crate::runtime::managed_session_events::ManagedSessionEventCenter;
 use crate::runtime_help::{RuntimeHelpDetail, RuntimeSkillHelpDescriptor};
 
 use crate::{
@@ -44,17 +45,24 @@ struct FfiJsonEnvelope<T: Serialize> {
 /// One engine registry entry stored behind one stable numeric FFI handle id.
 /// 通过稳定数值 FFI 句柄标识存放的单个引擎注册表条目。
 pub(crate) struct FfiEngineSlot {
-    /// Independently locked runtime engine instance owned by the current FFI handle.
-    /// 由当前 FFI 句柄拥有并独立加锁的运行时引擎实例。
-    pub(crate) engine: Arc<Mutex<LuaEngine>>,
+    /// Independently locked optional engine whose removal forms a quiescent free barrier.
+    /// 独立加锁的可选引擎；取出它会形成静默的释放屏障。
+    pub(crate) engine: Arc<Mutex<Option<LuaEngine>>>,
+    /// Cached managed-session event center available without acquiring the engine mutex.
+    /// 无需获取引擎互斥锁即可使用的受管会话事件中心缓存。
+    managed_session_event_center: Arc<ManagedSessionEventCenter>,
 }
 
 impl FfiEngineSlot {
     /// Wrap one runtime engine into one independently locked shared FFI handle slot.
     /// 将单个运行时引擎封装为一个可独立加锁的共享 FFI 句柄槽位。
     pub(crate) fn new(engine: LuaEngine) -> Self {
+        // Event-center handle cached before the engine moves behind its mutex.
+        // 在引擎移入互斥锁前缓存的事件中心句柄。
+        let managed_session_event_center = engine.managed_session_event_center();
         Self {
-            engine: Arc::new(Mutex::new(engine)),
+            engine: Arc::new(Mutex::new(Some(engine))),
+            managed_session_event_center,
         }
     }
 }
@@ -165,16 +173,32 @@ pub(crate) fn ffi_engine_registry() -> &'static Mutex<HashMap<u64, FfiEngineSlot
     FFI_ENGINE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Acquire the global FFI engine registry and return its guard, recovering after registry lock poisoning.
+/// 获取并返回全局 FFI 引擎注册表保护对象；如果注册表锁已 poison，则恢复继续使用。
+pub(crate) fn lock_ffi_engine_registry() -> MutexGuard<'static, HashMap<u64, FfiEngineSlot>> {
+    ffi_engine_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Clone one shared engine handle out of the global registry without holding the registry lock during execution.
 /// 从全局注册表中克隆一个共享引擎句柄，并确保执行期间不再持有注册表锁。
-fn clone_engine_handle(engine_id: u64) -> Result<Arc<Mutex<LuaEngine>>, String> {
-    let registry = ffi_engine_registry()
-        .lock()
-        .map_err(|_| "FFI engine registry lock poisoned".to_string())?;
+fn clone_engine_handle(engine_id: u64) -> Result<Arc<Mutex<Option<LuaEngine>>>, String> {
+    let registry = lock_ffi_engine_registry();
     registry
         .get(&engine_id)
         .map(|slot| Arc::clone(&slot.engine))
         .ok_or_else(|| format!("FFI engine {} not found", engine_id))
+}
+
+/// Acquire one registered FFI engine handle and return its guard, recovering after engine lock poisoning.
+/// 获取并返回单个已注册 FFI 引擎句柄的保护对象；如果引擎锁已 poison，则恢复继续使用。
+fn lock_engine_handle(
+    engine_handle: &Arc<Mutex<Option<LuaEngine>>>,
+) -> MutexGuard<'_, Option<LuaEngine>> {
+    engine_handle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Convert one owned byte slice into one LuaSkills-owned FFI buffer container.
@@ -196,13 +220,27 @@ fn owned_buffer_from_bytes(bytes: &[u8]) -> FfiOwnedBuffer {
 /// Convert one Rust value into one LuaSkills-owned UTF-8 JSON response buffer.
 /// 将单个 Rust 值转换为一个由 LuaSkills 管理的 UTF-8 JSON 响应缓冲。
 fn encode_json_buffer<T: Serialize>(value: &T) -> FfiOwnedBuffer {
-    let json_text = serde_json::to_string(value).unwrap_or_else(|error| {
-        format!(
-            "{{\"ok\":false,\"error\":\"Failed to serialize FFI response: {}\"}}",
-            error
-        )
-    });
+    let json_text = match serde_json::to_string(value) {
+        Ok(json_text) => json_text,
+        Err(error) => encode_json_serialization_error_text(error),
+    };
     owned_buffer_from_bytes(json_text.as_bytes())
+}
+
+/// Build escaped fallback JSON text for a response serialization failure.
+/// 为响应序列化失败构造已转义的兜底 JSON 文本。
+///
+/// The error parameter is the serializer error raised while encoding the original response.
+/// error 参数是编码原始响应时产生的序列化错误。
+///
+/// Return a valid JSON error envelope string that can be sent over the FFI boundary.
+/// 返回可通过 FFI 边界发送的合法 JSON 错误包络字符串。
+fn encode_json_serialization_error_text(error: serde_json::Error) -> String {
+    json!({
+        "ok": false,
+        "error": format!("Failed to serialize FFI response: {error}")
+    })
+    .to_string()
 }
 
 /// Build one successful FFI JSON envelope.
@@ -258,10 +296,68 @@ where
 {
     let engine_handle = clone_engine_handle(engine_id)?;
     let _active_guard = ActiveFfiEngineGuard::enter(engine_id)?;
-    let engine = engine_handle
-        .lock()
-        .map_err(|_| format!("FFI engine {} lock poisoned", engine_id))?;
-    operation(&engine)
+    let engine = lock_engine_handle(&engine_handle);
+    let engine = engine
+        .as_ref()
+        .ok_or_else(|| format!("FFI engine {} is closing", engine_id))?;
+    operation(engine)
+}
+
+/// Clone one engine-owned managed-session event center without retaining registry or engine locks.
+/// 克隆单个引擎拥有的受管会话事件中心，且不保留注册表锁或引擎锁。
+///
+/// `engine_id` identifies the registered engine whose event center is requested.
+/// `engine_id` 标识需要获取事件中心的已注册引擎。
+///
+/// Return a shared event center after every FFI registry and engine guard has been released.
+/// 在全部 FFI 注册表与引擎保护对象释放后返回共享事件中心。
+pub(crate) fn clone_managed_session_event_center(
+    engine_id: u64,
+) -> Result<Arc<ManagedSessionEventCenter>, String> {
+    let registry = lock_ffi_engine_registry();
+    // Cached center cloned without touching the engine mutex.
+    // 无需接触引擎互斥锁即可克隆的缓存事件中心。
+    let event_center = registry
+        .get(&engine_id)
+        .map(|slot| Arc::clone(&slot.managed_session_event_center))
+        .ok_or_else(|| format!("FFI engine {} not found", engine_id))?;
+    drop(registry);
+    Ok(event_center)
+}
+
+/// Remove one engine slot under the registry lock and return it for lock-free destruction.
+/// 在注册表锁内移除单个引擎槽，并返回该槽以便在锁外析构。
+///
+/// `engine_id` identifies the slot that must become unreachable to subsequent FFI lookups.
+/// `engine_id` 标识后续 FFI 查找必须无法再访问的目标槽。
+///
+/// Return the removed slot after releasing the registry guard, or `None` when absent.
+/// 释放注册表保护对象后返回已移除槽；不存在时返回 `None`。
+pub(crate) fn remove_ffi_engine_slot(engine_id: u64) -> Option<FfiEngineSlot> {
+    let mut registry = lock_ffi_engine_registry();
+    // Detached slot retained across the explicit registry guard release.
+    // 在显式释放注册表保护对象后仍保留的分离式槽。
+    let removed_slot = registry.remove(&engine_id);
+    drop(registry);
+    removed_slot
+}
+
+/// Quiesce a removed FFI slot, take its engine exactly once, and destroy it outside all locks.
+/// 使已移除的 FFI 槽静默，恰好一次取出其引擎，并在全部锁之外销毁。
+///
+/// `slot` must already be unreachable from the global registry, which prevents new operations.
+/// `slot` 必须已无法从全局注册表访问，从而阻止新操作进入。
+pub(crate) fn destroy_removed_ffi_engine_slot(slot: FfiEngineSlot) {
+    // Taking under the per-engine mutex waits for earlier operations and rejects pre-cloned waiters.
+    // 在每引擎互斥锁内取出会等待早先操作，并拒绝已经预克隆但仍在等待的调用方。
+    let engine = {
+        let mut engine = lock_engine_handle(&slot.engine);
+        engine.take()
+    };
+    // Engine destruction may wait for processes and callbacks, so no registry or engine lock is held.
+    // 引擎析构可能等待进程与回调，因此此处不持有注册表锁或引擎锁。
+    drop(engine);
+    drop(slot);
 }
 
 /// Execute one mutable engine operation by engine id.
@@ -272,10 +368,11 @@ where
 {
     let engine_handle = clone_engine_handle(engine_id)?;
     let _active_guard = ActiveFfiEngineGuard::enter(engine_id)?;
-    let mut engine = engine_handle
-        .lock()
-        .map_err(|_| format!("FFI engine {} lock poisoned", engine_id))?;
-    operation(&mut engine)
+    let mut engine = lock_engine_handle(&engine_handle);
+    let engine = engine
+        .as_mut()
+        .ok_or_else(|| format!("FFI engine {} is closing", engine_id))?;
+    operation(engine)
 }
 
 /// Return one stable list of all exported FFI entrypoints.
@@ -319,6 +416,9 @@ pub(crate) fn exported_ffi_function_names() -> Vec<String> {
         "luaskills_ffi_set_skill_operation_progress_json_callback",
         "luaskills_ffi_set_model_embed_json_callback",
         "luaskills_ffi_set_model_llm_json_callback",
+        "luaskills_ffi_managed_session_events_poll",
+        "luaskills_ffi_managed_session_events_wait",
+        "luaskills_ffi_set_managed_session_wake_callback",
         "luaskills_ffi_string_clone",
         "luaskills_ffi_version_json",
         "luaskills_ffi_describe_json",
@@ -348,6 +448,8 @@ pub(crate) fn exported_ffi_function_names() -> Vec<String> {
         "luaskills_ffi_system_runtime_lease_status_json",
         "luaskills_ffi_system_runtime_lease_list_json",
         "luaskills_ffi_system_runtime_lease_close_json",
+        "luaskills_ffi_managed_session_events_poll_json",
+        "luaskills_ffi_managed_session_events_wait_json",
         "luaskills_ffi_disable_skill_json",
         "luaskills_ffi_system_disable_skill_json",
         "luaskills_ffi_enable_skill_json",
@@ -380,6 +482,12 @@ pub(crate) fn exported_ffi_function_names() -> Vec<String> {
 
 /// Free one heap-allocated JSON string returned by the FFI layer.
 /// 释放一段由 FFI 层返回并在堆上分配的 JSON 字符串。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_string_free(value: *mut c_char) {
     if !value.is_null() {
@@ -409,6 +517,12 @@ pub extern "C" fn luaskills_ffi_describe_json() -> FfiOwnedBuffer {
 
 /// Create one new LuaSkills engine instance and return its stable FFI handle id.
 /// 创建一个新的 LuaSkills 引擎实例，并返回其稳定的 FFI 句柄标识。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_engine_new_json(
     input_json: FfiBorrowedBuffer,
@@ -423,10 +537,7 @@ pub unsafe extern "C" fn luaskills_ffi_engine_new_json(
     match LuaEngine::new(request.options) {
         Ok(engine) => {
             let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let mut registry = match ffi_engine_registry().lock() {
-                Ok(registry) => registry,
-                Err(_) => return ffi_error("FFI engine registry lock poisoned"),
-            };
+            let mut registry = lock_ffi_engine_registry();
             registry.insert(engine_id, FfiEngineSlot::new(engine));
             ffi_ok(EngineHandleJsonResult { engine_id })
         }
@@ -436,6 +547,12 @@ pub unsafe extern "C" fn luaskills_ffi_engine_new_json(
 
 /// Free one existing LuaSkills engine handle.
 /// 释放一个现有的 LuaSkills 引擎句柄。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_engine_free_json(
     input_json: FfiBorrowedBuffer,
@@ -447,18 +564,24 @@ pub unsafe extern "C" fn luaskills_ffi_engine_free_json(
         Ok(request) => request,
         Err(error) => return ffi_error(error),
     };
-    let mut registry = match ffi_engine_registry().lock() {
-        Ok(registry) => registry,
-        Err(_) => return ffi_error("FFI engine registry lock poisoned"),
+    // Removed slot whose potentially blocking engine teardown runs after the registry lock drops.
+    // 已移除的槽；其潜在阻塞引擎清理会在注册表锁释放后运行。
+    let removed_slot = match remove_ffi_engine_slot(request.engine_id) {
+        Some(removed_slot) => removed_slot,
+        None => return ffi_error(format!("FFI engine {} not found", request.engine_id)),
     };
-    if registry.remove(&request.engine_id).is_none() {
-        return ffi_error(format!("FFI engine {} not found", request.engine_id));
-    }
+    destroy_removed_ffi_engine_slot(removed_slot);
     ffi_ok(json!({ "freed": true }))
 }
 
 /// Load skills from one ordered root chain through the JSON FFI surface.
 /// 通过 JSON FFI 入口按有序根链加载技能。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_load_from_roots_json(
     input_json: FfiBorrowedBuffer,
@@ -482,6 +605,12 @@ pub unsafe extern "C" fn luaskills_ffi_load_from_roots_json(
 
 /// Reload skills from one ordered root chain through the JSON FFI surface.
 /// 通过 JSON FFI 入口按有序根链重载技能。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_reload_from_roots_json(
     input_json: FfiBorrowedBuffer,
@@ -505,6 +634,12 @@ pub unsafe extern "C" fn luaskills_ffi_reload_from_roots_json(
 
 /// List runtime entry descriptors visible to one host-injected authority through the JSON FFI surface.
 /// 通过 JSON FFI 入口列出单个宿主注入权限可见的运行时入口描述。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_list_entries_json(
     input_json: FfiBorrowedBuffer,
@@ -522,7 +657,7 @@ pub unsafe extern "C" fn luaskills_ffi_list_entries_json(
             Err(error) => return ffi_error(error),
         };
     match with_engine(request.engine_id, |engine| {
-        Ok(engine.list_entries_for_authority(authority))
+        engine.list_entries_for_authority(authority)
     }) {
         Ok(result) => ffi_ok::<Vec<RuntimeEntryDescriptor>>(result),
         Err(error) => ffi_error(error),
@@ -531,6 +666,12 @@ pub unsafe extern "C" fn luaskills_ffi_list_entries_json(
 
 /// List structured help trees visible to one host-injected authority through the JSON FFI surface.
 /// 通过 JSON FFI 入口列出单个宿主注入权限可见的结构化帮助树。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_list_skill_help_json(
     input_json: FfiBorrowedBuffer,
@@ -548,7 +689,7 @@ pub unsafe extern "C" fn luaskills_ffi_list_skill_help_json(
             Err(error) => return ffi_error(error),
         };
     match with_engine(request.engine_id, |engine| {
-        Ok(engine.list_skill_help_for_authority(authority))
+        engine.list_skill_help_for_authority(authority)
     }) {
         Ok(result) => ffi_ok::<Vec<RuntimeSkillHelpDescriptor>>(result),
         Err(error) => ffi_error(error),
@@ -557,6 +698,12 @@ pub unsafe extern "C" fn luaskills_ffi_list_skill_help_json(
 
 /// Render one structured help detail payload visible to one host-injected authority through the JSON FFI surface.
 /// 通过 JSON FFI 入口渲染单个宿主注入权限可见的结构化帮助详情载荷。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_render_skill_help_detail_json(
     input_json: FfiBorrowedBuffer,
@@ -590,6 +737,12 @@ pub unsafe extern "C" fn luaskills_ffi_render_skill_help_detail_json(
 
 /// Resolve prompt argument completion candidates through the JSON FFI surface.
 /// 通过 JSON FFI 入口解析提示词参数补全候选项。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_prompt_argument_completions_json(
     input_json: FfiBorrowedBuffer,
@@ -622,6 +775,12 @@ pub unsafe extern "C" fn luaskills_ffi_prompt_argument_completions_json(
 
 /// Check whether one canonical tool name belongs to one visible Lua skill entry.
 /// 检查某个 canonical 工具名是否属于一个可见 Lua 技能入口。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_is_skill_json(
     input_json: FfiBorrowedBuffer,
@@ -638,7 +797,7 @@ pub unsafe extern "C" fn luaskills_ffi_is_skill_json(
         Err(error) => return ffi_error(error),
     };
     match with_engine(request.engine_id, |engine| {
-        Ok(engine.is_skill_for_authority(authority, &request.tool_name))
+        engine.is_skill_for_authority(authority, &request.tool_name)
     }) {
         Ok(value) => ffi_ok(BoolJsonResult { value }),
         Err(error) => ffi_error(error),
@@ -647,6 +806,12 @@ pub unsafe extern "C" fn luaskills_ffi_is_skill_json(
 
 /// Resolve the visible owning skill id of one canonical tool name through the JSON FFI surface.
 /// 通过 JSON FFI 入口解析某个 canonical 工具名可见的所属技能标识符。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_skill_name_for_tool_json(
     input_json: FfiBorrowedBuffer,
@@ -664,7 +829,7 @@ pub unsafe extern "C" fn luaskills_ffi_skill_name_for_tool_json(
             Err(error) => return ffi_error(error),
         };
     match with_engine(request.engine_id, |engine| {
-        Ok(engine.skill_name_for_tool_for_authority(authority, &request.tool_name))
+        engine.skill_name_for_tool_for_authority(authority, &request.tool_name)
     }) {
         Ok(skill_id) => ffi_ok(OptionalSkillNameJsonResult { skill_id }),
         Err(error) => ffi_error(error),
@@ -675,6 +840,12 @@ pub unsafe extern "C" fn luaskills_ffi_skill_name_for_tool_json(
 /// 通过 JSON FFI 入口列出扁平化技能配置记录。
 /// Skill config is addressed by skill id and is intentionally outside root visibility filtering.
 /// skill 配置按 skill id 寻址，并有意不进入 root 可见性过滤。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_skill_config_list_json(
     input_json: FfiBorrowedBuffer,
@@ -698,6 +869,12 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_list_json(
 /// 通过 JSON FFI 入口读取单个可选技能配置值。
 /// Skill config only affects behavior when Lua skill code reads it explicitly.
 /// skill 配置只有在 Lua skill 代码显式读取时才影响行为。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_skill_config_get_json(
     input_json: FfiBorrowedBuffer,
@@ -726,6 +903,12 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_get_json(
 /// 通过 JSON FFI 入口插入或替换单个技能配置值。
 /// Hosts that do not want user-level config mutation should not expose this endpoint.
 /// 不希望用户级修改配置的宿主不应暴露该入口。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_skill_config_set_json(
     input_json: FfiBorrowedBuffer,
@@ -755,6 +938,12 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_set_json(
 /// 通过 JSON FFI 入口删除单个技能配置键。
 /// Hosts that do not want user-level config mutation should not expose this endpoint.
 /// 不希望用户级修改配置的宿主不应暴露该入口。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_skill_config_delete_json(
     input_json: FfiBorrowedBuffer,
@@ -784,6 +973,12 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_delete_json(
 /// 通过 JSON FFI 入口调用单个已加载技能入口。
 /// Calls target the active runtime execution surface and do not apply root visibility filtering.
 /// 调用面向当前已激活运行时执行面，不应用 root 可见性过滤。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_call_skill_json(
     input_json: FfiBorrowedBuffer,
@@ -811,6 +1006,12 @@ pub unsafe extern "C" fn luaskills_ffi_call_skill_json(
 /// 通过 JSON FFI 入口执行任意 Lua 代码。
 /// Hosts should wrap or hide this endpoint when arbitrary Lua execution is not intended.
 /// 不希望开放任意 Lua 执行的宿主应封装或隐藏该入口。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_run_lua_json(
     input_json: FfiBorrowedBuffer,
@@ -834,6 +1035,12 @@ pub unsafe extern "C" fn luaskills_ffi_run_lua_json(
 
 /// Create one persistent public runtime lease through the JSON FFI surface.
 /// 通过 JSON FFI 入口创建单个公开持久运行时租约。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_runtime_lease_create_json(
     input_json: FfiBorrowedBuffer,
@@ -866,6 +1073,12 @@ pub unsafe extern "C" fn luaskills_ffi_runtime_lease_create_json(
 
 /// Evaluate code inside one persistent public runtime lease through the JSON FFI surface.
 /// 通过 JSON FFI 入口在单个公开持久运行时租约中执行代码。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_runtime_lease_eval_json(
     input_json: FfiBorrowedBuffer,
@@ -913,6 +1126,12 @@ pub unsafe extern "C" fn luaskills_ffi_runtime_lease_eval_json(
 
 /// Return one persistent public runtime lease status through the JSON FFI surface.
 /// 通过 JSON FFI 入口返回单个公开持久运行时租约状态。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_runtime_lease_status_json(
     input_json: FfiBorrowedBuffer,
@@ -940,6 +1159,12 @@ pub unsafe extern "C" fn luaskills_ffi_runtime_lease_status_json(
 
 /// List active persistent public runtime leases through the JSON FFI surface.
 /// 通过 JSON FFI 入口列出活跃公开持久运行时租约。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_runtime_lease_list_json(
     input_json: FfiBorrowedBuffer,
@@ -963,6 +1188,12 @@ pub unsafe extern "C" fn luaskills_ffi_runtime_lease_list_json(
 
 /// Close one persistent public runtime lease through the JSON FFI surface.
 /// 通过 JSON FFI 入口关闭单个公开持久运行时租约。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_runtime_lease_close_json(
     input_json: FfiBorrowedBuffer,
@@ -990,17 +1221,27 @@ pub unsafe extern "C" fn luaskills_ffi_runtime_lease_close_json(
 
 /// Create one persistent `system_lua_lib` runtime lease through the system JSON FFI surface.
 /// 通过 system JSON FFI 入口创建单个持久 `system_lua_lib` 运行时租约。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_create_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<RuntimeSessionCreateJsonRequest>(
+    // Strict System create request with one required trusted package descriptor.
+    // 带必需可信包描述符的严格 System 创建请求。
+    let request = match decode_json_request::<SystemRuntimeSessionCreateJsonRequest>(
         input_json,
         "luaskills_ffi_system_runtime_lease_create_json",
     ) {
         Ok(request) => request,
         Err(error) => return ffi_error(error),
     };
+    // Explicit high-level JSON authority gate.
+    // 显式高层 JSON 权限门禁。
     let _authority = match require_json_authority(
         request.authority,
         "luaskills_ffi_system_runtime_lease_create_json",
@@ -1009,16 +1250,23 @@ pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_create_json(
         Err(error) => return ffi_error(error),
     };
     match with_engine(request.engine_id, |engine| {
+        // Engine request deliberately excludes public lua_roots and c_roots.
+        // 引擎请求有意排除公开接口的 lua_roots 与 c_roots。
         let payload = json!({
             "sid": request.sid,
             "ttl_sec": request.ttl_sec,
             "replace": request.replace,
             "cwd": request.cwd,
             "workspace_root": request.workspace_root,
-            "lua_roots": request.lua_roots,
-            "c_roots": request.c_roots,
-            "mounts": request.mounts
+            "mounts": request.mounts,
+            "system_package": {
+                "id": request.system_package.id,
+                "root": request.system_package.root,
+                "dependencies_file": request.system_package.dependencies_file,
+            }
         });
+        // Stable engine response parsed into the high-level JSON envelope.
+        // 解析到高层 JSON 包络中的稳定引擎响应。
         let response = engine.create_system_runtime_lease_json(&payload.to_string())?;
         parse_runtime_session_engine_payload(
             response,
@@ -1032,6 +1280,12 @@ pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_create_json(
 
 /// Evaluate code inside one persistent `system_lua_lib` runtime lease through the system JSON FFI surface.
 /// 通过 system JSON FFI 入口在单个持久 `system_lua_lib` 运行时租约中执行代码。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_eval_json(
     input_json: FfiBorrowedBuffer,
@@ -1089,6 +1343,12 @@ pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_eval_json(
 
 /// Return one persistent `system_lua_lib` runtime lease status through the system JSON FFI surface.
 /// 通过 system JSON FFI 入口返回单个持久 `system_lua_lib` 运行时租约状态。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_status_json(
     input_json: FfiBorrowedBuffer,
@@ -1126,6 +1386,12 @@ pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_status_json(
 
 /// List active persistent `system_lua_lib` runtime leases through the system JSON FFI surface.
 /// 通过 system JSON FFI 入口列出活跃持久 `system_lua_lib` 运行时租约。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_list_json(
     input_json: FfiBorrowedBuffer,
@@ -1159,6 +1425,12 @@ pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_list_json(
 
 /// Close one persistent `system_lua_lib` runtime lease through the system JSON FFI surface.
 /// 通过 system JSON FFI 入口关闭单个持久 `system_lua_lib` 运行时租约。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_close_json(
     input_json: FfiBorrowedBuffer,
@@ -1194,8 +1466,112 @@ pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_close_json(
     }
 }
 
+/// Poll one bounded batch of engine-level managed-session events through the JSON FFI surface.
+/// 通过 JSON FFI 入口轮询一批有界的引擎级受管会话事件。
+///
+/// `input_json` contains `engine_id`, positive `max_events`, and host-injected `authority`.
+/// `input_json` 包含 `engine_id`、正数 `max_events` 与宿主注入的 `authority`。
+///
+/// Return one owned JSON envelope whose result contains `events`, `remaining`, and `timed_out`.
+/// 返回一个拥有型 JSON 包络，其结果包含 `events`、`remaining` 与 `timed_out`。
+///
+/// # Safety
+/// # 安全性
+/// The caller must keep the borrowed request buffer readable for the duration of this call.
+/// 调用方必须在本次调用期间保持借用请求缓冲可读。
+/// The returned LuaSkills-owned buffer must be released with `luaskills_ffi_buffer_free`.
+/// 返回的 LuaSkills 所有缓冲必须使用 `luaskills_ffi_buffer_free` 释放。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_managed_session_events_poll_json(
+    input_json: FfiBorrowedBuffer,
+) -> FfiOwnedBuffer {
+    // Strict request decoded before the engine event center is acquired.
+    // 在获取引擎事件中心前解码的严格请求。
+    let request = match decode_json_request::<ManagedSessionEventsPollJsonRequest>(
+        input_json,
+        "luaskills_ffi_managed_session_events_poll_json",
+    ) {
+        Ok(request) => request,
+        Err(error) => return ffi_error(error),
+    };
+    // Explicit authority gate for host-level process event visibility.
+    // 面向宿主级进程事件可见性的显式权限门禁。
+    let _authority = match require_json_authority(
+        request.authority,
+        "luaskills_ffi_managed_session_events_poll_json",
+    ) {
+        Ok(authority) => authority,
+        Err(error) => return ffi_error(error),
+    };
+    // Detached center cloned while only the registry lock is held briefly; the engine lock is untouched.
+    // 仅在短暂持有注册表锁期间克隆分离式事件中心，不触碰引擎锁。
+    let event_center = match clone_managed_session_event_center(request.engine_id) {
+        Ok(event_center) => event_center,
+        Err(error) => return ffi_error(error),
+    };
+    match event_center.poll(request.max_events) {
+        Ok(batch) => ffi_ok(batch),
+        Err(error) => ffi_error(error),
+    }
+}
+
+/// Wait for one bounded batch of engine-level managed-session events through the JSON FFI surface.
+/// 通过 JSON FFI 入口等待一批有界的引擎级受管会话事件。
+///
+/// `input_json` contains `engine_id`, positive `max_events`, finite `timeout_ms`, and authority.
+/// `input_json` 包含 `engine_id`、正数 `max_events`、有限 `timeout_ms` 与权限等级。
+///
+/// Return one owned JSON envelope whose result contains `events`, `remaining`, and `timed_out`.
+/// 返回一个拥有型 JSON 包络，其结果包含 `events`、`remaining` 与 `timed_out`。
+///
+/// # Safety
+/// # 安全性
+/// The caller must keep the borrowed request buffer readable for the duration of this call.
+/// 调用方必须在本次调用期间保持借用请求缓冲可读。
+/// The returned LuaSkills-owned buffer must be released with `luaskills_ffi_buffer_free`.
+/// 返回的 LuaSkills 所有缓冲必须使用 `luaskills_ffi_buffer_free` 释放。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_managed_session_events_wait_json(
+    input_json: FfiBorrowedBuffer,
+) -> FfiOwnedBuffer {
+    // Strict request decoded before any potentially blocking work begins.
+    // 在任何潜在阻塞工作开始前解码的严格请求。
+    let request = match decode_json_request::<ManagedSessionEventsWaitJsonRequest>(
+        input_json,
+        "luaskills_ffi_managed_session_events_wait_json",
+    ) {
+        Ok(request) => request,
+        Err(error) => return ffi_error(error),
+    };
+    // Explicit authority gate for host-level process event visibility.
+    // 面向宿主级进程事件可见性的显式权限门禁。
+    let _authority = match require_json_authority(
+        request.authority,
+        "luaskills_ffi_managed_session_events_wait_json",
+    ) {
+        Ok(authority) => authority,
+        Err(error) => return ffi_error(error),
+    };
+    // Detached center cloned before blocking so no registry or engine lock survives into wait.
+    // 在阻塞前克隆分离式事件中心，确保注册表锁与引擎锁都不会进入等待阶段。
+    let event_center = match clone_managed_session_event_center(request.engine_id) {
+        Ok(event_center) => event_center,
+        Err(error) => return ffi_error(error),
+    };
+    match event_center.wait(request.max_events, request.timeout_ms) {
+        Ok(batch) => ffi_ok(batch),
+        Err(error) => ffi_error(error),
+    }
+}
+
 /// Disable one skill through the ordinary skills plane via the JSON FFI surface.
 /// 通过 JSON FFI 入口在普通 skills 平面停用单个技能。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_disable_skill_json(
     input_json: FfiBorrowedBuffer,
@@ -1223,6 +1599,12 @@ pub unsafe extern "C" fn luaskills_ffi_disable_skill_json(
 
 /// Disable one skill through the system plane via the JSON FFI surface.
 /// 通过 JSON FFI 入口在 system 平面停用单个技能。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_system_disable_skill_json(
     input_json: FfiBorrowedBuffer,
@@ -1258,6 +1640,12 @@ pub unsafe extern "C" fn luaskills_ffi_system_disable_skill_json(
 
 /// Enable one skill through the ordinary skills plane via the JSON FFI surface.
 /// 通过 JSON FFI 入口在普通 skills 平面启用单个技能。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_enable_skill_json(
     input_json: FfiBorrowedBuffer,
@@ -1281,6 +1669,12 @@ pub unsafe extern "C" fn luaskills_ffi_enable_skill_json(
 
 /// Enable one skill through the system plane via the JSON FFI surface.
 /// 通过 JSON FFI 入口在 system 平面启用单个技能。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_system_enable_skill_json(
     input_json: FfiBorrowedBuffer,
@@ -1309,6 +1703,12 @@ pub unsafe extern "C" fn luaskills_ffi_system_enable_skill_json(
 
 /// Uninstall one skill through the ordinary skills plane via the JSON FFI surface.
 /// 通过 JSON FFI 入口在普通 skills 平面卸载单个技能。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_uninstall_skill_json(
     input_json: FfiBorrowedBuffer,
@@ -1343,6 +1743,12 @@ pub unsafe extern "C" fn luaskills_ffi_uninstall_skill_json(
 
 /// Uninstall one skill through the system plane via the JSON FFI surface.
 /// 通过 JSON FFI 入口在 system 平面卸载单个技能。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_system_uninstall_skill_json(
     input_json: FfiBorrowedBuffer,
@@ -1390,6 +1796,12 @@ pub unsafe extern "C" fn luaskills_ffi_system_uninstall_skill_json(
 
 /// Install one managed skill through the ordinary skills plane via the JSON FFI surface.
 /// 通过 JSON FFI 入口在普通 skills 平面安装单个受管技能。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_install_skill_json(
     input_json: FfiBorrowedBuffer,
@@ -1419,6 +1831,12 @@ pub unsafe extern "C" fn luaskills_ffi_install_skill_json(
 
 /// Install one managed skill through the system plane via the JSON FFI surface.
 /// 通过 JSON FFI 入口在 system 平面安装单个受管技能。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_system_install_skill_json(
     input_json: FfiBorrowedBuffer,
@@ -1460,6 +1878,12 @@ pub unsafe extern "C" fn luaskills_ffi_system_install_skill_json(
 
 /// Install one private URL-manifest skill through a host-private system JSON FFI surface.
 /// 通过宿主私有 system JSON FFI 入口安装单个私有 URL manifest 技能。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_system_private_install_skill_from_url_manifest_json(
     input_json: FfiBorrowedBuffer,
@@ -1506,6 +1930,12 @@ pub unsafe extern "C" fn luaskills_ffi_system_private_install_skill_from_url_man
 
 /// Update one managed skill through the ordinary skills plane via the JSON FFI surface.
 /// 通过 JSON FFI 入口在普通 skills 平面更新单个受管技能。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_update_skill_json(
     input_json: FfiBorrowedBuffer,
@@ -1535,6 +1965,12 @@ pub unsafe extern "C" fn luaskills_ffi_update_skill_json(
 
 /// Update one managed skill through the system plane via the JSON FFI surface.
 /// 通过 JSON FFI 入口在 system 平面更新单个受管技能。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_system_update_skill_json(
     input_json: FfiBorrowedBuffer,
@@ -1574,6 +2010,12 @@ pub unsafe extern "C" fn luaskills_ffi_system_update_skill_json(
 
 /// Update one private URL-manifest skill through a host-private system JSON FFI surface.
 /// 通过宿主私有 system JSON FFI 入口更新单个私有 URL manifest 技能。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_system_private_update_skill_from_url_manifest_json(
     input_json: FfiBorrowedBuffer,

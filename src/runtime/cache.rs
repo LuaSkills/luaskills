@@ -3,8 +3,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Default maximum number of cached entries for the process-wide shared tool cache.
@@ -90,10 +90,38 @@ impl SharedToolCache {
 
     /// Store one cache record; missing TTL falls back to the default and values above the ceiling are clamped.
     /// 写入一条缓存记录；TTL 为空时使用默认值，超出上限时会自动钳制。
-    pub fn create(&self, tool_name: &str, value: Value, ttl_secs: Option<u64>) -> String {
+    ///
+    /// The tool_name parameter is the namespace that owns the cached payload.
+    /// tool_name 参数是拥有该缓存载荷的命名空间。
+    ///
+    /// The value parameter is the JSON payload stored for later retrieval.
+    /// value 参数是保存后供后续读取的 JSON 载荷。
+    ///
+    /// The ttl_secs parameter optionally overrides the configured default TTL.
+    /// ttl_secs 参数可选地覆盖配置中的默认 TTL。
+    ///
+    /// Returns the generated cache id when the cache record is stored.
+    /// 成功写入缓存记录时返回生成的缓存编号。
+    ///
+    /// Returns an error when the cache id timestamp cannot be represented.
+    /// 当缓存编号时间戳无法表示时返回错误。
+    pub fn create(
+        &self,
+        tool_name: &str,
+        value: Value,
+        ttl_secs: Option<u64>,
+    ) -> Result<String, String> {
+        // Current monotonic instant used for expiration and cleanup decisions.
+        // 用于过期与清理判断的当前单调时刻。
         let now = Instant::now();
+        // Effective TTL after defaulting, clamping, and minimum enforcement.
+        // 经过默认值、上限裁剪和最小值约束后的最终 TTL。
         let ttl = self.resolve_ttl(ttl_secs);
-        let cache_id = self.next_cache_id();
+        // Public cache id generated before insertion so failures stop the write.
+        // 插入前生成的公开缓存编号，失败时会阻止写入。
+        let cache_id = self.next_cache_id()?;
+        // Complete cache entry stored under the generated id.
+        // 存放在生成编号下的完整缓存条目。
         let entry = ToolCacheEntry {
             tool_name: tool_name.to_string(),
             value,
@@ -101,11 +129,13 @@ impl SharedToolCache {
             expires_at: now + ttl,
         };
 
-        let mut store = self.store.write().expect("tool cache poisoned");
+        // Writable cache store guard used for cleanup, insertion, and capacity enforcement.
+        // 用于清理、插入和容量约束的可写缓存存储保护对象。
+        let mut store = self.write_store();
         self.cleanup_expired_locked(&mut store, now);
         store.entries.insert(cache_id.clone(), entry);
         self.enforce_capacity_locked(&mut store);
-        cache_id
+        Ok(cache_id)
     }
 
     /// Read a cached entry by tool name and cache id; expired hits are removed and returned as empty.
@@ -114,7 +144,7 @@ impl SharedToolCache {
         let now = Instant::now();
 
         {
-            let store = self.store.read().expect("tool cache poisoned");
+            let store = self.read_store();
             if let Some(entry) = store.entries.get(cache_id)
                 && entry.tool_name == tool_name
                 && entry.expires_at > now
@@ -123,7 +153,7 @@ impl SharedToolCache {
             }
         }
 
-        let mut store = self.store.write().expect("tool cache poisoned");
+        let mut store = self.write_store();
         self.cleanup_expired_locked(&mut store, now);
         match store.entries.get(cache_id) {
             Some(entry) if entry.tool_name == tool_name && entry.expires_at > now => {
@@ -136,7 +166,7 @@ impl SharedToolCache {
     /// Delete one cache entry under the given tool namespace and return whether an entry was actually removed.
     /// 删除指定工具名下的缓存条目；返回是否确实删除了条目。
     pub fn delete(&self, tool_name: &str, cache_id: &str) -> bool {
-        let mut store = self.store.write().expect("tool cache poisoned");
+        let mut store = self.write_store();
         self.cleanup_expired_locked(&mut store, Instant::now());
         if let Some(entry) = store.entries.get(cache_id)
             && entry.tool_name == tool_name
@@ -145,6 +175,22 @@ impl SharedToolCache {
             return true;
         }
         false
+    }
+
+    /// Acquire a read guard and return the current cache store, recovering it after another cache operation panics while holding the lock.
+    /// 获取并返回当前缓存存储读保护；如果其它缓存操作持锁 panic，则恢复缓存存储继续使用。
+    fn read_store(&self) -> RwLockReadGuard<'_, ToolCacheStore> {
+        self.store
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Acquire a write guard and return the mutable cache store, recovering it after another cache operation panics while holding the lock.
+    /// 获取并返回当前缓存存储写保护；如果其它缓存操作持锁 panic，则恢复缓存存储继续使用。
+    fn write_store(&self) -> RwLockWriteGuard<'_, ToolCacheStore> {
+        self.store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Resolve the effective TTL by applying defaulting, clamping to the configured maximum, and enforcing a 1-second minimum.
@@ -157,13 +203,18 @@ impl SharedToolCache {
 
     /// Generate a cache id by combining a timestamp with a monotonic counter to reduce collision risk.
     /// 生成缓存编号，结合时间戳与自增计数以降低碰撞风险。
-    fn next_cache_id(&self) -> String {
-        let unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+    ///
+    /// Returns the generated cache id, or an error when the system clock cannot be represented.
+    /// 返回生成的缓存编号；当系统时钟无法表示时返回错误。
+    fn next_cache_id(&self) -> Result<String, String> {
+        // Wall-clock millisecond component used to make cache ids sortable and inspectable.
+        // 用于让缓存编号可排序、可检查的墙钟毫秒组成部分。
+        let unix_ms =
+            system_time_to_cache_id_unix_millis(SystemTime::now(), "tool cache id timestamp")?;
+        // Monotonic process-local sequence component used to avoid same-millisecond collisions.
+        // 用于避免同一毫秒内碰撞的进程内单调序号组成部分。
         let seq = self.counter.fetch_add(1, Ordering::Relaxed);
-        format!("tc-{}-{}", unix_ms, seq)
+        Ok(format!("tc-{}-{}", unix_ms, seq))
     }
 
     /// Remove all expired entries so subsequent reads and writes operate on the current valid view.
@@ -191,6 +242,29 @@ impl SharedToolCache {
     }
 }
 
+/// Convert one system time into the Unix millisecond component used by cache ids.
+/// 将单个系统时间转换为缓存编号使用的 Unix 毫秒组成部分。
+///
+/// The time parameter is the wall-clock timestamp to encode into one cache id.
+/// time 参数是要编码进单个缓存编号的墙钟时间戳。
+///
+/// The context parameter names the caller for precise error diagnostics.
+/// context 参数命名调用方，用于精确错误诊断。
+///
+/// Returns the Unix millisecond component for a cache id.
+/// 返回缓存编号使用的 Unix 毫秒组成部分。
+fn system_time_to_cache_id_unix_millis(time: SystemTime, context: &str) -> Result<u128, String> {
+    // Duration measured from the Unix epoch for one cache id timestamp.
+    // 单个缓存编号时间戳相对于 Unix epoch 的持续时间。
+    let duration = time.duration_since(UNIX_EPOCH).map_err(|error| {
+        format!(
+            "{} is before Unix epoch and cannot be used for a tool cache id: {}",
+            context, error
+        )
+    })?;
+    Ok(duration.as_millis())
+}
+
 static GLOBAL_TOOL_CACHE: OnceLock<Arc<SharedToolCache>> = OnceLock::new();
 
 /// Initialize the global shared cache, typically once during process startup.
@@ -209,10 +283,11 @@ pub fn global_tool_cache() -> Arc<SharedToolCache> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SharedToolCache, ToolCacheConfig};
+    use super::{SharedToolCache, ToolCacheConfig, system_time_to_cache_id_unix_millis};
     use serde_json::json;
+    use std::panic::{self, AssertUnwindSafe};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
 
     /// Build one deterministic cache config used by unit tests.
     /// 为单元测试构造一份稳定可预测的缓存配置。
@@ -228,12 +303,53 @@ mod tests {
         }
     }
 
+    /// Verify cache id timestamp conversion accepts normal post-epoch system times.
+    /// 验证缓存编号时间戳转换会接受正常的 epoch 之后系统时间。
+    #[test]
+    fn cache_id_unix_millis_accepts_post_epoch_time() {
+        // Timestamp one millisecond after the Unix epoch.
+        // Unix epoch 之后一毫秒的时间戳。
+        let timestamp = UNIX_EPOCH + Duration::from_millis(1);
+
+        assert_eq!(
+            system_time_to_cache_id_unix_millis(timestamp, "test cache id timestamp")
+                .expect("post-epoch timestamp should convert"),
+            1
+        );
+    }
+
+    /// Verify cache id timestamp conversion rejects pre-epoch system times.
+    /// 验证缓存编号时间戳转换会拒绝早于 epoch 的系统时间。
+    #[test]
+    fn cache_id_unix_millis_rejects_pre_epoch_time() {
+        // Timestamp one millisecond before the Unix epoch.
+        // Unix epoch 之前一毫秒的时间戳。
+        let timestamp = UNIX_EPOCH - Duration::from_millis(1);
+
+        // Error returned for a pre-epoch cache id timestamp conversion attempt.
+        // 早于 epoch 的缓存编号时间戳转换尝试返回的错误。
+        let error = system_time_to_cache_id_unix_millis(timestamp, "test cache id timestamp")
+            .expect_err("pre-epoch timestamp should fail");
+
+        assert!(
+            error.starts_with(
+                "test cache id timestamp is before Unix epoch and cannot be used for a tool cache id:"
+            ),
+            "unexpected error: {}",
+            error
+        );
+    }
+
     /// Verify entries are isolated by tool namespace and cannot be read across scopes.
     /// 验证缓存条目按工具命名空间隔离，不能跨作用域读取。
     #[test]
     fn cache_entries_are_isolated_by_tool_name() {
         let cache = SharedToolCache::new(test_cache_config(10, 5, 5));
-        let cache_id = cache.create("skill-a", json!({"value": 1}), None);
+        // Cache id created under the first skill namespace.
+        // 在第一个技能命名空间下创建的缓存编号。
+        let cache_id = cache
+            .create("skill-a", json!({"value": 1}), None)
+            .expect("cache entry should be created");
 
         assert_eq!(cache.get("skill-a", &cache_id), Some(json!({"value": 1})));
         assert_eq!(cache.get("skill-b", &cache_id), None);
@@ -244,7 +360,11 @@ mod tests {
     #[test]
     fn cache_entries_expire_after_default_ttl() {
         let cache = SharedToolCache::new(test_cache_config(10, 1, 1));
-        let cache_id = cache.create("skill-a", json!({"value": 1}), None);
+        // Cache id expected to expire after the configured default TTL.
+        // 预期会在配置默认 TTL 后过期的缓存编号。
+        let cache_id = cache
+            .create("skill-a", json!({"value": 1}), None)
+            .expect("cache entry should be created");
 
         thread::sleep(Duration::from_millis(1100));
 
@@ -256,7 +376,11 @@ mod tests {
     #[test]
     fn cache_requested_ttl_is_clamped_to_maximum() {
         let cache = SharedToolCache::new(test_cache_config(10, 5, 1));
-        let cache_id = cache.create("skill-a", json!({"value": 1}), Some(60));
+        // Cache id created with a caller TTL that should be clamped to the maximum.
+        // 使用调用方 TTL 创建且预期会被限制到最大 TTL 的缓存编号。
+        let cache_id = cache
+            .create("skill-a", json!({"value": 1}), Some(60))
+            .expect("cache entry should be created");
 
         thread::sleep(Duration::from_millis(1100));
 
@@ -268,12 +392,54 @@ mod tests {
     #[test]
     fn cache_evicts_oldest_entry_when_capacity_is_exceeded() {
         let cache = SharedToolCache::new(test_cache_config(2, 5, 5));
-        let first_id = cache.create("skill-a", json!({"value": 1}), None);
-        let second_id = cache.create("skill-a", json!({"value": 2}), None);
-        let third_id = cache.create("skill-a", json!({"value": 3}), None);
+        // Oldest cache id expected to be evicted after capacity is exceeded.
+        // 容量超限后预期会被淘汰的最早缓存编号。
+        let first_id = cache
+            .create("skill-a", json!({"value": 1}), None)
+            .expect("first cache entry should be created");
+        // Middle cache id expected to remain after evicting the oldest entry.
+        // 淘汰最早条目后预期仍保留的中间缓存编号。
+        let second_id = cache
+            .create("skill-a", json!({"value": 2}), None)
+            .expect("second cache entry should be created");
+        // Newest cache id expected to remain after capacity enforcement.
+        // 容量约束后预期仍保留的最新缓存编号。
+        let third_id = cache
+            .create("skill-a", json!({"value": 3}), None)
+            .expect("third cache entry should be created");
 
         assert_eq!(cache.get("skill-a", &first_id), None);
         assert_eq!(cache.get("skill-a", &second_id), Some(json!({"value": 2})));
         assert_eq!(cache.get("skill-a", &third_id), Some(json!({"value": 3})));
+    }
+
+    /// Verify cache operations recover after one writer panics while holding the internal store lock.
+    /// 验证某个写入者持有内部存储锁时 panic 后，缓存操作仍可恢复。
+    #[test]
+    fn cache_recovers_after_poisoned_write_lock() {
+        // Cache instance used to verify every public operation after lock poisoning.
+        // 用于验证锁 poison 后所有公开操作仍可工作的缓存实例。
+        let cache = SharedToolCache::new(test_cache_config(4, 5, 5));
+
+        // Captured panic result produced while the write guard is still alive.
+        // 写保护仍存活时触发并捕获的 panic 结果。
+        let poison_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            // Guard used only to mark the cache lock as poisoned for this recovery test.
+            // 仅用于为本恢复测试制造缓存锁 poison 的保护对象。
+            let _guard = cache.store.write().expect("initial tool cache write lock");
+            panic!("poison tool cache for recovery test");
+        }));
+
+        assert!(poison_result.is_err());
+
+        // Cache id created after poisoning, proving write recovery is effective.
+        // poison 后创建的缓存编号，用于证明写恢复有效。
+        let cache_id = cache
+            .create("skill-a", json!({"value": 1}), None)
+            .expect("cache entry should be created after poison recovery");
+
+        assert_eq!(cache.get("skill-a", &cache_id), Some(json!({"value": 1})));
+        assert!(cache.delete("skill-a", &cache_id));
+        assert_eq!(cache.get("skill-a", &cache_id), None);
     }
 }

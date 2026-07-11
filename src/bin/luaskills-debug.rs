@@ -1,4 +1,5 @@
 use luaskills::lua_skill::validate_luaskills_identifier;
+use luaskills::runtime::render_host_visible_path;
 use luaskills::{
     LuaEngine, LuaEngineOptions, LuaInvocationContext, LuaRuntimeHostOptions, LuaVmPoolConfig,
     RuntimeEntryDescriptor, RuntimeInvocationResult, RuntimeRequestContext, RuntimeSkillRoot,
@@ -150,6 +151,23 @@ struct PreparedDebugRuntime {
     entries: Vec<RuntimeEntryDescriptor>,
 }
 
+/// Internal result of synchronizing one source skill into a debug runtime root.
+/// 将单个源 skill 同步进调试运行时根目录后的内部结果。
+struct DebugSkillSyncResult {
+    /// Effective bound skill identifier.
+    /// 绑定后的生效 skill 标识符。
+    skill_id: String,
+    /// Absolute runtime root used by the debug command.
+    /// 调试命令使用的绝对运行时根目录。
+    runtime_root: PathBuf,
+    /// Absolute source skill directory path.
+    /// 源 skill 目录绝对路径。
+    source_skill_path: PathBuf,
+    /// Absolute synchronized skill directory path under the runtime root.
+    /// runtime_root 下同步后的 skill 目录绝对路径。
+    synced_skill_path: PathBuf,
+}
+
 /// Result of synchronizing one source skill into a debug runtime root.
 /// 将单个源 skill 同步到调试运行时根目录后的结果。
 #[derive(Debug, Serialize)]
@@ -255,7 +273,8 @@ fn run_debug_binary() -> Result<(), String> {
     let command = parse_debug_cli(&args)?;
     match command.kind {
         DebugCommandKind::Sync => {
-            let output = sync_debug_skill(&command)?;
+            let sync_result = sync_debug_skill(&command)?;
+            let output = build_sync_output(&sync_result);
             render_sync_output(command.output_mode, &output)
         }
         DebugCommandKind::Inspect => {
@@ -287,8 +306,8 @@ fn run_debug_binary() -> Result<(), String> {
                 skill_id: prepared.skill_id.clone(),
                 requested_tool_name,
                 resolved_tool_name,
-                runtime_root: prepared.runtime_root.display().to_string(),
-                synced_skill_path: prepared.synced_skill_path.display().to_string(),
+                runtime_root: render_host_visible_path(&prepared.runtime_root),
+                synced_skill_path: render_host_visible_path(&prepared.synced_skill_path),
                 result,
             };
             render_call_output(command.output_mode, &output)
@@ -397,7 +416,7 @@ fn read_cli_value<'a>(
 
 /// Synchronize the source skill into the debug runtime root and return its stable location.
 /// 将源 skill 同步到调试运行时根目录，并返回其稳定位置。
-fn sync_debug_skill(command: &DebugCliCommand) -> Result<DebugSyncOutput, String> {
+fn sync_debug_skill(command: &DebugCliCommand) -> Result<DebugSkillSyncResult, String> {
     let runtime_root = absolutize_path(&command.runtime_root)?;
     let source_skill_path = command
         .skill_path
@@ -412,24 +431,38 @@ fn sync_debug_skill(command: &DebugCliCommand) -> Result<DebugSyncOutput, String
         synchronize_skill_into_runtime_root(&runtime_root, &source_skill_path, &skill_id)?;
     manifest.bind_directory_skill_id(skill_id.clone());
 
-    Ok(DebugSyncOutput {
-        command: "sync",
+    Ok(DebugSkillSyncResult {
         skill_id,
-        runtime_root: runtime_root.display().to_string(),
-        source_skill_path: source_skill_path.display().to_string(),
-        synced_skill_path: synced_skill_path.display().to_string(),
+        runtime_root,
+        source_skill_path,
+        synced_skill_path,
     })
+}
+
+/// Build the public sync output payload from the internal sync result.
+/// 根据内部同步结果构建公开 sync 输出载荷。
+///
+/// The sync_result parameter keeps exact PathBuf values for internal execution flow.
+/// sync_result 参数保留内部执行流使用的精确 PathBuf 值。
+///
+/// Return the serialized sync output with host-visible path strings.
+/// 返回使用宿主可见路径字符串的序列化 sync 输出。
+fn build_sync_output(sync_result: &DebugSkillSyncResult) -> DebugSyncOutput {
+    DebugSyncOutput {
+        command: "sync",
+        skill_id: sync_result.skill_id.clone(),
+        runtime_root: render_host_visible_path(&sync_result.runtime_root),
+        source_skill_path: render_host_visible_path(&sync_result.source_skill_path),
+        synced_skill_path: render_host_visible_path(&sync_result.synced_skill_path),
+    }
 }
 
 /// Resolve the debug command target skill and optionally synchronize a source path first.
 /// 解析调试命令的目标 skill，并在提供源路径时先执行同步。
 fn resolve_debug_target(command: &DebugCliCommand) -> Result<(String, Option<PathBuf>), String> {
     if command.skill_path.is_some() {
-        let sync_output = sync_debug_skill(command)?;
-        return Ok((
-            sync_output.skill_id,
-            Some(PathBuf::from(sync_output.source_skill_path)),
-        ));
+        let sync_result = sync_debug_skill(command)?;
+        return Ok((sync_result.skill_id, Some(sync_result.source_skill_path)));
     }
     let skill_id = command
         .skill_id
@@ -445,12 +478,15 @@ fn prepare_debug_runtime(command: &DebugCliCommand) -> Result<PreparedDebugRunti
     ensure_debug_runtime_layout(&runtime_root)?;
     let (skill_id, source_skill_path) = resolve_debug_target(command)?;
     let synced_skill_path = runtime_root.join("skills").join(&skill_id);
-    if !synced_skill_path.join("skill.yaml").exists() {
+    // Manifest path that proves the synchronized skill directory is ready to load.
+    // 用于证明已同步 skill 目录可加载的清单路径。
+    let synced_skill_manifest_path = synced_skill_path.join("skill.yaml");
+    if !debug_synced_skill_manifest_path_is_file(&synced_skill_manifest_path)? {
         return Err(format!(
             "Synchronized skill '{}' was not found under '{}'. Run 'luaskills-debug sync --runtime-root {} --skill-path <source-skill>' first.",
             skill_id,
-            synced_skill_path.display(),
-            runtime_root.display()
+            render_debug_path(&synced_skill_path),
+            render_debug_path(&runtime_root)
         ));
     }
     let manifest = load_bound_skill_manifest(&synced_skill_path)?;
@@ -472,7 +508,10 @@ fn prepare_debug_runtime(command: &DebugCliCommand) -> Result<PreparedDebugRunti
         .load_from_roots(&skill_roots)
         .map_err(|error| error.to_string())?;
 
-    let entries = filter_skill_entries(&engine.list_entries(), &skill_id);
+    // Loaded runtime entry descriptors produced by the same public listing path as host callers.
+    // 通过与宿主调用方相同的公开列表路径生成的已加载运行时入口描述。
+    let runtime_entries = engine.list_entries().map_err(|error| error.to_string())?;
+    let entries = filter_skill_entries(&runtime_entries, &skill_id);
     if entries.is_empty() {
         return Err(format!(
             "Skill '{}' loaded without any callable entries",
@@ -491,6 +530,30 @@ fn prepare_debug_runtime(command: &DebugCliCommand) -> Result<PreparedDebugRunti
     })
 }
 
+/// Inspect whether one synchronized skill manifest path is a file without hiding filesystem probe errors.
+/// 检查单个已同步 skill 清单路径是否为文件，同时不隐藏文件系统探测错误。
+///
+/// The manifest_path parameter is the concrete `runtime_root/skills/<skill-id>/skill.yaml` path.
+/// manifest_path 参数是具体的 `runtime_root/skills/<skill-id>/skill.yaml` 路径。
+///
+/// Return true for an existing manifest file, false for a confirmed missing manifest, or an explicit probe/type error.
+/// 已存在清单文件返回 true，确认缺失清单返回 false；探测或类型异常时返回显式错误。
+fn debug_synced_skill_manifest_path_is_file(manifest_path: &Path) -> Result<bool, String> {
+    match fs::metadata(manifest_path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(format!(
+            "Synchronized skill manifest is not a file: '{}'",
+            render_debug_path(manifest_path)
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect synchronized skill manifest '{}': {}",
+            render_debug_path(manifest_path),
+            error
+        )),
+    }
+}
+
 /// Convert one possibly relative path into an absolute developer-facing path.
 /// 将单个可能为相对路径的输入转换为面向开发者的绝对路径。
 fn absolutize_path(path: &Path) -> Result<PathBuf, String> {
@@ -503,13 +566,19 @@ fn absolutize_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Render one path for luaskills-debug user-visible diagnostics.
+/// 为 luaskills-debug 用户可见诊断渲染单个路径。
+fn render_debug_path(path: &Path) -> String {
+    render_host_visible_path(path)
+}
+
 /// Load and bind one skill manifest from the source skill directory.
 /// 从源 skill 目录加载并绑定单个 skill 清单。
 fn load_bound_skill_manifest(skill_path: &Path) -> Result<SkillMeta, String> {
-    if !skill_path.is_dir() {
+    if !debug_skill_source_path_is_directory(skill_path)? {
         return Err(format!(
             "Skill path '{}' is not a directory",
-            skill_path.display()
+            render_debug_path(skill_path)
         ));
     }
 
@@ -519,7 +588,7 @@ fn load_bound_skill_manifest(skill_path: &Path) -> Result<SkillMeta, String> {
         .ok_or_else(|| {
             format!(
                 "Skill path '{}' must end with one UTF-8 directory name",
-                skill_path.display()
+                render_debug_path(skill_path)
             )
         })?;
     validate_luaskills_identifier(directory_name, "skill directory name")?;
@@ -528,14 +597,14 @@ fn load_bound_skill_manifest(skill_path: &Path) -> Result<SkillMeta, String> {
     let manifest_text = fs::read_to_string(&manifest_path).map_err(|error| {
         format!(
             "Failed to read skill manifest '{}': {}",
-            manifest_path.display(),
+            render_debug_path(&manifest_path),
             error
         )
     })?;
     let mut manifest: SkillMeta = serde_yaml::from_str(&manifest_text).map_err(|error| {
         format!(
             "Failed to parse skill manifest '{}': {}",
-            manifest_path.display(),
+            render_debug_path(&manifest_path),
             error
         )
     })?;
@@ -543,6 +612,26 @@ fn load_bound_skill_manifest(skill_path: &Path) -> Result<SkillMeta, String> {
     manifest.resolve_entry_input_schemas(skill_path)?;
     validate_luaskills_identifier(manifest.effective_skill_id(), "skill_id")?;
     Ok(manifest)
+}
+
+/// Inspect whether one debug skill source path is a directory without hiding filesystem probe errors.
+/// 检查单个调试 skill 源路径是否为目录，同时不隐藏文件系统探测错误。
+///
+/// The skill_path parameter is the developer-supplied source skill path after debug path absolutization.
+/// skill_path 参数是经过调试路径绝对化后的开发者输入源 skill 路径。
+///
+/// Return true for an existing directory, false for a confirmed missing or non-directory path, or an explicit probe error.
+/// 已存在目录返回 true，确认缺失或非目录路径返回 false；探测异常时返回显式错误。
+fn debug_skill_source_path_is_directory(skill_path: &Path) -> Result<bool, String> {
+    match fs::metadata(skill_path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect skill path '{}': {}",
+            render_debug_path(skill_path),
+            error
+        )),
+    }
 }
 
 /// Ensure the runtime root contains the core directory layout expected by one normal skill runtime.
@@ -568,7 +657,7 @@ fn ensure_debug_runtime_layout(runtime_root: &Path) -> Result<(), String> {
         fs::create_dir_all(&directory).map_err(|error| {
             format!(
                 "Failed to create runtime directory '{}': {}",
-                directory.display(),
+                render_debug_path(&directory),
                 error
             )
         })?;
@@ -588,11 +677,11 @@ fn synchronize_skill_into_runtime_root(
         return Ok(target_skill_path);
     }
 
-    if target_skill_path.exists() {
+    if debug_sync_target_path_is_directory(&target_skill_path)? {
         fs::remove_dir_all(&target_skill_path).map_err(|error| {
             format!(
                 "Failed to remove previous synchronized skill '{}': {}",
-                target_skill_path.display(),
+                render_debug_path(&target_skill_path),
                 error
             )
         })?;
@@ -601,28 +690,81 @@ fn synchronize_skill_into_runtime_root(
     Ok(target_skill_path)
 }
 
+/// Inspect whether one synchronized skill target path is a directory without hiding filesystem probe errors.
+/// 检查单个已同步 skill 目标路径是否为目录，同时不隐藏文件系统探测错误。
+///
+/// The target_skill_path parameter is the concrete `runtime_root/skills/<skill-id>` synchronization target.
+/// target_skill_path 参数是具体的 `runtime_root/skills/<skill-id>` 同步目标路径。
+///
+/// Return true for an existing directory, false for a confirmed missing target, or an explicit probe/type error.
+/// 已存在目录返回 true，确认缺失目标返回 false；探测或类型异常时返回显式错误。
+fn debug_sync_target_path_is_directory(target_skill_path: &Path) -> Result<bool, String> {
+    match fs::metadata(target_skill_path) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(format!(
+            "Previous synchronized skill path is not a directory: '{}'",
+            render_debug_path(target_skill_path)
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect previous synchronized skill '{}': {}",
+            render_debug_path(target_skill_path),
+            error
+        )),
+    }
+}
+
 /// Return whether two directory paths resolve to the same physical location when both already exist.
 /// 当两个目录路径都已存在时，返回它们是否解析到同一物理位置。
 fn paths_refer_to_same_directory(left: &Path, right: &Path) -> Result<bool, String> {
-    if !left.exists() || !right.exists() {
+    if !same_directory_candidate_path_is_directory(left, "source")?
+        || !same_directory_candidate_path_is_directory(right, "target")?
+    {
         return Ok(false);
     }
 
     let left_canonical = fs::canonicalize(left).map_err(|error| {
         format!(
             "Failed to canonicalize source path '{}': {}",
-            left.display(),
+            render_debug_path(left),
             error
         )
     })?;
     let right_canonical = fs::canonicalize(right).map_err(|error| {
         format!(
             "Failed to canonicalize target path '{}': {}",
-            right.display(),
+            render_debug_path(right),
             error
         )
     })?;
     Ok(left_canonical == right_canonical)
+}
+
+/// Inspect whether one same-directory comparison candidate is an existing directory.
+/// 检查单个同目录比较候选路径是否为已存在目录。
+///
+/// The path parameter is the concrete source or target path considered by same-directory comparison.
+/// path 参数是同目录比较正在考虑的具体源路径或目标路径。
+///
+/// The path_label parameter identifies the candidate side in diagnostics.
+/// path_label 参数在诊断中标识候选路径所在的一侧。
+///
+/// Return true only for an existing directory, false for a missing or non-directory path, or an explicit probe error.
+/// 仅已存在目录返回 true，缺失或非目录路径返回 false；探测异常时返回显式错误。
+fn same_directory_candidate_path_is_directory(
+    path: &Path,
+    path_label: &str,
+) -> Result<bool, String> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect {} path '{}' before same-directory comparison: {}",
+            path_label,
+            render_debug_path(path),
+            error
+        )),
+    }
 }
 
 /// Recursively copy one directory tree while rejecting symbolic links for predictable debug behavior.
@@ -631,7 +773,7 @@ fn copy_directory_recursive(source: &Path, target: &Path) -> Result<(), String> 
     fs::create_dir_all(target).map_err(|error| {
         format!(
             "Failed to create synchronized skill directory '{}': {}",
-            target.display(),
+            render_debug_path(target),
             error
         )
     })?;
@@ -639,21 +781,21 @@ fn copy_directory_recursive(source: &Path, target: &Path) -> Result<(), String> 
     for entry in fs::read_dir(source).map_err(|error| {
         format!(
             "Failed to enumerate skill directory '{}': {}",
-            source.display(),
+            render_debug_path(source),
             error
         )
     })? {
         let entry = entry.map_err(|error| {
             format!(
                 "Failed to read one directory entry under '{}': {}",
-                source.display(),
+                render_debug_path(source),
                 error
             )
         })?;
         let file_type = entry.file_type().map_err(|error| {
             format!(
                 "Failed to inspect entry '{}' type: {}",
-                entry.path().display(),
+                render_debug_path(&entry.path()),
                 error
             )
         })?;
@@ -661,7 +803,7 @@ fn copy_directory_recursive(source: &Path, target: &Path) -> Result<(), String> 
         if file_type.is_symlink() {
             return Err(format!(
                 "Symbolic-link entry '{}' is not supported by luaskills-debug",
-                entry.path().display()
+                render_debug_path(&entry.path())
             ));
         }
         if file_type.is_dir() {
@@ -670,8 +812,8 @@ fn copy_directory_recursive(source: &Path, target: &Path) -> Result<(), String> 
             fs::copy(entry.path(), &destination).map_err(|error| {
                 format!(
                     "Failed to copy '{}' to '{}': {}",
-                    entry.path().display(),
-                    destination.display(),
+                    render_debug_path(&entry.path()),
+                    render_debug_path(&destination),
                     error
                 )
             })?;
@@ -686,7 +828,7 @@ fn collect_ignored_skill_ids(
     skills_dir: &Path,
     target_skill_id: &str,
 ) -> Result<Vec<String>, String> {
-    if !skills_dir.exists() {
+    if !debug_runtime_skills_path_is_directory(skills_dir)? {
         return Ok(Vec::new());
     }
 
@@ -694,20 +836,26 @@ fn collect_ignored_skill_ids(
     for entry in fs::read_dir(skills_dir).map_err(|error| {
         format!(
             "Failed to enumerate runtime skills directory '{}': {}",
-            skills_dir.display(),
+            render_debug_path(skills_dir),
             error
         )
     })? {
         let entry = entry.map_err(|error| {
             format!(
                 "Failed to read one runtime skill directory entry under '{}': {}",
-                skills_dir.display(),
+                render_debug_path(skills_dir),
                 error
             )
         })?;
         if !entry
             .file_type()
-            .map_err(|error| format!("Failed to inspect '{}': {}", entry.path().display(), error))?
+            .map_err(|error| {
+                format!(
+                    "Failed to inspect '{}': {}",
+                    render_debug_path(&entry.path()),
+                    error
+                )
+            })?
             .is_dir()
         {
             continue;
@@ -724,6 +872,30 @@ fn collect_ignored_skill_ids(
     }
     ignored.sort();
     Ok(ignored)
+}
+
+/// Inspect whether the runtime `skills/` path is a directory before collecting ignored skills.
+/// 在收集忽略 skill 前检查运行时 `skills/` 路径是否为目录。
+///
+/// The skills_dir parameter is the concrete runtime `skills/` directory that will be enumerated.
+/// skills_dir 参数是即将被枚举的具体运行时 `skills/` 目录。
+///
+/// Return true for an existing directory, false for a confirmed missing path, or an explicit probe/type error.
+/// 已存在目录返回 true，确认缺失路径返回 false；探测或类型异常时返回显式错误。
+fn debug_runtime_skills_path_is_directory(skills_dir: &Path) -> Result<bool, String> {
+    match fs::metadata(skills_dir) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(format!(
+            "Runtime skills path is not a directory: '{}'",
+            render_debug_path(skills_dir)
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to inspect runtime skills directory '{}': {}",
+            render_debug_path(skills_dir),
+            error
+        )),
+    }
 }
 
 /// Build host options that map one debug runtime root into the normal LuaSkills runtime layout.
@@ -803,14 +975,14 @@ fn load_invocation_args(command: &DebugCliCommand) -> Result<Value, String> {
             let args_text = fs::read_to_string(args_file).map_err(|error| {
                 format!(
                     "Failed to read args file '{}': {}",
-                    args_file.display(),
+                    render_debug_path(args_file),
                     error
                 )
             })?;
             serde_json::from_str(&args_text).map_err(|error| {
                 format!(
                     "Failed to parse args file '{}': {}",
-                    args_file.display(),
+                    render_debug_path(args_file),
                     error
                 )
             })
@@ -847,12 +1019,12 @@ fn build_inspect_output(prepared: &PreparedDebugRuntime) -> DebugInspectOutput {
         manifest_name: prepared.manifest.name.clone(),
         manifest_version: prepared.manifest.version().to_string(),
         debug: prepared.manifest.debug,
-        runtime_root: prepared.runtime_root.display().to_string(),
+        runtime_root: render_host_visible_path(&prepared.runtime_root),
         source_skill_path: prepared
             .source_skill_path
             .as_ref()
-            .map(|path| path.display().to_string()),
-        synced_skill_path: prepared.synced_skill_path.display().to_string(),
+            .map(|path| render_host_visible_path(path)),
+        synced_skill_path: render_host_visible_path(&prepared.synced_skill_path),
         entries: prepared.entries.clone(),
     }
 }
@@ -987,8 +1159,10 @@ fn render_call_output(mode: DebugOutputMode, output: &DebugCallOutput) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        DebugCliCommand, DebugCommandKind, DebugOutputMode, load_invocation_args, parse_debug_cli,
-        prepare_debug_runtime, resolve_debug_tool_name, sync_debug_skill,
+        DebugCliCommand, DebugCommandKind, DebugOutputMode, collect_ignored_skill_ids,
+        load_bound_skill_manifest, load_invocation_args, parse_debug_cli,
+        paths_refer_to_same_directory, prepare_debug_runtime, render_debug_path,
+        resolve_debug_tool_name, sync_debug_skill,
     };
     use luaskills::{LuaInvocationContext, RuntimeEntryDescriptor};
     use std::env;
@@ -1123,6 +1297,282 @@ mod tests {
         }
     }
 
+    /// Verify missing runtime skills directories produce an empty ignored-skill list.
+    /// 验证缺失的运行时 skills 目录会生成空的忽略 skill 列表。
+    #[test]
+    fn collect_ignored_skill_ids_accepts_missing_skills_dir() {
+        // Temporary runtime root that intentionally does not contain a skills directory.
+        // 有意不包含 skills 目录的临时运行时根目录。
+        let runtime_root = make_temp_runtime_root();
+        // Missing runtime skills directory passed to the ignored-skill collector.
+        // 传给忽略 skill 收集器的缺失运行时 skills 目录。
+        let skills_dir = runtime_root.join("skills");
+
+        // Ignored skill ids returned for a confirmed-missing skills directory.
+        // 对确认缺失的 skills 目录返回的忽略 skill 标识符列表。
+        let ignored = collect_ignored_skill_ids(&skills_dir, "demo-skill")
+            .expect("missing skills directory should be accepted");
+
+        assert!(ignored.is_empty());
+    }
+
+    /// Verify runtime skills path type errors are reported before directory enumeration.
+    /// 验证运行时 skills 路径类型错误会在目录枚举前报告。
+    #[test]
+    fn collect_ignored_skill_ids_rejects_file_skills_dir() {
+        // Temporary runtime root that isolates the file-backed skills directory fixture.
+        // 隔离文件型 skills 目录夹具的临时运行时根目录。
+        let runtime_root = make_temp_runtime_root();
+        fs::create_dir_all(&runtime_root).expect("runtime root should be created");
+        // Runtime skills path intentionally occupied by a regular file.
+        // 被普通文件有意占用的运行时 skills 路径。
+        let skills_dir = runtime_root.join("skills");
+        fs::write(&skills_dir, b"not-a-directory").expect("skills fixture file should be written");
+
+        // Error returned before read_dir can turn the type problem into an enumeration failure.
+        // 在 read_dir 把类型问题变成枚举失败前返回的错误。
+        let error = collect_ignored_skill_ids(&skills_dir, "demo-skill")
+            .expect_err("file-backed skills path should fail");
+        // Expected diagnostic rendered through the debug path formatter.
+        // 通过调试路径渲染器生成的期望诊断。
+        let expected_error = format!(
+            "Runtime skills path is not a directory: '{}'",
+            render_debug_path(&skills_dir)
+        );
+
+        assert_eq!(error, expected_error);
+        remove_temp_directory(&runtime_root);
+    }
+
+    /// Verify runtime skills path probe errors are not treated as missing directories.
+    /// 验证运行时 skills 路径探测错误不会被当作缺失目录处理。
+    #[test]
+    fn collect_ignored_skill_ids_reports_skills_dir_probe_errors() {
+        // Runtime skills path containing an embedded NUL rejected by metadata probing.
+        // 包含内嵌 NUL、会被元数据探测拒绝的运行时 skills 路径。
+        let skills_dir = PathBuf::from("invalid\0skills");
+
+        // Error returned before the invalid path can behave like a missing skills directory.
+        // 在非法路径表现得像缺失 skills 目录之前返回的错误。
+        let error = collect_ignored_skill_ids(&skills_dir, "demo-skill")
+            .expect_err("invalid skills path probe should fail");
+
+        assert!(
+            error.contains("Failed to inspect runtime skills directory"),
+            "unexpected error: {}",
+            error
+        );
+        assert!(error.contains("invalid"), "unexpected error: {}", error);
+    }
+
+    /// Verify same-directory comparison reports source path probe errors explicitly.
+    /// 验证同目录比较会显式报告源路径探测错误。
+    #[test]
+    fn paths_refer_to_same_directory_reports_source_probe_errors() {
+        // Source path containing an embedded NUL rejected by metadata probing.
+        // 包含内嵌 NUL、会被元数据探测拒绝的源路径。
+        let source_path = PathBuf::from("invalid\0source");
+        // Existing target directory that would otherwise be safe to compare.
+        // 原本可安全参与比较的已存在目标目录。
+        let runtime_root = make_temp_runtime_root();
+        fs::create_dir_all(&runtime_root).expect("target directory should be created");
+
+        // Error returned before canonicalization can hide the source probe failure.
+        // 在 canonicalize 掩盖源路径探测失败前返回的错误。
+        let error = paths_refer_to_same_directory(&source_path, &runtime_root)
+            .expect_err("invalid source path probe should fail");
+
+        assert!(
+            error.contains("Failed to inspect source path"),
+            "unexpected error: {}",
+            error
+        );
+        assert!(error.contains("invalid"), "unexpected error: {}", error);
+        remove_temp_directory(&runtime_root);
+    }
+
+    /// Verify same-directory comparison reports target path probe errors explicitly.
+    /// 验证同目录比较会显式报告目标路径探测错误。
+    #[test]
+    fn paths_refer_to_same_directory_reports_target_probe_errors() {
+        // Existing source directory that passes same-directory candidate probing.
+        // 能通过同目录候选探测的已存在源目录。
+        let runtime_root = make_temp_runtime_root();
+        let source_path = runtime_root.join("source");
+        fs::create_dir_all(&source_path).expect("source directory should be created");
+        // Target path containing an embedded NUL rejected by metadata probing.
+        // 包含内嵌 NUL、会被元数据探测拒绝的目标路径。
+        let target_path = PathBuf::from("invalid\0target");
+
+        // Error returned before canonicalization can hide the target probe failure.
+        // 在 canonicalize 掩盖目标路径探测失败前返回的错误。
+        let error = paths_refer_to_same_directory(&source_path, &target_path)
+            .expect_err("invalid target path probe should fail");
+
+        assert!(
+            error.contains("Failed to inspect target path"),
+            "unexpected error: {}",
+            error
+        );
+        assert!(error.contains("invalid"), "unexpected error: {}", error);
+        remove_temp_directory(&runtime_root);
+    }
+
+    /// Verify debug skill-manifest parse errors render paths through the debug path formatter.
+    /// 验证调试 skill 清单解析错误会通过调试路径渲染器输出路径。
+    #[test]
+    fn load_bound_skill_manifest_parse_error_uses_host_visible_path() {
+        // Temporary root that isolates the invalid debug skill fixture.
+        // 隔离非法调试 skill 夹具的临时根目录。
+        let runtime_root = make_temp_runtime_root();
+        // Skill directory whose name passes the real directory-name identifier validation.
+        // 目录名能通过真实目录名标识符校验的 skill 目录。
+        let skill_dir = runtime_root.join("demo-skill");
+        fs::create_dir_all(&skill_dir).expect("skill directory should be created");
+        // Manifest path consumed by the real debug manifest loader.
+        // 真实调试清单加载器消费的清单路径。
+        let manifest_path = skill_dir.join("skill.yaml");
+        fs::write(&manifest_path, "entries: [").expect("invalid manifest should be written");
+        // Error returned by the real debug manifest loader.
+        // 真实调试清单加载器返回的错误。
+        let error =
+            load_bound_skill_manifest(&skill_dir).expect_err("invalid skill manifest should fail");
+        // Expected diagnostic prefix rendered with the debug path formatter.
+        // 使用调试路径渲染器生成的期望诊断前缀。
+        let expected_prefix = format!(
+            "Failed to parse skill manifest '{}':",
+            render_debug_path(&manifest_path)
+        );
+
+        assert!(
+            error.starts_with(&expected_prefix),
+            "unexpected error: {}",
+            error
+        );
+        remove_temp_directory(&runtime_root);
+    }
+
+    /// Verify debug skill source-path probe errors are not reported as ordinary non-directory paths.
+    /// 验证调试 skill 源路径探测错误不会被报告为普通非目录路径。
+    #[test]
+    fn load_bound_skill_manifest_reports_skill_path_probe_errors() {
+        // Skill path containing an embedded NUL that filesystem metadata cannot inspect.
+        // 包含内嵌 NUL 且文件系统元数据无法探测的 skill 路径。
+        let skill_path = PathBuf::from("invalid\0skill");
+        // Error returned before the invalid path can behave like a missing non-directory path.
+        // 在非法路径表现得像缺失的非目录路径之前返回的错误。
+        let error = match load_bound_skill_manifest(&skill_path) {
+            Ok(_) => panic!("invalid skill path probe should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.starts_with("Failed to inspect skill path"),
+            "unexpected error: {}",
+            error
+        );
+        assert!(error.contains("invalid"), "unexpected error: {}", error);
+    }
+
+    /// Verify debug args-file parse errors render paths through the debug path formatter.
+    /// 验证调试参数文件解析错误会通过调试路径渲染器输出路径。
+    #[test]
+    fn load_invocation_args_file_parse_error_uses_host_visible_path() {
+        // Temporary root that isolates the invalid args file fixture.
+        // 隔离非法参数文件夹具的临时根目录。
+        let runtime_root = make_temp_runtime_root();
+        fs::create_dir_all(&runtime_root).expect("runtime root should be created");
+        // Args file path consumed by the real invocation args loader.
+        // 真实调用参数加载器消费的参数文件路径。
+        let args_file = runtime_root.join("args.json");
+        fs::write(&args_file, "{not-json").expect("invalid args file should be written");
+        // Debug command that selects args-file loading through the normal command payload.
+        // 通过常规命令载荷选择参数文件加载的调试命令。
+        let command = DebugCliCommand {
+            kind: DebugCommandKind::Call,
+            runtime_root: runtime_root.clone(),
+            skill_path: None,
+            skill_id: Some("demo-skill".to_string()),
+            tool_name: Some("ping".to_string()),
+            args_json: None,
+            args_file: Some(args_file.clone()),
+            enable_host_result: false,
+            output_mode: DebugOutputMode::Pretty,
+        };
+        // Error returned by the real invocation args loader.
+        // 真实调用参数加载器返回的错误。
+        let error = load_invocation_args(&command).expect_err("invalid args JSON should fail");
+        // Expected diagnostic prefix rendered with the debug path formatter.
+        // 使用调试路径渲染器生成的期望诊断前缀。
+        let expected_prefix = format!(
+            "Failed to parse args file '{}':",
+            render_debug_path(&args_file)
+        );
+
+        assert!(
+            error.starts_with(&expected_prefix),
+            "unexpected error: {}",
+            error
+        );
+        remove_temp_directory(&runtime_root);
+    }
+
+    /// Verify debug sync rejects file-backed synchronized skill targets before directory removal.
+    /// 验证调试同步会在目录删除前拒绝文件型已同步 skill 目标。
+    #[test]
+    fn sync_debug_skill_rejects_file_target_skill_path() {
+        // Temporary runtime root that isolates the file-backed sync target fixture.
+        // 隔离文件型同步目标夹具的临时运行时根目录。
+        let runtime_root = make_temp_runtime_root();
+        // Source skill fixture loaded by the real debug sync path.
+        // 真实调试同步路径加载的源 skill 夹具。
+        let skill_path = PathBuf::from(
+            "examples/ffi/standard_runtime/runtime_root/skills/demo-standard-ffi-skill",
+        );
+        // Target skill path derived from runtime_root, skills directory, and the source directory skill id.
+        // 根据 runtime_root、skills 目录与源目录 skill id 派生出的目标 skill 路径。
+        let target_skill_path = runtime_root.join("skills").join("demo-standard-ffi-skill");
+        // Target parent directory required before writing the file-backed target.
+        // 写入文件型目标前需要存在的目标父目录。
+        let target_parent = target_skill_path
+            .parent()
+            .expect("target skill path should have a parent");
+        fs::create_dir_all(target_parent).expect("target parent should be created");
+        fs::write(&target_skill_path, b"not a directory").expect("file target should be written");
+        // Debug sync command consumed by the real synchronization entry point.
+        // 真实同步入口消费的调试同步命令。
+        let command = DebugCliCommand {
+            kind: DebugCommandKind::Sync,
+            runtime_root: runtime_root.clone(),
+            skill_path: Some(skill_path),
+            skill_id: None,
+            tool_name: None,
+            args_json: None,
+            args_file: None,
+            enable_host_result: false,
+            output_mode: DebugOutputMode::Pretty,
+        };
+
+        // Error returned before remove_dir_all can see the file-backed target path.
+        // 在 remove_dir_all 看到文件型目标路径之前返回的错误。
+        let error = match sync_debug_skill(&command) {
+            Ok(_) => panic!("file target skill path should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains("Previous synchronized skill path is not a directory"),
+            "unexpected error: {}",
+            error
+        );
+        assert!(
+            error.contains(&render_debug_path(&target_skill_path)),
+            "unexpected error: {}",
+            error
+        );
+        remove_temp_directory(&runtime_root);
+    }
+
     /// Verify the debug runtime can synchronize one skill into runtime_root and call it through the normal engine path.
     /// 验证调试运行时能够把单个 skill 同步进 runtime_root，并通过正式引擎路径完成调用。
     #[test]
@@ -1157,6 +1607,54 @@ mod tests {
         assert_eq!(result.content, "standard-ffi-demo:from-debug-bin");
         assert!(prepared.synced_skill_path.exists());
 
+        remove_temp_directory(&runtime_root);
+    }
+
+    /// Verify prepared debug runtime rejects directory-backed synchronized manifests before reading YAML.
+    /// 验证调试运行时准备会在读取 YAML 前拒绝目录型已同步清单。
+    #[test]
+    fn prepare_debug_runtime_rejects_directory_synced_skill_manifest() {
+        // Temporary runtime root that isolates the directory manifest fixture.
+        // 隔离目录型清单夹具的临时运行时根目录。
+        let runtime_root = make_temp_runtime_root();
+        // Synchronized skill directory selected by the skill-id debug command.
+        // skill-id 调试命令选中的已同步 skill 目录。
+        let synced_skill_path = runtime_root.join("skills").join("demo-skill");
+        // Manifest path deliberately occupied by a directory.
+        // 被有意创建为目录的清单路径。
+        let manifest_path = synced_skill_path.join("skill.yaml");
+        fs::create_dir_all(&manifest_path).expect("directory manifest should be created");
+        // Debug command that loads the pre-synchronized skill by id.
+        // 通过 id 加载已同步 skill 的调试命令。
+        let command = DebugCliCommand {
+            kind: DebugCommandKind::Call,
+            runtime_root: runtime_root.clone(),
+            skill_path: None,
+            skill_id: Some("demo-skill".to_string()),
+            tool_name: Some("ping".to_string()),
+            args_json: None,
+            args_file: None,
+            enable_host_result: false,
+            output_mode: DebugOutputMode::Pretty,
+        };
+
+        // Error returned before the directory manifest can reach the YAML reader.
+        // 在目录型清单进入 YAML 读取器之前返回的错误。
+        let error = match prepare_debug_runtime(&command) {
+            Ok(_) => panic!("directory synchronized manifest should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains("Synchronized skill manifest is not a file"),
+            "unexpected error: {}",
+            error
+        );
+        assert!(
+            error.contains(&render_debug_path(&manifest_path)),
+            "unexpected error: {}",
+            error
+        );
         remove_temp_directory(&runtime_root);
     }
 
