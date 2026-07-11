@@ -1021,9 +1021,12 @@ fn run_managed_popen_read(
             None if Instant::now() >= deadline => {
                 timed_out = true;
                 let _ = child.kill();
-                break child.wait().map_err(|error| {
-                    mlua::Error::runtime(format!("vulcan.io.popen kill: {error}"))
-                })?;
+                break crate::runtime::process_session::wait_for_child_exit_until(
+                    &mut child,
+                    Instant::now() + Duration::from_secs(5),
+                    "vulcan.io.popen timed-out direct child",
+                )
+                .map_err(mlua::Error::runtime)?;
             }
             None => thread::sleep(Duration::from_millis(10)),
         }

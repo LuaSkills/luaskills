@@ -847,6 +847,18 @@ Notes:
 
 Lua remains the first-class orchestration layer. Managed Python and Node.js runtimes are child execution surfaces that Lua calls through `vulcan.runtime.python.*` and `vulcan.runtime.node.*`; they do not replace the skill entry model, the Lua VM pool, or the host SDK contract.
 
+Both ordinary Skill calls and dedicated System Plugin leases carry one trusted package context. A System lease is created with a strict `system_package = { id, root, dependencies_file }` descriptor; `root` must be an absolute strict descendant of the engine's `system_lua_lib` directory, cannot contain Lua search-path metacharacters, and is revalidated before every eval. `dependencies_file` is resolved as a package-relative regular file without allowing path or symlink escape. Optional `workspace_root` must be an existing absolute directory, and `cwd` must resolve under either that workspace or the package root. The package root is the only System Plugin Lua module root, so sibling plugins do not share `require(...)` scope or managed dependency identity.
+
+Inside a System Plugin lease, the runtime also exposes:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `vulcan.runtime.system_plugin` | recursively read-only userdata view | `id`, canonical `root`, `lease_id`, `sid`, and `generation` for the bound package lease |
+| `vulcan.runtime.workspace_root` | `string \| nil` | canonical workspace root explicitly authorized by the host |
+| `vulcan.runtime.mounts` | recursively read-only userdata view | host-owned structured mount metadata |
+
+The two userdata views support indexing, `pairs` / `ipairs`, length, and normal JSON-result serialization. The three host-owned root fields cannot be assigned or replaced. Dedicated System VMs remove global `rawset` and the Lua `debug` library, preventing metatable bypass. These fields replace the old assumption that every System runtime context is absent or `nil`; entry-specific `vulcan.context.skill_dir / entry_dir / entry_file` fields remain separate and may still be `nil` because a lease eval is not a Skill entry call.
+
 The normal flow is:
 
 1. The skill declares Python or Node.js needs in `dependencies.yaml`.
@@ -881,6 +893,8 @@ node_runtime:
   package_json: node/package.json
   lockfile: node/pnpm-lock.yaml
 ```
+
+`node_runtime.version` must be one exact semantic version, not a range, tag, or partial version. The managed asynchronous ESM worker protocol requires Node.js `22.0.0` or newer; invalid SemVer and older versions are rejected before environment resolution or worker launch.
 
 Lua invocation:
 
@@ -984,14 +998,77 @@ Invoke result:
 Behavior notes:
 
 - The first invoke for a new environment hash creates the package environment. Later calls reuse the environment marker and usually reuse a live worker.
-- Python modules are loaded by file path and cached inside the Python worker.
+- Every live worker or persistent session snapshot retains a shared cross-process environment lifecycle lease. Final environment publication or replacement uses a nonblocking exclusive lease; while any worker or session remains active, the operation fails immediately with a stable `managed runtime environment is busy with active lifecycle leases` error instead of waiting or replacing files underneath the user.
+- Python modules are loaded by file path and cached inside the Python worker. Each worker fixes its one snapshot root at the front of `sys.path`, removes the cwd-derived empty entry, and rejects any later request that attempts to change that root.
 - Node.js modules are imported with native Node ESM behavior. Default, named, namespace, relative, side-effect, and dynamic imports should follow Node's normal rules when dependencies are declared in `package.json` and locked by `pnpm-lock.yaml`.
 - For Node.js, the current skill directory is copied into the managed environment import root before invocation. This keeps bare dependency resolution inside the managed `node_modules` directory and avoids Windows symlink privilege requirements.
+- On Unix, pooled workers enter the pinned snapshot directory before `exec`; every requested relative entry is validated component by component with descriptor-relative, no-follow `openat` calls. On Windows, workers receive absolute share-locked snapshot source paths and use the snapshot's short drive or UNC-share root as a neutral cwd, so they neither inherit the host cwd nor pass a long snapshot path as `CreateProcessW.lpCurrentDirectory`.
+- Managed `status`, pooled `invoke`, and System Plugin persistent sessions are supported on Windows x86_64, Linux x86_64/aarch64, and macOS x86_64/aarch64. Windows ARM/aarch64 is the sole explicit persistent-session exception.
 - Child code should return JSON-serializable values. Non-serializable results are reported as structured child errors instead of crashing the Lua skill VM.
 - `stdout` and `stderr` are captured into the result so Lua can decide whether to expose, redact, or log them.
 - Skills should not rely on system Python, system Node.js, external `node_modules`, or undeclared packages.
 
-For a working package, see [Managed Runtime Example](../examples/managed_runtime/README.md). During repository development, the layout checker and isolated smoke scripts provide a fast end-to-end verification path:
+#### Persistent `session.open(...)`
+
+Only dedicated System Plugin leases may use `vulcan.runtime.python.session.open(...)` or `vulcan.runtime.node.session.open(...)` when the child process must remain alive across multiple evaluations of the same lease VM. Persistent managed sessions support Windows x86_64, Linux x86_64/aarch64, and macOS x86_64/aarch64 with the same package snapshot, dependency, event, and process-tree cleanup rules. Windows ARM/aarch64 returns `persistent_session.supported=false` with the stable reason `windows_arm_is_not_supported` before environment creation, snapshot creation, or session reservation. Ordinary Skills retain supported `status` and `invoke` operations but cannot open persistent managed sessions. Every managed runtime `status()` response includes `persistent_session.supported`, `target_os`, `target_arch`, and an unsupported `reason` when applicable. The returned userdata uses the same `write`, `read`, `status`, `close`, and `kill` methods documented for `vulcan.process.session`, but the executable and dependency environment come only from the current trusted package declaration.
+
+Strict open input:
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `file` | `string` | yes | existing package-relative Python or Node source file; traversal and symlink escape are rejected |
+| `args` | dense `string[]` | no | direct child-process arguments; no shell expansion |
+| `cwd` | `string` | no | package-relative or absolute directory contained by the package root or the explicitly authorized System workspace root; defaults to the package root |
+| `stdout_encoding` | `string` | no | stdout decoding; defaults to the host runtime encoding |
+| `stderr_encoding` | `string` | no | stderr decoding; defaults to the host runtime encoding |
+| `stdin_encoding` | `string` | no | stdin encoding; defaults to the host runtime encoding |
+| `buffer_limit_bytes` | positive integer | no | retained byte limit per output stream; defaults to 1 MiB |
+
+Unknown fields are rejected. Python and Node both execute from a unique immutable per-session package snapshot copied through fixed, no-follow filesystem objects. Python uses the package's managed virtual environment without inherited `PYTHONHOME`, `PYTHONPATH`, or user-site packages; Node resolves bare dependencies from the exact managed `node_modules`. Symbolic links and unsupported objects in the copied package tree are rejected, and the authorized `cwd` object is pinned during process creation. Child code receives controlled package and lease metadata through `LUASKILLS_MANAGED_CONTEXT_JSON`, not an arbitrary copy of host request state.
+
+Minimal cross-eval System Plugin flow:
+
+```lua
+-- First eval: keep the userdata in the persistent lease VM.
+managed = vulcan.runtime.python.session.open({
+    file = "python/sidecar.py",
+    args = { "--stdio" },
+    cwd = "python",
+    stdout_encoding = "utf-8",
+    stderr_encoding = "utf-8",
+    stdin_encoding = "utf-8",
+    buffer_limit_bytes = 1024 * 1024,
+})
+local status = managed:status()
+return { managed_session_id = status.managed_session_id }
+```
+
+```lua
+-- Later eval on the same lease_id: reuse the same userdata and process.
+managed:write(vulcan.json.encode(args.message) .. "\n")
+local output = managed:read({ timeout_ms = 2000, max_bytes = 65536 })
+return {
+    managed_session_id = managed:status().managed_session_id,
+    stdout = output.stdout,
+    stderr = output.stderr,
+    stdout_total_bytes = output.stdout_total_bytes,
+    stdout_dropped_bytes = output.stdout_dropped_bytes,
+}
+```
+
+Only managed Python/Node session status tables include `managed_session_id`; ordinary `vulcan.process.session` status tables do not. The id precisely correlates the Lua userdata with host-side `RuntimeManagedSessionEvent.managed_session_id`.
+
+Lifecycle rules are deterministic:
+
+- A failed lease eval rolls back and terminates every managed session opened by that eval, even if Lua stored the userdata before raising the error.
+- Explicit lease close, same-SID replacement, lease expiration, VM destruction, and engine destruction terminate the complete child process tree and retire package-owned workers.
+- Ordinary Skill-root reload does not replace the dedicated System lease manager, so an active System Plugin session survives unrelated Skill reloads until its own lease lifecycle ends.
+- Dropping or collecting the userdata also terminates the process tree. Python/Node package snapshots are deleted only after process teardown.
+- The snapshot retains its environment's shared lifecycle lease through process teardown and snapshot cleanup, so environment replacement cannot race a still-live session or worker.
+- `session:close(...)` and `session:kill()` terminate descendants as well as the direct child.
+- Background stdout, stderr, exit, and failure watchers never invoke Lua. System Plugin sessions publish bounded engine events for the host to poll or wait on; a host wake callback may only wake or schedule host work and must not synchronously enter Lua.
+
+For the complete System lease, persistent-session, host-event, and cleanup workflow, see the [System Plugin managed runtime guide](system-plugin-managed-runtime.md). The [Managed Runtime Example](../examples/managed_runtime/README.md) is a working ordinary-Skill package for the pooled `status` / `invoke` path. During repository development, the layout checker and isolated smoke scripts provide a fast end-to-end verification path:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/debug-tools/managed_runtime_smoke.ps1
@@ -1559,7 +1636,7 @@ Notes:
 
 - In normal skill calls, all three are usually available.
 - In some runlua, help, or non-skill-file scenarios, they may be `nil`.
-- In `system_runtime_lease` / `system_lua_lib` host-runtime scenarios, all three should also be treated as `nil` because there is no current skill-file identity.
+- In a System Plugin lease eval, these three **entry-specific** fields remain `nil` because the eval is not a Skill entry call. This does not mean the package context is absent: use the recursively read-only `vulcan.runtime.system_plugin` view for package identity and `vulcan.runtime.workspace_root / mounts` for host-authorized context.
 - The current implementation automatically strips Windows verbatim path prefixes so Lua receives normal system paths.
 
 ### 12.8 `vulcan.context.host_result`
@@ -1708,7 +1785,7 @@ Notes:
 
 - These paths depend on the current skill root and host dependency layout.
 - If there is no valid current skill context, they are `nil`.
-- In `system_runtime_lease` / `system_lua_lib` scenarios, they should also be treated as `nil` because there is no current skill dependency-root identity.
+- In a System Plugin lease eval, these legacy Skill dependency-root fields remain `nil`. Managed Python/Node status, invoke, and session APIs instead resolve the exact `dependencies_file` bound by `system_package`; do not use `vulcan.deps.*` to infer whether a System package has declared dependencies.
 - Skills should rely on these protocol-exposed paths and should not guess the host's physical directory layout.
 
 ## 14. `vulcan.sqlite.*`

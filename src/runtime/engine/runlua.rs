@@ -1,5 +1,6 @@
 use super::lease::default_runlua_exec_args;
 use super::*;
+use std::sync::OnceLock;
 
 /// RunLua execution request accepted by `vulcan.runtime.lua.exec`.
 /// `vulcan.runtime.lua.exec` 接收的 RunLua 执行请求结构。
@@ -59,6 +60,12 @@ pub(super) struct RunLuaRuntimeContext {
     /// Optional SQLite host bridge available to nested runlua calls.
     /// 嵌套 runlua 调用可用的可选 SQLite 宿主桥接。
     sqlite_host: Option<Arc<SqliteSkillHost>>,
+    /// Engine-owned managed runtime lifecycle service shared with isolated VMs.
+    /// 与隔离 VM 共享的引擎所有受管运行时生命周期服务。
+    managed_runtime_services: Arc<ManagedRuntimeServices>,
+    /// Engine-owned short-lived worker service shared with isolated VMs.
+    /// 与隔离 VM 共享的引擎所有短期 Worker 服务。
+    managed_runtime_workers: Arc<ManagedRuntimeWorkerService>,
 }
 
 impl RunLuaRuntimeContext {
@@ -78,6 +85,8 @@ impl RunLuaRuntimeContext {
             runtime_skill_roots: engine.runtime_skill_roots.clone(),
             lancedb_host: engine.lancedb_host.clone(),
             sqlite_host: engine.sqlite_host.clone(),
+            managed_runtime_services: Arc::clone(&engine.managed_runtime_services),
+            managed_runtime_workers: Arc::clone(&engine.managed_runtime_workers),
         }
     }
 }
@@ -1076,7 +1085,12 @@ pub(super) fn execute_exec_request(request: ExecRequest) -> ExecResult {
                 {
                     timed_out_after_ms = Some(timeout_ms);
                     let _ = child.kill();
-                    break child.wait().ok();
+                    break crate::runtime::process_session::wait_for_child_exit_until(
+                        &mut child,
+                        Instant::now() + Duration::from_secs(5),
+                        "runlua timed-out direct child",
+                    )
+                    .ok();
                 }
                 thread::sleep(Duration::from_millis(10));
             }
@@ -1285,6 +1299,7 @@ impl LuaEngine {
                 dependency_context: AnonymousLuaDependencyContext::ClearWithHostOptions(
                     self.host_options.as_ref(),
                 ),
+                managed_package_context: AnonymousLuaManagedPackageContext::Clear,
             },
         )?;
 
@@ -1330,15 +1345,17 @@ impl LuaEngine {
         let runlua_pool = runtime_context.runlua_pool.clone();
         let runtime_context = runtime_context.clone();
         runlua_pool.acquire(move || {
-            Self::create_runlua_vm(
-                runtime_context.skills.as_ref(),
-                runtime_context.entry_registry.as_ref(),
-                runtime_context.host_options.clone(),
-                runtime_context.skill_config_store.clone(),
-                runtime_context.runtime_skill_roots.clone(),
-                runtime_context.lancedb_host.clone(),
-                runtime_context.sqlite_host.clone(),
-            )
+            Self::create_runlua_vm(RunLuaVmBuildContext {
+                skills: runtime_context.skills.as_ref(),
+                entry_registry: runtime_context.entry_registry.as_ref(),
+                host_options: runtime_context.host_options.clone(),
+                skill_config_store: runtime_context.skill_config_store.clone(),
+                runtime_skill_roots: runtime_context.runtime_skill_roots.clone(),
+                lancedb_host: runtime_context.lancedb_host.clone(),
+                sqlite_host: runtime_context.sqlite_host.clone(),
+                managed_runtime_services: runtime_context.managed_runtime_services.clone(),
+                managed_runtime_workers: runtime_context.managed_runtime_workers.clone(),
+            })
         })
     }
 
@@ -1378,6 +1395,7 @@ impl LuaEngine {
                 // Preserve the cleared dependency context installed by the request scope reset.
                 // 保留请求作用域 reset 已安装的清空依赖上下文。
                 dependency_context: AnonymousLuaDependencyContext::PreserveCurrent,
+                managed_package_context: AnonymousLuaManagedPackageContext::PreserveCurrent,
             },
         )?;
 

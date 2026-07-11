@@ -5,7 +5,10 @@ use std::sync::atomic::Ordering;
 
 use serde_json::Value;
 
-use crate::ffi::{FFI_ENGINE_COUNTER, lock_ffi_engine_registry, with_engine, with_engine_mut};
+use crate::ffi::{
+    FFI_ENGINE_COUNTER, clone_managed_session_event_center, destroy_removed_ffi_engine_slot,
+    lock_ffi_engine_registry, remove_ffi_engine_slot, with_engine, with_engine_mut,
+};
 use crate::host::callbacks::{
     RuntimeHostToolCallback, RuntimeHostToolRequest, RuntimeModelEmbedCallback,
     RuntimeModelEmbedRequest, RuntimeModelEmbedResponse, RuntimeModelError, RuntimeModelErrorCode,
@@ -21,6 +24,10 @@ use crate::host::database::{
     RuntimeSqliteProviderCallback, RuntimeSqliteProviderRequest, set_lancedb_provider_callback,
     set_lancedb_provider_json_callback, set_sqlite_provider_callback,
     set_sqlite_provider_json_callback,
+};
+use crate::runtime::logging;
+use crate::runtime::managed_session_events::{
+    FallibleRuntimeManagedSessionWakeCallback, RuntimeManagedSessionEventBatch,
 };
 use crate::runtime_context::RuntimeRequestContext;
 use crate::runtime_help::{
@@ -1605,6 +1612,102 @@ fn ffi_error_status(error_out: *mut FfiOwnedBuffer, message: impl Into<String>) 
     FFI_STATUS_ERROR
 }
 
+/// Serialize one managed-session event operation result into the caller-owned output slots.
+/// 将单次受管会话事件操作结果序列化到调用方拥有的输出槽位。
+///
+/// `operation_result` contains either the stable event batch or its explicit runtime error.
+/// `operation_result` 包含稳定事件批次或对应的显式运行时错误。
+///
+/// `result_json_out` must be non-null and writable; `error_out` may be null or writable.
+/// `result_json_out` 必须非空且可写；`error_out` 可以为空或可写。
+///
+/// Return `FFI_STATUS_OK` after writing direct batch JSON, otherwise `FFI_STATUS_ERROR`.
+/// 写入直接批次 JSON 后返回 `FFI_STATUS_OK`，否则返回 `FFI_STATUS_ERROR`。
+fn write_managed_session_event_batch(
+    operation_result: Result<RuntimeManagedSessionEventBatch, String>,
+    result_json_out: *mut FfiOwnedBuffer,
+    error_out: *mut FfiOwnedBuffer,
+) -> i32 {
+    // Successful event batch selected before any output allocation occurs.
+    // 在发生任何输出分配前选出的成功事件批次。
+    let batch = match operation_result {
+        Ok(batch) => batch,
+        Err(error) => return ffi_error_status(error_out, error),
+    };
+    // Stable direct JSON payload shared by poll and wait standard ABI calls.
+    // poll 与 wait 标准 ABI 调用共享的稳定直接 JSON 载荷。
+    let result_json = match serde_json::to_string(&batch) {
+        Ok(result_json) => result_json,
+        Err(error) => {
+            return ffi_error_status(
+                error_out,
+                format!("managed session event batch JSON encode failed: {error}"),
+            );
+        }
+    };
+    unsafe {
+        *result_json_out = alloc_owned_buffer_from_string(result_json);
+    }
+    ffi_ok_status(error_out)
+}
+
+/// Invoke one host wake callback and consume its optional LuaSkills-owned diagnostic buffer.
+/// 调用单个宿主唤醒回调并消费其可选的 LuaSkills 所有诊断缓冲。
+///
+/// `callback` is the registered C ABI function and `user_data` is its opaque host value.
+/// `callback` 是已注册的 C ABI 函数，`user_data` 是其不透明宿主值。
+///
+/// `engine_id` identifies the event source delivered to the callback.
+/// `engine_id` 标识传递给回调的事件来源。
+///
+/// Return success only when the host accepted the wake scheduling request.
+/// 仅在宿主接受唤醒调度请求时返回成功。
+fn invoke_managed_session_wake_callback(
+    callback: FfiManagedSessionWakeCallback,
+    user_data: usize,
+    engine_id: u64,
+) -> Result<(), String> {
+    // Callback-owned error output initialized to the required empty representation.
+    // 初始化为规定空表示形式的回调错误输出。
+    let mut error_out = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    // Callback status captured without holding any LuaSkills registry, engine, or event-center lock.
+    // 在不持有 LuaSkills 注册表锁、引擎锁或事件中心锁时捕获的回调状态。
+    let status = unsafe { callback(engine_id, user_data as *mut c_void, &mut error_out) };
+    // Optional callback diagnostic copied into Rust ownership and released immediately.
+    // 立即复制到 Rust 所有权并释放的可选回调诊断信息。
+    let callback_error = match take_optional_owned_ffi_string_buffer(
+        error_out,
+        "managed session wake callback error_out",
+    ) {
+        Ok(callback_error) => callback_error,
+        Err(error) => {
+            return Err(format!(
+                "managed session wake callback for engine {engine_id} returned invalid error_out: {error}"
+            ));
+        }
+    };
+    if status != FFI_STATUS_OK {
+        // Normalized host diagnostic retaining the engine source in runtime logs.
+        // 在运行时日志中保留引擎来源的规范化宿主诊断信息。
+        let message = callback_error
+            .unwrap_or_else(|| "callback returned failure without error message".to_string());
+        return Err(format!(
+            "managed session wake callback for engine {engine_id} failed: {message}"
+        ));
+    }
+    if let Some(message) = callback_error
+        && !message.is_empty()
+    {
+        logging::error(format!(
+            "managed session wake callback for engine {engine_id} returned unexpected error text on success: {message}"
+        ));
+    }
+    Ok(())
+}
+
 /// Clone one host string into one LuaSkills-owned heap string so callbacks can return safely across FFI.
 /// 将宿主字符串克隆到 LuaSkills 管理的堆字符串，便于回调安全跨 FFI 返回。
 ///
@@ -2239,12 +2342,14 @@ pub unsafe extern "C" fn luaskills_ffi_engine_free(
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
     clear_error_out(error_out);
-    let mut registry = lock_ffi_engine_registry();
-    if registry.remove(&engine_id).is_none() {
-        ffi_error_status(error_out, format!("FFI engine {} not found", engine_id))
-    } else {
-        ffi_ok_status(error_out)
-    }
+    // Removed slot whose callback-quiescing engine teardown must run outside the registry lock.
+    // 已移除的槽；其等待回调收敛的引擎清理必须在注册表锁外运行。
+    let removed_slot = match remove_ffi_engine_slot(engine_id) {
+        Some(removed_slot) => removed_slot,
+        None => return ffi_error_status(error_out, format!("FFI engine {} not found", engine_id)),
+    };
+    destroy_removed_ffi_engine_slot(removed_slot);
+    ffi_ok_status(error_out)
 }
 
 /// Load skills from one ordered root chain through the standard C ABI surface.
@@ -3090,6 +3195,141 @@ pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_close(
         "request_json",
         |engine, request_json| engine.close_system_runtime_lease_json(request_json),
     )
+}
+
+/// Poll one bounded batch of engine-level managed-session events through the standard C ABI.
+/// 通过标准 C ABI 轮询一批有界的引擎级受管会话事件。
+///
+/// `engine_id` identifies the engine and `max_events` is the positive destructive-drain limit.
+/// `engine_id` 标识目标引擎，`max_events` 是破坏性排空的正数上限。
+///
+/// `result_json_out` receives direct batch JSON; `error_out` receives an owned diagnostic on failure.
+/// `result_json_out` 接收直接批次 JSON；失败时 `error_out` 接收拥有型诊断信息。
+///
+/// Return zero on success or one on validation, lookup, center-state, or serialization failure.
+/// 成功返回零；校验、查找、事件中心状态或序列化失败返回一。
+///
+/// # Safety
+/// # 安全性
+/// Writable output pointers must remain valid for the duration of this call.
+/// 可写输出指针必须在本次调用期间保持有效。
+/// Returned LuaSkills-owned buffers must be released with `luaskills_ffi_buffer_free`.
+/// 返回的 LuaSkills 所有缓冲必须使用 `luaskills_ffi_buffer_free` 释放。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_managed_session_events_poll(
+    engine_id: u64,
+    max_events: usize,
+    result_json_out: *mut FfiOwnedBuffer,
+    error_out: *mut FfiOwnedBuffer,
+) -> i32 {
+    clear_error_out(error_out);
+    clear_out_buffer(result_json_out);
+    if result_json_out.is_null() {
+        return ffi_error_status(error_out, "result_json_out must not be null");
+    }
+    // Detached event center acquired before the destructive nonblocking drain.
+    // 在破坏性非阻塞排空前获取的分离式事件中心。
+    let event_center = match clone_managed_session_event_center(engine_id) {
+        Ok(event_center) => event_center,
+        Err(error) => return ffi_error_status(error_out, error),
+    };
+    write_managed_session_event_batch(event_center.poll(max_events), result_json_out, error_out)
+}
+
+/// Wait for one bounded batch of engine-level managed-session events through the standard C ABI.
+/// 通过标准 C ABI 等待一批有界的引擎级受管会话事件。
+///
+/// `engine_id` identifies the engine, `max_events` bounds the drain, and `timeout_ms` is finite.
+/// `engine_id` 标识目标引擎，`max_events` 限制排空数量，`timeout_ms` 是有限超时。
+///
+/// `result_json_out` receives direct batch JSON; `error_out` receives an owned diagnostic on failure.
+/// `result_json_out` 接收直接批次 JSON；失败时 `error_out` 接收拥有型诊断信息。
+///
+/// Return zero for an event or timeout batch, or one for an explicit error.
+/// 返回事件或超时批次时为零；发生显式错误时为一。
+///
+/// # Safety
+/// # 安全性
+/// Writable output pointers must remain valid until this potentially blocking call returns.
+/// 可写输出指针必须保持有效，直至这个潜在阻塞调用返回。
+/// Returned LuaSkills-owned buffers must be released with `luaskills_ffi_buffer_free`.
+/// 返回的 LuaSkills 所有缓冲必须使用 `luaskills_ffi_buffer_free` 释放。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_managed_session_events_wait(
+    engine_id: u64,
+    max_events: usize,
+    timeout_ms: u64,
+    result_json_out: *mut FfiOwnedBuffer,
+    error_out: *mut FfiOwnedBuffer,
+) -> i32 {
+    clear_error_out(error_out);
+    clear_out_buffer(result_json_out);
+    if result_json_out.is_null() {
+        return ffi_error_status(error_out, "result_json_out must not be null");
+    }
+    // Detached center cloned before blocking so the global registry and engine locks are released.
+    // 在阻塞前克隆分离式事件中心，确保全局注册表锁与引擎锁已经释放。
+    let event_center = match clone_managed_session_event_center(engine_id) {
+        Ok(event_center) => event_center,
+        Err(error) => return ffi_error_status(error_out, error),
+    };
+    write_managed_session_event_batch(
+        event_center.wait(max_events, timeout_ms),
+        result_json_out,
+        error_out,
+    )
+}
+
+/// Register, replace, or clear one per-engine managed-session wake callback.
+/// 注册、替换或清除单个引擎级受管会话唤醒回调。
+///
+/// `engine_id` identifies the engine, `callback` may be null to clear, and `user_data` is opaque.
+/// `engine_id` 标识目标引擎，`callback` 可为空以清除回调，`user_data` 为不透明值。
+///
+/// `error_out` receives an owned diagnostic when lookup or quiescent replacement fails.
+/// 查找或静默替换失败时，`error_out` 接收拥有型诊断信息。
+///
+/// Return only after the retired callback and its `user_data` are no longer in flight.
+/// 仅在退役回调及其 `user_data` 不再处于在途状态后返回。
+///
+/// # Safety
+/// # 安全性
+/// The callback and `user_data` must remain valid until this function later clears or replaces them.
+/// 回调与 `user_data` 必须保持有效，直至本函数后续清除或替换它们。
+/// Both must support safe access from arbitrary managed-session background threads.
+/// 两者都必须支持从任意受管会话后台线程安全访问。
+/// They must already be valid on entry because a pending queue may trigger catch-up before return.
+/// 它们在进入函数时就必须有效，因为待处理队列可能在返回前触发补偿调用。
+/// The callback must not unwind or synchronously reenter Lua execution across the C ABI boundary.
+/// 回调不得跨 C ABI 边界展开异常，也不得同步重入 Lua 执行。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_set_managed_session_wake_callback(
+    engine_id: u64,
+    callback: Option<FfiManagedSessionWakeCallback>,
+    user_data: *mut c_void,
+    error_out: *mut FfiOwnedBuffer,
+) -> i32 {
+    clear_error_out(error_out);
+    // Detached center ensures catch-up invocation and quiescent replacement do not hold engine locks.
+    // 分离式事件中心确保补偿调用与静默替换不会持有引擎锁。
+    let event_center = match clone_managed_session_event_center(engine_id) {
+        Ok(event_center) => event_center,
+        Err(error) => return ffi_error_status(error_out, error),
+    };
+    // Rust callback bridge retaining only the ABI function, engine id, and opaque pointer value.
+    // 仅保留 ABI 函数、引擎标识与不透明指针值的 Rust 回调桥接。
+    let wrapped = callback.map(|callback_fn| {
+        // Pointer bits stored as a Send-compatible integer until callback invocation.
+        // 在回调调用前以 Send 兼容整数形式保存的指针位。
+        let user_data = user_data as usize;
+        std::sync::Arc::new(move || {
+            invoke_managed_session_wake_callback(callback_fn, user_data, engine_id)
+        }) as FallibleRuntimeManagedSessionWakeCallback
+    });
+    match event_center.set_fallible_wake_callback(wrapped) {
+        Ok(()) => ffi_ok_status(error_out),
+        Err(error) => ffi_error_status(error_out, error),
+    }
 }
 
 /// Disable one skill through one ordered root chain via the standard C ABI surface.

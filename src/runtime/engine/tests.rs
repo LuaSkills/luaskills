@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use super::format_vulcan_fs_list_non_utf8_file_name_error;
 use super::host_result::{
     host_result_capability_to_json_value, normalize_change_set_payload,
     resolve_host_result_capability, validate_change_set_payload,
@@ -12,32 +14,41 @@ use super::vulcan_process_candidate_paths;
 use super::windows_wide_null_path;
 use super::{
     LoadedSkill, LuaEngine, LuaVm, LuaVmPool, LuaVmPoolConfig, LuaVmPoolState,
-    LuaVmRequestScopeGuard, ManagedRuntimeWorkerPool, NativeLibrarySearchGuard,
-    ResolvedEntryTarget, SkillApplyLifecycleAction, SkillConfigStore,
+    LuaVmRequestScopeGuard, ManagedRuntimeServices, ManagedRuntimeWorkerKey,
+    ManagedRuntimeWorkerService, NativeLibrarySearchGuard, ResolvedEntryTarget,
+    RunLuaVmBuildContext, SkillApplyLifecycleAction, SkillConfigStore,
     VulcanInternalExecutionContext, build_lua_call_dispatch_entries,
-    copy_managed_node_skill_import_root, default_runlua_vm_pool_config,
-    find_vulcan_process_candidate, format_lifecycle_recovery_error,
-    format_vulcan_fs_list_non_utf8_file_name_error, get_vulcan_context_table,
+    copy_managed_node_package_import_root, default_runlua_vm_pool_config,
+    find_vulcan_process_candidate, format_lifecycle_recovery_error, get_vulcan_context_table,
     get_vulcan_deps_table, get_vulcan_runtime_internal_table, get_vulcan_table,
-    invoke_managed_runtime_worker, json_to_lua_table, lock_managed_runtime_worker_pool,
-    lua_value_to_json, managed_runtime_status_from_plan, managed_runtime_worker_pool,
-    managed_runtime_worker_result_to_json, parse_runtime_request_context_json,
-    populate_vulcan_dependency_context, populate_vulcan_file_context,
-    populate_vulcan_internal_execution_context, prepare_managed_node_import_root,
-    read_lua_help_payload_source, read_skill_text_file, render_host_visible_path,
-    render_lua_help_payload_text, render_lua_print_argument, resolve_managed_runtime_skill_file,
-    resolve_vulcan_fs_copy_effective_destination_path, runtime_root_from_skill_dir,
-    spawn_managed_runtime_worker, system_time_to_unix_millis_i64, vulcan_fs_target_exists,
-    vulcan_fs_target_is_dir,
+    invoke_managed_runtime_worker, json_to_lua_table, lua_value_to_json,
+    managed_runtime_status_from_plan, managed_runtime_worker_result_to_json,
+    parse_runtime_request_context_json, populate_vulcan_dependency_context,
+    populate_vulcan_file_context, populate_vulcan_internal_execution_context,
+    prepare_managed_node_import_root, read_lua_help_payload_source, read_skill_text_file,
+    render_host_visible_path, render_lua_help_payload_text, render_lua_print_argument,
+    resolve_vulcan_fs_copy_effective_destination_path, spawn_managed_runtime_worker,
+    system_time_to_unix_millis_i64, vulcan_fs_target_exists, vulcan_fs_target_is_dir,
 };
 use crate::host::callbacks::runtime_model_callback_test_guard;
 use crate::host::database::RuntimeDatabaseProviderCallbacks;
 use crate::lua_skill::SkillMeta;
-use crate::runtime::encoding::{RuntimeTextEncoding, encode_runtime_text};
+use crate::runtime::encoding::{
+    RuntimeTextEncoding, default_runtime_text_encoding, encode_runtime_text,
+};
+use crate::runtime::managed_package::{
+    ManagedRuntimePackageContext, replace_lua_managed_package_context,
+};
 use crate::runtime::managed_runtime::{
-    ManagedRuntimeEnvMarker, ManagedRuntimeEnvPlan, ManagedRuntimeKind, managed_env_marker_path,
+    ManagedRuntimeEnvMarker, ManagedRuntimeEnvPlan, ManagedRuntimeKind,
+    current_managed_runtime_platform_key, managed_env_marker_path, resolve_node_env_plan,
+    resolve_python_env_plan, validate_managed_node_runtime_version,
+};
+use crate::runtime::managed_session_events::{
+    ManagedSessionEventCenter, RuntimeManagedSessionEvent, RuntimeManagedSessionEventKind,
 };
 use crate::runtime_options::LuaRuntimeRunLuaPoolConfig;
+use crate::skill::dependencies::PackageDependencyManifest;
 use crate::{
     LuaEngineOptions, LuaRuntimeCapabilityOptions, LuaRuntimeHostOptions, RuntimeClientInfo,
     RuntimeHostToolAction, RuntimeModelEmbedRequest, RuntimeModelEmbedResponse, RuntimeModelError,
@@ -60,13 +71,24 @@ use std::os::unix::fs::{PermissionsExt, symlink as create_unix_symlink};
 use std::os::windows::fs::{
     symlink_dir as create_windows_dir_symlink, symlink_file as create_windows_file_symlink,
 };
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Barrier, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    ERROR_INVALID_PARAMETER, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+};
 
 use crate::runtime::test_support::{TestEnvRestoreGuard, process_env_test_guard};
 
@@ -537,10 +559,23 @@ fn make_loaded_skill(
     let mut meta: SkillMeta = serde_yaml::from_str(&format!("name: {skill_id}\nversion: 0.1.0\nenable: true\ndebug: false\nentries:\n  - name: {local_entry_name}\n    lua_entry: runtime/test.lua\n    lua_module: {lua_module}\n"))
             .expect("deserialize minimal skill meta");
     meta.bind_directory_skill_id(skill_id.to_string());
+    // Real temporary runtime root required by the trusted package constructor.
+    // 可信包构造器所需的真实临时运行时根。
+    let runtime_root = make_temp_runtime_root(&format!("loaded-{directory_name}"));
+    // Real temporary Skill directory used by the package identity.
+    // 包身份使用的真实临时 Skill 目录。
+    let skill_dir = runtime_root.join("skills").join(directory_name);
+    fs::create_dir_all(&skill_dir).expect("create loaded Skill package root");
+    // Trusted package context attached to the synthetic LoadedSkill fixture.
+    // 附加到合成 LoadedSkill 夹具的可信包上下文。
+    let managed_package =
+        ManagedRuntimePackageContext::for_skill(skill_id, &skill_dir, &runtime_root, None)
+            .expect("create loaded Skill managed package");
     LoadedSkill {
         meta,
-        dir: PathBuf::from(format!("D:/tests/{directory_name}")),
+        dir: skill_dir,
         root_name: "ROOT".to_string(),
+        managed_package,
         lancedb_binding: None,
         sqlite_binding: None,
         resolved_entry_names: HashMap::new(),
@@ -618,7 +653,11 @@ fn make_test_engine(skills: HashMap<String, LoadedSkill>) -> LuaEngine {
             condvar: Condvar::new(),
         }),
         runlua_pool: Arc::new(LuaVmPool::new(default_runlua_vm_pool_config())),
-        runtime_sessions: Arc::new(RuntimeSessionManager::new()),
+        public_runtime_sessions: Arc::new(RuntimeSessionManager::new()),
+        system_runtime_sessions: Arc::new(RuntimeSessionManager::new()),
+        managed_runtime_services: ManagedRuntimeServices::new()
+            .expect("create managed runtime test services"),
+        managed_runtime_workers: ManagedRuntimeWorkerService::new(),
         skill_config_store: Arc::new(
             SkillConfigStore::new(None).expect("create runtime test skill config store"),
         ),
@@ -682,9 +721,13 @@ return {
   python_table = type(vulcan.runtime.python),
   python_status = type(vulcan.runtime.python.status),
   python_invoke = type(vulcan.runtime.python.invoke),
+  python_session = type(vulcan.runtime.python.session),
+  python_session_open = type(vulcan.runtime.python.session.open),
   node_table = type(vulcan.runtime.node),
   node_status = type(vulcan.runtime.node.status),
   node_invoke = type(vulcan.runtime.node.invoke),
+  node_session = type(vulcan.runtime.node.session),
+  node_session_open = type(vulcan.runtime.node.session.open),
 }
 "#,
             &json!({}),
@@ -695,9 +738,39 @@ return {
     assert_eq!(result["python_table"], "table");
     assert_eq!(result["python_status"], "function");
     assert_eq!(result["python_invoke"], "function");
+    assert_eq!(result["python_session"], "table");
+    assert_eq!(result["python_session_open"], "function");
     assert_eq!(result["node_table"], "table");
     assert_eq!(result["node_status"], "function");
     assert_eq!(result["node_invoke"], "function");
+    assert_eq!(result["node_session"], "table");
+    assert_eq!(result["node_session_open"], "function");
+}
+
+/// Verify ordinary Skill packages cannot open persistent Python or Node managed sessions.
+/// 验证普通 Skill 包不能打开持久 Python 或 Node 受管会话。
+#[test]
+fn ordinary_skill_package_cannot_open_persistent_managed_sessions() {
+    let runtime_root = make_temp_runtime_root("ordinary-skill-persistent-session");
+    let _ = fs::remove_dir_all(&runtime_root);
+    fs::create_dir_all(&runtime_root).expect("create ordinary Skill session runtime root");
+    let package = make_test_managed_runtime_package(&runtime_root, "ordinary-session-skill");
+    let lua = Lua::new();
+    replace_lua_managed_package_context(&lua, Some(package));
+    let services = ManagedRuntimeServices::new().expect("create managed session test services");
+    lua.set_app_data(services);
+    let encoding = default_runtime_text_encoding();
+
+    let python_error = super::open_managed_python_session(&lua, LuaValue::Nil, encoding)
+        .expect_err("ordinary Skill Python persistent session must be rejected")
+        .to_string();
+    let node_error = super::open_managed_node_session(&lua, LuaValue::Nil, encoding)
+        .expect_err("ordinary Skill Node persistent session must be rejected")
+        .to_string();
+
+    assert!(python_error.contains("available only inside a System Plugin lease"));
+    assert!(node_error.contains("available only inside a System Plugin lease"));
+    let _ = fs::remove_dir_all(&runtime_root);
 }
 
 /// Build one temporary runtime root path for one isolated skill-config test case.
@@ -845,8 +918,8 @@ fn setup_package_paths_rejects_non_directory_lua_packages_dir() {
 /// Build one minimal managed Node environment plan for import-root tests.
 /// 为 import-root 测试构造一个最小受管 Node 环境计划。
 ///
-/// The env_dir parameter is the environment directory that owns `.luaskills-skill`.
-/// env_dir 参数是拥有 `.luaskills-skill` 的环境目录。
+/// The env_dir parameter is the environment directory that owns `.luaskills-packages`.
+/// env_dir 参数是拥有 `.luaskills-packages` 的环境目录。
 ///
 /// Return a plan with stable dummy dependency metadata and the requested environment directory.
 /// 返回带有稳定假依赖元数据和指定环境目录的计划。
@@ -878,6 +951,44 @@ fn make_test_managed_node_env_plan(env_dir: PathBuf) -> ManagedRuntimeEnvPlan {
             env_hash: "env-hash".to_string(),
         },
     }
+}
+
+/// Publish the exact expected marker for one synthetic managed-environment plan.
+/// 为一个合成受管环境计划发布精确预期 marker。
+///
+/// `plan` supplies both the marker payload and its environment-owned destination path.
+/// `plan` 同时提供 marker 载荷及其环境所有的目标路径。
+///
+/// Return unit after a complete test-fixture write, panicking only on fixture construction failure.
+/// 在完整测试夹具写入后返回空值，仅在夹具构造失败时 panic。
+fn write_test_managed_env_marker(plan: &ManagedRuntimeEnvPlan) {
+    let marker = serde_json::to_vec_pretty(&plan.expected_marker)
+        .expect("encode synthetic managed environment marker");
+    fs::write(managed_env_marker_path(&plan.env_dir), marker)
+        .expect("write synthetic managed environment marker");
+}
+
+/// Build one real trusted Skill package context for managed-runtime tests.
+/// 为受管运行时测试构造一个真实可信的 Skill 包上下文。
+///
+/// The runtime_root parameter is the existing runtime root that owns the test package.
+/// runtime_root 参数是拥有测试包的现有运行时根目录。
+///
+/// The package_id parameter is the validated package identifier and directory name.
+/// package_id 参数是经过校验的包标识及目录名称。
+///
+/// Return the canonical package context consumed by production managed-runtime helpers.
+/// 返回生产受管运行时辅助函数所消费的规范包上下文。
+fn make_test_managed_runtime_package(
+    runtime_root: &Path,
+    package_id: &str,
+) -> Arc<ManagedRuntimePackageContext> {
+    // Real package directory required by the trusted package-context constructor.
+    // 可信包上下文构造器所需的真实包目录。
+    let package_root = runtime_root.join("skills").join(package_id);
+    fs::create_dir_all(&package_root).expect("create managed runtime test package root");
+    ManagedRuntimePackageContext::for_skill(package_id, &package_root, runtime_root, None)
+        .expect("create managed runtime test package context")
 }
 
 /// Verify managed runtime status exposes marker parse failures instead of hiding them as not-ready.
@@ -916,6 +1027,15 @@ fn managed_runtime_status_reports_invalid_env_marker_error() {
     assert_eq!(status["configured"], true);
     assert_eq!(status["ready"], false);
     assert_eq!(status["runtime"], "node");
+    assert_eq!(status["persistent_session"]["supported"], true);
+    assert_eq!(
+        status["persistent_session"]["target_os"],
+        std::env::consts::OS
+    );
+    assert_eq!(
+        status["persistent_session"]["target_arch"],
+        std::env::consts::ARCH
+    );
     assert_eq!(
         status["message"],
         "managed runtime environment status check failed"
@@ -3054,66 +3174,50 @@ fn runlua_pool_uses_default_config_when_host_does_not_override() {
 /// 验证受管运行时根目录推导错误会通过宿主可见路径渲染器输出路径。
 #[test]
 fn managed_runtime_root_error_uses_host_visible_path() {
-    // Skill directory shape that cannot provide the expected runtime root ancestor.
-    // 无法提供预期 runtime root 祖先目录的 skill 目录形态。
-    let skill_dir = PathBuf::from("orphan-skill");
-    // Error returned by the real managed runtime root derivation helper.
-    // 真实受管运行时根目录推导辅助函数返回的错误。
-    let error = runtime_root_from_skill_dir(&skill_dir, "vulcan.runtime.python.status")
-        .expect_err("orphan skill dir should not derive runtime root");
-    // Expected diagnostic fragment rendered with the shared host-visible path formatter.
-    // 使用共享宿主可见路径渲染器生成的期望诊断片段。
-    let expected = format!(
-        "vulcan.runtime.python.status: failed to derive runtime root from skill_dir {}",
-        render_host_visible_path(&skill_dir)
-    );
-
+    // Real package directory paired with an intentionally missing runtime root.
+    // 与故意缺失运行时根配对的真实包目录。
+    let fixture_root = make_temp_runtime_root("managed-package-missing-runtime-root");
+    let _ = fs::remove_dir_all(&fixture_root);
+    let package_root = fixture_root.join("package");
+    fs::create_dir_all(&package_root).expect("create package root");
+    // Missing authoritative runtime root rejected during context construction.
+    // 在上下文构造期间被拒绝的缺失权威运行时根。
+    let missing_runtime_root = fixture_root.join("missing-runtime");
+    let error = ManagedRuntimePackageContext::for_skill(
+        "missing-runtime",
+        &package_root,
+        &missing_runtime_root,
+        None,
+    )
+    .expect_err("missing runtime root must fail");
     assert!(
-        error.to_string().contains(&expected),
-        "unexpected error: {}",
-        error
+        error.contains("failed to canonicalize runtime root"),
+        "unexpected error: {error}"
     );
+    let _ = fs::remove_dir_all(&fixture_root);
 }
 
 /// Verify managed runtime source-file errors render paths through the host-visible formatter.
 /// 验证受管运行时源文件错误会通过宿主可见路径渲染器输出路径。
 #[test]
 fn managed_runtime_skill_file_error_uses_host_visible_path() {
-    // Temporary skill directory used by the real managed runtime file resolver.
-    // 真实受管运行时文件解析器使用的临时 skill 目录。
-    let skill_dir = make_temp_runtime_root("managed-runtime-missing-file").join("skills/demo");
-    let _ = fs::remove_dir_all(&skill_dir);
-    fs::create_dir_all(&skill_dir).expect("create managed runtime skill dir");
-    // Missing source file path expected after safe skill-relative resolution.
-    // 安全 skill 相对解析后预期得到的缺失源文件路径。
-    let missing_file = skill_dir.join("handlers/missing.py");
-    // Error returned by the real managed runtime skill-file resolver.
-    // 真实受管运行时 skill 文件解析器返回的错误。
-    let error = resolve_managed_runtime_skill_file(
-        &skill_dir,
-        "handlers/missing.py",
-        "vulcan.runtime.python.invoke",
-        "file",
-    )
-    .expect_err("missing managed runtime source file should fail");
-    // Expected diagnostic fragment rendered with the shared host-visible path formatter.
-    // 使用共享宿主可见路径渲染器生成的期望诊断片段。
-    let expected = format!(
-        "vulcan.runtime.python.invoke: file not found: {}",
-        render_host_visible_path(&missing_file)
-    );
-
+    // Real trusted package used by the canonical package-file resolver.
+    // 规范包文件解析器使用的真实可信包。
+    let runtime_root = make_temp_runtime_root("managed-package-missing-file");
+    let _ = fs::remove_dir_all(&runtime_root);
+    fs::create_dir_all(&runtime_root).expect("create runtime root");
+    let package = make_test_managed_runtime_package(&runtime_root, "missing-file");
+    // Missing canonical candidate expected in the stable diagnostic.
+    // 稳定诊断中预期出现的缺失规范候选路径。
+    let missing_file = package.package_root().join("handlers/missing.py");
+    let error = package
+        .resolve_existing_file("handlers/missing.py", "file")
+        .expect_err("missing package file must fail");
     assert!(
-        error.to_string().contains(&expected),
-        "unexpected error: {}",
-        error
+        error.contains(&render_host_visible_path(&missing_file)),
+        "unexpected error: {error}"
     );
-    let _ = fs::remove_dir_all(
-        skill_dir
-            .parent()
-            .and_then(Path::parent)
-            .expect("test skill dir should have runtime root"),
-    );
+    let _ = fs::remove_dir_all(&runtime_root);
 }
 
 /// Verify managed runtime source-file probe errors are not reported as missing files.
@@ -3126,27 +3230,22 @@ fn managed_runtime_skill_file_error_uses_host_visible_path() {
 /// 校验受管运行时文件解析器输出探测诊断后返回 unit。
 #[test]
 fn managed_runtime_skill_file_reports_probe_errors() {
-    // Skill directory containing one embedded NUL that makes the resolved source file impossible to inspect.
-    // 包含内嵌 NUL 的 skill 目录，使解析后的源文件无法被探测。
-    let invalid_skill_dir = PathBuf::from("invalid\0skill");
-
-    // Error returned before the invalid source file can behave like a missing file.
-    // 在非法源文件表现得像缺失文件之前返回的错误。
-    let error = resolve_managed_runtime_skill_file(
-        &invalid_skill_dir,
-        "handlers/main.py",
-        "vulcan.runtime.python.invoke",
-        "file",
-    )
-    .expect_err("invalid managed runtime source file probe should fail")
-    .to_string();
-
+    // Real trusted package used before introducing an invalid child path.
+    // 引入非法子路径前使用的真实可信包。
+    let runtime_root = make_temp_runtime_root("managed-package-probe-error");
+    let _ = fs::remove_dir_all(&runtime_root);
+    fs::create_dir_all(&runtime_root).expect("create runtime root");
+    let package = make_test_managed_runtime_package(&runtime_root, "probe-error");
+    // Embedded-NUL child path that cannot be canonicalized by the filesystem.
+    // 文件系统无法规范化的内嵌 NUL 子路径。
+    let error = package
+        .resolve_existing_file("handlers/invalid\0main.py", "file")
+        .expect_err("invalid package file probe must fail");
     assert!(
-        error.contains("vulcan.runtime.python.invoke: failed to inspect file"),
-        "unexpected error: {}",
-        error
+        error.contains("failed to canonicalize file"),
+        "unexpected error: {error}"
     );
-    assert!(error.contains("handlers"), "unexpected error: {}", error);
+    let _ = fs::remove_dir_all(&runtime_root);
 }
 
 /// Verify managed runtime source-file resolution rejects directory placeholders.
@@ -3159,51 +3258,34 @@ fn managed_runtime_skill_file_reports_probe_errors() {
 /// 校验受管运行时文件解析器输出非文件诊断后返回 unit。
 #[test]
 fn managed_runtime_skill_file_rejects_directory_source_path() {
-    // Temporary skill directory used to isolate the directory source-file fixture.
-    // 用于隔离目录型源文件夹具的临时 skill 目录。
-    let skill_dir = make_temp_runtime_root("managed-runtime-directory-file").join("skills/demo");
-    // Best-effort cleanup for stale state from an earlier run of this same test.
-    // 清理同一测试早先运行可能留下的残留状态。
-    let _ = fs::remove_dir_all(&skill_dir);
-    // Directory deliberately placed where the managed runtime request requires one source file.
-    // 故意放在受管运行时请求需要源文件位置上的目录。
-    let directory_source = skill_dir.join("handlers/main.py");
+    // Real trusted package containing a directory where a source file is required.
+    // 在需要源文件的位置包含目录的真实可信包。
+    let runtime_root = make_temp_runtime_root("managed-package-directory-file");
+    let _ = fs::remove_dir_all(&runtime_root);
+    fs::create_dir_all(&runtime_root).expect("create runtime root");
+    let package = make_test_managed_runtime_package(&runtime_root, "directory-file");
+    let directory_source = package.package_root().join("handlers/main.py");
     fs::create_dir_all(&directory_source).expect("create directory source fixture");
-
-    // Error returned before the directory source can be reported as a missing file.
-    // 在目录型源文件被报告为缺失文件之前返回的错误。
-    let error = resolve_managed_runtime_skill_file(
-        &skill_dir,
-        "handlers/main.py",
-        "vulcan.runtime.node.invoke",
-        "file",
-    )
-    .expect_err("directory managed runtime source path should fail")
-    .to_string();
-
+    // Explicit regular-file diagnostic returned for the directory target.
+    // 针对目录目标返回的显式普通文件诊断。
+    let error = package
+        .resolve_existing_file("handlers/main.py", "file")
+        .expect_err("directory package source must fail");
     assert!(
-        error.contains("vulcan.runtime.node.invoke: file is not a file"),
-        "unexpected error: {}",
-        error
+        error.contains("file is not a file"),
+        "unexpected error: {error}"
     );
     assert!(
         error.contains(&render_host_visible_path(&directory_source)),
-        "unexpected error: {}",
-        error
+        "unexpected error: {error}"
     );
-
-    let _ = fs::remove_dir_all(
-        skill_dir
-            .parent()
-            .and_then(Path::parent)
-            .expect("test skill dir should have runtime root"),
-    );
+    let _ = fs::remove_dir_all(&runtime_root);
 }
 
-/// Verify managed Node import-root cleanup errors render paths through the host-visible formatter.
-/// 验证受管 Node import-root 清理错误会通过宿主可见路径渲染器输出路径。
+/// Verify managed package snapshot-root creation errors use the host-visible path formatter.
+/// 验证受管包快照根创建错误会使用宿主可见路径渲染器。
 #[test]
-fn managed_node_import_root_cleanup_error_uses_host_visible_path() {
+fn managed_package_snapshot_root_creation_error_uses_host_visible_path() {
     // Temporary root that isolates the managed Node import-root cleanup fixture.
     // 隔离受管 Node import-root 清理夹具的临时根目录。
     let temp_root = make_temp_runtime_root("managed-node-import-cleanup-path");
@@ -3211,27 +3293,27 @@ fn managed_node_import_root_cleanup_error_uses_host_visible_path() {
     // Managed environment directory that owns the import root.
     // 拥有 import root 的受管环境目录。
     let env_dir = temp_root.join("env");
-    // Skill directory supplied to the real import-root preparation helper.
-    // 传给真实 import-root 准备辅助函数的 skill 目录。
-    let skill_dir = temp_root.join("skills/demo");
     fs::create_dir_all(&env_dir).expect("create managed node env dir");
-    fs::create_dir_all(&skill_dir).expect("create managed node skill dir");
-    // Existing import-root file that makes remove_dir_all fail deterministically.
-    // 让 remove_dir_all 稳定失败的既有 import-root 文件。
-    let import_root = env_dir.join(".luaskills-skill");
-    fs::write(&import_root, "stale import root file").expect("write stale import root file");
+    // Real trusted package context supplied to the import-root preparation helper.
+    // 传给 import-root 准备辅助函数的真实可信包上下文。
+    let package = make_test_managed_runtime_package(&temp_root, "demo");
     // Minimal managed Node env plan consumed by the real preparation helper.
     // 真实准备辅助函数消费的最小受管 Node 环境计划。
     let plan = make_test_managed_node_env_plan(env_dir);
+    // Namespace path pre-created as a file so environment-local root creation fails deterministically.
+    // 预先创建为文件的命名空间路径，使环境内根目录创建稳定失败。
+    let snapshot_namespace = plan.env_dir.join(".ls-t");
+    fs::write(&snapshot_namespace, "conflicting snapshot namespace")
+        .expect("write conflicting snapshot namespace file");
     // Error returned by the real managed Node import-root preparation helper.
     // 真实受管 Node import-root 准备辅助函数返回的错误。
-    let error = prepare_managed_node_import_root(&plan, &skill_dir)
-        .expect_err("file import root should fail directory removal");
+    let error = prepare_managed_node_import_root(&plan, package.as_ref())
+        .expect_err("file snapshot namespace should fail root creation");
     // Expected diagnostic prefix rendered with the shared host-visible path formatter.
     // 使用共享宿主可见路径渲染器生成的期望诊断前缀。
     let expected_prefix = format!(
-        "Failed to remove {}:",
-        render_host_visible_path(&import_root)
+        "failed to create managed package snapshot root {}:",
+        render_host_visible_path(&snapshot_namespace)
     );
 
     assert!(
@@ -3242,18 +3324,17 @@ fn managed_node_import_root_cleanup_error_uses_host_visible_path() {
     let _ = fs::remove_dir_all(&temp_root);
 }
 
-/// Verify managed Node import-root probe errors are reported before copy starts.
-/// 验证受管 Node import-root 探测错误会在复制开始前被报告。
+/// Verify managed Node import-root parent creation errors are reported before copy starts.
+/// 验证受管 Node import-root 父目录创建错误会在复制开始前被报告。
 #[test]
-fn managed_node_import_root_invalid_existing_path_is_reported() {
+fn managed_node_import_root_invalid_parent_path_is_reported() {
     // Temporary skill root that isolates the managed Node import-root probe fixture.
     // 隔离受管 Node import-root 探测夹具的临时 skill 根目录。
     let temp_root = make_temp_runtime_root("managed-node-import-invalid-path");
     let _ = fs::remove_dir_all(&temp_root);
-    // Skill directory supplied to the real import-root preparation helper.
-    // 传给真实 import-root 准备辅助函数的 skill 目录。
-    let skill_dir = temp_root.join("skills/demo");
-    fs::create_dir_all(&skill_dir).expect("create managed node skill dir");
+    // Real trusted package context supplied to the import-root preparation helper.
+    // 传给 import-root 准备辅助函数的真实可信包上下文。
+    let package = make_test_managed_runtime_package(&temp_root, "demo");
     // Managed environment path containing an embedded NUL that symlink_metadata cannot inspect.
     // 包含内嵌 NUL 且 symlink_metadata 无法探测的受管环境路径。
     let env_dir = PathBuf::from("invalid\0managed-node-env");
@@ -3261,13 +3342,13 @@ fn managed_node_import_root_invalid_existing_path_is_reported() {
     // 真实准备辅助函数消费的最小受管 Node 环境计划。
     let plan = make_test_managed_node_env_plan(env_dir);
 
-    // Error returned before the invalid import root can be treated as absent and recreated.
-    // 在非法 import root 被当作不存在并重建之前返回的错误。
-    let error = prepare_managed_node_import_root(&plan, &skill_dir)
-        .expect_err("invalid import root probe should fail before copy");
+    // Error returned before the invalid package parent can be created or copied into.
+    // 在非法包父目录可被创建或复制前返回的错误。
+    let error = prepare_managed_node_import_root(&plan, package.as_ref())
+        .expect_err("invalid import root parent should fail before copy");
 
     assert!(
-        error.starts_with("Failed to inspect"),
+        error.starts_with("failed to create managed package snapshot root"),
         "unexpected error: {}",
         error
     );
@@ -3301,12 +3382,12 @@ fn managed_node_import_root_copy_error_uses_host_visible_path() {
     fs::create_dir_all(&destination_file).expect("create conflicting destination directory");
     // Error returned by the real recursive import-root copy helper.
     // 真实递归 import-root 复制辅助函数返回的错误。
-    let error = copy_managed_node_skill_import_root(&source_dir, &destination_dir)
+    let error = copy_managed_node_package_import_root(&source_dir, &destination_dir)
         .expect_err("copying a file onto a directory should fail");
     // Expected diagnostic prefix rendered with the shared host-visible path formatter.
     // 使用共享宿主可见路径渲染器生成的期望诊断前缀。
     let expected_prefix = format!(
-        "Failed to copy {} to {}:",
+        "failed to copy {} to {}:",
         render_host_visible_path(&source_file),
         render_host_visible_path(&destination_file)
     );
@@ -3355,7 +3436,7 @@ fn managed_node_import_root_copy_rejects_unsupported_unix_file_type() {
 
     // Error returned before the unsupported source entry can be silently skipped.
     // 在不支持的源目录项被静默跳过之前返回的错误。
-    let error = copy_managed_node_skill_import_root(&source_dir, &destination_dir)
+    let error = copy_managed_node_package_import_root(&source_dir, &destination_dir)
         .expect_err("unsupported FIFO entry should fail import-root copy");
 
     assert!(
@@ -3401,7 +3482,7 @@ fn managed_node_import_root_copy_rejects_symlink_entry() {
 
     // Error returned before the symlink source entry can be silently followed or skipped.
     // 在符号链接源目录项被静默跟随或跳过之前返回的错误。
-    let error = copy_managed_node_skill_import_root(&source_dir, &destination_dir)
+    let error = copy_managed_node_package_import_root(&source_dir, &destination_dir)
         .expect_err("symlink entry should fail import-root copy");
 
     assert!(
@@ -4734,29 +4815,22 @@ fn load_skill_dependency_manifest_reports_probe_errors() {
 /// 校验必需清单加载器输出探测诊断后返回 unit。
 #[test]
 fn load_current_managed_runtime_manifest_reports_probe_errors() {
-    // Skill directory containing one embedded NUL that makes dependencies.yaml impossible to inspect.
-    // 包含内嵌 NUL 的 skill 目录，使 dependencies.yaml 无法被探测。
-    let invalid_skill_dir = PathBuf::from("invalid\0managed-skill");
-
-    // Error returned before the invalid manifest can behave like a missing required manifest.
-    // 在非法清单表现得像必需清单缺失之前返回的错误。
-    let error = super::load_current_managed_runtime_manifest(
-        &invalid_skill_dir,
-        "vulcan.runtime.node.invoke",
-    )
-    .expect_err("invalid required managed runtime manifest probe should fail")
-    .to_string();
-
+    // Real package context used to verify package-relative manifest containment.
+    // 用于验证包相对清单包含关系的真实包上下文。
+    let runtime_root = make_temp_runtime_root("managed-package-parent-manifest");
+    let _ = fs::remove_dir_all(&runtime_root);
+    fs::create_dir_all(&runtime_root).expect("create runtime root");
+    let package = make_test_managed_runtime_package(&runtime_root, "parent-manifest");
+    // Parent traversal rejected lexically before any filesystem probe.
+    // 在任何文件系统探测前按词法拒绝的父目录穿越。
+    let error = package
+        .resolve_existing_file("../dependencies.yaml", "dependency manifest")
+        .expect_err("parent manifest path must fail");
     assert!(
-        error.contains("vulcan.runtime.node.invoke: failed to inspect dependency manifest"),
-        "unexpected error: {}",
-        error
+        error.contains("must be a non-empty safe path"),
+        "unexpected error: {error}"
     );
-    assert!(
-        error.contains("dependencies.yaml"),
-        "unexpected error: {}",
-        error
-    );
+    let _ = fs::remove_dir_all(&runtime_root);
 }
 
 /// Verify optional managed-runtime manifest loading reports filesystem probe errors.
@@ -4769,29 +4843,27 @@ fn load_current_managed_runtime_manifest_reports_probe_errors() {
 /// 校验可选清单加载器输出探测诊断后返回 unit。
 #[test]
 fn load_optional_current_managed_runtime_manifest_reports_probe_errors() {
-    // Skill directory containing one embedded NUL that makes dependencies.yaml impossible to inspect.
-    // 包含内嵌 NUL 的 skill 目录，使 dependencies.yaml 无法被探测。
-    let invalid_skill_dir = PathBuf::from("invalid\0managed-status-skill");
-
-    // Error returned before the invalid manifest can behave like an absent optional manifest.
-    // 在非法清单表现得像可选清单不存在之前返回的错误。
-    let error = super::load_optional_current_managed_runtime_manifest(
-        &invalid_skill_dir,
-        "vulcan.runtime.node.status",
-    )
-    .expect_err("invalid optional managed runtime manifest probe should fail")
-    .to_string();
-
+    // Real package context used to verify absolute manifest rejection.
+    // 用于验证绝对清单路径拒绝逻辑的真实包上下文。
+    let runtime_root = make_temp_runtime_root("managed-package-absolute-manifest");
+    let _ = fs::remove_dir_all(&runtime_root);
+    fs::create_dir_all(&runtime_root).expect("create runtime root");
+    let package = make_test_managed_runtime_package(&runtime_root, "absolute-manifest");
+    let absolute_manifest = package.package_root().join("dependencies.yaml");
+    fs::write(&absolute_manifest, "dependencies: {}\n").expect("write manifest fixture");
+    // UTF-8 absolute fixture path supplied to the strict relative-path resolver.
+    // 提供给严格相对路径解析器的 UTF-8 绝对夹具路径。
+    let absolute_manifest_text = absolute_manifest
+        .to_str()
+        .expect("test path should be UTF-8");
+    let error = package
+        .resolve_existing_file(absolute_manifest_text, "dependency manifest")
+        .expect_err("absolute manifest path must fail");
     assert!(
-        error.contains("vulcan.runtime.node.status: failed to inspect dependency manifest"),
-        "unexpected error: {}",
-        error
+        error.contains("must be a non-empty safe path"),
+        "unexpected error: {error}"
     );
-    assert!(
-        error.contains("dependencies.yaml"),
-        "unexpected error: {}",
-        error
-    );
+    let _ = fs::remove_dir_all(&runtime_root);
 }
 
 /// Verify dependency manifest loading rejects directory placeholders.
@@ -4892,7 +4964,7 @@ fn load_single_skill_reports_skill_yaml_probe_errors() {
     // Error returned before the invalid manifest can behave like a missing skill.yaml file.
     // 在非法清单表现得像缺失 skill.yaml 文件之前返回的错误。
     let error = engine
-        .load_single_skill(&invalid_skill_dir, "ROOT")
+        .load_single_skill(&invalid_skill_dir, "ROOT", None)
         .expect_err("invalid skill.yaml probe should fail");
 
     assert!(
@@ -4926,7 +4998,7 @@ fn load_single_skill_reports_lua_entry_probe_errors() {
     // Error returned before the invalid Lua entry can behave like a missing file.
     // 在非法 Lua 入口表现得像缺失文件之前返回的错误。
     let error = engine
-        .load_single_skill(&skill_dir, "ROOT")
+        .load_single_skill(&skill_dir, "ROOT", None)
         .expect_err("invalid Lua entry probe should fail");
 
     assert!(
@@ -4968,7 +5040,7 @@ fn load_single_skill_rejects_directory_skill_yaml() {
     // Error returned before the directory manifest can fall through to YAML reading.
     // 在目录清单继续进入 YAML 读取之前返回的错误。
     let error = engine
-        .load_single_skill(&skill_dir, "ROOT")
+        .load_single_skill(&skill_dir, "ROOT", None)
         .expect_err("directory skill.yaml should fail");
     // Expected diagnostic fragment rendered with the shared host-visible path formatter.
     // 使用共享宿主可见路径渲染器生成的期望诊断片段。
@@ -5020,7 +5092,7 @@ fn load_single_skill_rejects_directory_lua_entry() {
     // Error returned before the directory Lua entry can fall through to compilation.
     // 在目录 Lua 入口继续进入编译之前返回的错误。
     let error = engine
-        .load_single_skill(&skill_dir, "ROOT")
+        .load_single_skill(&skill_dir, "ROOT", None)
         .expect_err("directory Lua entry should fail");
     // Expected diagnostic fragment rendered with the shared host-visible path formatter.
     // 使用共享宿主可见路径渲染器生成的期望诊断片段。
@@ -5064,7 +5136,7 @@ fn load_single_skill_missing_skill_yaml_error_uses_host_visible_path() {
     // Error returned by the real single-skill loading helper.
     // 真实单个 skill 加载辅助函数返回的错误。
     let error = engine
-        .load_single_skill(&skill_dir, "ROOT")
+        .load_single_skill(&skill_dir, "ROOT", None)
         .expect_err("missing skill.yaml should fail");
     // Expected diagnostic fragment rendered with the shared host-visible path formatter.
     // 使用共享宿主可见路径渲染器生成的期望诊断片段。
@@ -5112,7 +5184,7 @@ fn load_single_skill_invalid_skill_directory_error_uses_host_visible_path() {
     // Error returned by the real single-skill loading helper.
     // 真实单个 skill 加载辅助函数返回的错误。
     let error = engine
-        .load_single_skill(&skill_dir, "ROOT")
+        .load_single_skill(&skill_dir, "ROOT", None)
         .expect_err("invalid skill directory name should fail");
     // Expected diagnostic fragment rendered with the shared host-visible path formatter.
     // 使用共享宿主可见路径渲染器生成的期望诊断片段。
@@ -5155,7 +5227,7 @@ fn load_single_skill_missing_lua_entry_error_uses_host_visible_path() {
     // Error returned by the real single-skill loading helper.
     // 真实单个 skill 加载辅助函数返回的错误。
     let error = engine
-        .load_single_skill(&skill_dir, "ROOT")
+        .load_single_skill(&skill_dir, "ROOT", None)
         .expect_err("missing Lua entry should fail");
     // Expected diagnostic fragment rendered with the shared host-visible path formatter.
     // 使用共享宿主可见路径渲染器生成的期望诊断片段。
@@ -6943,34 +7015,1641 @@ fn runtime_session_eval_preserves_vm_state_across_calls() {
     assert_eq!(second["result"], json!(2));
 }
 
-/// Verify system runtime leases preserve one explicit host-owned cwd while still exposing the fixed system_lua_lib directory.
-/// 验证 system 运行时租约会保留宿主显式传入的 cwd，同时继续暴露固定的 system_lua_lib 目录。
-#[test]
-fn system_runtime_lease_preserves_explicit_cwd_override() {
-    let runtime_root = make_temp_runtime_root("system-runtime-lease-cwd");
-    if runtime_root.exists() {
-        let _ = fs::remove_dir_all(&runtime_root);
+/// Python sidecar source embedded from the repository integration fixture.
+/// 从仓库集成夹具嵌入的 Python sidecar 源码。
+const MANAGED_SESSION_PYTHON_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/managed_sessions/python/session.py"
+));
+/// Python sibling module embedded from the repository integration fixture.
+/// 从仓库集成夹具嵌入的 Python 同级模块。
+const MANAGED_SESSION_PYTHON_HELPER_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/managed_sessions/python/helper.py"
+));
+/// Python invoke handler embedded from the repository integration fixture.
+/// 从仓库集成夹具嵌入的 Python invoke 处理器。
+const MANAGED_SESSION_PYTHON_INVOKE_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/managed_sessions/python/invoke.py"
+));
+/// Node sidecar source embedded from the repository integration fixture.
+/// 从仓库集成夹具嵌入的 Node sidecar 源码。
+const MANAGED_SESSION_NODE_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/managed_sessions/node/session.mjs"
+));
+/// Node sibling module embedded from the repository integration fixture.
+/// 从仓库集成夹具嵌入的 Node 同级模块。
+const MANAGED_SESSION_NODE_HELPER_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/managed_sessions/node/helper.mjs"
+));
+/// Node invoke handler embedded from the repository integration fixture.
+/// 从仓库集成夹具嵌入的 Node invoke 处理器。
+const MANAGED_SESSION_NODE_INVOKE_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/managed_sessions/node/invoke.mjs"
+));
+/// Synthetic package-manager version used only by prebuilt integration environments.
+/// 仅由预构建集成环境使用的合成包管理器版本。
+const MANAGED_SESSION_TEST_PACKAGE_MANAGER_VERSION: &str = "0.0.0-test";
+
+/// Language runtime exercised by one real managed-session integration fixture.
+/// 单个真实受管会话集成夹具所验证的语言运行时。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedSessionTestRuntime {
+    /// Host CPython runtime.
+    /// 宿主 CPython 运行时。
+    Python,
+    /// Host Node.js runtime.
+    /// 宿主 Node.js 运行时。
+    Node,
+}
+
+impl ManagedSessionTestRuntime {
+    /// Return the stable lowercase test label for this runtime.
+    /// 返回当前运行时的稳定小写测试标签。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Python => "python",
+            Self::Node => "node",
+        }
     }
-    let explicit_cwd = runtime_root.join("host-cwd");
-    let fixed_system_dir = runtime_root.join("fixed-system-lua-lib");
-    fs::create_dir_all(&explicit_cwd).expect("create explicit host cwd");
 
-    let engine = make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions {
-        system_lua_lib_dir: Some(fixed_system_dir.clone()),
-        ..Default::default()
+    /// Return the Lua session-open function path for this runtime.
+    /// 返回当前运行时对应的 Lua session-open 函数路径。
+    fn lua_open_api(self) -> &'static str {
+        match self {
+            Self::Python => "vulcan.runtime.python.session.open",
+            Self::Node => "vulcan.runtime.node.session.open",
+        }
+    }
+
+    /// Return the Lua managed-runtime status function path for this runtime.
+    /// 返回当前运行时对应的 Lua 受管运行时状态函数路径。
+    fn lua_status_api(self) -> &'static str {
+        match self {
+            Self::Python => "vulcan.runtime.python.status",
+            Self::Node => "vulcan.runtime.node.status",
+        }
+    }
+
+    /// Return the Lua managed-runtime invoke function path for this runtime.
+    /// 返回当前运行时对应的 Lua 受管运行时调用函数路径。
+    fn lua_invoke_api(self) -> &'static str {
+        match self {
+            Self::Python => "vulcan.runtime.python.invoke",
+            Self::Node => "vulcan.runtime.node.invoke",
+        }
+    }
+
+    /// Return the package-relative sidecar file for this runtime.
+    /// 返回当前运行时对应的包相对 sidecar 文件。
+    fn sidecar_file(self) -> &'static str {
+        match self {
+            Self::Python => "runtime/session.py",
+            Self::Node => "runtime/session.mjs",
+        }
+    }
+
+    /// Return the package-relative invoke handler file for this runtime.
+    /// 返回当前运行时对应的包相对 invoke 处理器文件。
+    fn invoke_file(self) -> &'static str {
+        match self {
+            Self::Python => "runtime/invoke.py",
+            Self::Node => "runtime/invoke.mjs",
+        }
+    }
+
+    /// Return the marker proving one sibling runtime module was imported.
+    /// 返回用于证明已导入同级运行时模块的标记。
+    fn import_marker(self) -> &'static str {
+        match self {
+            Self::Python => "python-relative-import-ok",
+            Self::Node => "node-relative-import-ok",
+        }
+    }
+}
+
+/// One discovered real host interpreter used to seed a managed-runtime layout.
+/// 一个已发现的真实宿主解释器，用于构造受管运行时布局。
+#[derive(Clone, Debug)]
+pub(crate) struct HostManagedRuntime {
+    /// Canonical interpreter executable path.
+    /// 规范解释器可执行文件路径。
+    executable: PathBuf,
+    /// Exact runtime version reported by the interpreter.
+    /// 解释器报告的精确运行时版本。
+    version: String,
+}
+
+/// Discover one real Python or Node executable and its exact version.
+/// 发现一个真实 Python 或 Node 可执行文件及其精确版本。
+///
+/// `runtime` selects the interpreter probe; unavailable runtimes produce one explicit skip message.
+/// `runtime` 选择解释器探测；不可用运行时会产生一条明确跳过消息。
+///
+/// Return a canonical executable and version when usable, otherwise `None` for an explicit skip.
+/// 可用时返回规范可执行文件与版本；明确跳过时返回 `None`。
+pub(crate) fn discover_host_managed_runtime(
+    runtime: ManagedSessionTestRuntime,
+) -> Option<HostManagedRuntime> {
+    // Candidate program names searched without mutating process-wide PATH.
+    // 在不修改进程级 PATH 的情况下搜索的候选程序名。
+    let candidates: &[&str] = match runtime {
+        ManagedSessionTestRuntime::Python if cfg!(windows) => &["python"],
+        ManagedSessionTestRuntime::Python => &["python3", "python"],
+        ManagedSessionTestRuntime::Node => &["node"],
+    };
+    for candidate in candidates {
+        // Probe script prints the authoritative executable path and version on separate lines.
+        // 探测脚本会在独立行打印权威可执行文件路径与版本。
+        let probe_argument = match runtime {
+            ManagedSessionTestRuntime::Python => {
+                "import sys; print(sys.executable); print('.'.join(map(str, sys.version_info[:3])))"
+            }
+            ManagedSessionTestRuntime::Node => {
+                "console.log(process.execPath); console.log(process.versions.node)"
+            }
+        };
+        // Interpreter-specific inline-evaluation flag; Node uses `-e` while Python uses `-c`.
+        // 解释器专属的内联求值参数；Node 使用 `-e`，Python 使用 `-c`。
+        let probe_flag = match runtime {
+            ManagedSessionTestRuntime::Python => "-c",
+            ManagedSessionTestRuntime::Node => "-e",
+        };
+        // ProbeResult distinguishes an unavailable command from a malformed runtime response.
+        // ProbeResult 区分不可用命令与格式错误的运行时响应。
+        let probe_result = Command::new(candidate)
+            .args([probe_flag, probe_argument])
+            .output();
+        let Ok(output) = probe_result else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        // Stdout must contain exactly the two authoritative values needed by the fixture.
+        // Stdout 必须包含夹具所需的两个权威值。
+        let Ok(stdout) = String::from_utf8(output.stdout) else {
+            continue;
+        };
+        // Lines are trimmed because command output uses platform-native line endings.
+        // Lines 会被去除首尾空白，因为命令输出使用平台原生换行。
+        let mut lines = stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty());
+        let (Some(executable), Some(version)) = (lines.next(), lines.next()) else {
+            continue;
+        };
+        // Real Node integration runs only on the same supported ESM baseline enforced by plan
+        // resolution; an older host runtime is an explicit unavailable fixture, not a crash probe.
+        // 真实 Node 集成仅在环境计划强制的同一 ESM 支持基线上运行；较旧宿主运行时属于明确不可用
+        // 夹具，而不是崩溃探针。
+        if runtime == ManagedSessionTestRuntime::Node
+            && let Err(error) = validate_managed_node_runtime_version(version)
+        {
+            eprintln!("skip real managed Node integration candidate {executable}: {error}");
+            continue;
+        }
+        // CanonicalExecutable rejects launcher aliases that do not resolve to a real file.
+        // CanonicalExecutable 拒绝无法解析为真实文件的启动器别名。
+        let Ok(canonical_executable) = fs::canonicalize(executable) else {
+            continue;
+        };
+        return Some(HostManagedRuntime {
+            executable: canonical_executable,
+            version: version.to_string(),
+        });
+    }
+    eprintln!(
+        "skip real managed {} session integration test: no usable host {} runtime was found on PATH",
+        runtime.label(),
+        runtime.label()
+    );
+    // Native acceptance CI converts missing real runtimes into a hard failure.
+    // 原生验收 CI 会把缺少真实运行时转换为硬失败。
+    assert_ne!(
+        std::env::var("LUASKILLS_REQUIRE_MANAGED_SESSION_RUNTIMES").as_deref(),
+        Ok("1"),
+        "required real managed {} runtime was not found on PATH",
+        runtime.label()
+    );
+    None
+}
+
+/// Install one real executable inside a managed installation and write its relative manifest.
+/// 在受管安装目录内安装一个真实可执行文件，并写入其相对路径清单。
+///
+/// `install_dir`, runtime identity fields, and `source_executable` define one synthetic trusted
+/// installation whose manifest obeys the same containment contract as production assets.
+/// `install_dir`、运行时身份字段与 `source_executable` 定义一个合成可信安装，
+/// 其清单遵循与生产资产相同的包含关系契约。
+///
+/// Returns after the contained executable and strict manifest are durably materialized.
+/// 在受包含约束的可执行文件与严格清单完成落盘后返回。
+fn write_managed_session_install_manifest(
+    install_dir: &Path,
+    runtime: &str,
+    version: &str,
+    platform: &str,
+    source_executable: &Path,
+) {
+    // Platform-native contained executable name used by the relative manifest.
+    // 相对路径清单使用的平台原生受包含可执行文件名。
+    let executable_name = if cfg!(windows) {
+        format!("{runtime}.exe")
+    } else {
+        runtime.to_string()
+    };
+    // Relative path with only normal components accepted by production resolution.
+    // 仅包含生产解析所接受普通组件的相对路径。
+    let relative_executable = PathBuf::from("bin").join(executable_name);
+    // Concrete destination strictly inside the installation directory.
+    // 严格位于安装目录内的具体目标路径。
+    let installed_executable = install_dir.join(&relative_executable);
+    fs::create_dir_all(
+        installed_executable
+            .parent()
+            .expect("contained executable parent"),
+    )
+    .expect("create managed session install executable directory");
+    // Hard links preserve exact runtime bytes without a second copy; cross-volume fixtures fall back safely.
+    // 硬链接可在不二次复制的情况下保留精确运行时字节；跨卷夹具会安全降级为复制。
+    if fs::hard_link(source_executable, &installed_executable).is_err() {
+        fs::copy(source_executable, &installed_executable)
+            .expect("copy real executable into managed installation");
+    }
+    #[cfg(windows)]
+    if runtime == "python" {
+        install_managed_session_windows_python_companions(
+            source_executable,
+            installed_executable
+                .parent()
+                .expect("contained executable parent"),
+        );
+    }
+    // Manifest mirrors the exact runtime asset contract consumed by plan resolution.
+    // Manifest 模拟计划解析所消费的精确运行时资产契约。
+    let manifest = json!({
+        "schema_version": 1,
+        "runtime": runtime,
+        "version": version,
+        "platform": platform,
+        "executable": relative_executable,
     });
+    fs::write(
+        install_dir.join("runtime-manifest.json"),
+        serde_json::to_vec_pretty(&manifest).expect("encode managed session install manifest"),
+    )
+    .expect("write managed session install manifest");
+}
 
+/// Copy minimal Windows CPython bootstrap DLLs beside a contained Python test executable.
+/// 将最小 Windows CPython 启动 DLL 复制到受包含约束的 Python 测试可执行文件旁。
+///
+/// `source_executable` identifies the discovered host runtime and `destination_dir` is the
+/// contained managed runtime directory already present on the controlled child PATH.
+/// `source_executable` 标识已发现的宿主运行时，`destination_dir` 是已经位于受控子进程 PATH 上的
+/// 受包含约束受管运行时目录。
+///
+/// Returns after copying CPython, zlib, and VC runtime bootstrap DLLs, or immediately for a
+/// non-Python executable.
+/// 复制 CPython、zlib 与 VC runtime 启动 DLL 后返回；对于非 Python 可执行文件则立即返回。
+#[cfg(windows)]
+fn install_managed_session_windows_python_companions(
+    source_executable: &Path,
+    destination_dir: &Path,
+) {
+    // Lowercase source filename used only to identify the Python integration runtime.
+    // 仅用于识别 Python 集成运行时的小写源文件名。
+    let source_name = source_executable
+        .file_name()
+        .expect("managed session source executable name")
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if source_name != "python.exe" {
+        return;
+    }
+    // Host runtime directory containing CPython's stable and versioned DLLs.
+    // 包含 CPython 稳定及版本化 DLL 的宿主运行时目录。
+    let source_dir = source_executable
+        .parent()
+        .expect("managed session source executable parent");
+    for entry in fs::read_dir(source_dir).expect("read host Python runtime directory") {
+        // Real sibling file considered for the minimal fixture runtime bundle.
+        // 纳入最小夹具运行时包考虑范围的真实同级文件。
+        let entry = entry.expect("read host Python runtime entry");
+        // Lowercase sibling filename used for the explicit minimal bootstrap-DLL filter.
+        // 用于显式最小启动 DLL 过滤的小写同级文件名。
+        let file_name = entry.file_name();
+        let normalized_name = file_name.to_string_lossy().to_ascii_lowercase();
+        // Only direct CPython image dependencies are copied; unrelated Conda libraries stay out.
+        // 仅复制 CPython 映像直接依赖项；无关 Conda 库不会进入夹具。
+        let is_bootstrap_dll = normalized_name.ends_with(".dll")
+            && (normalized_name.starts_with("python")
+                || normalized_name == "zlib.dll"
+                || normalized_name.starts_with("vcruntime"));
+        if !is_bootstrap_dll {
+            continue;
+        }
+        if !entry
+            .file_type()
+            .expect("inspect host Python runtime entry")
+            .is_file()
+        {
+            continue;
+        }
+        // Contained companion path visible to the Windows DLL loader through controlled PATH.
+        // Windows DLL 加载器可通过受控 PATH 看到的受包含约束配套路径。
+        let destination = destination_dir.join(&file_name);
+        if fs::hard_link(entry.path(), &destination).is_err() {
+            fs::copy(entry.path(), &destination)
+                .expect("copy Python companion DLL into managed installation");
+        }
+    }
+}
+
+/// Install one Python executable at the platform-native managed virtual-environment path.
+/// 在平台原生受管虚拟环境路径安装一个 Python 可执行文件。
+#[cfg(unix)]
+fn install_managed_session_python_executable(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination.parent().expect("Python venv executable parent"))
+        .expect("create Python venv bin directory");
+    create_unix_symlink(source, destination).expect("link real Python into managed test venv");
+}
+
+/// Install one Python executable at the platform-native managed virtual-environment path.
+/// 在平台原生受管虚拟环境路径安装一个 Python 可执行文件。
+#[cfg(windows)]
+fn install_managed_session_python_executable(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination.parent().expect("Python venv executable parent"))
+        .expect("create Python venv Scripts directory");
+    if fs::hard_link(source, destination).is_err() {
+        fs::copy(source, destination).expect("copy real Python into managed test venv");
+    }
+    // CPython DLLs must be beside the copied executable because initial image loading precedes child PATH use.
+    // CPython DLL 必须位于复制后的可执行文件旁，因为初始映像加载早于子进程 PATH 的使用。
+    install_managed_session_windows_python_companions(
+        source,
+        destination.parent().expect("Python venv executable parent"),
+    );
+}
+
+/// Return the site-packages directory for one lightweight managed Python environment.
+/// 返回单个轻量受管 Python 环境的 site-packages 目录。
+///
+/// `env_dir` is the resolved managed environment root and `version` is the exact CPython version.
+/// `env_dir` 是已解析受管环境根，`version` 是精确 CPython 版本。
+///
+/// Return the platform-native directory searched by the managed virtual-environment interpreter.
+/// 返回受管虚拟环境解释器搜索的平台原生目录。
+fn managed_session_python_site_packages(env_dir: &Path, version: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        // Exact version is encoded by pyvenv.cfg; Windows keeps site-packages version-independent.
+        // 精确版本由 pyvenv.cfg 编码；Windows 的 site-packages 与版本无关。
+        let _ = version;
+        // Windows virtual environments use one version-independent Lib/site-packages path.
+        // Windows 虚拟环境使用一个与版本无关的 Lib/site-packages 路径。
+        env_dir.join(".venv/Lib/site-packages")
+    }
+    #[cfg(not(windows))]
+    {
+        // MajorMinor selects the standard Unix virtual-environment library directory.
+        // MajorMinor 选择标准 Unix 虚拟环境库目录。
+        let mut version_parts = version.split('.');
+        let major = version_parts.next().expect("managed Python major version");
+        let minor = version_parts.next().expect("managed Python minor version");
+        env_dir
+            .join(".venv/lib")
+            .join(format!("python{major}.{minor}"))
+            .join("site-packages")
+    }
+}
+
+/// Install one same-named dependency carrying a package-specific marker.
+/// 安装一个携带包专属标记的同名依赖。
+///
+/// `env_dir`, `runtime`, and `version` select the exact managed dependency tree.
+/// `env_dir`、`runtime` 与 `version` 选择精确受管依赖树。
+///
+/// `marker` is returned by the real invoke fixture to prove dependency isolation.
+/// `marker` 会由真实 invoke 夹具返回，用于证明依赖隔离。
+fn install_managed_session_fixture_dependency(
+    env_dir: &Path,
+    runtime: ManagedSessionTestRuntime,
+    version: &str,
+    marker: &str,
+) {
+    // EncodedMarker is safe source text for both Python and JavaScript string literals.
+    // EncodedMarker 是可安全用于 Python 与 JavaScript 字符串字面量的源码文本。
+    let encoded_marker = serde_json::to_string(marker).expect("encode fixture dependency marker");
+    match runtime {
+        ManagedSessionTestRuntime::Python => {
+            // SitePackages is the only dependency location available after PYTHONPATH removal.
+            // SitePackages 是移除 PYTHONPATH 后唯一可用的依赖位置。
+            let site_packages = managed_session_python_site_packages(env_dir, version);
+            fs::create_dir_all(&site_packages)
+                .expect("create managed Python fixture site-packages");
+            fs::write(
+                site_packages.join("managed_session_dependency.py"),
+                format!(
+                    "# Package-specific dependency marker used by managed integration tests.\n# 受管集成测试使用的包专属依赖标记。\nDEPENDENCY_MARKER = {encoded_marker}\n"
+                ),
+            )
+            .expect("write managed Python fixture dependency");
+        }
+        ManagedSessionTestRuntime::Node => {
+            // DependencyRoot is resolved as a bare ESM dependency from the package snapshot.
+            // DependencyRoot 会作为裸 ESM 依赖从包快照中解析。
+            let dependency_root = env_dir.join("node_modules/managed-session-dependency");
+            fs::create_dir_all(&dependency_root)
+                .expect("create managed Node fixture dependency root");
+            fs::write(
+                dependency_root.join("package.json"),
+                r#"{"name":"managed-session-dependency","version":"1.0.0","type":"module","exports":"./index.mjs"}"#,
+            )
+            .expect("write managed Node fixture dependency manifest");
+            fs::write(
+                dependency_root.join("index.mjs"),
+                format!(
+                    "// Package-specific dependency marker used by managed integration tests.\n// 受管集成测试使用的包专属依赖标记。\nexport const DEPENDENCY_MARKER = {encoded_marker};\n"
+                ),
+            )
+            .expect("write managed Node fixture dependency module");
+        }
+    }
+}
+
+/// Materialize one ready managed environment around a discovered host runtime.
+/// 围绕一个已发现宿主运行时构造就绪的受管环境。
+///
+/// `plan` is the production-resolved environment identity and `host` supplies the real executable.
+/// `plan` 是生产逻辑解析的环境身份，`host` 提供真实可执行文件。
+///
+/// `dependency_marker` is installed into only this exact environment.
+/// `dependency_marker` 只会安装到当前精确环境中。
+fn prepare_ready_managed_session_environment(
+    plan: &ManagedRuntimeEnvPlan,
+    runtime: ManagedSessionTestRuntime,
+    host: &HostManagedRuntime,
+    dependency_marker: &str,
+) {
+    fs::create_dir_all(&plan.env_dir).expect("create ready managed session environment");
+    fs::write(
+        managed_env_marker_path(&plan.env_dir),
+        serde_json::to_vec_pretty(&plan.expected_marker)
+            .expect("encode managed session environment marker"),
+    )
+    .expect("write managed session environment marker");
+    match runtime {
+        ManagedSessionTestRuntime::Python => {
+            // VenvExecutable is the exact executable path required by Python session launch.
+            // VenvExecutable 是 Python 会话启动要求的精确可执行文件路径。
+            #[cfg(windows)]
+            let venv_executable = plan.env_dir.join(".venv/Scripts/python.exe");
+            #[cfg(not(windows))]
+            let venv_executable = plan.env_dir.join(".venv/bin/python");
+            install_managed_session_python_executable(&host.executable, &venv_executable);
+            // PyvenvConfig points the lightweight test venv back to the real base interpreter.
+            // PyvenvConfig 将轻量测试 venv 指回真实基础解释器。
+            let pyvenv_config = format!(
+                "home = {}\ninclude-system-site-packages = false\nversion = {}\nexecutable = {}\n",
+                render_host_visible_path(
+                    host.executable
+                        .parent()
+                        .expect("host Python executable parent")
+                ),
+                host.version,
+                render_host_visible_path(&host.executable)
+            );
+            fs::write(plan.env_dir.join(".venv/pyvenv.cfg"), pyvenv_config)
+                .expect("write managed test pyvenv config");
+            install_managed_session_fixture_dependency(
+                &plan.env_dir,
+                runtime,
+                &host.version,
+                dependency_marker,
+            );
+            // Probe confirms the exact managed interpreter and isolated dependency can start.
+            // Probe 确认精确受管解释器及隔离依赖均可启动。
+            let probe = Command::new(&venv_executable)
+                .args([
+                    "-c",
+                    "import managed_session_dependency; print(managed_session_dependency.DEPENDENCY_MARKER)",
+                ])
+                .output()
+                .expect("run managed test Python executable");
+            assert!(
+                probe.status.success(),
+                "managed test Python executable failed: {}",
+                String::from_utf8_lossy(&probe.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(probe.stdout)
+                    .expect("managed Python dependency probe output")
+                    .trim(),
+                dependency_marker
+            );
+            // IsolatedProbe uses the production env_clear policy before any session/worker test.
+            // IsolatedProbe 会在任何会话/Worker 测试之前使用生产 env_clear 策略。
+            let mut isolated_probe = Command::new(&venv_executable);
+            isolated_probe.args([
+                "-c",
+                "import managed_session_dependency; print(managed_session_dependency.DEPENDENCY_MARKER)",
+            ]);
+            crate::runtime::managed_runtime_session::configure_managed_python_command_environment(
+                &mut isolated_probe,
+                plan,
+            )
+            .expect("configure isolated managed Python probe");
+            // IsolatedOutput proves the real interpreter and dependency remain executable without host env.
+            // IsolatedOutput 证明真实解释器与依赖在没有宿主环境时仍可执行。
+            let isolated_output = isolated_probe
+                .output()
+                .expect("run isolated managed test Python executable");
+            assert!(
+                isolated_output.status.success(),
+                "isolated managed test Python executable failed: status={} stdout={} stderr={}",
+                isolated_output.status,
+                String::from_utf8_lossy(&isolated_output.stdout),
+                String::from_utf8_lossy(&isolated_output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(isolated_output.stdout)
+                    .expect("isolated managed Python dependency probe output")
+                    .trim(),
+                dependency_marker
+            );
+        }
+        ManagedSessionTestRuntime::Node => {
+            fs::create_dir_all(plan.env_dir.join("node_modules"))
+                .expect("create ready Node dependency directory");
+            install_managed_session_fixture_dependency(
+                &plan.env_dir,
+                runtime,
+                &host.version,
+                dependency_marker,
+            );
+            // IsolatedProbe confirms the exact contained Node executable survives relocation and
+            // the production environment-clearing policy before Worker launch is exercised.
+            // IsolatedProbe 确认精确受包含 Node 可执行文件可在重定位后及生产环境清空策略下存活，
+            // 然后才验证 Worker 启动。
+            let mut isolated_probe = Command::new(&plan.runtime_executable);
+            isolated_probe.args(["-e", "process.stdout.write(process.versions.node)"]);
+            crate::runtime::managed_runtime_session::configure_managed_node_command_environment(
+                &mut isolated_probe,
+                plan,
+            )
+            .expect("configure isolated managed Node probe");
+            let isolated_output = isolated_probe
+                .output()
+                .expect("run isolated managed test Node executable");
+            assert!(
+                isolated_output.status.success(),
+                "isolated managed test Node executable failed: status={} stdout={} stderr={}",
+                isolated_output.status,
+                String::from_utf8_lossy(&isolated_output.stdout),
+                String::from_utf8_lossy(&isolated_output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(isolated_output.stdout)
+                    .expect("isolated managed Node executable probe output"),
+                host.version
+            );
+        }
+    }
+}
+
+/// One isolated System Plugin package backed by a prevalidated real host runtime.
+/// 一个由已验证真实宿主运行时支撑的隔离 System Plugin 包。
+pub(crate) struct ManagedSessionSystemLayout {
+    /// Base strict System Plugin filesystem layout.
+    /// 基础严格 System Plugin 文件系统布局。
+    base: SystemRuntimeTestLayout,
+    /// Language runtime configured in dependencies.yaml.
+    /// 在 dependencies.yaml 中配置的语言运行时。
+    runtime: ManagedSessionTestRuntime,
+    /// Declared runtime version used for installation and environment path identity.
+    /// 用于安装与环境路径身份的已声明运行时版本。
+    runtime_version: String,
+    /// Ready managed environment directory used by cleanup assertions.
+    /// 清理断言使用的就绪受管环境目录。
+    env_dir: PathBuf,
+    /// Marker installed into this package's exact managed dependency tree.
+    /// 安装到当前包精确受管依赖树中的标记。
+    dependency_marker: String,
+}
+
+impl ManagedSessionSystemLayout {
+    /// Create a real managed runtime package without invoking network package managers.
+    /// 创建一个真实受管运行时包，同时不调用网络包管理器。
+    ///
+    /// `label`, `runtime`, and `host` select an isolated root and authoritative interpreter.
+    /// `label`、`runtime` 与 `host` 选择隔离根目录及权威解释器。
+    ///
+    /// Return a strict System layout whose environment marker and executable are already ready.
+    /// 返回一个环境标记与可执行文件均已就绪的严格 System 布局。
+    pub(crate) fn new(
+        label: &str,
+        runtime: ManagedSessionTestRuntime,
+        host: &HostManagedRuntime,
+    ) -> Self {
+        Self::new_with_runtime_version(label, None, runtime, host)
+    }
+
+    /// Create a real managed runtime package with an optional path-padding runtime version.
+    /// 使用可选路径填充运行时版本创建一个真实受管运行时包。
+    ///
+    /// `label` identifies the package, `runtime_version` can lengthen only the managed environment
+    /// path, and `runtime` plus `host` select the exact executable fixture.
+    /// `label` 标识包，`runtime_version` 可仅加长受管环境路径，`runtime` 与 `host` 选择精确可执行
+    /// 文件夹具。
+    ///
+    /// Returns a ready strict System layout using the declared version for reproducible identity.
+    /// 返回一个使用已声明版本形成可复现身份的就绪严格 System 布局。
+    fn new_with_runtime_version(
+        label: &str,
+        runtime_version: Option<&str>,
+        runtime: ManagedSessionTestRuntime,
+        host: &HostManagedRuntime,
+    ) -> Self {
+        // Base creates the strict trust-root and canonical package paths.
+        // Base 创建严格信任根与规范包路径。
+        let base = SystemRuntimeTestLayout::new(label);
+        let runtime_version = runtime_version.unwrap_or(&host.version).to_string();
+        // DependencyMarker identifies the package-specific managed dependency tree.
+        // DependencyMarker 标识包专属的受管依赖树。
+        let dependency_marker = format!("{}-{label}-dependency", runtime.label());
+        // Platform must match the runtime installation manifests exactly.
+        // Platform 必须与运行时安装清单精确一致。
+        let platform =
+            current_managed_runtime_platform_key().expect("resolve managed session test platform");
+        // RuntimeDir follows the production shared-runtime installation layout.
+        // RuntimeDir 遵循生产共享运行时安装布局。
+        let runtime_dir = match runtime {
+            ManagedSessionTestRuntime::Python => base
+                .runtime_root
+                .join("dependencies/runtimes/python")
+                .join(format!("cpython-{runtime_version}-{platform}")),
+            ManagedSessionTestRuntime::Node => base
+                .runtime_root
+                .join("dependencies/runtimes/node")
+                .join(format!("node-{runtime_version}-{platform}")),
+        };
+        // PackageManagerDir satisfies plan resolution while a ready marker prevents installation.
+        // PackageManagerDir 满足计划解析；就绪标记会阻止实际安装。
+        let package_manager_dir = match runtime {
+            ManagedSessionTestRuntime::Python => base
+                .runtime_root
+                .join("dependencies/runtimes/python")
+                .join(format!(
+                    "uv-{MANAGED_SESSION_TEST_PACKAGE_MANAGER_VERSION}-{platform}"
+                )),
+            ManagedSessionTestRuntime::Node => base
+                .runtime_root
+                .join("dependencies/runtimes/node")
+                .join(format!(
+                    "pnpm-{MANAGED_SESSION_TEST_PACKAGE_MANAGER_VERSION}"
+                )),
+        };
+        write_managed_session_install_manifest(
+            &runtime_dir,
+            runtime.label(),
+            &runtime_version,
+            &platform,
+            &host.executable,
+        );
+        let (package_manager_name, package_manager_platform) = match runtime {
+            ManagedSessionTestRuntime::Python => ("uv", platform.as_str()),
+            ManagedSessionTestRuntime::Node => ("pnpm", "any"),
+        };
+        write_managed_session_install_manifest(
+            &package_manager_dir,
+            package_manager_name,
+            MANAGED_SESSION_TEST_PACKAGE_MANAGER_VERSION,
+            package_manager_platform,
+            &host.executable,
+        );
+        // RuntimeSourceDir contains the real sidecar and sibling import fixture.
+        // RuntimeSourceDir 包含真实 sidecar 与同级导入夹具。
+        let runtime_source_dir = base.package_root.join("runtime");
+        fs::create_dir_all(&runtime_source_dir)
+            .expect("create managed session package runtime directory");
+        match runtime {
+            ManagedSessionTestRuntime::Python => {
+                fs::write(
+                    runtime_source_dir.join("session.py"),
+                    MANAGED_SESSION_PYTHON_SOURCE,
+                )
+                .expect("write Python managed session fixture");
+                fs::write(
+                    runtime_source_dir.join("helper.py"),
+                    MANAGED_SESSION_PYTHON_HELPER_SOURCE,
+                )
+                .expect("write Python managed session helper");
+                fs::write(
+                    runtime_source_dir.join("invoke.py"),
+                    MANAGED_SESSION_PYTHON_INVOKE_SOURCE,
+                )
+                .expect("write Python managed invoke fixture");
+                fs::create_dir_all(base.package_root.join("python"))
+                    .expect("create Python lockfile directory");
+                fs::write(base.package_root.join("python/requirements.lock"), "")
+                    .expect("write Python managed session lockfile");
+                fs::write(
+                    &base.dependencies_file,
+                    format!(
+                        "python_runtime:\n  version: \"{}\"\n  package_manager: uv\n  package_manager_version: \"{}\"\n  lockfile: python/requirements.lock\n",
+                        runtime_version, MANAGED_SESSION_TEST_PACKAGE_MANAGER_VERSION
+                    ),
+                )
+                .expect("write Python managed session dependencies");
+            }
+            ManagedSessionTestRuntime::Node => {
+                fs::write(
+                    runtime_source_dir.join("session.mjs"),
+                    MANAGED_SESSION_NODE_SOURCE,
+                )
+                .expect("write Node managed session fixture");
+                fs::write(
+                    runtime_source_dir.join("helper.mjs"),
+                    MANAGED_SESSION_NODE_HELPER_SOURCE,
+                )
+                .expect("write Node managed session helper");
+                fs::write(
+                    runtime_source_dir.join("invoke.mjs"),
+                    MANAGED_SESSION_NODE_INVOKE_SOURCE,
+                )
+                .expect("write Node managed invoke fixture");
+                fs::create_dir_all(base.package_root.join("node"))
+                    .expect("create Node manifest directory");
+                fs::write(
+                    base.package_root.join("node/package.json"),
+                    r#"{"name":"managed-session-fixture","version":"1.0.0","private":true}"#,
+                )
+                .expect("write Node managed session package manifest");
+                fs::write(
+                    base.package_root.join("node/pnpm-lock.yaml"),
+                    "lockfileVersion: '9.0'\n",
+                )
+                .expect("write Node managed session lockfile");
+                fs::write(
+                    &base.dependencies_file,
+                    format!(
+                        "node_runtime:\n  version: \"{}\"\n  package_manager: pnpm\n  package_manager_version: \"{}\"\n  package_json: node/package.json\n  lockfile: node/pnpm-lock.yaml\n",
+                        runtime_version, MANAGED_SESSION_TEST_PACKAGE_MANAGER_VERSION
+                    ),
+                )
+                .expect("write Node managed session dependencies");
+            }
+        }
+        // Lua module proves the package root is present on package.path inside the System VM.
+        // Lua 模块证明 System VM 内的 package.path 包含包根目录。
+        fs::write(
+            base.package_root.join("fixture_module.lua"),
+            "-- Stable package.path marker returned by integration tests.\n-- 集成测试返回的稳定 package.path 标记。\nreturn { marker = 'system-package-module-ok' }\n",
+        )
+        .expect("write System package Lua module fixture");
+        // Manifest is parsed through the same strict loader used by System lease creation.
+        // Manifest 通过 System 租约创建使用的同一严格加载器解析。
+        let manifest = PackageDependencyManifest::load_from_path(&base.dependencies_file)
+            .expect("load managed session dependency manifest");
+        // Package context is used only to derive the exact ready environment identity.
+        // Package context 仅用于派生精确的就绪环境身份。
+        let package = ManagedRuntimePackageContext::for_skill(
+            &base.package_id,
+            &base.package_root,
+            &base.runtime_root,
+            Some(manifest),
+        )
+        .expect("build managed session fixture package context");
+        // Plan is the authoritative environment path consumed later by the System context.
+        // Plan 是后续 System 上下文消费的权威环境路径。
+        let plan = match runtime {
+            ManagedSessionTestRuntime::Python => resolve_python_env_plan(
+                package.as_ref(),
+                package
+                    .dependency_manifest()
+                    .and_then(|manifest| manifest.python_runtime.as_ref())
+                    .expect("Python runtime declaration"),
+            ),
+            ManagedSessionTestRuntime::Node => resolve_node_env_plan(
+                package.as_ref(),
+                package
+                    .dependency_manifest()
+                    .and_then(|manifest| manifest.node_runtime.as_ref())
+                    .expect("Node runtime declaration"),
+            ),
+        }
+        .expect("resolve managed session environment plan");
+        prepare_ready_managed_session_environment(&plan, runtime, host, &dependency_marker);
+        Self {
+            base,
+            runtime,
+            runtime_version,
+            env_dir: plan.env_dir,
+            dependency_marker,
+        }
+    }
+
+    /// Return host options for the strict System Plugin runtime roots.
+    /// 返回严格 System Plugin 运行时根对应的宿主选项。
+    pub(crate) fn host_options(&self) -> LuaRuntimeHostOptions {
+        self.base.host_options()
+    }
+
+    /// Return one strict System lease request, optionally replacing the same SID generation.
+    /// 返回一个严格 System 租约请求，并可选择替换同 SID 代际。
+    pub(crate) fn create_request(&self, sid: &str, replace: bool) -> Value {
+        // Request uses the infinite System lifetime required by long-running plugin sessions.
+        // Request 使用长期插件会话要求的无限 System 生命周期。
+        let mut request = self.base.create_request(sid);
+        request["ttl_sec"] = json!(0);
+        request["replace"] = json!(replace);
+        request
+    }
+
+    /// Return the package-relative sidecar file for this layout.
+    /// 返回当前布局对应的包相对 sidecar 文件。
+    fn sidecar_file(&self) -> &'static str {
+        self.runtime.sidecar_file()
+    }
+
+    /// Return the Lua session-open API for this layout.
+    /// 返回当前布局对应的 Lua session-open API。
+    fn lua_open_api(&self) -> &'static str {
+        self.runtime.lua_open_api()
+    }
+
+    /// Return the expected package-relative import marker.
+    /// 返回预期的包相对导入标记。
+    fn import_marker(&self) -> &'static str {
+        self.runtime.import_marker()
+    }
+
+    /// Return the package-relative invoke handler file for this layout.
+    /// 返回当前布局对应的包相对 invoke 处理器文件。
+    fn invoke_file(&self) -> &'static str {
+        self.runtime.invoke_file()
+    }
+
+    /// Return the Lua managed-runtime status function path for this layout.
+    /// 返回当前布局对应的 Lua 受管运行时状态函数路径。
+    fn lua_status_api(&self) -> &'static str {
+        self.runtime.lua_status_api()
+    }
+
+    /// Return the Lua managed-runtime invoke function path for this layout.
+    /// 返回当前布局对应的 Lua 受管运行时调用函数路径。
+    fn lua_invoke_api(&self) -> &'static str {
+        self.runtime.lua_invoke_api()
+    }
+
+    /// Return the package runtime directory used as an authorized relative cwd.
+    /// 返回作为授权相对 cwd 使用的包 runtime 目录。
+    fn runtime_source_dir(&self) -> PathBuf {
+        self.base.package_root.join("runtime")
+    }
+}
+
+/// A second System Plugin package sharing one engine runtime root but owning its dependencies.
+/// 共享同一引擎运行时根、但独立拥有依赖的第二个 System Plugin 包。
+struct ManagedSessionSiblingSystemPackage {
+    /// Stable package identifier trusted by strict System lease creation.
+    /// 严格 System 租约创建所信任的稳定包标识。
+    package_id: String,
+    /// Canonical package root under the configured System trust root.
+    /// 配置的 System 信任根下的规范包根。
+    package_root: PathBuf,
+    /// Canonical dependency manifest path.
+    /// 规范依赖清单路径。
+    dependencies_file: PathBuf,
+    /// Runtime implemented by the sibling package fixture.
+    /// 同级包夹具实现的运行时。
+    runtime: ManagedSessionTestRuntime,
+    /// Ready package-specific managed environment.
+    /// 包专属的就绪受管环境。
+    env_dir: PathBuf,
+    /// Marker installed in only the sibling dependency tree.
+    /// 只安装在同级包依赖树中的标记。
+    dependency_marker: String,
+    /// Marker exported by the sibling's same-named Lua module.
+    /// 同级包同名 Lua 模块导出的标记。
+    lua_module_marker: String,
+}
+
+impl ManagedSessionSiblingSystemPackage {
+    /// Return one strict infinite-lifetime System lease request for this package.
+    /// 返回当前包的严格无限生命周期 System 租约请求。
+    ///
+    /// `sid` supplies the stable host identity for the independent lease.
+    /// `sid` 为独立租约提供稳定宿主身份。
+    ///
+    /// Return canonical package paths without any cross-package search roots.
+    /// 返回规范包路径，且不包含任何跨包搜索根。
+    fn create_request(&self, sid: &str) -> Value {
+        json!({
+            "sid": sid,
+            "ttl_sec": 0,
+            "system_package": {
+                "id": self.package_id.as_str(),
+                "root": render_host_visible_path(&self.package_root),
+                "dependencies_file": "dependencies.yaml",
+            }
+        })
+    }
+}
+
+/// Create one sibling System Plugin with a distinct lock identity and dependency tree.
+/// 创建一个具有独立锁身份与依赖树的同级 System Plugin。
+///
+/// `layout` supplies the already-installed shared runtime assets and System trust root.
+/// `layout` 提供已安装的共享运行时资产与 System 信任根。
+///
+/// `package_id` and `dependency_marker` identify the isolated package and dependency evidence.
+/// `package_id` 与 `dependency_marker` 标识隔离包及依赖证据。
+///
+/// Return a canonical sibling package ready for real status and invoke calls.
+/// 返回可执行真实 status 与 invoke 调用的规范同级包。
+fn create_managed_session_sibling_system_package(
+    layout: &ManagedSessionSystemLayout,
+    host: &HostManagedRuntime,
+    package_id: &str,
+    dependency_marker: &str,
+) -> ManagedSessionSiblingSystemPackage {
+    // PackageRoot remains strictly inside the same configured System Lua trust root.
+    // PackageRoot 严格位于同一已配置 System Lua 信任根内部。
+    let package_root = layout.base.system_lua_lib_dir.join(package_id);
+    let dependencies_file = package_root.join("dependencies.yaml");
+    let runtime_source_dir = package_root.join("runtime");
+    fs::create_dir_all(&runtime_source_dir)
+        .expect("create sibling managed runtime source directory");
+    match layout.runtime {
+        ManagedSessionTestRuntime::Python => {
+            fs::write(
+                runtime_source_dir.join("invoke.py"),
+                MANAGED_SESSION_PYTHON_INVOKE_SOURCE,
+            )
+            .expect("write sibling Python invoke fixture");
+            fs::write(
+                runtime_source_dir.join("helper.py"),
+                MANAGED_SESSION_PYTHON_HELPER_SOURCE,
+            )
+            .expect("write sibling Python relative-import helper fixture");
+            fs::create_dir_all(package_root.join("python"))
+                .expect("create sibling Python lock directory");
+            fs::write(
+                package_root.join("python/requirements.lock"),
+                format!("# isolated System package lock identity: {package_id}\n"),
+            )
+            .expect("write sibling Python lockfile");
+            fs::write(
+                &dependencies_file,
+                format!(
+                    "python_runtime:\n  version: \"{}\"\n  package_manager: uv\n  package_manager_version: \"{}\"\n  lockfile: python/requirements.lock\n",
+                    host.version, MANAGED_SESSION_TEST_PACKAGE_MANAGER_VERSION
+                ),
+            )
+            .expect("write sibling Python dependencies");
+        }
+        ManagedSessionTestRuntime::Node => {
+            fs::write(
+                runtime_source_dir.join("invoke.mjs"),
+                MANAGED_SESSION_NODE_INVOKE_SOURCE,
+            )
+            .expect("write sibling Node invoke fixture");
+            fs::write(
+                runtime_source_dir.join("helper.mjs"),
+                MANAGED_SESSION_NODE_HELPER_SOURCE,
+            )
+            .expect("write sibling Node relative-import helper fixture");
+            fs::create_dir_all(package_root.join("node"))
+                .expect("create sibling Node manifest directory");
+            fs::write(
+                package_root.join("node/package.json"),
+                format!(
+                    r#"{{"name":"{package_id}","version":"1.0.0","private":true,"type":"module"}}"#
+                ),
+            )
+            .expect("write sibling Node package manifest");
+            fs::write(
+                package_root.join("node/pnpm-lock.yaml"),
+                format!(
+                    "lockfileVersion: '9.0'\n# isolated System package lock identity: {package_id}\n"
+                ),
+            )
+            .expect("write sibling Node lockfile");
+            fs::write(
+                &dependencies_file,
+                format!(
+                    "node_runtime:\n  version: \"{}\"\n  package_manager: pnpm\n  package_manager_version: \"{}\"\n  package_json: node/package.json\n  lockfile: node/pnpm-lock.yaml\n",
+                    host.version, MANAGED_SESSION_TEST_PACKAGE_MANAGER_VERSION
+                ),
+            )
+            .expect("write sibling Node dependencies");
+        }
+    }
+    // LuaModuleMarker distinguishes the same module name loaded by two dedicated System VMs.
+    // LuaModuleMarker 区分两个专用 System VM 加载的同名模块。
+    let lua_module_marker = format!("{package_id}-lua-module");
+    fs::write(
+        package_root.join("fixture_module.lua"),
+        format!(
+            "-- Package-specific module marker returned by isolation tests.\n-- 隔离测试返回的包专属模块标记。\nreturn {{ marker = {} }}\n",
+            serde_json::to_string(&lua_module_marker).expect("quote sibling Lua module marker")
+        ),
+    )
+    .expect("write sibling System Lua module fixture");
+    // Manifest follows the same strict parser used during System lease creation.
+    // Manifest 使用与 System 租约创建相同的严格解析器。
+    let manifest = PackageDependencyManifest::load_from_path(&dependencies_file)
+        .expect("load sibling managed dependency manifest");
+    // PackageContext derives the exact package-specific environment identity.
+    // PackageContext 派生精确的包专属环境身份。
+    let package = ManagedRuntimePackageContext::for_skill(
+        package_id,
+        &package_root,
+        &layout.base.runtime_root,
+        Some(manifest),
+    )
+    .expect("build sibling managed package context");
+    // Plan proves lock contents participate in environment isolation.
+    // Plan 证明锁文件内容参与环境隔离。
+    let plan = match layout.runtime {
+        ManagedSessionTestRuntime::Python => resolve_python_env_plan(
+            package.as_ref(),
+            package
+                .dependency_manifest()
+                .and_then(|manifest| manifest.python_runtime.as_ref())
+                .expect("sibling Python runtime declaration"),
+        ),
+        ManagedSessionTestRuntime::Node => resolve_node_env_plan(
+            package.as_ref(),
+            package
+                .dependency_manifest()
+                .and_then(|manifest| manifest.node_runtime.as_ref())
+                .expect("sibling Node runtime declaration"),
+        ),
+    }
+    .expect("resolve sibling managed environment plan");
+    prepare_ready_managed_session_environment(&plan, layout.runtime, host, dependency_marker);
+    ManagedSessionSiblingSystemPackage {
+        package_id: package_id.to_string(),
+        package_root: fs::canonicalize(&package_root)
+            .expect("canonicalize sibling System package root"),
+        dependencies_file: fs::canonicalize(&dependencies_file)
+            .expect("canonicalize sibling dependency manifest"),
+        runtime: layout.runtime,
+        env_dir: plan.env_dir,
+        dependency_marker: dependency_marker.to_string(),
+        lua_module_marker,
+    }
+}
+
+/// Stable identity returned by one strict System lease creation.
+/// 单次严格 System 租约创建返回的稳定身份。
+#[derive(Clone, Debug)]
+struct ManagedSessionLeaseHandle {
+    /// Opaque manager-issued lease identifier.
+    /// 管理器签发的不透明租约标识。
+    lease_id: String,
+    /// SID-local lease generation.
+    /// SID 内部租约代际。
+    generation: u64,
+}
+
+/// Create one strict System lease and assert its canonical success response.
+/// 创建一个严格 System 租约并断言其规范成功响应。
+fn create_managed_session_test_lease(
+    engine: &LuaEngine,
+    layout: &ManagedSessionSystemLayout,
+    sid: &str,
+    replace: bool,
+) -> ManagedSessionLeaseHandle {
+    create_managed_session_test_lease_from_request(engine, &layout.create_request(sid, replace))
+}
+
+/// Create one strict System lease from an already-built canonical request.
+/// 从一个已构造的规范请求创建严格 System 租约。
+///
+/// `engine` owns the dedicated VM and `request` identifies its exact trusted package.
+/// `engine` 拥有专用 VM，`request` 标识其精确可信包。
+///
+/// Return the opaque lease identity and generation after asserting successful creation.
+/// 在断言创建成功后返回不透明租约身份与代际。
+fn create_managed_session_test_lease_from_request(
+    engine: &LuaEngine,
+    request: &Value,
+) -> ManagedSessionLeaseHandle {
+    // Created is decoded from the same JSON surface used by production hosts.
+    // Created 从生产宿主使用的同一 JSON 接口解码。
     let created: Value = serde_json::from_str(
         &engine
-            .create_system_runtime_lease_json(
+            .create_system_runtime_lease_json(&request.to_string())
+            .expect("create managed session System lease"),
+    )
+    .expect("decode managed session System lease response");
+    assert_eq!(created["ok"], true, "unexpected create response: {created}");
+    ManagedSessionLeaseHandle {
+        lease_id: created["lease_id"]
+            .as_str()
+            .expect("managed session lease id")
+            .to_string(),
+        generation: created["generation"]
+            .as_u64()
+            .expect("managed session lease generation"),
+    }
+}
+
+/// Evaluate Lua inside one exact System lease generation and decode the stable JSON response.
+/// 在一个精确 System 租约代际中执行 Lua，并解码稳定 JSON 响应。
+fn eval_managed_session_test_lease(
+    engine: &LuaEngine,
+    lease: &ManagedSessionLeaseHandle,
+    code: &str,
+) -> Value {
+    // Request binds evaluation to both the opaque lease id and generation.
+    // Request 将执行同时绑定到不透明租约 id 与代际。
+    let request = json!({
+        "lease_id": lease.lease_id,
+        "generation": lease.generation,
+        "code": code,
+    });
+    serde_json::from_str(
+        &engine
+            .eval_system_runtime_lease_json(&request.to_string())
+            .expect("evaluate managed session System lease"),
+    )
+    .expect("decode managed session System eval response")
+}
+
+/// Close one exact System lease generation and assert a successful first close.
+/// 关闭一个精确 System 租约代际并断言首次关闭成功。
+fn close_managed_session_test_lease(engine: &LuaEngine, lease: &ManagedSessionLeaseHandle) {
+    // Closed response proves the VM and its userdata were synchronously retired.
+    // Closed 响应证明 VM 及其 userdata 已同步退役。
+    let closed: Value = serde_json::from_str(
+        &engine
+            .close_system_runtime_lease_json(
                 &json!({
-                    "authority": "system",
-                    "sid": "system-cwd-test",
-                    "ttl_sec": 60,
-                    "cwd": render_host_visible_path(&explicit_cwd)
+                    "lease_id": lease.lease_id,
+                    "generation": lease.generation,
                 })
                 .to_string(),
             )
+            .expect("close managed session System lease"),
+    )
+    .expect("decode managed session close response");
+    assert_eq!(closed["ok"], true, "unexpected close response: {closed}");
+    assert_eq!(closed["closed"], true);
+}
+
+/// Build Lua source that stores one managed session in a persistent global.
+/// 构造把一个受管会话保存到持久全局变量的 Lua 源码。
+pub(crate) fn managed_session_open_lua(
+    layout: &ManagedSessionSystemLayout,
+    global_name: &str,
+    buffer_limit_bytes: usize,
+    args: &[String],
+) -> String {
+    // Args contains JSON-quoted strings, which are valid Lua string literals for fixture paths.
+    // Args 包含 JSON 引号字符串；这些字符串对夹具路径也是合法 Lua 字面量。
+    let args = args
+        .iter()
+        .map(|value| serde_json::to_string(value).expect("quote managed session Lua argument"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "local fixture_module = require('fixture_module')\n{global_name} = {}({{ file = '{}', args = {{{args}}}, cwd = 'runtime', stdout_encoding = 'utf-8', stderr_encoding = 'utf-8', stdin_encoding = 'utf-8', buffer_limit_bytes = {buffer_limit_bytes} }})\nreturn {{ module_marker = fixture_module.marker, status = {global_name}:status() }}",
+        layout.lua_open_api(),
+        layout.sidecar_file(),
+    )
+}
+
+/// Direct and descendant process identifiers emitted by one real sidecar.
+/// 一个真实 sidecar 输出的直接与后代进程标识。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ManagedSessionProcessTree {
+    /// Direct managed sidecar process identifier.
+    /// 直接受管 sidecar 进程标识。
+    root_pid: u32,
+    /// Sleeping descendant process identifier.
+    /// 休眠后代进程标识。
+    child_pid: u32,
+}
+
+/// Parse the startup record from one Lua session read result.
+/// 从一次 Lua 会话读取结果中解析启动记录。
+fn parse_managed_session_started(read_result: &Value) -> (ManagedSessionProcessTree, Value) {
+    // Stdout is the exact decoded stream returned by shared process userdata.
+    // Stdout 是共享进程 userdata 返回的精确解码流。
+    let stdout = read_result["stdout"]
+        .as_str()
+        .expect("managed session read stdout");
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        // Record ignores non-JSON diagnostics while requiring one authoritative started event.
+        // Record 会忽略非 JSON 诊断，同时要求存在一条权威 started 事件。
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if record["event"] != "started" {
+            continue;
+        }
+        // RootPid and ChildPid are bounded to the platform process-id width used by Child.
+        // RootPid 与 ChildPid 被限制到 Child 使用的平台进程 id 宽度。
+        let root_pid = u32::try_from(record["root_pid"].as_u64().expect("started root_pid"))
+            .expect("root_pid fits u32");
+        let child_pid = u32::try_from(record["child_pid"].as_u64().expect("started child_pid"))
+            .expect("child_pid fits u32");
+        return (
+            ManagedSessionProcessTree {
+                root_pid,
+                child_pid,
+            },
+            record,
+        );
+    }
+    panic!(
+        "managed session startup record missing from stdout: {stdout:?}; read result: {read_result}"
+    );
+}
+
+/// Return whether one process is still alive without converting probe failures into exit.
+/// 返回某个进程是否仍存活，且不会把探测失败转换为退出。
+fn managed_session_process_exists(pid: u32) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        /// Synchronize access required by WaitForSingleObject on one process handle.
+        /// 在进程句柄上调用 WaitForSingleObject 所需的同步访问权限。
+        const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+        // Handle pins the selected process identity while its signaled state is inspected.
+        // Handle 在检查信号状态期间固定所选进程身份。
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE_ACCESS,
+                0,
+                pid,
+            )
+        };
+        if handle.is_null() {
+            // Error distinguishes an absent PID from a real process-probe failure.
+            // Error 用于区分 PID 不存在与真实进程探测失败。
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                return Ok(false);
+            }
+            return Err(format!("OpenProcess({pid}): {error}"));
+        }
+        // HandleOwner closes the native handle on every branch.
+        // HandleOwner 会在每个分支关闭原生句柄。
+        let handle_owner = unsafe { OwnedHandle::from_raw_handle(handle as _) };
+        // WaitResult reports whether the process has reached a terminal state.
+        // WaitResult 报告进程是否已经进入终态。
+        let wait_result = unsafe { WaitForSingleObject(handle_owner.as_raw_handle() as HANDLE, 0) };
+        match wait_result {
+            WAIT_TIMEOUT => Ok(true),
+            WAIT_OBJECT_0 => Ok(false),
+            WAIT_FAILED => Err(format!(
+                "WaitForSingleObject({pid}): {}",
+                std::io::Error::last_os_error()
+            )),
+            other => Err(format!(
+                "WaitForSingleObject({pid}) returned unexpected status {other}"
+            )),
+        }
+    }
+    #[cfg(unix)]
+    {
+        // Result is the signal-free POSIX process-existence probe.
+        // Result 是不发送信号的 POSIX 进程存在性探测。
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if result == 0 {
+            return Ok(true);
+        }
+        // Error classifies absent, permission-restricted, and failed probes explicitly.
+        // Error 会显式分类进程不存在、权限受限与探测失败。
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(false),
+            Some(libc::EPERM) => Ok(true),
+            _ => Err(format!("kill({pid}, 0): {error}")),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(format!(
+            "managed session process probing is unsupported on {}",
+            std::env::consts::OS
+        ))
+    }
+}
+
+/// Assert that both processes in one managed sidecar tree exit before a deadline.
+/// 断言一个受管 sidecar 进程树中的两个进程都会在截止时间前退出。
+fn assert_managed_session_process_tree_exits(
+    process_tree: ManagedSessionProcessTree,
+    timeout: Duration,
+) {
+    // Deadline bounds platform scheduling and asynchronous Job/process-group teardown.
+    // Deadline 为平台调度与异步 Job/进程组清理设置上限。
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        // RootAlive and ChildAlive preserve probe failures as test failures.
+        // RootAlive 与 ChildAlive 会把探测失败保留为测试失败。
+        let root_alive = managed_session_process_exists(process_tree.root_pid)
+            .expect("probe managed session root process");
+        let child_alive = managed_session_process_exists(process_tree.child_pid)
+            .expect("probe managed session descendant process");
+        if !root_alive && !child_alive {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("managed session process tree did not exit before timeout: {process_tree:?}");
+}
+
+/// Drain every currently queued managed-session event without waiting.
+/// 以非等待方式取出当前所有排队的受管会话事件。
+fn drain_managed_session_events(center: &ManagedSessionEventCenter) {
+    loop {
+        // Batch removes up to all logical slots supported by the service limit.
+        // Batch 最多取出服务上限支持的全部逻辑槽。
+        let batch = center.poll(256).expect("drain managed session events");
+        if batch.events.is_empty() && batch.remaining == 0 {
+            return;
+        }
+    }
+}
+
+/// Wait until all requested event kinds have been observed from real background activity.
+/// 等待从真实后台活动中观察到全部请求的事件类型。
+fn wait_for_managed_session_event_kinds(
+    center: &ManagedSessionEventCenter,
+    expected: &[RuntimeManagedSessionEventKind],
+    timeout: Duration,
+) -> Vec<RuntimeManagedSessionEvent> {
+    // Deadline bounds the durable event wait loop.
+    // Deadline 为持久事件等待循环设置上限。
+    let deadline = Instant::now() + timeout;
+    // Events retains sequence order across multiple bounded batches.
+    // Events 跨多个有界批次保留序号顺序。
+    let mut events: Vec<RuntimeManagedSessionEvent> = Vec::new();
+    loop {
+        if expected
+            .iter()
+            .all(|kind| events.iter().any(|event| event.kind == *kind))
+        {
+            return events;
+        }
+        // RemainingMillis is recomputed without allowing a zero wait before the deadline.
+        // RemainingMillis 会重新计算，并避免在截止前出现零等待。
+        let remaining_millis = deadline
+            .checked_duration_since(Instant::now())
+            .map(|remaining| remaining.as_millis().max(1) as u64)
+            .unwrap_or(0);
+        assert!(
+            remaining_millis > 0,
+            "managed session events timed out: {events:?}"
+        );
+        // Batch waits for at least one new durable event or reports timeout explicitly.
+        // Batch 等待至少一个新的持久事件，或显式报告超时。
+        let batch = center
+            .wait(256, remaining_millis)
+            .expect("wait for managed session events");
+        assert!(
+            !batch.timed_out,
+            "managed session events timed out: {events:?}"
+        );
+        events.extend(batch.events);
+    }
+}
+
+/// One real strict System Plugin layout used by direct engine tests.
+/// 直接引擎测试使用的真实严格 System Plugin 布局。
+struct SystemRuntimeTestLayout {
+    /// Canonical runtime root configured on the engine.
+    /// 配置到引擎上的规范运行时根目录。
+    runtime_root: PathBuf,
+    /// Canonical System Lua trust root.
+    /// 规范 System Lua 信任根目录。
+    system_lua_lib_dir: PathBuf,
+    /// Stable System Plugin package identifier.
+    /// 稳定的 System Plugin 包标识符。
+    package_id: String,
+    /// Canonical System Plugin package root.
+    /// 规范 System Plugin 包根目录。
+    package_root: PathBuf,
+    /// Canonical dependency manifest file.
+    /// 规范依赖清单文件。
+    dependencies_file: PathBuf,
+}
+
+impl SystemRuntimeTestLayout {
+    /// Create one isolated real System Plugin package layout.
+    /// 创建一个隔离的真实 System Plugin 包布局。
+    ///
+    /// The label parameter partitions temporary layouts created by independent tests.
+    /// label 参数用于隔离不同测试创建的临时布局。
+    ///
+    /// Return canonical paths ready for strict System lease creation.
+    /// 返回可直接用于严格 System 租约创建的规范路径。
+    fn new(label: &str) -> Self {
+        let runtime_root = make_temp_runtime_root(label);
+        let _ = fs::remove_dir_all(&runtime_root);
+        let system_lua_lib_dir = runtime_root.join("system_lua_lib");
+        let package_id = "vulcan-debug".to_string();
+        let package_root = system_lua_lib_dir.join(&package_id);
+        let dependencies_file = package_root.join("dependencies.yaml");
+        fs::create_dir_all(&package_root).expect("create System runtime test package root");
+        fs::write(&dependencies_file, "{}\n")
+            .expect("write System runtime test dependency manifest");
+        Self {
+            runtime_root: fs::canonicalize(&runtime_root)
+                .expect("canonicalize System runtime test root"),
+            system_lua_lib_dir: fs::canonicalize(&system_lua_lib_dir)
+                .expect("canonicalize System runtime trust root"),
+            package_id,
+            package_root: fs::canonicalize(&package_root)
+                .expect("canonicalize System runtime package root"),
+            dependencies_file: fs::canonicalize(&dependencies_file)
+                .expect("canonicalize System runtime dependency manifest"),
+        }
+    }
+
+    /// Return host options bound to the real runtime and System trust roots.
+    /// 返回绑定真实运行时根与 System 信任根的宿主选项。
+    fn host_options(&self) -> LuaRuntimeHostOptions {
+        LuaRuntimeHostOptions {
+            runtime_root: Some(self.runtime_root.clone()),
+            system_lua_lib_dir: Some(self.system_lua_lib_dir.clone()),
+            ..Default::default()
+        }
+    }
+
+    /// Return one strict direct-engine System lease create request.
+    /// 返回一个严格的直接引擎 System 租约创建请求。
+    ///
+    /// The sid parameter is the stable host-provided lease identity.
+    /// sid 参数是宿主提供的稳定租约身份。
+    ///
+    /// Return a request without high-level FFI-only authority or public module roots.
+    /// 返回不含高层 FFI 专属 authority 或公开模块根的请求。
+    fn create_request(&self, sid: &str) -> Value {
+        json!({
+            "sid": sid,
+            "ttl_sec": 60,
+            "system_package": {
+                "id": self.package_id.as_str(),
+                "root": render_host_visible_path(&self.package_root),
+                "dependencies_file": "dependencies.yaml"
+            }
+        })
+    }
+
+    /// Return the canonical package descriptor expected in lease responses.
+    /// 返回租约响应中预期的规范包描述符。
+    fn expected_package_json(&self) -> Value {
+        json!({
+            "id": self.package_id.as_str(),
+            "root": render_host_visible_path(&self.package_root),
+            "dependencies_file": render_host_visible_path(&self.dependencies_file)
+        })
+    }
+}
+
+impl Drop for SystemRuntimeTestLayout {
+    /// Remove the isolated runtime layout after the owning engine has been dropped.
+    /// 在所属引擎释放后删除隔离运行时布局。
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.runtime_root);
+    }
+}
+
+/// Verify System lease replacement and close retire each exact package owner from the worker service.
+/// 验证 System 租约替换与关闭会分别从 Worker 服务退役对应的精确包所有者。
+#[test]
+fn system_lease_replace_and_close_retire_worker_owners() {
+    let layout = SystemRuntimeTestLayout::new("system-worker-owner-retirement");
+    let engine = make_runtime_test_engine_with_host_options(layout.host_options());
+    // First active System lease whose package owner remains reusable until replacement.
+    // 其包所有者在替换前保持可复用的首个活动 System 租约。
+    let first: Value = serde_json::from_str(
+        &engine
+            .create_system_runtime_lease_json(
+                &layout.create_request("system-worker-owner").to_string(),
+            )
+            .expect("create first System worker-owner lease"),
+    )
+    .expect("decode first System worker-owner lease");
+    assert_eq!(first["ok"], true);
+    assert!(
+        engine
+            .managed_runtime_workers
+            .lock_pool()
+            .buckets
+            .is_empty()
+    );
+
+    // Replacement request committing a new package lifetime under the same SID.
+    // 在同一 SID 下提交新包生命周期的替换请求。
+    let mut replacement_request = layout.create_request("system-worker-owner");
+    replacement_request["replace"] = json!(true);
+    let replacement: Value = serde_json::from_str(
+        &engine
+            .create_system_runtime_lease_json(&replacement_request.to_string())
+            .expect("replace System worker-owner lease"),
+    )
+    .expect("decode replacement System worker-owner lease");
+    assert_eq!(replacement["ok"], true);
+    assert!(
+        engine
+            .managed_runtime_workers
+            .lock_pool()
+            .buckets
+            .is_empty()
+    );
+
+    // Close request retiring the replacement generation's distinct package owner.
+    // 退役替换代际独立包所有者的关闭请求。
+    let close_request = json!({
+        "lease_id": replacement["lease_id"],
+        "sid": replacement["sid"],
+        "generation": replacement["generation"],
+    });
+    let closed: Value = serde_json::from_str(
+        &engine
+            .close_system_runtime_lease_json(&close_request.to_string())
+            .expect("close replacement System worker-owner lease"),
+    )
+    .expect("decode closed System worker-owner lease");
+    assert_eq!(closed["ok"], true);
+    assert!(
+        engine
+            .managed_runtime_workers
+            .lock_pool()
+            .buckets
+            .is_empty()
+    );
+}
+
+/// Verify one prune pass retires every expired System package owner, not only one lease.
+/// 验证单次清理会退役全部过期 System 包所有者，而不只是一个租约。
+#[test]
+fn system_lease_prune_retires_all_expired_worker_owners() {
+    let layout = SystemRuntimeTestLayout::new("system-worker-owner-prune");
+    let engine = make_runtime_test_engine_with_host_options(layout.host_options());
+    for sid in ["expired-worker-owner-a", "expired-worker-owner-b"] {
+        // Finite request producing a distinct package owner for each SID.
+        // 为每个 SID 生成独立包所有者的有限期请求。
+        let mut request = layout.create_request(sid);
+        request["ttl_sec"] = json!(1);
+        let created: Value = serde_json::from_str(
+            &engine
+                .create_system_runtime_lease_json(&request.to_string())
+                .expect("create expiring System worker-owner lease"),
+        )
+        .expect("decode expiring System worker-owner lease");
+        assert_eq!(created["ok"], true);
+    }
+    thread::sleep(Duration::from_millis(1_200));
+    // Listing performs one manager prune that must enqueue both expired owners.
+    // 列表操作执行一次管理器清理，且必须将两个过期所有者全部入队。
+    let listed: Value = serde_json::from_str(
+        &engine
+            .list_system_runtime_leases_json("{}")
+            .expect("list after System worker-owner expiry"),
+    )
+    .expect("decode System worker-owner list");
+    assert_eq!(listed["ok"], true);
+    assert_eq!(listed["leases"].as_array().map(Vec::len), Some(0));
+    assert!(
+        engine
+            .managed_runtime_workers
+            .lock_pool()
+            .buckets
+            .is_empty()
+    );
+}
+
+/// Verify System leases preserve explicit cwd and echo one canonical package across create, status, and list.
+/// 验证 System 租约会保留显式 cwd，并在 create、status 与 list 中回显同一规范包。
+#[test]
+fn system_runtime_lease_preserves_explicit_cwd_and_package_identity() {
+    let layout = SystemRuntimeTestLayout::new("system-runtime-lease-cwd");
+    let explicit_cwd = layout.runtime_root.join("host-cwd");
+    fs::create_dir_all(&explicit_cwd).expect("create explicit host cwd");
+    let engine = make_runtime_test_engine_with_host_options(layout.host_options());
+    let mut create_request = layout.create_request("system-cwd-test");
+    create_request["workspace_root"] = json!(render_host_visible_path(&layout.runtime_root));
+    create_request["cwd"] = json!(render_host_visible_path(&explicit_cwd));
+
+    let created: Value = serde_json::from_str(
+        &engine
+            .create_system_runtime_lease_json(&create_request.to_string())
             .expect("create system runtime lease"),
     )
     .expect("system runtime lease create response json");
@@ -6981,8 +8660,9 @@ fn system_runtime_lease_preserves_explicit_cwd_override() {
     );
     assert_eq!(
         created["system_lua_lib"],
-        json!(render_host_visible_path(&fixed_system_dir))
+        json!(render_host_visible_path(&layout.system_lua_lib_dir))
     );
+    assert_eq!(created["system_package"], layout.expected_package_json());
 
     let lease_id = created["lease_id"]
         .as_str()
@@ -6991,17 +8671,13 @@ fn system_runtime_lease_preserves_explicit_cwd_override() {
     let generation = created["generation"]
         .as_u64()
         .expect("generation should be present");
-
+    let status_request = json!({
+        "lease_id": lease_id,
+        "generation": generation
+    });
     let status: Value = serde_json::from_str(
         &engine
-            .system_runtime_lease_status_json(
-                &json!({
-                    "authority": "system",
-                    "lease_id": lease_id,
-                    "generation": generation
-                })
-                .to_string(),
-            )
+            .system_runtime_lease_status_json(&status_request.to_string())
             .expect("status system runtime lease"),
     )
     .expect("system runtime lease status response json");
@@ -7012,20 +8688,31 @@ fn system_runtime_lease_preserves_explicit_cwd_override() {
     );
     assert_eq!(
         status["system_lua_lib"],
-        json!(render_host_visible_path(&fixed_system_dir))
+        json!(render_host_visible_path(&layout.system_lua_lib_dir))
+    );
+    assert_eq!(status["system_package"], layout.expected_package_json());
+
+    let listed: Value = serde_json::from_str(
+        &engine
+            .list_system_runtime_leases_json("{}")
+            .expect("list system runtime leases"),
+    )
+    .expect("system runtime lease list response json");
+    assert_eq!(listed["ok"], true);
+    assert_eq!(listed["leases"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        listed["leases"][0]["system_package"],
+        layout.expected_package_json()
     );
 
+    let eval_request = json!({
+        "lease_id": lease_id,
+        "generation": generation,
+        "code": "return { cwd = vulcan.runtime.cwd() }"
+    });
     let eval: Value = serde_json::from_str(
         &engine
-            .eval_system_runtime_lease_json(
-                &json!({
-                    "authority": "system",
-                    "lease_id": lease_id,
-                    "generation": generation,
-                    "code": "return { cwd = vulcan.runtime.cwd() }"
-                })
-                .to_string(),
-            )
+            .eval_system_runtime_lease_json(&eval_request.to_string())
             .expect("eval system runtime lease"),
     )
     .expect("system runtime lease eval response json");
@@ -7033,14 +8720,1538 @@ fn system_runtime_lease_preserves_explicit_cwd_override() {
     assert_eq!(eval["cwd"], json!(render_host_visible_path(&explicit_cwd)));
     assert_eq!(
         eval["system_lua_lib"],
-        json!(render_host_visible_path(&fixed_system_dir))
+        json!(render_host_visible_path(&layout.system_lua_lib_dir))
     );
+    assert_eq!(eval["system_package"], layout.expected_package_json());
     assert_eq!(
         eval["result"]["cwd"],
         json!(render_host_visible_path(&explicit_cwd))
     );
+}
 
-    let _ = fs::remove_dir_all(&runtime_root);
+/// Verify System workspace and cwd inputs are canonical authorization boundaries, not display data.
+/// 验证 System 工作区与 cwd 输入属于规范授权边界，而非仅用于显示的数据。
+#[test]
+fn system_runtime_lease_rejects_relative_workspace_and_unauthorized_cwd() {
+    let layout = SystemRuntimeTestLayout::new("system-runtime-path-authorization");
+    let engine = make_runtime_test_engine_with_host_options(layout.host_options());
+    // Relative workspace roots depend on ambient process cwd and must never become authorization roots.
+    // 相对工作区根依赖进程环境 cwd，绝不能成为授权根。
+    let mut relative_workspace = layout.create_request("system-relative-workspace");
+    relative_workspace["workspace_root"] = json!("relative-workspace");
+    let workspace_error = engine
+        .create_system_runtime_lease_json(&relative_workspace.to_string())
+        .expect_err("relative System workspace root must be rejected");
+    assert!(workspace_error.contains("workspace_root must be an absolute path"));
+
+    // Existing cwd outside both the package and an absent workspace must also be rejected.
+    // 位于包外且没有工作区授权的既有 cwd 也必须被拒绝。
+    let outside_cwd = layout.runtime_root.join("unauthorized-cwd");
+    fs::create_dir_all(&outside_cwd).expect("create unauthorized System cwd");
+    let mut unauthorized_cwd = layout.create_request("system-unauthorized-cwd");
+    unauthorized_cwd["cwd"] = json!(render_host_visible_path(&outside_cwd));
+    let cwd_error = engine
+        .create_system_runtime_lease_json(&unauthorized_cwd.to_string())
+        .expect_err("unauthorized System cwd must be rejected");
+    assert!(cwd_error.contains("outside the System package root"));
+}
+
+/// Verify System workspace and cwd authorization remains bound to activation-time directory objects.
+/// 验证 System 工作区与 cwd 授权始终绑定到激活时的目录对象。
+#[test]
+fn system_runtime_lease_rejects_replaced_workspace_and_cwd_objects() {
+    // Layout and engine provide one strict System package shared by two independent leases.
+    // Layout 与引擎提供由两个独立租约共享的严格 System 包。
+    let layout = SystemRuntimeTestLayout::new("system-runtime-path-identity");
+    let engine = make_runtime_test_engine_with_host_options(layout.host_options());
+    // CwdWorkspace remains stable while only its selected cwd object is replaced at the same name.
+    // CwdWorkspace 保持稳定，仅其选定 cwd 对象在同名位置被替换。
+    let cwd_workspace = layout.runtime_root.join("cwd-workspace");
+    let authorized_cwd = cwd_workspace.join("selected-cwd");
+    fs::create_dir_all(&authorized_cwd).expect("create identity-bound System cwd");
+    let mut cwd_request = layout.create_request("system-cwd-object-identity");
+    cwd_request["workspace_root"] = json!(render_host_visible_path(&cwd_workspace));
+    cwd_request["cwd"] = json!(render_host_visible_path(&authorized_cwd));
+    let cwd_lease: Value = serde_json::from_str(
+        &engine
+            .create_system_runtime_lease_json(&cwd_request.to_string())
+            .expect("create cwd-identity System lease"),
+    )
+    .expect("decode cwd-identity System lease");
+    assert_eq!(cwd_lease["ok"], true);
+    let retired_cwd = cwd_workspace.join("retired-cwd");
+    fs::rename(&authorized_cwd, &retired_cwd).expect("retire original System cwd object");
+    fs::create_dir(&authorized_cwd).expect("replace System cwd at the authorized name");
+    let cwd_eval: Value = serde_json::from_str(
+        &engine
+            .eval_system_runtime_lease_json(
+                &json!({
+                    "lease_id": cwd_lease["lease_id"],
+                    "sid": cwd_lease["sid"],
+                    "generation": cwd_lease["generation"],
+                    "code": "return true",
+                })
+                .to_string(),
+            )
+            .expect("encode replaced-cwd evaluation"),
+    )
+    .expect("decode replaced-cwd evaluation");
+    assert_eq!(cwd_eval["ok"], false);
+    assert!(
+        cwd_eval["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cwd filesystem object changed")),
+        "unexpected replaced-cwd response: {cwd_eval}"
+    );
+
+    // WorkspaceOnly is independently captured even when the effective cwd defaults to the package.
+    // WorkspaceOnly 即使在有效 cwd 默认采用包根时也会被独立捕获。
+    let workspace_only = layout.runtime_root.join("workspace-only");
+    fs::create_dir(&workspace_only).expect("create identity-bound System workspace");
+    let mut workspace_request = layout.create_request("system-workspace-object-identity");
+    workspace_request["workspace_root"] = json!(render_host_visible_path(&workspace_only));
+    let workspace_lease: Value = serde_json::from_str(
+        &engine
+            .create_system_runtime_lease_json(&workspace_request.to_string())
+            .expect("create workspace-identity System lease"),
+    )
+    .expect("decode workspace-identity System lease");
+    assert_eq!(workspace_lease["ok"], true);
+    let retired_workspace = layout.runtime_root.join("retired-workspace");
+    fs::rename(&workspace_only, &retired_workspace)
+        .expect("retire original System workspace object");
+    fs::create_dir(&workspace_only).expect("replace System workspace at the authorized name");
+    let workspace_eval: Value = serde_json::from_str(
+        &engine
+            .eval_system_runtime_lease_json(
+                &json!({
+                    "lease_id": workspace_lease["lease_id"],
+                    "sid": workspace_lease["sid"],
+                    "generation": workspace_lease["generation"],
+                    "code": "return true",
+                })
+                .to_string(),
+            )
+            .expect("encode replaced-workspace evaluation"),
+    )
+    .expect("decode replaced-workspace evaluation");
+    assert_eq!(workspace_eval["ok"], false);
+    assert!(
+        workspace_eval["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("workspace_root filesystem object changed")),
+        "unexpected replaced-workspace response: {workspace_eval}"
+    );
+}
+
+/// Verify a persistent System VM refuses evaluation after its activated package root disappears.
+/// 验证持久 System VM 在已激活包根消失后会拒绝执行。
+#[test]
+fn system_runtime_lease_revalidates_package_root_before_each_eval() {
+    let layout = SystemRuntimeTestLayout::new("system-runtime-live-root-revalidation");
+    let engine = make_runtime_test_engine_with_host_options(layout.host_options());
+    let created: Value = serde_json::from_str(
+        &engine
+            .create_system_runtime_lease_json(
+                &layout
+                    .create_request("system-live-root-revalidation")
+                    .to_string(),
+            )
+            .expect("create System live-root lease"),
+    )
+    .expect("decode System live-root lease");
+    assert_eq!(created["ok"], true);
+    fs::remove_dir_all(&layout.package_root).expect("remove activated System package root");
+    let evaluated: Value = serde_json::from_str(
+        &engine
+            .eval_system_runtime_lease_json(
+                &json!({
+                    "lease_id": created["lease_id"],
+                    "sid": created["sid"],
+                    "generation": created["generation"],
+                    "code": "return true",
+                })
+                .to_string(),
+            )
+            .expect("encode failed live-root evaluation"),
+    )
+    .expect("decode failed live-root evaluation");
+
+    assert_eq!(evaluated["ok"], false);
+    assert_eq!(evaluated["error_code"], "eval_failed");
+    assert!(
+        evaluated["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("failed to revalidate package root"))
+    );
+}
+
+/// Verify System Plugin context containers reject normal and raw mutation while remaining iterable and serializable.
+/// 验证 System Plugin 上下文容器会拒绝普通及 raw 修改，同时保持可迭代与可序列化。
+#[test]
+fn system_runtime_plugin_context_is_deeply_read_only() {
+    // Strict package layout whose mounts include nested object and array containers.
+    // 挂载信息包含嵌套对象与数组容器的严格包布局。
+    let layout = SystemRuntimeTestLayout::new("system-runtime-readonly-context");
+    let engine = make_runtime_test_engine_with_host_options(layout.host_options());
+    let mut create_request = layout.create_request("system-readonly-context");
+    create_request["mounts"] = json!({
+        "nested": { "value": "original" },
+        "array": [2, 3, 5]
+    });
+    let created: Value = serde_json::from_str(
+        &engine
+            .create_system_runtime_lease_json(&create_request.to_string())
+            .expect("create read-only System context lease"),
+    )
+    .expect("decode read-only System context lease");
+    assert_eq!(created["ok"], true);
+
+    // Lua probes direct assignment, rawset bypass attempts, pairs/ipairs, length, and host serialization.
+    // Lua 探测直接赋值、rawset 绕过尝试、pairs/ipairs、长度及宿主序列化。
+    let eval_request = json!({
+        "lease_id": created["lease_id"],
+        "sid": created["sid"],
+        "generation": created["generation"],
+        "code": r#"
+local plugin = vulcan.runtime.system_plugin
+local mounts = vulcan.runtime.mounts
+local direct_ok = pcall(function() plugin.id = 'mutated' end)
+local raw_ok = pcall(function() rawset(plugin, 'id', 'mutated') end)
+local nested_ok = pcall(function() mounts.nested.value = 'mutated' end)
+local runtime_direct_ok = pcall(function() vulcan.runtime.system_plugin = { id = 'mutated' } end)
+local runtime_setmetatable_ok = pcall(function() setmetatable(vulcan.runtime, {}) end)
+local require_debug_ok = pcall(function() return require('debug') end)
+local pair_count = 0
+for _key, _value in pairs(plugin) do pair_count = pair_count + 1 end
+local array_sum = 0
+for _index, value in ipairs(mounts.array) do array_sum = array_sum + value end
+return {
+    direct_ok = direct_ok,
+    raw_ok = raw_ok,
+    nested_ok = nested_ok,
+    runtime_direct_ok = runtime_direct_ok,
+    runtime_setmetatable_ok = runtime_setmetatable_ok,
+    rawset_type = type(rawset),
+    debug_type = type(debug),
+    require_debug_ok = require_debug_ok,
+    pair_count = pair_count,
+    array_len = #mounts.array,
+    array_sum = array_sum,
+    plugin = plugin,
+    mounts = mounts,
+}
+"#
+    });
+    let evaluated: Value = serde_json::from_str(
+        &engine
+            .eval_system_runtime_lease_json(&eval_request.to_string())
+            .expect("evaluate read-only System context"),
+    )
+    .expect("decode read-only System context evaluation");
+    assert_eq!(evaluated["ok"], true, "evaluation failed: {evaluated}");
+    let result = &evaluated["result"];
+    assert_eq!(result["direct_ok"], false);
+    assert_eq!(result["raw_ok"], false);
+    assert_eq!(result["nested_ok"], false);
+    assert_eq!(result["runtime_direct_ok"], false);
+    assert_eq!(result["runtime_setmetatable_ok"], false);
+    assert_eq!(result["rawset_type"], "nil");
+    assert_eq!(result["debug_type"], "nil");
+    assert_eq!(result["require_debug_ok"], false);
+    assert_eq!(result["pair_count"], 5);
+    assert_eq!(result["array_len"], 3);
+    assert_eq!(result["array_sum"], 10);
+    assert_eq!(result["plugin"]["id"], layout.package_id);
+    assert_eq!(result["plugin"]["sid"], "system-readonly-context");
+    assert_eq!(result["mounts"], create_request["mounts"]);
+}
+
+/// Verify an active System lease and its VM state survive an ordinary Skill reload.
+/// 验证活动 System 租约及其 VM 状态会在普通 Skill 重载后继续存活。
+#[test]
+fn system_runtime_lease_survives_ordinary_skill_reload() {
+    let layout = SystemRuntimeTestLayout::new("system-runtime-lease-reload");
+    let skill_root = RuntimeSkillRoot {
+        name: "ROOT".to_string(),
+        skills_dir: layout.runtime_root.join("skills"),
+    };
+    write_minimal_skill_to_root_with_response(
+        &skill_root.skills_dir,
+        "ordinary-reload-skill",
+        "before-reload",
+    );
+    let mut engine = make_runtime_test_engine_with_host_options(layout.host_options());
+    engine
+        .load_from_roots(std::slice::from_ref(&skill_root))
+        .expect("load ordinary Skill before System lease creation");
+    let created: Value = serde_json::from_str(
+        &engine
+            .create_system_runtime_lease_json(
+                &layout.create_request("system-reload-survival").to_string(),
+            )
+            .expect("create System lease before ordinary reload"),
+    )
+    .expect("decode System reload-survival create response");
+    let lease_id = created["lease_id"]
+        .as_str()
+        .expect("System reload-survival lease id")
+        .to_string();
+    let generation = created["generation"]
+        .as_u64()
+        .expect("System reload-survival generation");
+    let first_eval: Value = serde_json::from_str(
+        &engine
+            .eval_system_runtime_lease_json(
+                &json!({
+                    "lease_id": lease_id,
+                    "generation": generation,
+                    "code": "persistent_counter = 1; return persistent_counter"
+                })
+                .to_string(),
+            )
+            .expect("evaluate System lease before ordinary reload"),
+    )
+    .expect("decode pre-reload System eval response");
+    assert_eq!(first_eval["ok"], true);
+    assert_eq!(first_eval["result"], json!(1));
+
+    write_minimal_skill_to_root_with_response(
+        &skill_root.skills_dir,
+        "ordinary-reload-skill",
+        "after-reload",
+    );
+    engine
+        .reload_from_roots(std::slice::from_ref(&skill_root))
+        .expect("reload ordinary Skills without retiring System leases");
+    let ordinary_result = engine
+        .call_skill("ordinary-reload-skill-ping", &json!({}), None)
+        .expect("call reloaded ordinary Skill");
+    assert_eq!(ordinary_result.content, "after-reload");
+
+    let second_eval: Value = serde_json::from_str(
+        &engine
+            .eval_system_runtime_lease_json(
+                &json!({
+                    "lease_id": lease_id,
+                    "generation": generation,
+                    "code": "persistent_counter = persistent_counter + 1; return persistent_counter"
+                })
+                .to_string(),
+            )
+            .expect("evaluate preserved System lease after ordinary reload"),
+    )
+    .expect("decode post-reload System eval response");
+    assert_eq!(second_eval["ok"], true);
+    assert_eq!(second_eval["result"], json!(2));
+    assert_eq!(
+        second_eval["system_package"],
+        layout.expected_package_json()
+    );
+}
+
+/// Verify the dedicated System VM cannot dispatch ordinary loaded Skill entries through vulcan.call.
+/// 验证专用 System VM 无法通过 vulcan.call 分发普通已加载 Skill 入口。
+#[test]
+fn system_runtime_lease_dedicated_vm_cannot_dispatch_ordinary_skill() {
+    let layout = SystemRuntimeTestLayout::new("system-runtime-lease-isolation");
+    let skill_root = RuntimeSkillRoot {
+        name: "ROOT".to_string(),
+        skills_dir: layout.runtime_root.join("skills"),
+    };
+    write_minimal_skill_to_root_with_response(
+        &skill_root.skills_dir,
+        "ordinary-isolation-skill",
+        "ordinary-visible",
+    );
+    let mut engine = make_runtime_test_engine_with_host_options(layout.host_options());
+    engine
+        .load_from_roots(std::slice::from_ref(&skill_root))
+        .expect("load ordinary Skill before isolated System VM creation");
+    let ordinary_result = engine
+        .call_skill("ordinary-isolation-skill-ping", &json!({}), None)
+        .expect("ordinary host dispatch should remain available");
+    assert_eq!(ordinary_result.content, "ordinary-visible");
+    let created: Value = serde_json::from_str(
+        &engine
+            .create_system_runtime_lease_json(
+                &layout
+                    .create_request("system-dispatch-isolation")
+                    .to_string(),
+            )
+            .expect("create isolated System runtime lease"),
+    )
+    .expect("decode isolated System lease create response");
+    let eval: Value = serde_json::from_str(
+        &engine
+            .eval_system_runtime_lease_json(
+                &json!({
+                    "lease_id": created["lease_id"],
+                    "generation": created["generation"],
+                    "code": "return vulcan.call('ordinary-isolation-skill-ping', {})"
+                })
+                .to_string(),
+            )
+            .expect("evaluate isolated System Skill dispatch attempt"),
+    )
+    .expect("decode isolated System dispatch response");
+    assert_eq!(eval["ok"], false);
+    assert_eq!(eval["error_code"], json!("eval_failed"));
+    let message = eval["message"]
+        .as_str()
+        .expect("isolated System dispatch failure message");
+    assert!(
+        message.contains("Skill 'ordinary-isolation-skill-ping' not found"),
+        "unexpected isolation error: {message}"
+    );
+}
+
+/// Open one session and synchronously read its authoritative startup record.
+/// 打开一个会话并同步读取其权威启动记录。
+fn open_and_capture_managed_session_tree(
+    engine: &LuaEngine,
+    layout: &ManagedSessionSystemLayout,
+    lease: &ManagedSessionLeaseHandle,
+    global_name: &str,
+    args: &[String],
+) -> ManagedSessionProcessTree {
+    // OpenResponse proves the userdata was stored in the persistent lease VM.
+    // OpenResponse 证明 userdata 已保存到持久租约 VM 中。
+    let open_response = eval_managed_session_test_lease(
+        engine,
+        lease,
+        &managed_session_open_lua(layout, global_name, 4096, args),
+    );
+    assert_eq!(open_response["ok"], true, "open failed: {open_response}");
+    // ReadResponse waits for sidecar initialization and returns the startup JSON line.
+    // ReadResponse 等待 sidecar 初始化并返回启动 JSON 行。
+    let read_response = eval_managed_session_test_lease(
+        engine,
+        lease,
+        &format!(
+            "return {global_name}:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = 'started' }})"
+        ),
+    );
+    assert_eq!(
+        read_response["ok"], true,
+        "startup read failed: {read_response}"
+    );
+    parse_managed_session_started(&read_response["result"]).0
+}
+
+/// Assert that no live Node session snapshot remains under the ready environment.
+/// 断言就绪环境下不再保留任何活动 Node 会话快照。
+fn assert_no_active_node_session_snapshots(layout: &ManagedSessionSystemLayout) {
+    // SnapshotsRoot may remain as an empty private namespace after deterministic cleanup.
+    // SnapshotsRoot 在确定性清理后可以保留为空的私有命名空间。
+    let snapshots_root = layout.env_dir.join(".ls-s");
+    let Ok(mut snapshots) = fs::read_dir(&snapshots_root) else {
+        return;
+    };
+    assert!(
+        snapshots.next().is_none(),
+        "active Node session snapshot leaked under {}",
+        render_host_visible_path(&snapshots_root)
+    );
+}
+
+/// Exercise real managed status and repeated invoke calls inside one strict System lease.
+/// 在一个严格 System 租约内验证真实受管 status 与重复 invoke 调用。
+///
+/// `runtime` selects the production Lua surface, `layout_label` partitions its filesystem, and
+/// `expect_long_source` requires Windows long-path evidence from the copied worker source.
+/// `runtime` 选择生产 Lua 接口，`layout_label` 隔离其文件系统，`expect_long_source` 要求返回
+/// Windows 长路径复制 Worker 源码证据。
+///
+/// Returns unit after status, cold invoke, warm reuse, isolation, and optional long-path assertions.
+/// 完成 status、冷调用、热复用、隔离及可选长路径断言后返回空值。
+fn run_managed_runtime_status_invoke_integration(
+    runtime: ManagedSessionTestRuntime,
+    layout_label: &str,
+    expect_long_source: bool,
+) {
+    // Host is absent only when the requested real interpreter is unavailable.
+    // Host 仅在请求的真实解释器不可用时为空。
+    let Some(host) = discover_host_managed_runtime(runtime) else {
+        return;
+    };
+    let _env_guard = process_env_test_guard();
+    // Restore guard paired with a representative host secret injected before worker launch.
+    // 与 Worker 启动前注入的代表性宿主密钥配对的恢复保护器。
+    let _secret_restore_guard = TestEnvRestoreGuard::capture("LUASKILLS_TEST_HOST_SECRET");
+    unsafe {
+        std::env::set_var(
+            "LUASKILLS_TEST_HOST_SECRET",
+            "must-not-cross-managed-worker-boundary",
+        );
+    }
+    // Layout contains the real handler and one package-specific ready dependency tree.
+    // Layout 包含真实处理器与一个包专属就绪依赖树。
+    let layout = if expect_long_source {
+        // RuntimeVersion lengthens only the managed environment group; the System package cwd stays short.
+        // RuntimeVersion 仅加长受管环境分组；System 包 cwd 保持较短。
+        let runtime_version = match runtime {
+            ManagedSessionTestRuntime::Python => {
+                format!("{}-{}", host.version, "p".repeat(160))
+            }
+            ManagedSessionTestRuntime::Node => {
+                format!("{}+{}", host.version, "n".repeat(160))
+            }
+        };
+        ManagedSessionSystemLayout::new_with_runtime_version(
+            layout_label,
+            Some(&runtime_version),
+            runtime,
+            &host,
+        )
+    } else {
+        ManagedSessionSystemLayout::new(layout_label, runtime, &host)
+    };
+    let engine = make_runtime_test_engine_with_host_options(layout.host_options());
+    let lease = create_managed_session_test_lease(
+        &engine,
+        &layout,
+        &format!("system-managed-status-invoke-{}", runtime.label()),
+        false,
+    );
+    // Eval performs status and two sequential invokes through the actual managed worker protocol.
+    // Eval 通过真实受管 Worker 协议执行 status 与两次顺序 invoke。
+    let eval = eval_managed_session_test_lease(
+        &engine,
+        &lease,
+        &format!(
+            "local status = {}()\nlocal first = {}({{ file = '{}', args = {{ value = 'first' }}, timeout_ms = 5000 }})\nlocal second = {}({{ file = '{}', args = {{ value = 'second' }}, timeout_ms = 5000 }})\nreturn {{ status = status, first = first, second = second }}",
+            layout.lua_status_api(),
+            layout.lua_invoke_api(),
+            layout.invoke_file(),
+            layout.lua_invoke_api(),
+            layout.invoke_file(),
+        ),
+    );
+    assert_eq!(
+        eval["ok"], true,
+        "managed status/invoke eval failed: {eval}"
+    );
+    // Status proves the System package declaration resolves to the prevalidated real runtime.
+    // Status 证明 System 包声明解析到预验证的真实运行时。
+    let status = &eval["result"]["status"];
+    assert_eq!(status["available"], true);
+    assert_eq!(status["configured"], true);
+    assert_eq!(status["ready"], true);
+    assert_eq!(status["runtime"], runtime.label());
+    assert_eq!(status["runtime_version"], layout.runtime_version);
+    assert_eq!(status["env_dir"], render_host_visible_path(&layout.env_dir));
+    // FirstResult proves arguments, dependency resolution, trusted context, and output capture.
+    // FirstResult 证明参数、依赖解析、可信上下文与输出捕获均有效。
+    let first = &eval["result"]["first"];
+    assert_eq!(first["ok"], true, "first managed invoke failed: {first}");
+    assert_eq!(first["status"], 0);
+    assert_eq!(first["timed_out"], false);
+    assert_eq!(first["worker_reused"], false);
+    assert_eq!(first["value"]["counter"], 1);
+    assert_eq!(
+        first["value"]["dependency_marker"],
+        layout.dependency_marker
+    );
+    assert_eq!(first["value"]["relative_marker"], layout.import_marker());
+    assert_eq!(first["value"]["package_id"], layout.base.package_id);
+    assert_eq!(first["value"]["value"], "first");
+    assert_eq!(first["value"]["host_secret_visible"], false);
+    assert!(
+        !first["value"]["path"]
+            .as_str()
+            .expect("first managed invoke controlled PATH")
+            .is_empty()
+    );
+    // SourcePath and WorkerCwd prove execution came from the private snapshot without inheriting
+    // an uncontrolled Windows host cwd.
+    // SourcePath 与 WorkerCwd 证明执行来自私有快照，且不会继承未受控的 Windows 宿主 cwd。
+    let source_path = first["value"]["source_path"]
+        .as_str()
+        .expect("first managed invoke snapshot source path");
+    let worker_cwd = first["value"]["cwd"]
+        .as_str()
+        .expect("first managed invoke worker cwd");
+    assert!(source_path.contains(".ls-w"), "{source_path}");
+    assert!(!worker_cwd.is_empty());
+    #[cfg(windows)]
+    if expect_long_source {
+        use std::os::windows::ffi::OsStrExt;
+
+        assert!(
+            Path::new(source_path).as_os_str().encode_wide().count() >= 260,
+            "expected long Windows snapshot source, got {source_path}"
+        );
+        assert!(
+            Path::new(worker_cwd)
+                .as_os_str()
+                .encode_wide()
+                .count()
+                .saturating_add(1)
+                < 260,
+            "expected short Windows worker cwd, got {worker_cwd}"
+        );
+        assert_ne!(
+            PathBuf::from(worker_cwd),
+            std::env::current_dir().expect("resolve host cwd for worker isolation assertion")
+        );
+    }
+    #[cfg(not(windows))]
+    assert!(!expect_long_source, "long source assertion is Windows-only");
+    assert!(
+        first["stdout"]
+            .as_str()
+            .expect("first managed invoke stdout")
+            .contains(&format!("{}-invoke", runtime.label()))
+    );
+    assert_eq!(first["env_hash"], status["env_hash"]);
+    assert_eq!(first["env_dir"], status["env_dir"]);
+    // SecondResult proves the warm worker retained only this package module's state.
+    // SecondResult 证明热 Worker 只保留当前包模块的状态。
+    let second = &eval["result"]["second"];
+    assert_eq!(second["ok"], true, "second managed invoke failed: {second}");
+    assert_eq!(second["worker_reused"], true);
+    assert_eq!(second["value"]["counter"], 2);
+    assert_eq!(second["value"]["value"], "second");
+    assert_eq!(
+        second["value"]["dependency_marker"],
+        layout.dependency_marker
+    );
+    close_managed_session_test_lease(&engine, &lease);
+}
+
+/// Exercise two System Plugin packages with same-named modules and dependencies in one engine.
+/// 在一个引擎内验证两个具有同名模块与依赖的 System Plugin 包。
+///
+/// `runtime` selects the Python or Node dependency and invoke implementation.
+/// `runtime` 选择 Python 或 Node 依赖及 invoke 实现。
+fn run_managed_system_plugin_dependency_module_isolation_integration(
+    runtime: ManagedSessionTestRuntime,
+) {
+    let Some(host) = discover_host_managed_runtime(runtime) else {
+        return;
+    };
+    let _env_guard = process_env_test_guard();
+    // Primary and Sibling share runtime assets but have different lock inputs and package roots.
+    // Primary 与 Sibling 共享运行时资产，但拥有不同锁输入与包根。
+    let layout = ManagedSessionSystemLayout::new(
+        &format!("managed-plugin-isolation-{}", runtime.label()),
+        runtime,
+        &host,
+    );
+    let sibling_dependency_marker = format!("{}-sibling-dependency", runtime.label());
+    let sibling = create_managed_session_sibling_system_package(
+        &layout,
+        &host,
+        "vulcan-debug-sibling",
+        &sibling_dependency_marker,
+    );
+    assert_ne!(layout.env_dir, sibling.env_dir);
+    assert_eq!(sibling.runtime, runtime);
+    assert!(sibling.dependencies_file.is_file());
+    let engine = make_runtime_test_engine_with_host_options(layout.host_options());
+    let primary_lease = create_managed_session_test_lease(
+        &engine,
+        &layout,
+        &format!("system-plugin-primary-{}", runtime.label()),
+        false,
+    );
+    let sibling_lease = create_managed_session_test_lease_from_request(
+        &engine,
+        &sibling.create_request(&format!("system-plugin-sibling-{}", runtime.label())),
+    );
+    // PrimaryEval loads the shared Lua module name and advances only the primary worker module.
+    // PrimaryEval 加载共享 Lua 模块名，并只推进主包 Worker 模块。
+    let primary_eval = eval_managed_session_test_lease(
+        &engine,
+        &primary_lease,
+        &format!(
+            "local module = require('fixture_module')\nlocal status = {}()\nlocal first = {}({{ file = '{}', args = {{ value = 'primary-first' }}, timeout_ms = 5000 }})\nlocal second = {}({{ file = '{}', args = {{ value = 'primary-second' }}, timeout_ms = 5000 }})\nlocal spam = {}({{ file = '{}', args = {{ value = 'primary-spam', spam = true }}, timeout_ms = 5000 }})\nreturn {{ module_marker = module.marker, status = status, first = first, second = second, spam = spam }}",
+            runtime.lua_status_api(),
+            runtime.lua_invoke_api(),
+            runtime.invoke_file(),
+            runtime.lua_invoke_api(),
+            runtime.invoke_file(),
+            runtime.lua_invoke_api(),
+            runtime.invoke_file(),
+        ),
+    );
+    assert_eq!(
+        primary_eval["ok"], true,
+        "primary package invoke failed: {primary_eval}"
+    );
+    // SiblingEval uses the same public names while resolving only sibling package artifacts.
+    // SiblingEval 使用相同公开名称，同时只解析同级包制品。
+    let sibling_eval = eval_managed_session_test_lease(
+        &engine,
+        &sibling_lease,
+        &format!(
+            "local module = require('fixture_module')\nlocal status = {}()\nlocal first = {}({{ file = '{}', args = {{ value = 'sibling-first' }}, timeout_ms = 5000 }})\nreturn {{ module_marker = module.marker, status = status, first = first }}",
+            runtime.lua_status_api(),
+            runtime.lua_invoke_api(),
+            runtime.invoke_file(),
+        ),
+    );
+    assert_eq!(
+        sibling_eval["ok"], true,
+        "sibling package invoke failed: {sibling_eval}"
+    );
+    // Lua module markers prove package.path/module caches never cross dedicated System VMs.
+    // Lua 模块标记证明 package.path/模块缓存不会跨越专用 System VM。
+    assert_eq!(
+        primary_eval["result"]["module_marker"],
+        "system-package-module-ok"
+    );
+    assert_eq!(
+        sibling_eval["result"]["module_marker"],
+        sibling.lua_module_marker
+    );
+    // Environment identities and same-named dependency values prove dependency-tree isolation.
+    // 环境身份与同名依赖值证明依赖树隔离。
+    let primary_status = &primary_eval["result"]["status"];
+    let sibling_status = &sibling_eval["result"]["status"];
+    assert_eq!(primary_status["ready"], true);
+    assert_eq!(sibling_status["ready"], true);
+    assert_ne!(primary_status["env_hash"], sibling_status["env_hash"]);
+    assert_eq!(
+        primary_status["env_dir"],
+        render_host_visible_path(&layout.env_dir)
+    );
+    assert_eq!(
+        sibling_status["env_dir"],
+        render_host_visible_path(&sibling.env_dir)
+    );
+    let primary_first = &primary_eval["result"]["first"];
+    let sibling_first = &sibling_eval["result"]["first"];
+    assert_eq!(
+        primary_first["ok"], true,
+        "primary managed result failed: {primary_first}"
+    );
+    assert_eq!(
+        sibling_first["ok"], true,
+        "sibling managed result failed: {sibling_first}"
+    );
+    assert_eq!(
+        primary_first["value"]["dependency_marker"],
+        layout.dependency_marker
+    );
+    assert_eq!(
+        sibling_first["value"]["dependency_marker"],
+        sibling.dependency_marker
+    );
+    assert_eq!(
+        primary_first["value"]["relative_marker"],
+        runtime.import_marker()
+    );
+    assert_eq!(
+        sibling_first["value"]["relative_marker"],
+        runtime.import_marker()
+    );
+    assert_eq!(primary_first["value"]["package_id"], layout.base.package_id);
+    assert_eq!(sibling_first["value"]["package_id"], sibling.package_id);
+    assert_eq!(primary_first["value"]["counter"], 1);
+    assert_eq!(primary_eval["result"]["second"]["value"]["counter"], 2);
+    let primary_spam = &primary_eval["result"]["spam"];
+    assert_eq!(primary_spam["ok"], true);
+    assert_eq!(primary_spam["value"]["counter"], 3);
+    assert!(
+        primary_spam["stdout_dropped_bytes"]
+            .as_u64()
+            .is_some_and(|dropped| dropped > 0)
+    );
+    assert!(
+        primary_spam["stdout"]
+            .as_str()
+            .is_some_and(|stdout| stdout.len() <= 256 * 1024)
+    );
+    assert_eq!(sibling_first["value"]["counter"], 1);
+    close_managed_session_test_lease(&engine, &primary_lease);
+    close_managed_session_test_lease(&engine, &sibling_lease);
+}
+
+/// Exercise persistent state, events, security boundaries, and bounded output for one runtime.
+/// 针对一个运行时验证持久状态、事件、安全边界与有界输出。
+fn run_managed_session_persistence_integration(runtime: ManagedSessionTestRuntime) {
+    // Host is optional only when the requested real interpreter is unavailable.
+    // Host 仅在请求的真实解释器不可用时才为空。
+    let Some(host) = discover_host_managed_runtime(runtime) else {
+        return;
+    };
+    // Process-wide guard serializes PATH-sensitive child runtime launches.
+    // 进程级保护锁串行化依赖 PATH 的子运行时启动。
+    let _env_guard = process_env_test_guard();
+    // Restore guard paired with a representative host secret injected before session launch.
+    // 与会话启动前注入的代表性宿主密钥配对的恢复保护器。
+    let _secret_restore_guard = TestEnvRestoreGuard::capture("LUASKILLS_TEST_HOST_SECRET");
+    unsafe {
+        std::env::set_var(
+            "LUASKILLS_TEST_HOST_SECRET",
+            "must-not-cross-managed-session-boundary",
+        );
+    }
+    // Layout contains one strict System package and one prevalidated ready environment.
+    // Layout 包含一个严格 System 包与一个已预验证的就绪环境。
+    let layout = ManagedSessionSystemLayout::new(
+        &format!("managed-session-persistence-{}", runtime.label()),
+        runtime,
+        &host,
+    );
+    // Engine is the production JSON surface under test.
+    // Engine 是被测的生产 JSON 接口。
+    let engine = make_runtime_test_engine_with_host_options(layout.host_options());
+    // EventCenter receives notifications from the real pipe readers and exit watcher.
+    // EventCenter 接收真实管道读取器与退出监视器的通知。
+    let event_center = engine.managed_runtime_services.event_center();
+    // WakeCount proves actual background output wakes the host edge callback.
+    // WakeCount 证明真实后台输出会唤醒宿主边沿回调。
+    let wake_count = Arc::new(AtomicUsize::new(0));
+    let wake_count_for_callback = Arc::clone(&wake_count);
+    event_center
+        .set_wake_callback(Some(Arc::new(move || {
+            wake_count_for_callback.fetch_add(1, AtomicOrdering::AcqRel);
+        })))
+        .expect("install managed session wake callback");
+    // Lease uses the required infinite System profile lifetime.
+    // Lease 使用所要求的无限 System profile 生命周期。
+    let lease = create_managed_session_test_lease(
+        &engine,
+        &layout,
+        &format!("system-managed-persistence-{}", runtime.label()),
+        false,
+    );
+
+    // FirstEval creates and stores the session in a persistent Lua global.
+    // FirstEval 创建会话并把它保存到持久 Lua 全局变量。
+    let first_eval = eval_managed_session_test_lease(
+        &engine,
+        &lease,
+        &managed_session_open_lua(&layout, "persistent_session", 1024, &[]),
+    );
+    assert_eq!(first_eval["ok"], true, "first eval failed: {first_eval}");
+    assert_eq!(
+        first_eval["result"]["module_marker"],
+        "system-package-module-ok"
+    );
+    assert_eq!(first_eval["result"]["status"]["running"], true);
+    // Lua-visible id correlates this userdata with the engine-level event stream.
+    // Lua 可见标识会把当前 userdata 与引擎级事件流关联起来。
+    let lua_managed_session_id = first_eval["result"]["status"]["managed_session_id"]
+        .as_u64()
+        .expect("Lua-visible managed session id");
+
+    // SecondEval writes one stateful command through the same saved userdata.
+    // SecondEval 通过同一个已保存 userdata 写入一条有状态命令。
+    let second_eval = eval_managed_session_test_lease(
+        &engine,
+        &lease,
+        r#"persistent_session:write('{"action":"echo","value":"alpha"}\n'); return true"#,
+    );
+    assert_eq!(second_eval["ok"], true, "second eval failed: {second_eval}");
+
+    // ThirdEval reads startup, stderr, and echo output from that exact process.
+    // ThirdEval 从该精确进程读取启动、stderr 与 echo 输出。
+    let third_eval = eval_managed_session_test_lease(
+        &engine,
+        &lease,
+        "return persistent_session:read({ timeout_ms = 5000, max_bytes = 4096, until_text = 'alpha' })",
+    );
+    assert_eq!(third_eval["ok"], true, "third eval failed: {third_eval}");
+    // ReadResult is the shared process-session contract returned through JSON.
+    // ReadResult 是通过 JSON 返回的共享进程会话契约。
+    let read_result = &third_eval["result"];
+    // ProcessTree identifies the real root and descendant used for later cleanup assertions.
+    // ProcessTree 标识用于后续清理断言的真实根进程与后代进程。
+    let (process_tree, started) = parse_managed_session_started(read_result);
+    assert_eq!(started["marker"], layout.import_marker());
+    if runtime == ManagedSessionTestRuntime::Node {
+        assert_eq!(started["dependency_marker"], layout.dependency_marker);
+    }
+    assert_eq!(started["host_secret_visible"], false);
+    assert_eq!(started["managed_context_present"], true);
+    assert!(
+        !started["path"]
+            .as_str()
+            .expect("managed session controlled PATH")
+            .is_empty()
+    );
+    assert_eq!(
+        started["cwd"],
+        render_host_visible_path(
+            &fs::canonicalize(layout.runtime_source_dir())
+                .expect("canonicalize managed session runtime cwd")
+        )
+    );
+    assert!(
+        read_result["stdout"]
+            .as_str()
+            .expect("persistent session stdout")
+            .contains(r#""value":"alpha","counter":1"#)
+    );
+    // StderrText includes any diagnostic bytes already drained with the alpha response.
+    // StderrText 包含随 alpha 响应一同取出的全部已就绪诊断字节。
+    let mut stderr_text = read_result["stderr"]
+        .as_str()
+        .expect("persistent session stderr")
+        .to_string();
+    if !stderr_text.contains("stderr-started") {
+        // StderrRead handles the valid scheduling race where the stderr reader appends slightly later.
+        // StderrRead 处理 stderr 读取器稍晚追加这一合法调度竞态。
+        let stderr_read = eval_managed_session_test_lease(
+            &engine,
+            &lease,
+            "return persistent_session:read({ timeout_ms = 5000, max_bytes = 4096, until_text = 'stderr-started' })",
+        );
+        assert_eq!(stderr_read["ok"], true, "stderr read failed: {stderr_read}");
+        stderr_text.push_str(
+            stderr_read["result"]["stderr"]
+                .as_str()
+                .expect("delayed persistent session stderr"),
+        );
+    }
+    assert!(stderr_text.contains("stderr-started"));
+    assert!(
+        managed_session_process_exists(process_tree.root_pid)
+            .expect("probe persistent sidecar root")
+    );
+    assert!(
+        managed_session_process_exists(process_tree.child_pid)
+            .expect("probe persistent sidecar descendant")
+    );
+
+    // InitialEvents must include both readable streams from real background readers.
+    // InitialEvents 必须包含真实后台读取器产生的两个可读流事件。
+    let initial_events = wait_for_managed_session_event_kinds(
+        &event_center,
+        &[
+            RuntimeManagedSessionEventKind::StdoutReadable,
+            RuntimeManagedSessionEventKind::StderrReadable,
+        ],
+        Duration::from_secs(5),
+    );
+    // ManagedSessionId is the engine-local identity shared by all events for this sidecar.
+    // ManagedSessionId 是当前 sidecar 全部事件共享的引擎本地身份。
+    let managed_session_id = initial_events[0].managed_session_id;
+    assert_eq!(managed_session_id, lua_managed_session_id);
+    assert!(initial_events.iter().all(|event| {
+        event.system_lease_id == lease.lease_id
+            && event.generation == lease.generation
+            && event.managed_session_id == managed_session_id
+    }));
+    assert!(
+        initial_events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)
+    );
+    assert!(wake_count.load(AtomicOrdering::Acquire) >= 1);
+    drain_managed_session_events(&event_center);
+
+    // ZeroRead proves the integrated Lua surface preserves true nonblocking timeout semantics.
+    // ZeroRead 证明集成 Lua 接口保留真正非阻塞超时语义。
+    let zero_read = eval_managed_session_test_lease(
+        &engine,
+        &lease,
+        "return persistent_session:read({ timeout_ms = 0, max_bytes = 4096 })",
+    );
+    assert_eq!(zero_read["ok"], true);
+    assert_eq!(zero_read["result"]["timed_out"], true);
+    assert_eq!(zero_read["result"]["stdout"], "");
+    // ZeroEventWait proves host polling is also truly nonblocking when the queue is empty.
+    // ZeroEventWait 证明事件队列为空时宿主轮询也是真正非阻塞。
+    let zero_event_wait = event_center
+        .wait(256, 0)
+        .expect("nonblocking managed event wait");
+    assert!(zero_event_wait.events.is_empty());
+    assert!(zero_event_wait.timed_out);
+
+    // SpamWrite requests enough flushed output to overflow the configured 1024-byte ring.
+    // SpamWrite 请求足够多的刷新输出，以溢出配置的 1024 字节环形缓冲。
+    let spam_write = eval_managed_session_test_lease(
+        &engine,
+        &lease,
+        r#"persistent_session:write('{"action":"spam"}\n'); return true"#,
+    );
+    assert_eq!(spam_write["ok"], true);
+    // SpamRead waits for the final marker while retaining only the newest bounded window.
+    // SpamRead 等待最终标记，同时只保留最新的有界窗口。
+    let spam_read = eval_managed_session_test_lease(
+        &engine,
+        &lease,
+        "return persistent_session:read({ timeout_ms = 5000, max_bytes = 4096, until_text = 'spam_end' })",
+    );
+    assert_eq!(spam_read["ok"], true, "spam read failed: {spam_read}");
+    assert!(
+        spam_read["result"]["stdout"]
+            .as_str()
+            .expect("spam stdout")
+            .contains("spam_end")
+    );
+    assert!(
+        spam_read["result"]["stdout_dropped_bytes"]
+            .as_u64()
+            .expect("stdout dropped byte count")
+            > 0
+    );
+    assert!(
+        spam_read["result"]["stdout_total_bytes"]
+            .as_u64()
+            .expect("stdout total byte count")
+            > 1024
+    );
+    // SpamEvents contains one coalesced stdout slot despite many flushed sidecar writes.
+    // SpamEvents 尽管 sidecar 多次刷新写入，仍只包含一个合并后的 stdout 槽。
+    let spam_events = event_center.poll(256).expect("poll coalesced spam events");
+    assert_eq!(
+        spam_events
+            .events
+            .iter()
+            .filter(|event| {
+                event.managed_session_id == managed_session_id
+                    && event.kind == RuntimeManagedSessionEventKind::StdoutReadable
+            })
+            .count(),
+        1
+    );
+    drain_managed_session_events(&event_center);
+
+    // ExitWrite asks only the root sidecar to exit, leaving its descendant for tree cleanup.
+    // ExitWrite 只要求根 sidecar 退出，并把后代留给进程树清理。
+    let exit_write = eval_managed_session_test_lease(
+        &engine,
+        &lease,
+        r#"persistent_session:write('{"action":"exit"}\n'); return true"#,
+    );
+    assert_eq!(exit_write["ok"], true);
+    // ExitEvents proves the independent direct-child watcher reliably publishes terminal state.
+    // ExitEvents 证明独立直接子进程监视器会可靠发布终态。
+    let exit_events = wait_for_managed_session_event_kinds(
+        &event_center,
+        &[RuntimeManagedSessionEventKind::Exited],
+        Duration::from_secs(5),
+    );
+    assert!(exit_events.iter().any(|event| {
+        event.managed_session_id == managed_session_id
+            && event.kind == RuntimeManagedSessionEventKind::Exited
+    }));
+    assert!(
+        managed_session_process_exists(process_tree.child_pid)
+            .expect("probe descendant after root exit"),
+        "descendant must remain alive until explicit tree cleanup"
+    );
+    // CloseResult terminates and waits for the entire tree after the root already exited.
+    // CloseResult 在根进程已经退出后终止并等待完整进程树。
+    let close_result = eval_managed_session_test_lease(
+        &engine,
+        &lease,
+        "return persistent_session:close({ timeout_ms = 0 })",
+    );
+    assert_eq!(
+        close_result["ok"], true,
+        "session close failed: {close_result}"
+    );
+    assert_managed_session_process_tree_exits(process_tree, Duration::from_secs(5));
+    drain_managed_session_events(&event_center);
+    thread::sleep(Duration::from_millis(50));
+    // StaleEvents remains empty because close permanently shuts the observer gate.
+    // StaleEvents 保持为空，因为 close 会永久关闭观察器通知门。
+    let stale_events = event_center
+        .wait(256, 0)
+        .expect("poll events after managed session close");
+    assert!(stale_events.events.is_empty());
+    assert!(stale_events.timed_out);
+
+    // ParentTraversal attempts to leave the package root lexically and must fail before launch.
+    // ParentTraversal 尝试以词法方式离开包根，且必须在启动前失败。
+    let parent_traversal = eval_managed_session_test_lease(
+        &engine,
+        &lease,
+        &format!(
+            "return {}({{ file = '../outside-sidecar', buffer_limit_bytes = 1024 }})",
+            layout.lua_open_api()
+        ),
+    );
+    assert_eq!(parent_traversal["ok"], false);
+    assert!(
+        parent_traversal["message"]
+            .as_str()
+            .expect("parent traversal error")
+            .contains("must be a non-empty safe path")
+    );
+    // OutsideSource is the real target used to create one escaping symbolic link.
+    // OutsideSource 是用于创建逃逸符号链接的真实目标。
+    let outside_source = layout
+        .base
+        .runtime_root
+        .join(format!("outside-session-{}", runtime.label()));
+    fs::write(&outside_source, "outside managed session fixture")
+        .expect("write outside managed session target");
+    // EscapeLink lives inside the package but canonicalizes outside its trust boundary.
+    // EscapeLink 位于包内，但规范化后会越出其信任边界。
+    let escape_link = layout.runtime_source_dir().join(match runtime {
+        ManagedSessionTestRuntime::Python => "escape.py",
+        ManagedSessionTestRuntime::Node => "escape.mjs",
+    });
+    if create_test_file_symlink(&escape_link, &outside_source) {
+        // SymlinkEscape must fail without starting another managed process.
+        // SymlinkEscape 必须失败，且不得启动另一个受管进程。
+        let symlink_escape = eval_managed_session_test_lease(
+            &engine,
+            &lease,
+            &format!(
+                "return {}({{ file = 'runtime/{}', buffer_limit_bytes = 1024 }})",
+                layout.lua_open_api(),
+                escape_link
+                    .file_name()
+                    .expect("escape link file name")
+                    .to_string_lossy()
+            ),
+        );
+        assert_eq!(symlink_escape["ok"], false);
+        assert!(
+            symlink_escape["message"]
+                .as_str()
+                .expect("symlink escape error")
+                .contains("escapes package root")
+                || symlink_escape["message"]
+                    .as_str()
+                    .expect("Node symlink copy error")
+                    .contains("unsupported package entry type")
+        );
+    }
+
+    event_center
+        .set_wake_callback(None)
+        .expect("clear managed session wake callback");
+    close_managed_session_test_lease(&engine, &lease);
+    assert_no_active_node_session_snapshots(&layout);
+}
+
+/// Exercise two simultaneous process identities and independent state for one runtime.
+/// 针对一个运行时验证两个并行进程身份与独立状态。
+fn run_managed_session_isolation_integration(runtime: ManagedSessionTestRuntime) {
+    // Host is absent only when the real requested interpreter is unavailable.
+    // Host 仅在请求的真实解释器不可用时为空。
+    let Some(host) = discover_host_managed_runtime(runtime) else {
+        return;
+    };
+    let _env_guard = process_env_test_guard();
+    // Layout and engine isolate both sessions from every other test.
+    // Layout 与 Engine 把两个会话同其他测试完全隔离。
+    let layout = ManagedSessionSystemLayout::new(
+        &format!("managed-session-isolation-{}", runtime.label()),
+        runtime,
+        &host,
+    );
+    let engine = make_runtime_test_engine_with_host_options(layout.host_options());
+    let lease = create_managed_session_test_lease(
+        &engine,
+        &layout,
+        &format!("system-managed-isolation-{}", runtime.label()),
+        false,
+    );
+    // OpenBoth creates two distinct userdata instances in the same persistent VM.
+    // OpenBoth 在同一持久 VM 中创建两个不同 userdata 实例。
+    let open_both = eval_managed_session_test_lease(
+        &engine,
+        &lease,
+        &format!(
+            "session_a = {}({{ file = '{}', cwd = 'runtime', buffer_limit_bytes = 4096 }})\nsession_b = {}({{ file = '{}', cwd = 'runtime', buffer_limit_bytes = 4096 }})\nreturn true",
+            layout.lua_open_api(),
+            layout.sidecar_file(),
+            layout.lua_open_api(),
+            layout.sidecar_file(),
+        ),
+    );
+    assert_eq!(
+        open_both["ok"], true,
+        "open two sessions failed: {open_both}"
+    );
+    // WriteBoth sends different values without relying on worker-pool affinity.
+    // WriteBoth 在不依赖 Worker Pool 亲和性的情况下发送不同值。
+    let write_both = eval_managed_session_test_lease(
+        &engine,
+        &lease,
+        r#"session_a:write('{"action":"echo","value":"isolation-a"}\n'); session_b:write('{"action":"echo","value":"isolation-b"}\n'); return true"#,
+    );
+    assert_eq!(write_both["ok"], true);
+    // ReadBoth returns each stream separately after its own marker appears.
+    // ReadBoth 在各自标记出现后分别返回两个流。
+    let read_both = eval_managed_session_test_lease(
+        &engine,
+        &lease,
+        "local a = session_a:read({ timeout_ms = 5000, max_bytes = 4096, until_text = 'isolation-a' }); if not string.find(a.stderr, 'stderr-started', 1, true) then local extra_a = session_a:read({ timeout_ms = 5000, max_bytes = 4096, until_text = 'stderr-started' }); a.stderr = a.stderr .. extra_a.stderr end; local b = session_b:read({ timeout_ms = 5000, max_bytes = 4096, until_text = 'isolation-b' }); if not string.find(b.stderr, 'stderr-started', 1, true) then local extra_b = session_b:read({ timeout_ms = 5000, max_bytes = 4096, until_text = 'stderr-started' }); b.stderr = b.stderr .. extra_b.stderr end; return { a = a, b = b }",
+    );
+    assert_eq!(
+        read_both["ok"], true,
+        "read two sessions failed: {read_both}"
+    );
+    let (tree_a, _) = parse_managed_session_started(&read_both["result"]["a"]);
+    let (tree_b, _) = parse_managed_session_started(&read_both["result"]["b"]);
+    assert_ne!(tree_a.root_pid, tree_b.root_pid);
+    assert_ne!(tree_a.child_pid, tree_b.child_pid);
+    // StdoutA and StdoutB prove data never crosses session buffers.
+    // StdoutA 与 StdoutB 证明数据不会跨越会话缓冲区。
+    let stdout_a = read_both["result"]["a"]["stdout"]
+        .as_str()
+        .expect("session A stdout");
+    let stdout_b = read_both["result"]["b"]["stdout"]
+        .as_str()
+        .expect("session B stdout");
+    assert!(stdout_a.contains("isolation-a"));
+    assert!(!stdout_a.contains("isolation-b"));
+    assert!(stdout_b.contains("isolation-b"));
+    assert!(!stdout_b.contains("isolation-a"));
+    assert!(stdout_a.contains(r#""counter":1"#));
+    assert!(stdout_b.contains(r#""counter":1"#));
+
+    // SecondA increments only session A's local counter.
+    // SecondA 只递增 session A 的本地计数器。
+    let second_a = eval_managed_session_test_lease(
+        &engine,
+        &lease,
+        r#"session_a:write('{"action":"echo","value":"isolation-a-2"}\n'); return session_a:read({ timeout_ms = 5000, max_bytes = 4096, until_text = 'isolation-a-2' })"#,
+    );
+    assert_eq!(second_a["ok"], true);
+    assert!(
+        second_a["result"]["stdout"]
+            .as_str()
+            .expect("second session A stdout")
+            .contains(r#""counter":2"#)
+    );
+    // IdleB proves session B remains live and has no unread output from session A.
+    // IdleB 证明 session B 仍存活，且没有来自 session A 的未读输出。
+    let idle_b = eval_managed_session_test_lease(
+        &engine,
+        &lease,
+        "local read = session_b:read({ timeout_ms = 0, max_bytes = 4096 }); local status = session_b:status(); return { read = read, status = status }",
+    );
+    assert_eq!(idle_b["ok"], true);
+    assert_eq!(idle_b["result"]["read"]["timed_out"], true);
+    assert_eq!(idle_b["result"]["read"]["stdout"], "");
+    assert_eq!(idle_b["result"]["status"]["running"], true);
+
+    close_managed_session_test_lease(&engine, &lease);
+    assert_managed_session_process_tree_exits(tree_a, Duration::from_secs(5));
+    assert_managed_session_process_tree_exits(tree_b, Duration::from_secs(5));
+    assert_no_active_node_session_snapshots(&layout);
+}
+
+/// Exercise rollback, replace, reload survival, and engine-drop cleanup for one runtime.
+/// 针对一个运行时验证回滚、替换、重载存活与 Engine Drop 清理。
+fn run_managed_session_lifecycle_integration(runtime: ManagedSessionTestRuntime) {
+    let Some(host) = discover_host_managed_runtime(runtime) else {
+        return;
+    };
+    let _env_guard = process_env_test_guard();
+    // Layout is reused because its ready environment is immutable across lifecycle cases.
+    // Layout 会被复用，因为其就绪环境在各生命周期场景间保持不可变。
+    let layout = ManagedSessionSystemLayout::new(
+        &format!("managed-session-lifecycle-{}", runtime.label()),
+        runtime,
+        &host,
+    );
+    // Engine remains mutable so ordinary Skill reload can be exercised in place.
+    // Engine 保持可变，以便原地验证普通 Skill 重载。
+    let mut engine = make_runtime_test_engine_with_host_options(layout.host_options());
+
+    // RollbackLease verifies an eval error kills only the session created by that transaction.
+    // RollbackLease 验证 eval 错误只会杀死该事务创建的会话。
+    let rollback_lease = create_managed_session_test_lease(
+        &engine,
+        &layout,
+        &format!("system-managed-rollback-{}", runtime.label()),
+        false,
+    );
+    // PidFile receives startup identity before the forced Lua error triggers rollback.
+    // PidFile 会在强制 Lua 错误触发回滚前接收启动身份。
+    let pid_file = layout
+        .runtime_source_dir()
+        .join(format!("rollback-{}.json", runtime.label()));
+    let pid_file_lua = serde_json::to_string(&render_host_visible_path(&pid_file))
+        .expect("quote rollback pid file for Lua");
+    // RollbackEval waits for startup, then fails the transaction deliberately.
+    // RollbackEval 等待启动完成，随后有意让事务失败。
+    let rollback_eval = eval_managed_session_test_lease(
+        &engine,
+        &rollback_lease,
+        &format!(
+            "rollback_session = {}({{ file = '{}', args = {{{pid_file_lua}}}, cwd = 'runtime', buffer_limit_bytes = 4096 }})\nlocal ready = rollback_session:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = 'started' }})\nerror('forced managed session rollback after ' .. ready.stdout)",
+            layout.lua_open_api(),
+            layout.sidecar_file(),
+        ),
+    );
+    assert_eq!(rollback_eval["ok"], false);
+    assert_eq!(rollback_eval["error_code"], "eval_failed");
+    // RollbackRecord is written by the real sidecar before rollback termination begins.
+    // RollbackRecord 由真实 sidecar 在回滚终止开始前写入。
+    let rollback_record: Value = serde_json::from_slice(
+        &fs::read(&pid_file).expect("read rollback managed session pid file"),
+    )
+    .expect("decode rollback managed session pid file");
+    let rollback_tree = ManagedSessionProcessTree {
+        root_pid: u32::try_from(
+            rollback_record["root_pid"]
+                .as_u64()
+                .expect("rollback root_pid"),
+        )
+        .expect("rollback root_pid fits u32"),
+        child_pid: u32::try_from(
+            rollback_record["child_pid"]
+                .as_u64()
+                .expect("rollback child_pid"),
+        )
+        .expect("rollback child_pid fits u32"),
+    };
+    assert_managed_session_process_tree_exits(rollback_tree, Duration::from_secs(5));
+    // RollbackCleanup proves package snapshots disappear immediately while the failed lease VM remains alive.
+    // RollbackCleanup 证明失败租约 VM 仍存活时，包快照已经由回滚立即删除。
+    assert_no_active_node_session_snapshots(&layout);
+    // RolledBackStatus remains safely callable through the Lua global and reports closed state.
+    // RolledBackStatus 仍可通过 Lua 全局安全调用，并报告已关闭状态。
+    let rolled_back_status = eval_managed_session_test_lease(
+        &engine,
+        &rollback_lease,
+        "return rollback_session:status()",
+    );
+    assert_eq!(rolled_back_status["ok"], true);
+    assert_eq!(rolled_back_status["result"]["closed"], true);
+    close_managed_session_test_lease(&engine, &rollback_lease);
+    assert_no_active_node_session_snapshots(&layout);
+
+    // ExpiringLease proves manager pruning destroys both the persistent VM and full process tree.
+    // ExpiringLease 证明管理器过期清理会销毁持久 VM 与完整进程树。
+    let expiring_sid = format!("system-managed-expiry-{}", runtime.label());
+    let mut expiring_request = layout.create_request(&expiring_sid, false);
+    expiring_request["ttl_sec"] = json!(1);
+    let expiring_lease = create_managed_session_test_lease_from_request(&engine, &expiring_request);
+    let expiring_tree = open_and_capture_managed_session_tree(
+        &engine,
+        &layout,
+        &expiring_lease,
+        "expiring_session",
+        &[],
+    );
+    thread::sleep(Duration::from_millis(1_200));
+    // Listing triggers the same complete prune pass used by production lease maintenance.
+    // 列表操作触发生产租约维护使用的同一完整过期清理流程。
+    let listed_after_expiry: Value = serde_json::from_str(
+        &engine
+            .list_system_runtime_leases_json("{}")
+            .expect("list System leases after managed session expiry"),
+    )
+    .expect("decode System lease list after managed session expiry");
+    assert!(
+        listed_after_expiry["leases"]
+            .as_array()
+            .expect("System lease list array")
+            .iter()
+            .all(|lease| lease["lease_id"] != expiring_lease.lease_id)
+    );
+    assert_managed_session_process_tree_exits(expiring_tree, Duration::from_secs(5));
+    // ExpiredEval proves the stale handle returns its stable terminal error without panic.
+    // ExpiredEval 证明陈旧句柄会返回稳定过期错误且不会 panic。
+    let expired_eval = eval_managed_session_test_lease(&engine, &expiring_lease, "return 1");
+    assert_eq!(expired_eval["ok"], false);
+    assert_eq!(expired_eval["error_code"], "lease_expired");
+    assert_no_active_node_session_snapshots(&layout);
+
+    // ReplacedLease owns a live process tree that replacement must synchronously retire.
+    // ReplacedLease 拥有一棵活动进程树，替换操作必须同步将其退役。
+    let replaced_lease = create_managed_session_test_lease(
+        &engine,
+        &layout,
+        &format!("system-managed-replace-{}", runtime.label()),
+        false,
+    );
+    let replaced_tree = open_and_capture_managed_session_tree(
+        &engine,
+        &layout,
+        &replaced_lease,
+        "replace_session",
+        &[],
+    );
+    let replacement = create_managed_session_test_lease(
+        &engine,
+        &layout,
+        &format!("system-managed-replace-{}", runtime.label()),
+        true,
+    );
+    assert!(replacement.generation > replaced_lease.generation);
+    assert_managed_session_process_tree_exits(replaced_tree, Duration::from_secs(5));
+    // StaleEval proves the old generation returns its stable terminal error instead of panicking.
+    // StaleEval 证明旧代际返回稳定终态错误，而不会 panic。
+    let stale_eval = eval_managed_session_test_lease(&engine, &replaced_lease, "return 1");
+    assert_eq!(stale_eval["ok"], false);
+    assert_eq!(stale_eval["error_code"], "lease_replaced");
+    close_managed_session_test_lease(&engine, &replacement);
+    assert_no_active_node_session_snapshots(&layout);
+
+    // ReloadLease proves ordinary Skill reload preserves the dedicated System VM and session.
+    // ReloadLease 证明普通 Skill 重载会保留专用 System VM 与会话。
+    let reload_lease = create_managed_session_test_lease(
+        &engine,
+        &layout,
+        &format!("system-managed-reload-{}", runtime.label()),
+        false,
+    );
+    let reload_tree = open_and_capture_managed_session_tree(
+        &engine,
+        &layout,
+        &reload_lease,
+        "reload_session",
+        &[],
+    );
+    // EmptySkillRoot is a valid formal root used only to rebuild ordinary runtime state.
+    // EmptySkillRoot 是仅用于重建普通运行时状态的合法正式根。
+    let empty_skill_root = RuntimeSkillRoot {
+        name: "ROOT".to_string(),
+        skills_dir: layout.base.runtime_root.join("reload-skills"),
+    };
+    fs::create_dir_all(&empty_skill_root.skills_dir).expect("create empty reload Skill root");
+    engine
+        .reload_from_roots(std::slice::from_ref(&empty_skill_root))
+        .expect("reload ordinary Skills while managed System session is active");
+    // ReloadEcho proves the exact sidecar state remains reachable after reload.
+    // ReloadEcho 证明重载后仍可访问精确 sidecar 状态。
+    let reload_echo = eval_managed_session_test_lease(
+        &engine,
+        &reload_lease,
+        r#"reload_session:write('{"action":"echo","value":"after-reload"}\n'); return reload_session:read({ timeout_ms = 5000, max_bytes = 4096, until_text = 'after-reload' })"#,
+    );
+    assert_eq!(reload_echo["ok"], true, "reload echo failed: {reload_echo}");
+    assert!(
+        reload_echo["result"]["stdout"]
+            .as_str()
+            .expect("reload session stdout")
+            .contains("after-reload")
+    );
+    close_managed_session_test_lease(&engine, &reload_lease);
+    assert_managed_session_process_tree_exits(reload_tree, Duration::from_secs(5));
+    assert_no_active_node_session_snapshots(&layout);
+
+    // EngineDropLease is intentionally left active until the owning engine is dropped.
+    // EngineDropLease 会被有意保持活动，直到所属 Engine 被释放。
+    let engine_drop_lease = create_managed_session_test_lease(
+        &engine,
+        &layout,
+        &format!("system-managed-engine-drop-{}", runtime.label()),
+        false,
+    );
+    let engine_drop_tree = open_and_capture_managed_session_tree(
+        &engine,
+        &layout,
+        &engine_drop_lease,
+        "engine_drop_session",
+        &[],
+    );
+    drop(engine);
+    assert_managed_session_process_tree_exits(engine_drop_tree, Duration::from_secs(5));
+    assert_no_active_node_session_snapshots(&layout);
+}
+
+/// Verify a strict System lease executes real managed Python status and invoke APIs.
+/// 验证严格 System 租约会执行真实受管 Python status 与 invoke API。
+#[test]
+fn system_runtime_python_status_and_invoke_execute_real_runtime() {
+    run_managed_runtime_status_invoke_integration(
+        ManagedSessionTestRuntime::Python,
+        "managed-status-invoke-python",
+        false,
+    );
+}
+
+/// Verify a strict System lease executes real managed Node status and invoke APIs.
+/// 验证严格 System 租约会执行真实受管 Node status 与 invoke API。
+#[test]
+fn system_runtime_node_status_and_invoke_execute_real_runtime() {
+    run_managed_runtime_status_invoke_integration(
+        ManagedSessionTestRuntime::Node,
+        "managed-status-invoke-node",
+        false,
+    );
+}
+
+/// Verify pooled Python invocation remains reusable when its snapshot source exceeds MAX_PATH.
+/// 验证池化 Python 调用在快照源码超过 MAX_PATH 时仍可复用。
+#[cfg(windows)]
+#[test]
+fn system_runtime_python_worker_supports_long_snapshot_source_path() {
+    run_managed_runtime_status_invoke_integration(
+        ManagedSessionTestRuntime::Python,
+        "managed-python-long-worker",
+        true,
+    );
+}
+
+/// Verify pooled Node invocation remains reusable when its snapshot source exceeds MAX_PATH.
+/// 验证池化 Node 调用在快照源码超过 MAX_PATH 时仍可复用。
+#[cfg(windows)]
+#[test]
+fn system_runtime_node_worker_supports_long_snapshot_source_path() {
+    run_managed_runtime_status_invoke_integration(
+        ManagedSessionTestRuntime::Node,
+        "managed-node-long-worker",
+        true,
+    );
+}
+
+/// Verify two Python System Plugins isolate same-named dependencies and modules.
+/// 验证两个 Python System Plugin 会隔离同名依赖与模块。
+#[test]
+fn system_runtime_python_plugins_isolate_dependencies_and_modules() {
+    run_managed_system_plugin_dependency_module_isolation_integration(
+        ManagedSessionTestRuntime::Python,
+    );
+}
+
+/// Verify two Node System Plugins isolate same-named dependencies and modules.
+/// 验证两个 Node System Plugin 会隔离同名依赖与模块。
+#[test]
+fn system_runtime_node_plugins_isolate_dependencies_and_modules() {
+    run_managed_system_plugin_dependency_module_isolation_integration(
+        ManagedSessionTestRuntime::Node,
+    );
+}
+
+/// Verify a real managed Python session persists across evals and emits bounded events.
+/// 验证真实受管 Python 会话会跨 eval 持续存在并发出有界事件。
+#[test]
+fn system_runtime_python_session_persists_across_evals_and_emits_events() {
+    run_managed_session_persistence_integration(ManagedSessionTestRuntime::Python);
+}
+
+/// Verify a real managed Node session persists across evals and emits bounded events.
+/// 验证真实受管 Node 会话会跨 eval 持续存在并发出有界事件。
+#[test]
+fn system_runtime_node_session_persists_across_evals_and_emits_events() {
+    run_managed_session_persistence_integration(ManagedSessionTestRuntime::Node);
+}
+
+/// Verify two real managed Python sessions remain process- and state-isolated.
+/// 验证两个真实受管 Python 会话保持进程与状态隔离。
+#[test]
+fn system_runtime_python_sessions_are_isolated() {
+    run_managed_session_isolation_integration(ManagedSessionTestRuntime::Python);
+}
+
+/// Verify two real managed Node sessions remain process- and state-isolated.
+/// 验证两个真实受管 Node 会话保持进程与状态隔离。
+#[test]
+fn system_runtime_node_sessions_are_isolated() {
+    run_managed_session_isolation_integration(ManagedSessionTestRuntime::Node);
+}
+
+/// Verify Python session resources follow rollback, replace, reload, and engine lifecycles.
+/// 验证 Python 会话资源遵循回滚、替换、重载与 Engine 生命周期。
+#[test]
+fn system_runtime_python_session_lifecycle_cleanup_is_complete() {
+    run_managed_session_lifecycle_integration(ManagedSessionTestRuntime::Python);
+}
+
+/// Verify Node session resources follow rollback, replace, reload, and engine lifecycles.
+/// 验证 Node 会话资源遵循回滚、替换、重载与 Engine 生命周期。
+#[test]
+fn system_runtime_node_session_lifecycle_cleanup_is_complete() {
+    run_managed_session_lifecycle_integration(ManagedSessionTestRuntime::Node);
 }
 
 /// Verify closed runtime sessions return a stable lease_closed error.
@@ -7179,16 +10390,18 @@ fn runtime_session_replaced_tombstone_ignores_corrupted_snapshot_identity() {
         .as_u64()
         .expect("first generation should be present");
 
-    engine.runtime_sessions.replace_active_snapshot_for_test(
-        &first_lease_id,
-        json!({
-            "ok": true,
-            "sid": "corrupted-sid",
-            "lease_id": "corrupted-lease",
-            "generation": 999_u64,
-            "profile": "system_lua_lib"
-        }),
-    );
+    engine
+        .public_runtime_sessions
+        .replace_active_snapshot_for_test(
+            &first_lease_id,
+            json!({
+                "ok": true,
+                "sid": "corrupted-sid",
+                "lease_id": "corrupted-lease",
+                "generation": 999_u64,
+                "profile": "system_lua_lib"
+            }),
+        );
 
     let second_created: Value = serde_json::from_str(
         &engine
@@ -7246,17 +10459,19 @@ fn runtime_session_list_uses_typed_identity_when_snapshot_is_corrupted() {
         .as_u64()
         .expect("generation should be present");
 
-    engine.runtime_sessions.replace_active_snapshot_for_test(
-        &lease_id,
-        json!({
-            "ok": true,
-            "sid": "corrupted-sid",
-            "lease_id": "corrupted-lease",
-            "generation": 999_u64,
-            "profile": "system_lua_lib",
-            "lifetime": "finite"
-        }),
-    );
+    engine
+        .public_runtime_sessions
+        .replace_active_snapshot_for_test(
+            &lease_id,
+            json!({
+                "ok": true,
+                "sid": "corrupted-sid",
+                "lease_id": "corrupted-lease",
+                "generation": 999_u64,
+                "profile": "system_lua_lib",
+                "lifetime": "finite"
+            }),
+        );
 
     let listed: Value = serde_json::from_str(
         &engine
@@ -7329,7 +10544,7 @@ fn runtime_session_stale_handle_reports_replaced_after_manager_get() {
         .expect("first lease id should be present")
         .to_string();
     let stale_session = engine
-        .runtime_sessions
+        .public_runtime_sessions
         .get(&first_lease_id, None, None, None)
         .expect("capture stale runtime session handle");
 
@@ -7364,7 +10579,7 @@ fn runtime_session_replace_rejects_busy_lease() {
         .to_string();
 
     let session = engine
-        .runtime_sessions
+        .public_runtime_sessions
         .get(&lease_id, None, None, None)
         .expect("get busy replace runtime session");
     let guard = session.lock().expect("lock busy replace runtime session");
@@ -7430,7 +10645,7 @@ fn runtime_session_operations_recover_poisoned_session_lock() {
     // Shared runtime session handle cloned from the manager before poisoning.
     // 在制造 poison 前从管理器克隆出的共享运行时会话句柄。
     let session = engine
-        .runtime_sessions
+        .public_runtime_sessions
         .get(&lease_id, None, None, None)
         .expect("get poisoned ops runtime session");
 
@@ -7505,7 +10720,7 @@ fn runtime_session_replace_recovers_poisoned_existing_session_lock() {
     // Shared runtime session handle cloned from the manager before poisoning.
     // 在制造 poison 前从管理器克隆出的共享运行时会话句柄。
     let session = engine
-        .runtime_sessions
+        .public_runtime_sessions
         .get(&original_lease_id, None, None, None)
         .expect("get poisoned replace runtime session");
 
@@ -7690,7 +10905,7 @@ fn runtime_session_list_keeps_busy_active_leases_visible() {
         .expect("busy lease id should be present")
         .to_string();
     let session = engine
-        .runtime_sessions
+        .public_runtime_sessions
         .get(&lease_id, None, None, None)
         .expect("get busy runtime session");
     let _guard = session.lock().expect("lock busy runtime session");
@@ -7786,16 +11001,53 @@ end
     let _ = fs::remove_dir_all(&temp_root);
 }
 
-/// Verify the managed runtime worker pool recovers after its process-wide lock is poisoned.
-/// 验证进程级受管运行时 worker 池锁 poison 后仍可恢复。
+/// Build one exact worker key backed by a real package and canonical environment directory.
+/// 使用真实包与规范环境目录构造一个精确 Worker 键。
+///
+/// `runtime_root` owns the fixture and `label` partitions package and runtime identities.
+/// `runtime_root` 拥有夹具，`label` 用于隔离包及运行时身份。
+///
+/// Return a key suitable for the production engine-owned worker service.
+/// 返回适用于生产引擎所有 Worker 服务的键。
+fn make_test_managed_runtime_worker_key(
+    runtime_root: &Path,
+    label: &str,
+) -> (ManagedRuntimeWorkerKey, Arc<ManagedRuntimePackageContext>) {
+    // Trusted package whose exact owner token participates in worker lifetime isolation.
+    // 其精确所有者令牌参与 Worker 生命周期隔离的可信包。
+    let package = make_test_managed_runtime_package(runtime_root, label);
+    // Canonical environment directory participating in the complete worker key.
+    // 参与完整 Worker 键的规范环境目录。
+    let env_dir = runtime_root.join(format!("env-{label}"));
+    fs::create_dir_all(&env_dir).expect("create worker key environment directory");
+    let env_dir = fs::canonicalize(&env_dir).expect("canonicalize worker key environment");
+    (
+        ManagedRuntimeWorkerKey {
+            runtime: label.to_string(),
+            env_hash: format!("hash-{label}"),
+            env_dir,
+            package_identity: package.identity().clone(),
+            owner_token: package.owner_token(),
+            owner_state: package.owner_state(),
+        },
+        package,
+    )
+}
+
+/// Verify one engine-owned worker service recovers after its isolated pool lock is poisoned.
+/// 验证单个引擎所有 Worker 服务在隔离池锁中毒后仍可恢复。
 #[test]
-fn managed_runtime_worker_pool_recovers_after_poisoned_global_lock() {
-    // Captured panic result from a holder that poisons the global managed runtime worker pool lock.
-    // 全局受管运行时 worker 池锁持有者制造 poison 后被捕获的 panic 结果。
+fn managed_runtime_worker_service_recovers_after_poisoned_engine_lock() {
+    // Isolated service whose poison state cannot affect any other engine.
+    // 其中毒状态不会影响任何其他引擎的隔离服务。
+    let service = ManagedRuntimeWorkerService::new();
+    // Captured panic result from a holder that poisons only this service's pool lock.
+    // 仅使当前服务池锁中毒的持有者所产生的 panic 捕获结果。
     let poison_result = panic::catch_unwind(AssertUnwindSafe(|| {
-        // Guard used only to poison the process-wide managed runtime worker pool.
-        // 仅用于制造进程级受管运行时 worker 池 poison 的保护对象。
-        let _guard = managed_runtime_worker_pool()
+        // Guard used only to poison the current engine-owned worker service.
+        // 仅用于使当前引擎所有 Worker 服务中毒的保护对象。
+        let _guard = service
+            .pool
             .lock()
             .expect("initial managed runtime worker pool lock");
         panic!("poison managed runtime worker pool for recovery test");
@@ -7803,19 +11055,193 @@ fn managed_runtime_worker_pool_recovers_after_poisoned_global_lock() {
 
     assert!(poison_result.is_err());
 
+    // Real runtime root and package identity used by the migrated worker key.
+    // 迁移后 Worker 键使用的真实运行时根与包身份。
+    let runtime_root = make_temp_runtime_root("managed-worker-poison-key");
+    let _ = fs::remove_dir_all(&runtime_root);
+    let package = make_test_managed_runtime_package(&runtime_root, "poison-test");
+    // Canonical environment directory participating in worker isolation.
+    // 参与 Worker 隔离的规范环境目录。
+    let env_dir = runtime_root.join("env");
+    fs::create_dir_all(&env_dir).expect("create poison worker environment directory");
+    let env_dir = fs::canonicalize(&env_dir).expect("canonicalize poison worker environment");
     // Unique worker key used for a harmless mutation against the recovered pool.
     // 用于对已恢复池执行无害修改的唯一 worker 键。
     let key = super::ManagedRuntimeWorkerKey {
         runtime: "poison-test".to_string(),
         env_hash: "hash".to_string(),
-        skill_dir: PathBuf::from("D:/poison-test-skill"),
+        env_dir,
+        package_identity: package.identity().clone(),
+        owner_token: package.owner_token(),
+        owner_state: package.owner_state(),
     };
-    // Recovered global worker pool guard used to prove later pool access does not fail.
-    // 已恢复的全局 worker 池保护对象，用于证明后续池访问不会失败。
-    let mut pool = lock_managed_runtime_worker_pool();
+    // Recovered engine-local pool guard proving later access remains available.
+    // 证明后续访问仍然可用的已恢复引擎局部池保护对象。
+    let mut pool = service.lock_pool();
     pool.discard(&key);
 
     assert!(!pool.buckets.contains_key(&key));
+    drop(pool);
+    let _ = fs::remove_dir_all(&runtime_root);
+}
+
+/// Verify a missing-worker factory runs outside the service pool lock and may retire its owner.
+/// 验证缺失 Worker 工厂在服务池锁之外运行，并且可以退役其所有者。
+///
+/// This regression test bounds completion so a future lock-order regression fails deterministically.
+/// 此回归测试限制完成时间，使未来的锁顺序回退能够确定性失败。
+#[test]
+fn managed_runtime_worker_factory_runs_outside_pool_lock() {
+    // Isolated runtime fixture and exact owner key used by the reentrant factory.
+    // 重入工厂所使用的隔离运行时夹具与精确所有者键。
+    let runtime_root = make_temp_runtime_root("managed-worker-unlocked-factory");
+    let _ = fs::remove_dir_all(&runtime_root);
+    fs::create_dir_all(&runtime_root).expect("create unlocked factory runtime root");
+    let (key, _package) = make_test_managed_runtime_worker_key(&runtime_root, "unlocked-factory");
+    let owner_token = key.owner_token;
+    let service = ManagedRuntimeWorkerService::new();
+    let thread_service = Arc::clone(&service);
+    let factory_service = Arc::clone(&service);
+    // Bounded result channel proving the reentrant retirement cannot deadlock on the pool lock.
+    // 有界结果通道，用于证明重入退役不会在池锁上死锁。
+    let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+    let worker_thread = thread::spawn(move || {
+        let outcome = thread_service.acquire(key, move || {
+            // Owner retirement intentionally re-enters the same service during unlocked startup.
+            // 所有者退役会在无锁启动期间有意重入同一个服务。
+            factory_service.retire_owner(owner_token);
+            Err("factory stopped after owner retirement".to_string())
+        });
+        let message = match outcome {
+            Ok(_) => "unexpected worker acquisition success".to_string(),
+            Err(error) => error,
+        };
+        result_sender
+            .send(message)
+            .expect("send unlocked factory outcome");
+    });
+
+    let error = result_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("worker factory must complete without holding the pool lock");
+    assert_eq!(error, "factory stopped after owner retirement");
+    worker_thread
+        .join()
+        .expect("join unlocked factory worker thread");
+    drop(service);
+    let _ = fs::remove_dir_all(&runtime_root);
+}
+
+/// Verify concurrent worker requests share one immutable owner snapshot and retire it safely.
+/// 验证并发 Worker 请求共享同一个不可变所有者快照，并可安全退役该快照。
+#[test]
+fn managed_worker_package_snapshot_is_singleton_per_owner_and_retirement_safe() {
+    let runtime_root = make_temp_runtime_root("managed-node-worker-snapshot-singleton");
+    let _ = fs::remove_dir_all(&runtime_root);
+    fs::create_dir_all(&runtime_root).expect("create Node snapshot runtime root");
+    let package = make_test_managed_runtime_package(&runtime_root, "snapshot-singleton");
+    fs::write(
+        package.package_root().join("handler.js"),
+        "export default 1;\n",
+    )
+    .expect("write Node snapshot package source");
+    let env_dir = runtime_root.join("env");
+    fs::create_dir_all(&env_dir).expect("create Node snapshot environment");
+    let plan = make_test_managed_node_env_plan(env_dir);
+    write_test_managed_env_marker(&plan);
+    let key = super::managed_runtime_worker_key(&plan, package.as_ref());
+    let service = ManagedRuntimeWorkerService::new();
+    // Barrier forces all callers to contend on the same lazy initialization cell.
+    // Barrier 强制全部调用方在同一个延迟初始化单元上竞争。
+    let barrier = Arc::new(Barrier::new(8));
+    let mut threads = Vec::new();
+    for _index in 0..8 {
+        let thread_service = Arc::clone(&service);
+        let thread_package = Arc::clone(&package);
+        let thread_plan = plan.clone();
+        let thread_key = key.clone();
+        let thread_barrier = Arc::clone(&barrier);
+        threads.push(thread::spawn(move || {
+            thread_barrier.wait();
+            thread_service.package_snapshot(&thread_key, &thread_plan, thread_package.as_ref())
+        }));
+    }
+    let snapshots = threads
+        .into_iter()
+        .map(|thread| {
+            thread
+                .join()
+                .expect("join concurrent Node snapshot thread")
+                .expect("prepare concurrent Node snapshot")
+        })
+        .collect::<Vec<_>>();
+    let first_snapshot = snapshots
+        .first()
+        .expect("at least one Node snapshot should exist");
+    let snapshot_root = first_snapshot.root().to_path_buf();
+    assert!(
+        snapshots
+            .iter()
+            .all(|snapshot| Arc::ptr_eq(first_snapshot, snapshot))
+    );
+    assert!(snapshot_root.join("handler.js").is_file());
+    assert_eq!(service.lock_package_snapshots().len(), 1);
+
+    service.retire_owner(package.owner_token());
+    assert!(service.lock_package_snapshots().is_empty());
+    assert!(
+        snapshot_root.exists(),
+        "active snapshot owners must retain files"
+    );
+    drop(snapshots);
+    assert!(
+        !snapshot_root.exists(),
+        "snapshot must disappear after the final active owner is released"
+    );
+    let _ = fs::remove_dir_all(&runtime_root);
+}
+
+/// Verify a transient package snapshot filesystem failure leaves the lazy cache and is retried.
+/// 验证瞬态包快照文件系统失败会从延迟缓存移除并得到重试。
+#[test]
+fn managed_worker_package_snapshot_retries_after_transient_failure() {
+    let runtime_root = make_temp_runtime_root("managed-node-worker-snapshot-retry");
+    let _ = fs::remove_dir_all(&runtime_root);
+    fs::create_dir_all(&runtime_root).expect("create Node snapshot retry runtime root");
+    let package = make_test_managed_runtime_package(&runtime_root, "snapshot-retry");
+    fs::write(
+        package.package_root().join("handler.js"),
+        "export default 1;\n",
+    )
+    .expect("write retry Node package source");
+    // A file at the private snapshot namespace forces the first namespace creation to fail while
+    // the enclosing environment remains valid under its lifecycle lease.
+    // 私有快照命名空间上的文件会强制首次命名空间创建失败，同时外围环境在生命周期租约下仍然有效。
+    let env_dir = runtime_root.join("env");
+    fs::create_dir_all(&env_dir).expect("create retry managed environment");
+    let plan = make_test_managed_node_env_plan(env_dir.clone());
+    write_test_managed_env_marker(&plan);
+    let snapshot_namespace = env_dir.join(".ls-w");
+    fs::write(&snapshot_namespace, "temporary collision")
+        .expect("write temporary snapshot namespace collision");
+    let key = super::managed_runtime_worker_key(&plan, package.as_ref());
+    let service = ManagedRuntimeWorkerService::new();
+    let first_error = service
+        .package_snapshot(&key, &plan, package.as_ref())
+        .expect_err("temporary environment collision must fail snapshot creation");
+    assert!(first_error.contains("failed to create managed package snapshot root"));
+    assert!(service.lock_package_snapshots().is_empty());
+
+    fs::remove_file(&snapshot_namespace).expect("remove temporary snapshot namespace collision");
+    let snapshot = service
+        .package_snapshot(&key, &plan, package.as_ref())
+        .expect("retry Node snapshot after filesystem recovery");
+    let snapshot_root = snapshot.root().to_path_buf();
+    assert!(snapshot_root.join("handler.js").is_file());
+    service.retire_owner(package.owner_token());
+    drop(snapshot);
+    assert!(!snapshot_root.exists());
+    let _ = fs::remove_dir_all(&runtime_root);
 }
 
 /// Verify the managed runtime worker pool reuses one warm line-oriented worker.
@@ -7825,11 +11251,26 @@ fn managed_runtime_worker_pool_reuses_warm_worker() {
     // Hold the shared PATH guard while the test spawns a named shell executable.
     // 在测试按名称启动 shell 可执行文件期间持有共享 PATH 保护锁。
     let _env_guard = process_env_test_guard();
-    let mut pool = ManagedRuntimeWorkerPool::new();
+    // Engine-owned service whose pool must retain one healthy worker between calls.
+    // 其池必须在调用间保留一个健康 Worker 的引擎所有服务。
+    let service = ManagedRuntimeWorkerService::new();
+    // Real runtime root and package identity used by the migrated worker key.
+    // 迁移后 Worker 键使用的真实运行时根与包身份。
+    let runtime_root = make_temp_runtime_root("managed-worker-reuse-key");
+    let _ = fs::remove_dir_all(&runtime_root);
+    let package = make_test_managed_runtime_package(&runtime_root, "pool-test");
+    // Canonical environment directory participating in worker isolation.
+    // 参与 Worker 隔离的规范环境目录。
+    let env_dir = runtime_root.join("env");
+    fs::create_dir_all(&env_dir).expect("create reused worker environment directory");
+    let env_dir = fs::canonicalize(&env_dir).expect("canonicalize reused worker environment");
     let key = super::ManagedRuntimeWorkerKey {
         runtime: "test".to_string(),
         env_hash: "hash".to_string(),
-        skill_dir: PathBuf::from("D:/test-skill"),
+        env_dir,
+        package_identity: package.identity().clone(),
+        owner_token: package.owner_token(),
+        owner_state: package.owner_state(),
     };
     let mut spawn_count = 0usize;
     let mut factory = || {
@@ -7838,7 +11279,7 @@ fn managed_runtime_worker_pool_reuses_warm_worker() {
         spawn_managed_runtime_worker(&mut command)
     };
 
-    let (worker, reused) = pool
+    let (worker, reused) = service
         .acquire(key.clone(), &mut factory)
         .expect("first worker should spawn");
     assert!(!reused);
@@ -7848,9 +11289,9 @@ fn managed_runtime_worker_pool_reuses_warm_worker() {
     assert_eq!(first.envelope["ok"], true);
     assert_eq!(first.envelope["value"], 1);
     assert!(!first.discard_worker);
-    pool.release(key.clone(), worker);
+    service.release(key.clone(), worker);
 
-    let (worker, reused) = pool
+    let (worker, reused) = service
         .acquire(key.clone(), &mut factory)
         .expect("second worker should reuse");
     assert!(reused);
@@ -7860,8 +11301,213 @@ fn managed_runtime_worker_pool_reuses_warm_worker() {
     assert_eq!(second.envelope["ok"], true);
     assert_eq!(second.envelope["value"], 2);
     assert!(!second.discard_worker);
-    pool.release(key, worker);
+    service.release(key, worker);
     assert_eq!(spawn_count, 1);
+    drop(service);
+    let _ = fs::remove_dir_all(&runtime_root);
+}
+
+/// Verify every VM kind in one engine shares one worker service while separate engines remain isolated.
+/// 验证单个引擎内的每种 VM 共享同一 Worker 服务，同时不同引擎保持隔离。
+#[test]
+fn managed_runtime_worker_service_is_engine_local_and_shared_by_all_vm_kinds() {
+    // Independent engines whose short-worker services must never alias.
+    // 其短期 Worker 服务绝不能互为别名的独立引擎。
+    let first_engine = make_runtime_test_engine();
+    let second_engine = make_runtime_test_engine();
+    assert!(!Arc::ptr_eq(
+        &first_engine.managed_runtime_workers,
+        &second_engine.managed_runtime_workers
+    ));
+
+    // Ordinary pooled VM created through the primary engine path.
+    // 通过主引擎路径创建的普通池化 VM。
+    let ordinary_vm = first_engine.create_vm().expect("create ordinary worker VM");
+    // Isolated runlua VM created with the exact engine-owned service Arc.
+    // 使用精确引擎所有服务 Arc 创建的隔离 runlua VM。
+    let runlua_vm = LuaEngine::create_runlua_vm(RunLuaVmBuildContext::from_engine(
+        &first_engine,
+        &first_engine.skills,
+        &first_engine.entry_registry,
+    ))
+    .expect("create isolated runlua worker VM");
+    // Dedicated System VM that must share services without ordinary Skill dispatch state.
+    // 必须共享服务但不包含普通 Skill 分发状态的专用 System VM。
+    let system_vm = first_engine
+        .create_system_runtime_vm()
+        .expect("create System worker VM");
+
+    for vm in [&ordinary_vm, &runlua_vm, &system_vm] {
+        // Installed service cloned after releasing the Lua app-data borrow.
+        // 释放 Lua 应用数据借用后克隆的已安装服务。
+        let installed_service = vm
+            .lua
+            .app_data_ref::<Arc<ManagedRuntimeWorkerService>>()
+            .map(|service| Arc::clone(&service))
+            .expect("worker service must be installed");
+        assert!(Arc::ptr_eq(
+            &installed_service,
+            &first_engine.managed_runtime_workers
+        ));
+    }
+}
+
+/// Verify owner retirement removes idle workers and destroys active workers when they return.
+/// 验证所有者退役会移除空闲 Worker，并在活动 Worker 归还时将其销毁。
+#[test]
+fn managed_runtime_worker_owner_retirement_covers_idle_and_active_workers() {
+    // Hold the shared PATH guard while production worker commands are spawned.
+    // 在启动生产 Worker 命令期间持有共享 PATH 保护锁。
+    let _env_guard = process_env_test_guard();
+    // Isolated runtime fixture and exact owner-partitioned worker key.
+    // 隔离运行时夹具与按精确所有者分区的 Worker 键。
+    let runtime_root = make_temp_runtime_root("managed-worker-owner-retire");
+    let _ = fs::remove_dir_all(&runtime_root);
+    fs::create_dir_all(&runtime_root).expect("create owner retirement runtime root");
+    let (key, _package) = make_test_managed_runtime_worker_key(&runtime_root, "owner-retire");
+    let service = ManagedRuntimeWorkerService::new();
+    // Factory count proving two simultaneous checkouts reserve distinct workers.
+    // 证明两个同时借出会预留不同 Worker 的工厂计数。
+    let mut spawn_count = 0usize;
+    let mut factory = || {
+        spawn_count += 1;
+        let mut command = managed_runtime_echo_worker_command();
+        spawn_managed_runtime_worker(&mut command)
+    };
+    // Active worker retained across retirement and idle worker returned before retirement.
+    // 跨退役保持活动的 Worker 与退役前已归还的空闲 Worker。
+    let (active_worker, _) = service
+        .acquire(key.clone(), &mut factory)
+        .expect("acquire active owner worker");
+    let (idle_worker, _) = service
+        .acquire(key.clone(), &mut factory)
+        .expect("acquire idle owner worker");
+    service.release(key.clone(), idle_worker);
+    {
+        let pool = service.lock_pool();
+        let bucket = pool.buckets.get(&key).expect("owner bucket before retire");
+        assert_eq!(bucket.available.len(), 1);
+        assert_eq!(bucket.total_count, 2);
+    }
+
+    service.retire_owner(key.owner_token);
+    {
+        let pool = service.lock_pool();
+        assert!(!pool.buckets.contains_key(&key));
+    }
+    assert!(
+        key.owner_state
+            .upgrade()
+            .expect("test owner state should remain live")
+            .is_retired()
+    );
+    // Returning the previously active worker cannot recreate its retired bucket.
+    // 归还此前活动的 Worker 不能重新创建其已退役桶。
+    service.release(key.clone(), active_worker);
+    assert!(!service.lock_pool().buckets.contains_key(&key));
+    let retired_error = service
+        .acquire(key.clone(), || panic!("retired owner factory must not run"))
+        .err()
+        .expect("retired owner acquisition must fail");
+    assert!(retired_error.contains("is retired"));
+    assert_eq!(spawn_count, 2);
+    drop(service);
+    let _ = fs::remove_dir_all(&runtime_root);
+}
+
+/// Verify dropping an engine releases its worker service and every idle worker owned by that service.
+/// 验证释放引擎会释放其 Worker 服务以及该服务拥有的全部空闲 Worker。
+#[test]
+fn lua_engine_drop_releases_managed_runtime_worker_service() {
+    // Hold the shared PATH guard while one real idle worker is installed into the engine service.
+    // 将一个真实空闲 Worker 安装到引擎服务期间持有共享 PATH 保护锁。
+    let _env_guard = process_env_test_guard();
+    let runtime_root = make_temp_runtime_root("managed-worker-engine-drop");
+    let _ = fs::remove_dir_all(&runtime_root);
+    fs::create_dir_all(&runtime_root).expect("create engine drop runtime root");
+    let (key, _package) = make_test_managed_runtime_worker_key(&runtime_root, "engine-drop");
+    let engine = make_runtime_test_engine();
+    // Weak service reference proving no VM or pool retains the service after engine destruction.
+    // 证明引擎销毁后没有 VM 或池保留服务的弱引用。
+    let weak_service = Arc::downgrade(&engine.managed_runtime_workers);
+    let (worker, _) = engine
+        .managed_runtime_workers
+        .acquire(key.clone(), || {
+            let mut command = managed_runtime_echo_worker_command();
+            spawn_managed_runtime_worker(&mut command)
+        })
+        .expect("spawn engine-owned idle worker");
+    engine.managed_runtime_workers.release(key, worker);
+    drop(engine);
+    assert!(weak_service.upgrade().is_none());
+    let _ = fs::remove_dir_all(&runtime_root);
+}
+
+/// Verify ordinary Skill reload retires only old loaded-Skill owners and preserves unrelated System owners.
+/// 验证普通 Skill 重载只退役旧已加载 Skill 所有者，并保留无关 System 所有者。
+#[test]
+fn ordinary_skill_reload_retires_only_loaded_skill_worker_owners() {
+    // Synthetic old Skill whose exact package lifetime must retire after replacement state is ready.
+    // 其精确包生命周期必须在替换状态就绪后退役的合成旧 Skill。
+    let old_skill = make_loaded_skill("worker-reload-old", "worker-reload", "main", "main");
+    let old_owner_state = old_skill
+        .managed_package
+        .owner_state()
+        .upgrade()
+        .expect("old Skill owner state should be live");
+    let runtime_root = old_skill.managed_package.runtime_root().to_path_buf();
+    // Independent package owner representing a System lease outside the ordinary Skill table.
+    // 表示普通 Skill 表之外 System 租约的独立包所有者。
+    let system_package = make_test_managed_runtime_package(&runtime_root, "system-preserved");
+    let system_owner_state = system_package
+        .owner_state()
+        .upgrade()
+        .expect("System owner state should be live");
+    let mut skills = HashMap::new();
+    skills.insert("worker-reload".to_string(), old_skill);
+    let mut engine = make_test_engine(skills);
+    // Empty replacement ROOT proving the old Skill disappears without introducing a new owner.
+    // 证明旧 Skill 消失且不引入新所有者的空替换 ROOT。
+    let replacement_skills = runtime_root.join("replacement-skills");
+    fs::create_dir_all(&replacement_skills).expect("create empty replacement Skill root");
+    engine
+        .reload_from_roots(&[crate::host::options::RuntimeSkillRoot {
+            name: "ROOT".to_string(),
+            skills_dir: replacement_skills,
+        }])
+        .expect("reload empty ordinary Skill root");
+    assert!(old_owner_state.is_retired());
+    assert!(!system_owner_state.is_retired());
+    drop(engine);
+    drop(system_package);
+    let _ = fs::remove_dir_all(&runtime_root);
+}
+
+/// Verify an oversized worker protocol line is fully drained without consuming the next record.
+/// 验证超大 Worker 协议行会被完整排空，且不会消费下一条记录。
+#[test]
+fn managed_runtime_worker_line_limit_preserves_next_protocol_record() {
+    // Input contains one over-limit record followed by one valid JSON envelope.
+    // 输入包含一条超限记录及其后的一条有效 JSON 信封。
+    let mut input = vec![b'x'; super::MANAGED_RUNTIME_WORKER_PROTOCOL_LINE_LIMIT_BYTES + 64];
+    input.extend_from_slice(b"\n{\"ok\":true}\n");
+    let mut reader = std::io::Cursor::new(input);
+    let oversized = super::read_managed_runtime_worker_line(&mut reader)
+        .expect("read oversized worker line")
+        .expect("oversized worker line should produce one record")
+        .expect_err("oversized worker line must be rejected");
+    assert!(oversized.contains("protocol line exceeded"));
+
+    let next = super::read_managed_runtime_worker_line(&mut reader)
+        .expect("read protocol record after oversized line")
+        .expect("valid worker line should remain available")
+        .expect("valid worker line should decode");
+    assert_eq!(next, r#"{"ok":true}"#);
+    assert!(
+        super::read_managed_runtime_worker_line(&mut reader)
+            .expect("read clean worker EOF")
+            .is_none()
+    );
 }
 
 /// Verify malformed managed runtime worker envelopes become explicit protocol errors.

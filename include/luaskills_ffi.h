@@ -14,7 +14,8 @@ luaskills 导出的稳定标准 C ABI 接口面。
 - This header is the low-level standard ABI for controlled host integrations.
 - Public high-level JSON FFI declarations are provided by luaskills_json_ffi.h.
 - Returned memory must be released only with the matching luaskills free function.
-- Host callbacks must be registered before engine creation when callback-based modes are used.
+- Global callback-based providers and services must be registered before engine creation.
+- The managed-session wake callback is per-engine and must be registered after engine creation.
 - Callbacks must not unwind across the C ABI boundary.
 - Same-thread reentry into the same engine is not supported.
 - Skills are treated as trusted code by default; this ABI does not promise sandbox isolation.
@@ -22,7 +23,8 @@ v0.1.x beta 集成契约：
 - 当前头文件是面向受控宿主集成的低层标准 ABI。
 - 公共高层 JSON FFI 声明位于 luaskills_json_ffi.h。
 - 所有返回内存都只能使用匹配的 luaskills 释放函数处理。
-- 使用 callback 模式时，宿主必须先注册 callback，再创建 engine。
+- 全局 callback 型 provider 与服务必须先注册，再创建 engine。
+- 受管会话唤醒 callback 按 engine 注册，必须在 engine 创建后设置。
 - callback 不允许把异常跨越 C ABI 边界传播。
 - 不支持同一线程内对同一 engine 的重入调用。
 - 当前默认将 skill 视为受信代码，本 ABI 不承诺沙箱隔离。
@@ -453,6 +455,26 @@ typedef int32_t (*FfiLanceDbProviderCallback)(
 );
 
 /*
+Edge-triggered callback that only schedules host work for pending managed-session events.
+仅为待处理受管会话事件调度宿主工作的边沿触发回调。
+The callback may run on an arbitrary background thread and must not synchronously enter Lua.
+该回调可能在任意后台线程运行，且不得同步进入 Lua。
+The callback implementation and user_data must be safe to access from any such thread.
+回调实现与 user_data 必须能够从任意此类线程安全访问。
+Fill error_out with luaskills_ffi_buffer_clone before returning nonzero.
+返回非零前必须使用 luaskills_ffi_buffer_clone 填充 error_out。
+Nonzero returns are retried asynchronously with bounded exponential backoff while the same queue edge remains pending.
+当同一队列边沿仍待处理时，非零返回会通过有界指数退避异步重试。
+Registration against an already nonempty queue may invoke one catch-up callback before returning.
+针对已非空队列注册时，返回前可能调用一次补偿回调。
+*/
+typedef int32_t (*FfiManagedSessionWakeCallback)(
+    uint64_t engine_id,
+    void *user_data,
+    FfiOwnedBuffer *error_out
+);
+
+/*
 Clone one host-owned byte buffer into one luaskills-owned owned-buffer container.
 将宿主拥有的字节缓冲克隆为 luaskills 自主管理的拥有型缓冲容器。
 */
@@ -802,6 +824,13 @@ int32_t luaskills_ffi_runtime_lease_close(
 /*
 Open one system_lua_lib runtime lease through the standard C ABI surface.
 通过标准 C ABI 接口打开一个 system_lua_lib 运行时租约。
+
+request_json is the strict System create body only: sid, ttl_sec, replace, cwd, workspace_root,
+mounts, and required system_package. Do not include engine_id or authority; engine_id is the
+separate first argument and the standard ABI performs no JSON authority envelope parsing.
+request_json 仅包含严格 System 创建正文：sid、ttl_sec、replace、cwd、workspace_root、
+mounts 与必填 system_package。不得包含 engine_id 或 authority；engine_id 已是独立首参数，
+标准 ABI 不解析 JSON authority 外层。
 */
 int32_t luaskills_ffi_system_runtime_lease_create(
     uint64_t engine_id,
@@ -851,6 +880,56 @@ int32_t luaskills_ffi_system_runtime_lease_close(
     uint64_t engine_id,
     FfiBorrowedBuffer request_json,
     FfiOwnedBuffer *result_json_out,
+    FfiOwnedBuffer *error_out
+);
+
+/*
+Destructively poll at most max_events managed-session events without waiting.
+无等待地破坏性轮询至多 max_events 个受管会话事件。
+result_json_out receives direct JSON with events, remaining, and timed_out fields.
+result_json_out 接收包含 events、remaining 与 timed_out 字段的直接 JSON。
+Closed and empty centers return an explicit error; free the result with luaskills_ffi_buffer_free.
+关闭且队列为空时返回显式错误；结果必须使用 luaskills_ffi_buffer_free 释放。
+*/
+int32_t luaskills_ffi_managed_session_events_poll(
+    uint64_t engine_id,
+    size_t max_events,
+    FfiOwnedBuffer *result_json_out,
+    FfiOwnedBuffer *error_out
+);
+
+/*
+Wait for and destructively drain at most max_events managed-session events.
+等待并破坏性排空至多 max_events 个受管会话事件。
+timeout_ms=0 is a true nonblocking poll; timeout returns success with timed_out=true.
+timeout_ms=0 表示真正的非阻塞轮询；超时以 timed_out=true 的成功批次返回。
+Closed and empty centers return an explicit error.
+关闭且队列为空的事件中心返回显式错误。
+*/
+int32_t luaskills_ffi_managed_session_events_wait(
+    uint64_t engine_id,
+    size_t max_events,
+    uint64_t timeout_ms,
+    FfiOwnedBuffer *result_json_out,
+    FfiOwnedBuffer *error_out
+);
+
+/*
+Register, replace, or clear one per-engine managed-session wake callback.
+注册、替换或清除单个 engine 的受管会话唤醒回调。
+Pass a null callback to clear it.
+传入空 callback 表示清除。
+Replacement and clearing return only after retired calls finish, so user_data may be released after success.
+替换与清除仅在退役调用结束后返回，因此成功返回后可释放 user_data。
+Callback dispatch and retries run on one serial per-engine worker and never block event publishers.
+回调投递与重试运行在每个 engine 的单个串行工作线程上，绝不阻塞事件发布者。
+New callback user_data must already be valid because a catch-up invocation may occur before return.
+新回调的 user_data 必须已经有效，因为返回前可能发生补偿调用。
+*/
+int32_t luaskills_ffi_set_managed_session_wake_callback(
+    uint64_t engine_id,
+    FfiManagedSessionWakeCallback callback,
+    void *user_data,
     FfiOwnedBuffer *error_out
 );
 

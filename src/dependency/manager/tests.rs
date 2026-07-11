@@ -2,7 +2,7 @@ use super::*;
 use crate::runtime::path::render_host_visible_path;
 use crate::skill::dependencies::{
     DependencyArchiveType, DependencyExportSpec, DependencyPackageSpec, DependencySourceSpec,
-    GithubReleaseSourceSpec, SkillDependencyManifest, ToolDependencySpec, UrlSourceSpec,
+    GithubReleaseSourceSpec, PackageDependencyManifest, ToolDependencySpec, UrlSourceSpec,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -198,7 +198,7 @@ fn ensure_dependency_reuses_existing_github_release_exports_without_remote_resol
         github_api_base_url: manager.config.github_api_base_url.clone(),
     });
     let skill_id = "demo-skill";
-    let manifest = SkillDependencyManifest {
+    let manifest = PackageDependencyManifest {
         tool_dependencies: vec![github_tool_dependency(
             "demo-tool",
             Some("1.2.3"),
@@ -206,7 +206,7 @@ fn ensure_dependency_reuses_existing_github_release_exports_without_remote_resol
         )],
         lua_dependencies: Vec::new(),
         ffi_dependencies: Vec::new(),
-        ..SkillDependencyManifest::default()
+        ..PackageDependencyManifest::default()
     };
     let dependency_root = build_dependency_install_root(
         &manager.config.tool_root,
@@ -245,11 +245,11 @@ fn ensure_dependency_reuses_existing_unversioned_github_release_exports() {
         github_api_base_url: manager.config.github_api_base_url.clone(),
     });
     let skill_id = "demo-skill";
-    let manifest = SkillDependencyManifest {
+    let manifest = PackageDependencyManifest {
         tool_dependencies: vec![github_tool_dependency("demo-tool", None, platform_key)],
         lua_dependencies: Vec::new(),
         ffi_dependencies: Vec::new(),
-        ..SkillDependencyManifest::default()
+        ..PackageDependencyManifest::default()
     };
     let dependency_root = build_dependency_install_root(
         &manager.config.tool_root,
@@ -349,7 +349,7 @@ fn ensure_dependency_reuses_existing_github_release_tag_exports_without_remote_r
         github_api_base_url: manager.config.github_api_base_url.clone(),
     });
     let skill_id = "demo-skill";
-    let manifest = SkillDependencyManifest {
+    let manifest = PackageDependencyManifest {
         tool_dependencies: vec![github_tagged_tool_dependency(
             "demo-tool",
             Some("1.2.3"),
@@ -357,7 +357,7 @@ fn ensure_dependency_reuses_existing_github_release_tag_exports_without_remote_r
         )],
         lua_dependencies: Vec::new(),
         ffi_dependencies: Vec::new(),
-        ..SkillDependencyManifest::default()
+        ..PackageDependencyManifest::default()
     };
     let dependency_root = build_dependency_install_root(
         &manager.config.tool_root,
@@ -400,7 +400,7 @@ fn ensure_dependency_reuses_existing_unversioned_github_release_tag_exports() {
         github_api_base_url: manager.config.github_api_base_url.clone(),
     });
     let skill_id = "demo-skill";
-    let manifest = SkillDependencyManifest {
+    let manifest = PackageDependencyManifest {
         tool_dependencies: vec![github_tagged_tool_dependency(
             "demo-tool",
             None,
@@ -408,7 +408,7 @@ fn ensure_dependency_reuses_existing_unversioned_github_release_tag_exports() {
         )],
         lua_dependencies: Vec::new(),
         ffi_dependencies: Vec::new(),
-        ..SkillDependencyManifest::default()
+        ..PackageDependencyManifest::default()
     };
     let dependency_root = build_dependency_install_root(
         &manager.config.tool_root,
@@ -483,23 +483,23 @@ fn cleanup_updated_skill_dependencies_removes_stale_roots_and_keeps_reused_roots
 
     let (manager, root) = test_manager();
     let skill_id = "demo-skill";
-    let previous_manifest = SkillDependencyManifest {
+    let previous_manifest = PackageDependencyManifest {
         tool_dependencies: vec![
             tool_dependency("rg", "14.1.1", platform_key),
             tool_dependency("fd", "9.0.0", platform_key),
         ],
         lua_dependencies: Vec::new(),
         ffi_dependencies: Vec::new(),
-        ..SkillDependencyManifest::default()
+        ..PackageDependencyManifest::default()
     };
-    let current_manifest = SkillDependencyManifest {
+    let current_manifest = PackageDependencyManifest {
         tool_dependencies: vec![
             tool_dependency("rg", "14.1.2", platform_key),
             tool_dependency("fd", "9.0.0", platform_key),
         ],
         lua_dependencies: Vec::new(),
         ffi_dependencies: Vec::new(),
-        ..SkillDependencyManifest::default()
+        ..PackageDependencyManifest::default()
     };
 
     let stale_root = build_dependency_install_root(
@@ -569,11 +569,11 @@ fn cleanup_updated_skill_dependencies_keeps_identical_roots() {
 
     let (manager, root) = test_manager();
     let skill_id = "demo-skill";
-    let manifest = SkillDependencyManifest {
+    let manifest = PackageDependencyManifest {
         tool_dependencies: vec![tool_dependency("rg", "14.1.1", platform_key)],
         lua_dependencies: Vec::new(),
         ffi_dependencies: Vec::new(),
-        ..SkillDependencyManifest::default()
+        ..PackageDependencyManifest::default()
     };
 
     let dependency_root = build_dependency_install_root(
@@ -610,16 +610,16 @@ fn cleanup_updated_skill_dependencies_removes_deleted_dependencies() {
 
     let (manager, root) = test_manager();
     let skill_id = "demo-skill";
-    let previous_manifest = SkillDependencyManifest {
+    let previous_manifest = PackageDependencyManifest {
         tool_dependencies: vec![
             tool_dependency("rg", "14.1.1", platform_key),
             tool_dependency("fd", "9.0.0", platform_key),
         ],
         lua_dependencies: Vec::new(),
         ffi_dependencies: Vec::new(),
-        ..SkillDependencyManifest::default()
+        ..PackageDependencyManifest::default()
     };
-    let current_manifest = SkillDependencyManifest::default();
+    let current_manifest = PackageDependencyManifest::default();
 
     let rg_root = build_dependency_install_root(
         &manager.config.tool_root,
@@ -673,20 +673,20 @@ fn cleanup_updated_skill_dependencies_preserves_existing_roots_for_add_only_chan
 
     let (manager, root) = test_manager();
     let skill_id = "demo-skill";
-    let previous_manifest = SkillDependencyManifest {
+    let previous_manifest = PackageDependencyManifest {
         tool_dependencies: vec![tool_dependency("rg", "14.1.1", platform_key)],
         lua_dependencies: Vec::new(),
         ffi_dependencies: Vec::new(),
-        ..SkillDependencyManifest::default()
+        ..PackageDependencyManifest::default()
     };
-    let current_manifest = SkillDependencyManifest {
+    let current_manifest = PackageDependencyManifest {
         tool_dependencies: vec![
             tool_dependency("rg", "14.1.1", platform_key),
             tool_dependency("fd", "9.0.0", platform_key),
         ],
         lua_dependencies: Vec::new(),
         ffi_dependencies: Vec::new(),
-        ..SkillDependencyManifest::default()
+        ..PackageDependencyManifest::default()
     };
 
     let rg_root = build_dependency_install_root(
@@ -749,15 +749,15 @@ fn cleanup_updated_skill_dependencies_rejects_file_stale_root() {
     let skill_id = "demo-skill";
     // Previous manifest that owns one skill-local tool dependency.
     // 拥有一个技能私有工具依赖的旧清单。
-    let previous_manifest = SkillDependencyManifest {
+    let previous_manifest = PackageDependencyManifest {
         tool_dependencies: vec![tool_dependency("rg", "14.1.1", platform_key)],
         lua_dependencies: Vec::new(),
         ffi_dependencies: Vec::new(),
-        ..SkillDependencyManifest::default()
+        ..PackageDependencyManifest::default()
     };
     // Current empty manifest that makes the previous dependency root stale.
     // 当前空清单会使旧依赖根目录变为过期根目录。
-    let current_manifest = SkillDependencyManifest::default();
+    let current_manifest = PackageDependencyManifest::default();
     // Concrete stale root derived by the same helper used by production cleanup.
     // 使用生产清理流程同一辅助函数派生出的具体过期根目录。
     let stale_root = build_dependency_install_root(
@@ -808,13 +808,13 @@ fn cleanup_updated_skill_dependencies_reports_invalid_stale_root_path() {
     let (mut manager, root) = test_manager();
     manager.config.tool_root = PathBuf::from("invalid\0tool-root");
     let skill_id = "demo-skill";
-    let previous_manifest = SkillDependencyManifest {
+    let previous_manifest = PackageDependencyManifest {
         tool_dependencies: vec![tool_dependency("rg", "14.1.1", platform_key)],
         lua_dependencies: Vec::new(),
         ffi_dependencies: Vec::new(),
-        ..SkillDependencyManifest::default()
+        ..PackageDependencyManifest::default()
     };
-    let current_manifest = SkillDependencyManifest::default();
+    let current_manifest = PackageDependencyManifest::default();
 
     // Error returned before an invalid stale root can be removed or treated as already absent.
     // 在非法过期根目录被删除或当作已经不存在前返回的错误。

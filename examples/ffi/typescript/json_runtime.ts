@@ -25,6 +25,95 @@ export type RuntimeLeaseIdentity = {
 };
 
 /**
+Strict System Plugin package descriptor required by system runtime-lease creation.
+system 运行时租约创建所必需的严格 System Plugin 包描述符。
+ */
+export type SystemRuntimePackageDescriptor = {
+  /**
+  Stable package identifier selected by the host.
+  宿主选择的稳定包标识符。
+   */
+  id: string;
+  /**
+  Absolute package root strictly below the engine's system_lua_lib directory.
+  严格位于引擎 system_lua_lib 目录下的绝对包根目录。
+   */
+  root: string;
+  /**
+  Package-relative dependency manifest path.
+  包相对依赖清单路径。
+   */
+  dependencies_file: string;
+};
+
+/**
+Host-owned path context accepted by strict System runtime-lease creation.
+严格 System 运行时租约创建接受的宿主所有路径上下文。
+ */
+export type SystemRuntimeLeaseContext = {
+  /** Child working directory under the package or authorized workspace root. */
+  /** 位于包根或已授权工作区根下的子进程工作目录。 */
+  cwd?: string;
+  /** Canonical workspace root explicitly authorized by the host. */
+  /** 宿主显式授权的规范工作区根。 */
+  workspace_root?: string;
+  /** Recursively read-only structured mount metadata exposed to Lua. */
+  /** 暴露给 Lua 的递归只读结构化挂载元数据。 */
+  mounts?: JsonMap;
+};
+
+/**
+Stable event kinds emitted for System Plugin managed child sessions.
+为 System Plugin 受管子会话发出的稳定事件类型。
+ */
+export type ManagedSessionEventKind =
+  | "stdout_readable"
+  | "stderr_readable"
+  | "exited"
+  | "failed";
+
+/**
+One sequenced host-visible event for a managed child session.
+单个带序号、宿主可见的受管子会话事件。
+ */
+export type ManagedSessionEvent = {
+  /** Opaque System lease id that owns the child session. */
+  /** 拥有子会话的不透明 System 租约标识。 */
+  system_lease_id: string;
+  /** Stable host-selected System lease SID. */
+  /** 宿主选择的稳定 System 租约 SID。 */
+  sid: string;
+  /** SID-local lease generation. */
+  /** SID 内部的租约代际。 */
+  generation: number;
+  /** Engine-local id returned by the managed session status. */
+  /** 由受管会话状态返回的引擎内局部标识。 */
+  managed_session_id: number;
+  /** Coalesced readiness or terminal event kind. */
+  /** 合并后的就绪或终止事件类型。 */
+  kind: ManagedSessionEventKind;
+  /** Engine event-center-global monotonic sequence. */
+  /** 引擎事件中心全局单调序号。 */
+  sequence: number;
+};
+
+/**
+One bounded destructive event-drain result.
+单次有界破坏性事件排空结果。
+ */
+export type ManagedSessionEventBatch = {
+  /** Events removed in sequence order. */
+  /** 按序号顺序移除的事件。 */
+  events: ManagedSessionEvent[];
+  /** Pending logical events after this drain. */
+  /** 本次排空后仍待处理的逻辑事件数。 */
+  remaining: number;
+  /** Whether wait returned because its deadline expired without an event. */
+  /** wait 是否因截止时间到期且没有事件而返回。 */
+  timed_out: boolean;
+};
+
+/**
 Stable authority labels used by system JSON FFI wrappers.
 system JSON FFI 包装层使用的稳定权限标签。
  */
@@ -41,6 +130,12 @@ Delegated-tool authority label for user-facing system JSON FFI wrappers.
 面向用户的 system JSON FFI 包装层使用的委托工具权限标签。
  */
 export const SKILL_AUTHORITY_DELEGATED_TOOL: SkillManagementAuthority = "delegated_tool";
+
+/**
+Stable package id used only by the repository's standard FFI fixture.
+仅供仓库标准 FFI 夹具使用的稳定包标识。
+ */
+const STANDARD_FIXTURE_SYSTEM_PACKAGE_ID = "ffi-demo-system-plugin";
 
 /**
 Stable JSON result value returned by generic JSON FFI helper calls.
@@ -100,10 +195,21 @@ export function ensureStandardFixtureLayout(root: string): void {
     "temp",
     "resources",
     "lua_packages",
+    "system_lua_lib",
     path.join("bin", "tools"),
     "libs",
   ]) {
     fs.mkdirSync(path.join(root, relativePath), { recursive: true });
+  }
+  // Canonical System Plugin package root used by system lease demos.
+  // system 租约示例使用的规范 System Plugin 包根目录。
+  const packageRoot = path.join(root, "system_lua_lib", STANDARD_FIXTURE_SYSTEM_PACKAGE_ID);
+  fs.mkdirSync(packageRoot, { recursive: true });
+  // Required package-relative manifest kept deliberately empty for the generic fixture.
+  // 通用夹具所需的包相对清单，内容刻意保持为空依赖。
+  const dependenciesFile = path.join(packageRoot, "dependencies.yaml");
+  if (!fs.existsSync(dependenciesFile)) {
+    fs.writeFileSync(dependenciesFile, "{}\n", "utf8");
   }
 }
 
@@ -145,6 +251,19 @@ export class JsonFfiClient {
     };
     const request = makeBorrowedBuffer(JSON.stringify(payload));
     return this.decodeOwnedJsonBuffer(ffiFunction(request.buffer));
+  }
+
+  /**
+  Call one no-argument JSON FFI function and return the decoded result value.
+  调用一个无参数 JSON FFI 函数并返回解码后的结果值。
+   */
+  callWithoutInputValue(functionName: string): JsonValue {
+    // Exact void prototype required by descriptor-style exports.
+    // 描述符类导出所要求的精确 void 原型。
+    const ffiFunction = this.library.func(
+      `FfiOwnedBuffer ${functionName}(void)`,
+    ) as () => { ptr: Buffer | null; len: number | bigint };
+    return this.decodeOwnedJsonBuffer(ffiFunction());
   }
 
   /**
@@ -190,7 +309,13 @@ export class JsonFfiClient {
    */
   describe(): JsonMap {
     if (this.describeCache === null) {
-      this.describeCache = this.call("luaskills_ffi_describe_json", {});
+      // Descriptor export has no input buffer, unlike request-taking `_json` functions.
+      // 描述符导出没有输入缓冲，不同于接收请求的 `_json` 函数。
+      const described = this.callWithoutInputValue("luaskills_ffi_describe_json");
+      if (!described || typeof described !== "object" || Array.isArray(described)) {
+        throw new Error("JSON FFI descriptor body must be one object");
+      }
+      this.describeCache = described as JsonMap;
     }
     return this.describeCache;
   }
@@ -219,25 +344,22 @@ export class StandardFixtureRuntimeClient {
   createEngine(
     defaultTextEncoding: string | null = "utf-8",
     enableManagedIoCompat = true,
-  ): number | bigint {
+  ): number {
     const payload = this.client.call(
       "luaskills_ffi_engine_new_json",
       this.buildEngineRequest(defaultTextEncoding, enableManagedIoCompat),
     );
     const engineId = payload.engine_id;
-    if (typeof engineId !== "number" && typeof engineId !== "bigint") {
-      throw new Error("engine_new_json did not return one numeric engine_id");
-    }
-    return engineId;
+    return requireJsonSafeInteger(engineId, "engine_new_json engine_id", 1);
   }
 
   /**
   Load the shared skill root into one existing engine.
   把共享技能根加载进一个已有引擎。
    */
-  loadRoot(engineId: number | bigint, rootName = "ROOT"): void {
+  loadRoot(engineId: number, rootName = "ROOT"): void {
     this.client.call("luaskills_ffi_load_from_roots_json", {
-      engine_id: engineId,
+      engine_id: requireJsonSafeInteger(engineId, "engine_id", 1),
       skill_roots: [
         {
           name: rootName,
@@ -251,9 +373,9 @@ export class StandardFixtureRuntimeClient {
   Free one previously created runtime engine.
   释放一个先前创建的运行时引擎。
    */
-  freeEngine(engineId: number | bigint): void {
+  freeEngine(engineId: number): void {
     this.client.call("luaskills_ffi_engine_free_json", {
-      engine_id: engineId,
+      engine_id: requireJsonSafeInteger(engineId, "engine_id", 1),
     });
   }
 
@@ -261,7 +383,7 @@ export class StandardFixtureRuntimeClient {
   Build one plain runtime-lease client that targets the public JSON FFI endpoints.
   构造一个指向公共 JSON FFI 入口的普通运行时租约客户端。
    */
-  runtimeLeases(engineId: number | bigint): RuntimeLeaseClient {
+  runtimeLeases(engineId: number): RuntimeLeaseClient {
     return new RuntimeLeaseClient(this.client, engineId);
   }
 
@@ -270,10 +392,33 @@ export class StandardFixtureRuntimeClient {
   构造一个指向 system JSON FFI 入口并绑定 authority 的运行时租约客户端。
    */
   systemRuntimeLeases(
-    engineId: number | bigint,
+    engineId: number,
     authority: SkillManagementAuthority = SKILL_AUTHORITY_DELEGATED_TOOL,
   ): RuntimeLeaseClient {
-    return new RuntimeLeaseClient(this.client, engineId, authority);
+    return new RuntimeLeaseClient(
+      this.client,
+      engineId,
+      authority,
+      this.fixtureSystemPackage(),
+    );
+  }
+
+  /**
+  Build one authority-bound managed-session event client for the target engine.
+  为目标引擎构造一个绑定 authority 的受管会话事件客户端。
+
+  @param engineId Stable numeric FFI engine handle.
+  engineId 参数：稳定数值 FFI 引擎句柄。
+  @param authority Host-injected authority forwarded to every event request.
+  authority 参数：转发到每个事件请求的宿主注入权限。
+  @returns One authority-bound managed-session event client.
+  返回值：一个绑定权限的受管会话事件客户端。
+   */
+  managedSessionEvents(
+    engineId: number,
+    authority: SkillManagementAuthority = SKILL_AUTHORITY_DELEGATED_TOOL,
+  ): ManagedSessionEventsClient {
+    return new ManagedSessionEventsClient(this.client, engineId, authority);
   }
 
   /**
@@ -294,7 +439,7 @@ export class StandardFixtureRuntimeClient {
   构造一个封装 system JSON FFI 入口并绑定 authority 的引擎辅助器。
    */
   systemClient(
-    engineId: number | bigint,
+    engineId: number,
     authority: SkillManagementAuthority = SKILL_AUTHORITY_DELEGATED_TOOL,
     rootName = "ROOT",
   ): SystemEngineJsonClient {
@@ -303,7 +448,27 @@ export class StandardFixtureRuntimeClient {
       engineId,
       authority,
       this.fixtureSkillRoots(rootName),
+      this.fixtureSystemPackage(),
     );
+  }
+
+  /**
+  Build the strict System Plugin descriptor used by repository fixture leases.
+  构造仓库夹具租约使用的严格 System Plugin 描述符。
+   */
+  fixtureSystemPackage(): SystemRuntimePackageDescriptor {
+    // Canonical fixture package directory created by ensureStandardFixtureLayout.
+    // 由 ensureStandardFixtureLayout 创建的规范夹具包目录。
+    const packageRoot = path.resolve(
+      this.runtimeRoot,
+      "system_lua_lib",
+      STANDARD_FIXTURE_SYSTEM_PACKAGE_ID,
+    );
+    return {
+      id: STANDARD_FIXTURE_SYSTEM_PACKAGE_ID,
+      root: packageRoot,
+      dependencies_file: "dependencies.yaml",
+    };
   }
 
   /**
@@ -328,6 +493,7 @@ export class StandardFixtureRuntimeClient {
           host_provided_tool_root: path.join(this.runtimeRoot, "bin", "tools"),
           host_provided_lua_root: path.join(this.runtimeRoot, "lua_packages"),
           host_provided_ffi_root: path.join(this.runtimeRoot, "libs"),
+          system_lua_lib_dir: path.join(this.runtimeRoot, "system_lua_lib"),
           download_cache_root: path.join(this.runtimeRoot, "temp", "downloads"),
           dependency_dir_name: "dependencies",
           state_dir_name: "state",
@@ -368,9 +534,12 @@ export class RuntimeLeaseClient {
    */
   constructor(
     private readonly client: JsonFfiClient,
-    private readonly engineId: number | bigint,
+    private readonly engineId: number,
     private readonly systemToolAuthority?: SkillManagementAuthority,
-  ) {}
+    private readonly systemPackage?: SystemRuntimePackageDescriptor,
+  ) {
+    requireJsonSafeInteger(engineId, "engine_id", 1);
+  }
 
   /**
   Dispatch one raw runtime-lease JSON request without applying success checks.
@@ -391,13 +560,42 @@ export class RuntimeLeaseClient {
   Create or replace one persistent runtime lease.
   创建或替换一个持久运行时租约。
    */
-  create(sid: string, ttlSec = 600, replace = false): JsonMap {
+  create(
+    sid: string,
+    ttlSec = 600,
+    replace = false,
+    context: SystemRuntimeLeaseContext = {},
+  ): JsonMap {
+    // Base fields shared by public and System lease creation.
+    // 公共与 System 租约创建共享的基础字段。
+    const request: JsonMap = {
+      sid,
+      ttl_sec: requireJsonSafeInteger(
+        ttlSec,
+        "ttl_sec",
+        this.systemToolAuthority === undefined ? 1 : 0,
+      ),
+      replace,
+    };
+    if (this.systemToolAuthority !== undefined) {
+      if (this.systemPackage === undefined) {
+        throw new Error("system runtime lease creation requires system_package");
+      }
+      request.system_package = this.systemPackage;
+    }
+    if (context.mounts !== undefined) {
+      request.mounts = context.mounts;
+    } else if (this.systemToolAuthority !== undefined) {
+      request.mounts = {};
+    }
+    if (context.cwd !== undefined) {
+      request.cwd = context.cwd;
+    }
+    if (context.workspace_root !== undefined) {
+      request.workspace_root = context.workspace_root;
+    }
     return requireRuntimeLeaseOK(
-      this.callRaw("create", {
-        sid,
-        ttl_sec: ttlSec,
-        replace,
-      }),
+      this.callRaw("create", request),
       "runtime lease create",
     );
   }
@@ -406,8 +604,16 @@ export class RuntimeLeaseClient {
   Create one runtime-lease handle object from a fresh create response.
   基于新的 create 响应创建一个运行时租约句柄对象。
    */
-  createHandle(sid: string, ttlSec = 600, replace = false): RuntimeLeaseHandle {
-    return RuntimeLeaseHandle.fromPayload(this, this.create(sid, ttlSec, replace));
+  createHandle(
+    sid: string,
+    ttlSec = 600,
+    replace = false,
+    context: SystemRuntimeLeaseContext = {},
+  ): RuntimeLeaseHandle {
+    return RuntimeLeaseHandle.fromPayload(
+      this,
+      this.create(sid, ttlSec, replace, context),
+    );
   }
 
   /**
@@ -428,11 +634,11 @@ export class RuntimeLeaseClient {
     args: JsonMap = {},
     timeoutMs = 60_000,
     sid?: string,
-    generation?: number | bigint,
+    generation?: number,
   ): JsonMap {
     const payload: JsonMap = {
       lease_id: leaseId,
-      timeout_ms: timeoutMs,
+      timeout_ms: requireJsonSafeInteger(timeoutMs, "timeout_ms", 1),
       args,
       code,
     };
@@ -440,7 +646,7 @@ export class RuntimeLeaseClient {
       payload.sid = sid;
     }
     if (generation !== undefined) {
-      payload.generation = generation;
+      payload.generation = requireJsonSafeInteger(generation, "generation");
     }
     return requireRuntimeLeaseOK(
       this.callRaw("eval", payload),
@@ -452,7 +658,7 @@ export class RuntimeLeaseClient {
   Read one runtime lease status payload with optional identity guards.
   读取单个运行时租约状态载荷，并可附带可选身份护栏。
    */
-  status(leaseId: string, sid?: string, generation?: number | bigint): JsonMap {
+  status(leaseId: string, sid?: string, generation?: number): JsonMap {
     const payload: JsonMap = {
       lease_id: leaseId,
     };
@@ -460,7 +666,7 @@ export class RuntimeLeaseClient {
       payload.sid = sid;
     }
     if (generation !== undefined) {
-      payload.generation = generation;
+      payload.generation = requireJsonSafeInteger(generation, "generation");
     }
     return this.callRaw("status", payload);
   }
@@ -501,7 +707,7 @@ export class RuntimeLeaseClient {
   Close one runtime lease and return its final status payload with optional identity guards.
   关闭单个运行时租约并返回其最终状态载荷，并可附带可选身份护栏。
    */
-  close(leaseId: string, sid?: string, generation?: number | bigint): JsonMap {
+  close(leaseId: string, sid?: string, generation?: number): JsonMap {
     const payload: JsonMap = {
       lease_id: leaseId,
     };
@@ -509,7 +715,7 @@ export class RuntimeLeaseClient {
       payload.sid = sid;
     }
     if (generation !== undefined) {
-      payload.generation = generation;
+      payload.generation = requireJsonSafeInteger(generation, "generation");
     }
     return this.callRaw("close", payload);
   }
@@ -536,6 +742,72 @@ export class RuntimeLeaseClient {
 }
 
 /**
+Authority-bound JSON client for engine-level System managed-session events.
+面向引擎级 System 受管会话事件、绑定 authority 的 JSON 客户端。
+ */
+export class ManagedSessionEventsClient {
+  /**
+  Bind one JSON client, engine id, and host-injected authority.
+  绑定一个 JSON 客户端、引擎标识与宿主注入的 authority。
+
+  @param client Low-level JSON FFI transport.
+  client 参数：底层 JSON FFI 传输器。
+  @param engineId Stable numeric FFI engine handle.
+  engineId 参数：稳定数值 FFI 引擎句柄。
+  @param authority Host-injected authority required by the event surface.
+  authority 参数：事件接口要求的宿主注入权限。
+   */
+  constructor(
+    private readonly client: JsonFfiClient,
+    private readonly engineId: number,
+    private readonly authority: SkillManagementAuthority,
+  ) {
+    requireJsonSafeInteger(engineId, "engine_id", 1);
+  }
+
+  /**
+  Destructively poll at most maxEvents ready events without waiting.
+  无等待地破坏性轮询最多 maxEvents 个就绪事件。
+
+  @param maxEvents Positive maximum number of events removed from the queue.
+  maxEvents 参数：从队列移除的正数事件数量上限。
+  @returns One validated immediate event batch.
+  返回值：一个经过校验的即时事件批次。
+   */
+  poll(maxEvents = 64): ManagedSessionEventBatch {
+    return requireManagedSessionEventBatch(
+      this.client.call("luaskills_ffi_managed_session_events_poll_json", {
+        engine_id: this.engineId,
+        max_events: requireJsonSafeInteger(maxEvents, "max_events", 1),
+        authority: this.authority,
+      }),
+    );
+  }
+
+  /**
+  Destructively wait for at most maxEvents events until timeoutMs expires.
+  破坏性等待最多 maxEvents 个事件，直至 timeoutMs 到期。
+
+  @param maxEvents Positive maximum number of events removed from the queue.
+  maxEvents 参数：从队列移除的正数事件数量上限。
+  @param timeoutMs Finite wait duration in milliseconds; zero is nonblocking.
+  timeoutMs 参数：有限等待毫秒数；零表示非阻塞。
+  @returns One validated event or timeout batch.
+  返回值：一个经过校验的事件批次或超时批次。
+   */
+  wait(maxEvents = 64, timeoutMs = 1_000): ManagedSessionEventBatch {
+    return requireManagedSessionEventBatch(
+      this.client.call("luaskills_ffi_managed_session_events_wait_json", {
+        engine_id: this.engineId,
+        max_events: requireJsonSafeInteger(maxEvents, "max_events", 1),
+        timeout_ms: requireJsonSafeInteger(timeoutMs, "timeout_ms"),
+        authority: this.authority,
+      }),
+    );
+  }
+}
+
+/**
 Authority-bound helper that wraps one engine's system JSON FFI entrypoints.
 封装单个引擎 system JSON FFI 入口并绑定 authority 的辅助器。
  */
@@ -546,10 +818,13 @@ export class SystemEngineJsonClient {
    */
   constructor(
     private readonly client: JsonFfiClient,
-    private readonly engineId: number | bigint,
+    private readonly engineId: number,
     private readonly authority: SkillManagementAuthority,
     private readonly defaultSkillRoots: JsonMap[] = [],
-  ) {}
+    private readonly defaultSystemPackage?: SystemRuntimePackageDescriptor,
+  ) {
+    requireJsonSafeInteger(engineId, "engine_id", 1);
+  }
 
   /**
   Call one system JSON FFI function and require an object-shaped result payload.
@@ -572,7 +847,26 @@ export class SystemEngineJsonClient {
   在当前引擎包装器下构造一个绑定 authority 的运行时租约辅助器。
    */
   runtimeLeases(): RuntimeLeaseClient {
-    return new RuntimeLeaseClient(this.client, this.engineId, this.authority);
+    if (this.defaultSystemPackage === undefined) {
+      throw new Error("system runtime lease helper requires system_package");
+    }
+    return new RuntimeLeaseClient(
+      this.client,
+      this.engineId,
+      this.authority,
+      this.defaultSystemPackage,
+    );
+  }
+
+  /**
+  Build one event helper whose poll and wait requests reuse the bound authority.
+  构造一个让 poll 与 wait 请求复用当前 authority 的事件辅助器。
+
+  @returns One event client bound to this engine and authority.
+  返回值：一个绑定当前引擎与权限的事件客户端。
+   */
+  managedSessionEvents(): ManagedSessionEventsClient {
+    return new ManagedSessionEventsClient(this.client, this.engineId, this.authority);
   }
 
   /**
@@ -879,14 +1173,112 @@ Read one required runtime-lease integer field from one JSON payload.
 从一份 JSON 载荷中读取一个必填的运行时租约整数字段。
  */
 export function requireRuntimeLeaseNumberField(payload: JsonMap, fieldName: string): number {
-  const value = payload[fieldName];
-  if (typeof value === "number" && Number.isFinite(value)) {
+  return requireJsonSafeInteger(payload[fieldName], fieldName);
+}
+
+/**
+Validate one JSON integer before it crosses a number-only JSON FFI boundary.
+在单个整数跨越仅支持 number 的 JSON FFI 边界前进行校验。
+
+Parameters: `value` is the decoded or caller-supplied value, `label` names diagnostics, and
+`minimum` is the inclusive lower bound.
+参数：`value` 是解码或调用方提供的值，`label` 用于诊断命名，`minimum` 是包含端点的下界。
+
+Returns the unchanged safely representable JSON integer.
+返回未改变且可安全表示的 JSON 整数。
+ */
+function requireJsonSafeInteger(
+  value: unknown,
+  label: string,
+  minimum = 0,
+): number {
+  if (
+    typeof value === "number"
+    && Number.isSafeInteger(value)
+    && value >= minimum
+  ) {
     return value;
   }
-  if (typeof value === "bigint") {
-    return Number(value);
+  throw new Error(
+    `${label} must be one safe integer greater than or equal to ${minimum}`,
+  );
+}
+
+/**
+Validate and return one managed-session event batch from the JSON FFI result.
+校验并返回 JSON FFI 结果中的单个受管会话事件批次。
+
+Parameters: `payload` is the decoded `_json` result object.
+参数：`payload` 是已解码的 `_json` 结果对象。
+
+Returns a fully shape-validated managed-session event batch.
+返回一个已完成全部结构校验的受管会话事件批次。
+ */
+function requireManagedSessionEventBatch(payload: JsonMap): ManagedSessionEventBatch {
+  // Raw event list validated before the payload is exposed through the typed wrapper.
+  // 在通过类型化包装层暴露载荷前完成校验的原始事件列表。
+  const events = payload.events;
+  // Queue depth remaining after the destructive drain.
+  // 破坏性排空后剩余的队列深度。
+  const remaining = payload.remaining;
+  // Explicit wait-timeout marker distinguished from an ordinary empty poll.
+  // 与普通空轮询区分的显式等待超时标记。
+  const timedOut = payload.timed_out;
+  if (
+    !Array.isArray(events)
+    || typeof remaining !== "number"
+    || !Number.isSafeInteger(remaining)
+    || remaining < 0
+    || typeof timedOut !== "boolean"
+  ) {
+    throw new Error("managed-session event result has an invalid batch shape");
   }
-  throw new Error(`runtime lease payload is missing required integer field: ${fieldName}`);
+  for (const event of events) {
+    if (!isJsonMap(event) || !isManagedSessionEvent(event)) {
+      throw new Error("managed-session event result contains an invalid event");
+    }
+  }
+  return {
+    events: events as ManagedSessionEvent[],
+    remaining,
+    timed_out: timedOut,
+  };
+}
+
+/**
+Return whether one JSON object satisfies the stable managed-session event shape.
+返回一个 JSON 对象是否满足稳定的受管会话事件结构。
+
+Parameters: `event` is one decoded candidate event object.
+参数：`event` 是一个已解码的候选事件对象。
+
+Returns true only when every identity, kind, and sequence field is valid.
+仅当全部身份、类型与序号字段均有效时返回 true。
+ */
+function isManagedSessionEvent(event: JsonMap): boolean {
+  // Stable event kinds admitted by the Rust event protocol.
+  // Rust 事件协议允许的稳定事件类型。
+  const kinds: readonly ManagedSessionEventKind[] = [
+    "stdout_readable",
+    "stderr_readable",
+    "exited",
+    "failed",
+  ];
+  return (
+    typeof event.system_lease_id === "string"
+    && typeof event.sid === "string"
+    && typeof event.generation === "number"
+    && Number.isSafeInteger(event.generation)
+    && event.generation >= 0
+    && typeof event.managed_session_id === "number"
+    && Number.isSafeInteger(event.managed_session_id)
+    && event.managed_session_id >= 0
+    && typeof event.kind === "string"
+    && kinds.includes(event.kind as ManagedSessionEventKind)
+    && typeof event.sequence === "number"
+    && Number.isSafeInteger(event.sequence)
+    && event.sequence >= 0
+  );
 }
 
 /**

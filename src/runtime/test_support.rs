@@ -11,7 +11,7 @@ pub(crate) fn process_env_test_guard() -> MutexGuard<'static, ()> {
     GUARD
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("lock process env test guard")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Restore one process environment variable after a test mutates it.

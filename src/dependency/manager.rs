@@ -17,7 +17,7 @@ use crate::runtime::path::render_host_visible_path;
 use crate::runtime_logging::{info as log_info, warn as log_warn};
 use crate::runtime_options::RuntimeSkillRoot;
 use crate::skill::dependencies::{
-    DependencyExportSpec, FfiDependencySpec, LuaDependencySpec, SkillDependencyManifest,
+    DependencyExportSpec, FfiDependencySpec, LuaDependencySpec, PackageDependencyManifest,
     SkillListIndexFile, ToolDependencySpec,
 };
 
@@ -88,7 +88,7 @@ impl DependencyManager {
     pub fn ensure_skill_dependencies(
         &self,
         skill_id: &str,
-        manifest: &SkillDependencyManifest,
+        manifest: &PackageDependencyManifest,
     ) -> Result<(), String> {
         let platform_key = current_platform_key();
         if platform_key == "unknown" {
@@ -625,7 +625,7 @@ impl DependencyManager {
         base_dir: &Path,
         override_dir: Option<&Path>,
         removed_skill_id: &str,
-        removed_manifest: Option<&SkillDependencyManifest>,
+        removed_manifest: Option<&PackageDependencyManifest>,
     ) -> Result<(), String> {
         let mut roots = vec![RuntimeSkillRoot {
             name: "ROOT".to_string(),
@@ -650,7 +650,7 @@ impl DependencyManager {
         &self,
         skill_roots: &[RuntimeSkillRoot],
         removed_skill_id: &str,
-        removed_manifest: Option<&SkillDependencyManifest>,
+        removed_manifest: Option<&PackageDependencyManifest>,
     ) -> Result<(), String> {
         self.remove_skill_private_dependency_roots(removed_skill_id)?;
         let _ = (skill_roots, removed_manifest);
@@ -662,8 +662,8 @@ impl DependencyManager {
     pub fn cleanup_updated_skill_dependencies(
         &self,
         skill_id: &str,
-        previous_manifest: Option<&SkillDependencyManifest>,
-        current_manifest: Option<&SkillDependencyManifest>,
+        previous_manifest: Option<&PackageDependencyManifest>,
+        current_manifest: Option<&PackageDependencyManifest>,
     ) -> Result<(), String> {
         let platform_key = current_platform_key();
         if platform_key == "unknown" {
@@ -699,7 +699,7 @@ impl DependencyManager {
     fn collect_skill_local_dependency_roots(
         &self,
         skill_id: &str,
-        manifest: Option<&SkillDependencyManifest>,
+        manifest: Option<&PackageDependencyManifest>,
         platform_key: &str,
     ) -> Result<BTreeSet<PathBuf>, String> {
         let mut roots = BTreeSet::new();

@@ -841,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "luaskills"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "base64",
  "encoding_rs",
@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "luaskills-demo-rust"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "luaskills",
  "serde_json",

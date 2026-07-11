@@ -3,17 +3,17 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "demo": "tsx demo.ts",
-    "lifecycle": "tsx lifecycle_demo.ts",
-    "query": "tsx query_demo.ts",
-    "runtime-lease": "tsx runtime_lease_demo.ts"
+    "demo": "node --experimental-strip-types demo.ts",
+    "lifecycle": "node --experimental-strip-types lifecycle_demo.ts",
+    "query": "node --experimental-strip-types query_demo.ts",
+    "runtime-lease": "node --experimental-strip-types runtime_lease_demo.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "koffi": "^2.8.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
-    "tsx": "^4.20.0",
     "typescript": "^5.8.0"
   }
 }

@@ -1,19 +1,22 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use mlua::{Function, HookTriggers, Lua, MultiValue, Table, Value as LuaValue, VmState};
+use mlua::{
+    AnyUserData, Function, HookTriggers, Lua, MultiValue, Table, Value as LuaValue, VmState,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt::Display;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
@@ -41,12 +44,34 @@ use crate::runtime::encoding::{
     RuntimeTextEncoding, decode_runtime_text, default_runtime_text_encoding, encode_runtime_text,
 };
 use crate::runtime::managed_io::{create_vulcan_io_table, install_managed_io_compat};
+use crate::runtime::managed_package::{
+    ManagedRuntimeOwnerState, ManagedRuntimePackageContext, ManagedRuntimePackageIdentity,
+    current_lua_managed_package_context, optional_lua_managed_package_context,
+    replace_lua_managed_package_context, retire_managed_runtime_owner_state,
+};
 use crate::runtime::managed_runtime::{
-    ManagedRuntimeEnvPlan, ensure_managed_env, managed_env_is_ready, resolve_node_env_plan,
-    resolve_python_env_plan,
+    ManagedRuntimeEnvPlan, current_managed_runtime_persistent_session_capability,
+    ensure_managed_env, managed_env_is_ready, resolve_node_env_plan, resolve_python_env_plan,
+};
+use crate::runtime::managed_runtime_services::{
+    ManagedRuntimeServices, ManagedRuntimeSessionEventIdentity, ManagedRuntimeTransactionContext,
+};
+#[cfg(test)]
+use crate::runtime::managed_runtime_session::prepare_unleased_managed_package_snapshot;
+use crate::runtime::managed_runtime_session::{
+    ManagedPackageSnapshot, ManagedRuntimeSessionOpenRequest,
+    configure_managed_node_command_environment, configure_managed_python_command_environment,
+    ensure_persistent_managed_runtime_session_platform_supported, launch_managed_node_session,
+    launch_managed_python_session, prepare_managed_package_snapshot,
+};
+use crate::runtime::managed_session_events::{
+    ManagedSessionEventCenter, RuntimeManagedSessionEventBatch, RuntimeManagedSessionWakeCallback,
 };
 use crate::runtime::path::render_host_visible_path;
-use crate::runtime::process_session::create_process_session_table;
+use crate::runtime::process_session::{
+    DetachedChildReaperPermit, ManagedChildProcessTree, create_managed_process_session_userdata,
+    create_process_session_table,
+};
 use crate::runtime_context::{RuntimeClientInfo, RuntimeRequestContext};
 use crate::runtime_help::{
     RuntimeHelpDetail, RuntimeHelpNodeDescriptor, RuntimeSkillHelpDescriptor,
@@ -54,7 +79,7 @@ use crate::runtime_help::{
 use crate::runtime_logging::{error as log_error, info as log_info, warn as log_warn};
 use crate::runtime_options::{LuaInvocationContext, LuaRuntimeHostOptions, RuntimeSkillRoot};
 use crate::runtime_result::RuntimeInvocationResult;
-use crate::skill::dependencies::SkillDependencyManifest;
+use crate::skill::dependencies::PackageDependencyManifest;
 use crate::skill::manager::{
     PreparedSkillApply, ResolvedSkillInstance, SkillApplyResult, SkillInstallRequest,
     SkillManagementAuthority, SkillManager, SkillManagerConfig, SkillOperationPlane,
@@ -97,6 +122,9 @@ struct LoadedSkill {
     meta: SkillMeta,
     dir: std::path::PathBuf,
     root_name: String,
+    /// Trusted managed-runtime package context built by the skill loader.
+    /// 由 Skill 加载器构造的可信受管运行时包上下文。
+    managed_package: Arc<ManagedRuntimePackageContext>,
     lancedb_binding: Option<Arc<LanceDbSkillBinding>>,
     sqlite_binding: Option<Arc<SqliteSkillBinding>>,
     resolved_entry_names: HashMap<String, String>,
@@ -459,6 +487,66 @@ struct LuaVm {
     last_used_at: Instant,
 }
 
+/// Complete dependency context required to construct one isolated runlua-compatible VM.
+/// 构造单个隔离且兼容 runlua 的 VM 所需的完整依赖上下文。
+struct RunLuaVmBuildContext<'a> {
+    /// Loaded Skill registry visible to the new VM.
+    /// 新 VM 可见的已加载 Skill 注册表。
+    skills: &'a HashMap<String, LoadedSkill>,
+    /// Canonical entry registry visible to nested calls.
+    /// 嵌套调用可见的规范入口注册表。
+    entry_registry: &'a BTreeMap<String, ResolvedEntryTarget>,
+    /// Normalized host options shared with runtime bridges.
+    /// 与运行时桥接共享的规范化宿主选项。
+    host_options: Arc<LuaRuntimeHostOptions>,
+    /// Unified Skill configuration store installed into the runtime module.
+    /// 安装到运行时模块的统一 Skill 配置存储。
+    skill_config_store: Arc<SkillConfigStore>,
+    /// Runtime Skill roots used for dependency context resolution.
+    /// 用于依赖上下文解析的运行时 Skill 根。
+    runtime_skill_roots: Vec<RuntimeSkillRoot>,
+    /// Optional LanceDB host bridge visible to nested calls.
+    /// 嵌套调用可见的可选 LanceDB 宿主桥接。
+    lancedb_host: Option<Arc<LanceDbSkillHost>>,
+    /// Optional SQLite host bridge visible to nested calls.
+    /// 嵌套调用可见的可选 SQLite 宿主桥接。
+    sqlite_host: Option<Arc<SqliteSkillHost>>,
+    /// Engine-owned long-session, transaction, and event service.
+    /// 引擎所有的长期会话、事务与事件服务。
+    managed_runtime_services: Arc<ManagedRuntimeServices>,
+    /// Engine-owned short-lived worker service.
+    /// 引擎所有的短期 Worker 服务。
+    managed_runtime_workers: Arc<ManagedRuntimeWorkerService>,
+}
+
+impl<'a> RunLuaVmBuildContext<'a> {
+    /// Capture one VM build context from an engine and explicit visible registries.
+    /// 从引擎及显式可见注册表捕获一个 VM 构建上下文。
+    ///
+    /// `engine` supplies shared services while `skills` and `entry_registry` define VM visibility.
+    /// `engine` 提供共享服务，`skills` 与 `entry_registry` 定义 VM 可见性。
+    ///
+    /// Return one complete immutable construction context.
+    /// 返回一个完整不可变构造上下文。
+    fn from_engine(
+        engine: &LuaEngine,
+        skills: &'a HashMap<String, LoadedSkill>,
+        entry_registry: &'a BTreeMap<String, ResolvedEntryTarget>,
+    ) -> Self {
+        Self {
+            skills,
+            entry_registry,
+            host_options: Arc::clone(&engine.host_options),
+            skill_config_store: Arc::clone(&engine.skill_config_store),
+            runtime_skill_roots: engine.runtime_skill_roots.clone(),
+            lancedb_host: engine.lancedb_host.clone(),
+            sqlite_host: engine.sqlite_host.clone(),
+            managed_runtime_services: Arc::clone(&engine.managed_runtime_services),
+            managed_runtime_workers: Arc::clone(&engine.managed_runtime_workers),
+        }
+    }
+}
+
 /// Shared mutable state for the Lua VM pool.
 /// Lua 虚拟机池的共享可变状态。
 struct LuaVmPoolState {
@@ -665,7 +753,18 @@ pub struct LuaEngine {
     runtime_skill_roots: Vec<RuntimeSkillRoot>,
     pool: Arc<LuaVmPool>,
     runlua_pool: Arc<LuaVmPool>,
-    runtime_sessions: Arc<RuntimeSessionManager>,
+    /// Public runtime-session manager replaced together with ordinary Skill state.
+    /// 随普通 Skill 状态一同替换的公开运行时会话管理器。
+    public_runtime_sessions: Arc<RuntimeSessionManager>,
+    /// Dedicated System runtime-session manager preserved across ordinary Skill reloads.
+    /// 在普通 Skill 重载期间保持不变的专用 System 运行时会话管理器。
+    system_runtime_sessions: Arc<RuntimeSessionManager>,
+    /// Engine-owned managed process, transaction, and event lifecycle service.
+    /// 引擎拥有的受管进程、事务与事件生命周期服务。
+    managed_runtime_services: Arc<ManagedRuntimeServices>,
+    /// Engine-owned short-lived managed runtime worker service shared by every engine VM.
+    /// 由每个引擎 VM 共享的引擎所有短期受管运行时 Worker 服务。
+    managed_runtime_workers: Arc<ManagedRuntimeWorkerService>,
     skill_config_store: Arc<SkillConfigStore>,
     lancedb_host: Option<Arc<LanceDbSkillHost>>,
     sqlite_host: Option<Arc<SqliteSkillHost>>,
@@ -984,40 +1083,6 @@ fn required_skill_file_path_exists(
             render_log_friendly_path(skill_dir),
             error
         )),
-    }
-}
-
-/// Inspect whether one managed-runtime source file is a regular file without hiding probe errors.
-/// 检查单个受管运行时源文件是否为普通文件，同时不隐藏探测错误。
-///
-/// The path parameter is the resolved source file path under the current skill directory.
-/// path 参数是当前 skill 目录下解析出的源文件路径。
-///
-/// The api_name parameter identifies the Lua-facing managed runtime API used in diagnostics.
-/// api_name 参数用于在诊断中标识面向 Lua 的受管运行时 API。
-///
-/// The field_name parameter names the request field that produced the source file path.
-/// field_name 参数命名产出源文件路径的请求字段。
-///
-/// Return true for a regular file, false for a confirmed missing file, or an explicit probe/configuration error.
-/// 普通文件返回 true，确认缺失文件返回 false；探测失败或配置无效时返回显式错误。
-fn managed_runtime_skill_file_is_file(
-    path: &Path,
-    api_name: &str,
-    field_name: &str,
-) -> Result<bool, mlua::Error> {
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => Ok(true),
-        Ok(_) => Err(mlua::Error::runtime(format!(
-            "{api_name}: {field_name} is not a file: {}",
-            render_log_friendly_path(path)
-        ))),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(mlua::Error::runtime(format!(
-            "{api_name}: failed to inspect {field_name} {}: {}",
-            render_log_friendly_path(path),
-            error
-        ))),
     }
 }
 
@@ -1726,6 +1791,9 @@ struct LuaCallDispatchEntry {
     /// Owning skill directory used to restore file context.
     /// 用于恢复文件上下文的所属 skill 目录。
     owner_skill_dir: PathBuf,
+    /// Trusted managed package context owned by the target Skill.
+    /// 目标 Skill 拥有的可信受管包上下文。
+    owner_managed_package: Arc<ManagedRuntimePackageContext>,
     /// Absolute entry file path used to restore file context.
     /// 用于恢复文件上下文的绝对入口文件路径。
     entry_path: PathBuf,
@@ -1858,6 +1926,7 @@ fn build_lua_call_dispatch_entries(
             local_name: target.local_name.clone(),
             root_name: skill.root_name.clone(),
             owner_skill_dir: skill.dir.clone(),
+            owner_managed_package: skill.managed_package.clone(),
             entry_path,
         });
     }
@@ -2092,6 +2161,20 @@ enum AnonymousLuaDependencyContext<'a> {
     PreserveCurrent,
 }
 
+/// Managed package-context behavior used while entering anonymous Lua execution.
+/// 进入匿名 Lua 执行时使用的受管包上下文行为。
+enum AnonymousLuaManagedPackageContext<'a> {
+    /// Clear any package inherited from a pooled or previous execution scope.
+    /// 清除从池化或此前执行作用域继承的任何包。
+    Clear,
+    /// Install one explicit trusted package for the anonymous execution scope.
+    /// 为匿名执行作用域安装一个显式可信包。
+    Set(&'a Arc<ManagedRuntimePackageContext>),
+    /// Preserve the package already installed by the surrounding execution scope.
+    /// 保留外围执行作用域已经安装的包。
+    PreserveCurrent,
+}
+
 /// Lua context metadata required before executing anonymous Lua code.
 /// 执行匿名 Lua 代码前所需的 Lua 上下文元数据。
 struct AnonymousLuaExecutionContext<'a> {
@@ -2107,6 +2190,9 @@ struct AnonymousLuaExecutionContext<'a> {
     /// Dependency context behavior for this anonymous execution mode.
     /// 当前匿名执行模式的依赖上下文行为。
     dependency_context: AnonymousLuaDependencyContext<'a>,
+    /// Managed package behavior for this anonymous execution mode.
+    /// 当前匿名执行模式的受管包行为。
+    managed_package_context: AnonymousLuaManagedPackageContext<'a>,
 }
 
 /// Resolved nested skill call target used to enter one `vulcan.call`.
@@ -2127,6 +2213,9 @@ struct LuaNestedCallTarget<'a> {
     /// Absolute owning skill directory used for file and dependency context.
     /// 用于文件与依赖上下文的所属 skill 绝对目录。
     owner_skill_dir: &'a Path,
+    /// Trusted managed package context owned by the nested target.
+    /// 嵌套目标拥有的可信受管包上下文。
+    owner_managed_package: &'a Arc<ManagedRuntimePackageContext>,
     /// Absolute Lua entry file path used for the nested file context.
     /// 用于嵌套文件上下文的 Lua 入口绝对路径。
     entry_path: &'a Path,
@@ -2166,6 +2255,7 @@ fn build_lua_nested_call_target<'a>(
         owner_local_name: &dispatch_entry.local_name,
         owner_root_name: &dispatch_entry.root_name,
         owner_skill_dir: &dispatch_entry.owner_skill_dir,
+        owner_managed_package: &dispatch_entry.owner_managed_package,
         entry_path: &dispatch_entry.entry_path,
         invocation_context,
         lancedb_binding: provider_bindings.lancedb,
@@ -2217,6 +2307,9 @@ fn populate_lua_nested_resource_contexts(
     host_options: &LuaRuntimeHostOptions,
     target: LuaNestedCallTarget<'_>,
 ) -> Result<(), String> {
+    // Target package context installed before any nested managed-runtime API can execute.
+    // 在任何嵌套受管运行时 API 执行前安装的目标包上下文。
+    replace_lua_managed_package_context(lua, Some(target.owner_managed_package.clone()));
     populate_vulcan_file_context(lua, Some(target.owner_skill_dir), Some(target.entry_path))?;
     populate_vulcan_dependency_context(
         lua,
@@ -2568,6 +2661,9 @@ struct LuaNestedOuterStateSnapshot {
     /// Captured file context.
     /// 已捕获的文件上下文。
     file_context: VulcanFileContextSnapshot,
+    /// Captured host-private managed package context.
+    /// 已捕获的宿主私有受管包上下文。
+    managed_package: Option<Arc<ManagedRuntimePackageContext>>,
 }
 
 /// Capture the complete outer state required to restore after one nested `vulcan.call`.
@@ -2587,6 +2683,7 @@ fn capture_lua_nested_outer_state(lua: &Lua) -> Result<LuaNestedOuterStateSnapsh
         sqlite_skill_name: capture_provider_skill_marker(&vulcan, "__sqlite_skill_name")?,
         internal_context: capture_vulcan_internal_execution_context(lua)?,
         file_context: capture_vulcan_file_context(lua)?,
+        managed_package: optional_lua_managed_package_context(lua),
     })
 }
 
@@ -2851,102 +2948,6 @@ fn current_vulcan_config_skill_id(lua: &Lua, api_name: &str) -> Result<String, m
         })
 }
 
-/// Resolve the current skill directory from `vulcan.context.skill_dir`.
-/// 从 `vulcan.context.skill_dir` 解析当前 skill 目录。
-fn current_vulcan_skill_dir(lua: &Lua, api_name: &str) -> Result<PathBuf, mlua::Error> {
-    let context = get_vulcan_context_table(lua).map_err(mlua::Error::runtime)?;
-    let skill_dir: Option<String> = context
-        .get("skill_dir")
-        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
-    let skill_dir = skill_dir
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| mlua::Error::runtime(format!("{api_name}: no active skill_dir")))?;
-    Ok(PathBuf::from(skill_dir))
-}
-
-/// Resolve the runtime root that owns one active skill directory.
-/// 解析拥有当前 skill 目录的 runtime 根目录。
-fn runtime_root_from_skill_dir(skill_dir: &Path, api_name: &str) -> Result<PathBuf, mlua::Error> {
-    skill_dir
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .ok_or_else(|| {
-            mlua::Error::runtime(format!(
-                "{api_name}: failed to derive runtime root from skill_dir {}",
-                render_log_friendly_path(skill_dir)
-            ))
-        })
-}
-
-/// Resolve one safe skill-relative file path.
-/// 解析一个安全的 skill 相对文件路径。
-fn resolve_managed_runtime_skill_file(
-    skill_dir: &Path,
-    relative_path: &str,
-    api_name: &str,
-    field_name: &str,
-) -> Result<PathBuf, mlua::Error> {
-    let path = Path::new(relative_path);
-    if relative_path.trim().is_empty()
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-    {
-        return Err(mlua::Error::runtime(format!(
-            "{api_name}: {field_name} must be a safe path under the skill directory"
-        )));
-    }
-    let resolved = skill_dir.join(path);
-    if !managed_runtime_skill_file_is_file(&resolved, api_name, field_name)? {
-        return Err(mlua::Error::runtime(format!(
-            "{api_name}: {field_name} not found: {}",
-            render_log_friendly_path(&resolved)
-        )));
-    }
-    Ok(resolved)
-}
-
-/// Load the current skill dependency manifest when it exists.
-/// 当当前 skill 存在依赖清单时加载它。
-fn load_current_managed_runtime_manifest(
-    skill_dir: &Path,
-    api_name: &str,
-) -> Result<SkillDependencyManifest, mlua::Error> {
-    let dependencies_path = skill_dir.join("dependencies.yaml");
-    // Required manifest file probe that preserves filesystem errors before reporting absence.
-    // 必需清单文件探测会在报告缺失前保留文件系统错误。
-    let manifest_exists = skill_dependency_manifest_path_exists(&dependencies_path)
-        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
-    if !manifest_exists {
-        return Err(mlua::Error::runtime(format!(
-            "{api_name}: dependencies.yaml is required for managed runtimes"
-        )));
-    }
-    SkillDependencyManifest::load_from_path(&dependencies_path).map_err(mlua::Error::runtime)
-}
-
-/// Load the current skill dependency manifest when status APIs can tolerate absence.
-/// 在状态 API 可容忍缺失时加载当前 skill 的依赖清单。
-fn load_optional_current_managed_runtime_manifest(
-    skill_dir: &Path,
-    api_name: &str,
-) -> Result<Option<SkillDependencyManifest>, mlua::Error> {
-    let dependencies_path = skill_dir.join("dependencies.yaml");
-    // Optional manifest file probe that distinguishes absence from filesystem probe failures.
-    // 可选清单文件探测会区分文件缺失与文件系统探测失败。
-    let manifest_exists = skill_dependency_manifest_path_exists(&dependencies_path)
-        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
-    if !manifest_exists {
-        return Ok(None);
-    }
-    SkillDependencyManifest::load_from_path(&dependencies_path)
-        .map(Some)
-        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))
-}
-
 /// Read one optional string field from a managed runtime invoke table.
 /// 从受管运行时 invoke 表读取一个可选字符串字段。
 fn managed_runtime_optional_string_field(
@@ -2986,6 +2987,453 @@ fn managed_runtime_optional_timeout_ms(
     optional_u64_arg(value, api_name, "timeout_ms")
 }
 
+/// Host-private Lua app-data slot containing the active resource transaction.
+/// 包含活动资源事务的宿主私有 Lua 应用数据槽。
+#[derive(Clone, Copy, Default)]
+struct ManagedRuntimeTransactionContextSlot {
+    /// Active evaluation transaction; absent outside a transactional lease eval.
+    /// 活动执行事务；事务型租约执行之外不存在。
+    context: Option<ManagedRuntimeTransactionContext>,
+}
+
+/// RAII Lua transaction scope restoring the previous app-data context on every exit path.
+/// 在每条退出路径上恢复此前应用数据上下文的 RAII Lua 事务作用域。
+struct LuaManagedRuntimeTransactionScopeGuard {
+    /// Lua VM whose host-private transaction slot is temporarily replaced.
+    /// 宿主私有事务槽被临时替换的 Lua VM。
+    lua: Lua,
+    /// Exact transaction context active before this scope.
+    /// 当前作用域前活动的精确事务上下文。
+    previous: Option<ManagedRuntimeTransactionContext>,
+}
+
+/// Return the engine-owned managed runtime services installed in one Lua VM.
+/// 返回安装在单个 Lua VM 中的引擎所有受管运行时服务。
+fn current_lua_managed_runtime_services(
+    lua: &Lua,
+    api_name: &str,
+) -> Result<Arc<ManagedRuntimeServices>, mlua::Error> {
+    // Cloned service reference released from the app-data borrow before any lock or launch.
+    // 在任何加锁或启动前解除应用数据借用的服务克隆。
+    let services = lua
+        .app_data_ref::<Arc<ManagedRuntimeServices>>()
+        .map(|services| Arc::clone(&services));
+    services.ok_or_else(|| {
+        mlua::Error::runtime(format!(
+            "{api_name}: managed runtime services are not installed"
+        ))
+    })
+}
+
+/// Return the engine-owned worker service installed in one Lua VM.
+/// 返回安装在单个 Lua VM 中的引擎所有 Worker 服务。
+///
+/// `lua` owns the app-data registry and `api_name` prefixes a stable missing-service error.
+/// `lua` 拥有应用数据注册表，`api_name` 为稳定的服务缺失错误添加前缀。
+///
+/// Return the exact service shared by every VM created from the same engine.
+/// 返回同一引擎创建的全部 VM 共享的精确服务。
+fn current_lua_managed_runtime_worker_service(
+    lua: &Lua,
+    api_name: &str,
+) -> Result<Arc<ManagedRuntimeWorkerService>, mlua::Error> {
+    // Cloned worker service released from the app-data borrow before pool access or process launch.
+    // 在访问池或启动进程前解除应用数据借用的 Worker 服务克隆。
+    let service = lua
+        .app_data_ref::<Arc<ManagedRuntimeWorkerService>>()
+        .map(|service| Arc::clone(&service));
+    service.ok_or_else(|| {
+        mlua::Error::runtime(format!(
+            "{api_name}: managed runtime worker service is not installed"
+        ))
+    })
+}
+
+/// Return the active evaluation transaction when one was installed.
+/// 返回已安装的活动执行事务。
+fn optional_lua_managed_runtime_transaction(lua: &Lua) -> Option<ManagedRuntimeTransactionContext> {
+    lua.app_data_ref::<ManagedRuntimeTransactionContextSlot>()
+        .and_then(|slot| slot.context)
+}
+
+/// Replace the active Lua resource transaction and return the previous context.
+/// 替换活动 Lua 资源事务并返回此前上下文。
+fn replace_lua_managed_runtime_transaction(
+    lua: &Lua,
+    context: Option<ManagedRuntimeTransactionContext>,
+) -> Option<ManagedRuntimeTransactionContext> {
+    lua.set_app_data(ManagedRuntimeTransactionContextSlot { context })
+        .and_then(|slot| slot.context)
+}
+
+impl LuaManagedRuntimeTransactionScopeGuard {
+    /// Install one optional transaction context until this guard is dropped.
+    /// 安装一个可选事务上下文，直到当前保护对象被释放。
+    fn install(lua: &Lua, context: Option<ManagedRuntimeTransactionContext>) -> Self {
+        // Exact previous context captured for nested or repeated execution safety.
+        // 为嵌套或重复执行安全捕获的精确此前上下文。
+        let previous = replace_lua_managed_runtime_transaction(lua, context);
+        Self {
+            lua: lua.clone(),
+            previous,
+        }
+    }
+}
+
+impl Drop for LuaManagedRuntimeTransactionScopeGuard {
+    /// Restore the exact previous transaction context without running Lua code.
+    /// 在不执行 Lua 代码的情况下恢复精确此前事务上下文。
+    fn drop(&mut self) {
+        replace_lua_managed_runtime_transaction(&self.lua, self.previous);
+    }
+}
+
+/// Default retained byte limit for each managed runtime session output stream.
+/// 每个受管运行时会话输出流默认保留的字节上限。
+const MANAGED_RUNTIME_SESSION_DEFAULT_BUFFER_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// Parse one strict managed Python or Node persistent-session request.
+/// 解析一个严格的受管 Python 或 Node 持久会话请求。
+fn parse_managed_runtime_session_open_request(
+    spec: LuaValue,
+    api_name: &str,
+    default_encoding: RuntimeTextEncoding,
+) -> Result<ManagedRuntimeSessionOpenRequest, mlua::Error> {
+    // Required Lua request table.
+    // 必需的 Lua 请求表。
+    let table = match spec {
+        LuaValue::Table(table) => table,
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "{api_name}: spec must be a table, got {}",
+                lua_value_type_name(&other)
+            )));
+        }
+    };
+    validate_managed_runtime_session_open_fields(&table, api_name)?;
+    // Required package-relative source file.
+    // 必需的包相对源文件。
+    let file = managed_runtime_optional_string_field(&table, api_name, "file")?
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| mlua::Error::runtime(format!("{api_name}: file is required")))?;
+    // Optional direct process argument array.
+    // 可选的直接进程参数数组。
+    let args = parse_managed_runtime_session_args(&table, api_name)?;
+    // Optional cwd resolved and authorized by the pure Rust launch layer.
+    // 由纯 Rust 启动层解析并授权的可选 cwd。
+    let cwd = managed_runtime_optional_string_field(&table, api_name, "cwd")?;
+    // Explicit or host-default stream encodings.
+    // 显式或宿主默认的流编码。
+    let stdout_encoding = managed_runtime_session_encoding_field(
+        &table,
+        "stdout_encoding",
+        api_name,
+        default_encoding,
+    )?;
+    let stderr_encoding = managed_runtime_session_encoding_field(
+        &table,
+        "stderr_encoding",
+        api_name,
+        default_encoding,
+    )?;
+    let stdin_encoding = managed_runtime_session_encoding_field(
+        &table,
+        "stdin_encoding",
+        api_name,
+        default_encoding,
+    )?;
+    // Positive per-stream byte limit converted without truncation.
+    // 无截断转换得到的正数每流字节上限。
+    let buffer_limit_bytes = match optional_u64_arg(
+        table
+            .get("buffer_limit_bytes")
+            .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?,
+        api_name,
+        "buffer_limit_bytes",
+    )? {
+        Some(0) => {
+            return Err(mlua::Error::runtime(format!(
+                "{api_name}: buffer_limit_bytes must be greater than zero"
+            )));
+        }
+        Some(value) => usize::try_from(value).map_err(|_| {
+            mlua::Error::runtime(format!(
+                "{api_name}: buffer_limit_bytes exceeds the platform usize range"
+            ))
+        })?,
+        None => MANAGED_RUNTIME_SESSION_DEFAULT_BUFFER_LIMIT_BYTES,
+    };
+    Ok(ManagedRuntimeSessionOpenRequest {
+        file,
+        args,
+        cwd,
+        stdout_encoding,
+        stderr_encoding,
+        stdin_encoding,
+        buffer_limit_bytes,
+    })
+}
+
+/// Reject every unknown field in a managed runtime session open request.
+/// 拒绝受管运行时会话打开请求中的每个未知字段。
+fn validate_managed_runtime_session_open_fields(
+    table: &Table,
+    api_name: &str,
+) -> Result<(), mlua::Error> {
+    for pair in table.clone().pairs::<LuaValue, LuaValue>() {
+        // Outer request key decoded as UTF-8 text.
+        // 解码为 UTF-8 文本的外层请求键。
+        let (key, _value) =
+            pair.map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
+        let LuaValue::String(key) = key else {
+            return Err(mlua::Error::runtime(format!(
+                "{api_name}: request keys must be strings"
+            )));
+        };
+        // Stable field name checked against the complete session contract.
+        // 针对完整会话契约检查的稳定字段名称。
+        let key = key.to_str().map_err(|error| {
+            mlua::Error::runtime(format!("{api_name}: key is not UTF-8: {error}"))
+        })?;
+        if !matches!(
+            key.as_ref(),
+            "file"
+                | "args"
+                | "cwd"
+                | "stdout_encoding"
+                | "stderr_encoding"
+                | "stdin_encoding"
+                | "buffer_limit_bytes"
+        ) {
+            return Err(mlua::Error::runtime(format!(
+                "{api_name}: unknown field `{key}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Parse the optional dense string array passed as child-process arguments.
+/// 解析作为子进程参数传入的可选稠密字符串数组。
+fn parse_managed_runtime_session_args(
+    table: &Table,
+    api_name: &str,
+) -> Result<Vec<String>, mlua::Error> {
+    // Raw args value distinguishing absence from a table contract.
+    // 区分缺失与表契约的原始 args 值。
+    let value: LuaValue = table
+        .get("args")
+        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
+    let args_table = match value {
+        LuaValue::Nil => return Ok(Vec::new()),
+        LuaValue::Table(table) => table,
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "{api_name}: args must be an array table or nil, got {}",
+                lua_value_type_name(&other)
+            )));
+        }
+    };
+    // Lua raw array length used to require a dense one-based sequence.
+    // 用于要求稠密一基序列的 Lua 原始数组长度。
+    let length = args_table.raw_len();
+    // Parsed argument strings in stable index order.
+    // 按稳定索引顺序解析的参数字符串。
+    let mut args = Vec::with_capacity(length);
+    for index in 1..=length {
+        // Required UTF-8 argument at the current dense array index.
+        // 当前稠密数组索引处必需的 UTF-8 参数。
+        let argument: mlua::String = args_table.get(index).map_err(|error| {
+            mlua::Error::runtime(format!(
+                "{api_name}: args[{index}] must be a string: {error}"
+            ))
+        })?;
+        args.push(
+            argument
+                .to_str()
+                .map_err(|error| {
+                    mlua::Error::runtime(format!("{api_name}: args[{index}] is not UTF-8: {error}"))
+                })?
+                .to_string(),
+        );
+    }
+    for pair in args_table.pairs::<LuaValue, LuaValue>() {
+        // Actual argument-table key verified against the dense index range.
+        // 针对稠密索引范围验证的实际参数表键。
+        let (key, _value) =
+            pair.map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
+        let LuaValue::Integer(index) = key else {
+            return Err(mlua::Error::runtime(format!(
+                "{api_name}: args must contain only integer array keys"
+            )));
+        };
+        if index < 1
+            || usize::try_from(index)
+                .ok()
+                .is_none_or(|index| index > length)
+        {
+            return Err(mlua::Error::runtime(format!(
+                "{api_name}: args must be a dense one-based array"
+            )));
+        }
+    }
+    Ok(args)
+}
+
+/// Parse one optional session encoding label with a trusted host default.
+/// 使用可信宿主默认值解析一个可选会话编码标签。
+fn managed_runtime_session_encoding_field(
+    table: &Table,
+    field_name: &str,
+    api_name: &str,
+    default_encoding: RuntimeTextEncoding,
+) -> Result<RuntimeTextEncoding, mlua::Error> {
+    // Optional explicit encoding label supplied by the package code.
+    // 包代码提供的可选显式编码标签。
+    let label = managed_runtime_optional_string_field(table, api_name, field_name)?;
+    match label {
+        Some(label) => RuntimeTextEncoding::parse(&label)
+            .map_err(|error| mlua::Error::runtime(format!("{api_name}: {field_name}: {error}"))),
+        None => Ok(default_encoding),
+    }
+}
+
+/// Require one bound System lease and build its managed-session event routing identity.
+/// 要求一个已绑定的 System 租约，并构造其受管会话事件路由身份。
+fn system_managed_runtime_session_event_identity(
+    package: &ManagedRuntimePackageContext,
+    api_name: &str,
+) -> Result<ManagedRuntimeSessionEventIdentity, mlua::Error> {
+    // System-only binding is mandatory because persistent sessions require lease ownership.
+    // System 专属绑定是必需的，因为长期会话必须拥有租约所有权。
+    let binding = package.lease_binding().ok_or_else(|| {
+        mlua::Error::runtime(format!(
+            "{api_name}: persistent managed sessions are available only inside a System Plugin lease"
+        ))
+    })?;
+    // Manager-issued lease identity guaranteed before System package evaluation begins.
+    // 在 System 包执行开始前保证存在的管理器签发租约身份。
+    let identity = binding.identity().ok_or_else(|| {
+        mlua::Error::runtime(format!("{api_name}: system lease identity is not bound"))
+    })?;
+    Ok(ManagedRuntimeSessionEventIdentity {
+        lease_id: identity.lease_id().to_string(),
+        sid: binding.sid().to_string(),
+        generation: identity.generation(),
+    })
+}
+
+/// Open one managed Python persistent session through the shared process userdata.
+/// 通过共享进程 userdata 打开一个受管 Python 持久会话。
+fn open_managed_python_session(
+    lua: &Lua,
+    spec: LuaValue,
+    default_encoding: RuntimeTextEncoding,
+) -> Result<AnyUserData, mlua::Error> {
+    // Stable API name used by validation and launch diagnostics.
+    // 校验与启动诊断使用的稳定 API 名称。
+    let api_name = "vulcan.runtime.python.session.open";
+    ensure_persistent_managed_runtime_session_platform_supported()
+        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
+    // Trusted System Plugin package whose lease owns every persistent session.
+    // 其租约拥有每个长期会话的可信 System Plugin 包。
+    let package = current_lua_managed_package_context(lua, api_name)?;
+    // Engine-owned resource and event lifecycle service.
+    // 引擎拥有的资源与事件生命周期服务。
+    let services = current_lua_managed_runtime_services(lua, api_name)?;
+    // Bound System identity is checked before transaction lookup for one stable package-kind error.
+    // 在查询事务前检查已绑定 System 身份，以获得稳定的包类型错误。
+    let event_identity = system_managed_runtime_session_event_identity(package.as_ref(), api_name)?;
+    // Active evaluation transaction required for deterministic rollback on any Lua failure.
+    // 为确保任何 Lua 失败都能确定性回滚而要求的活动执行事务。
+    let transaction = optional_lua_managed_runtime_transaction(lua).ok_or_else(|| {
+        mlua::Error::runtime(format!(
+            "{api_name}: persistent managed sessions require an active System lease evaluation"
+        ))
+    })?;
+    // Pre-launch reservation registered before any child output can occur.
+    // 在任何子进程输出发生前注册的启动前预留。
+    let reservation = services
+        .reserve_session(
+            package.owner_token(),
+            Some(transaction),
+            Some(event_identity),
+        )
+        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
+    // Optional package-agnostic observer publishing durable System events.
+    // 发布持久 System 事件的可选包无关观察器。
+    let observer = reservation.observer();
+    // Strict session launch request parsed from Lua.
+    // 从 Lua 解析得到的严格会话启动请求。
+    let request = parse_managed_runtime_session_open_request(spec, api_name, default_encoding)?;
+    // Pure Rust launch result owning the process tree and optional package snapshot cleanup.
+    // 拥有进程树与可选包快照清理的纯 Rust 启动结果。
+    let launch = launch_managed_python_session(package.as_ref(), request, observer)
+        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
+    // Live session id activated only after the process core is fully constructed.
+    // 仅在进程核心完整构造后激活的活动会话 id。
+    let (session_id, cleanup) = reservation
+        .activate(&launch.core, launch.cleanup)
+        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
+    create_managed_process_session_userdata(lua, launch.core, Some(cleanup), Some(session_id))
+}
+
+/// Open one managed Node persistent session through the shared process userdata.
+/// 通过共享进程 userdata 打开一个受管 Node 持久会话。
+fn open_managed_node_session(
+    lua: &Lua,
+    spec: LuaValue,
+    default_encoding: RuntimeTextEncoding,
+) -> Result<AnyUserData, mlua::Error> {
+    // Stable API name used by validation and launch diagnostics.
+    // 校验与启动诊断使用的稳定 API 名称。
+    let api_name = "vulcan.runtime.node.session.open";
+    ensure_persistent_managed_runtime_session_platform_supported()
+        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
+    // Trusted System Plugin package whose lease owns every persistent session.
+    // 其租约拥有每个长期会话的可信 System Plugin 包。
+    let package = current_lua_managed_package_context(lua, api_name)?;
+    // Engine-owned resource and event lifecycle service.
+    // 引擎拥有的资源与事件生命周期服务。
+    let services = current_lua_managed_runtime_services(lua, api_name)?;
+    // Bound System identity is checked before transaction lookup for one stable package-kind error.
+    // 在查询事务前检查已绑定 System 身份，以获得稳定的包类型错误。
+    let event_identity = system_managed_runtime_session_event_identity(package.as_ref(), api_name)?;
+    // Active evaluation transaction required for deterministic rollback on any Lua failure.
+    // 为确保任何 Lua 失败都能确定性回滚而要求的活动执行事务。
+    let transaction = optional_lua_managed_runtime_transaction(lua).ok_or_else(|| {
+        mlua::Error::runtime(format!(
+            "{api_name}: persistent managed sessions require an active System lease evaluation"
+        ))
+    })?;
+    // Pre-launch reservation registered before any child output can occur.
+    // 在任何子进程输出发生前注册的启动前预留。
+    let reservation = services
+        .reserve_session(
+            package.owner_token(),
+            Some(transaction),
+            Some(event_identity),
+        )
+        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
+    // Optional package-agnostic observer publishing durable System events.
+    // 发布持久 System 事件的可选包无关观察器。
+    let observer = reservation.observer();
+    // Strict session launch request parsed from Lua.
+    // 从 Lua 解析得到的严格会话启动请求。
+    let request = parse_managed_runtime_session_open_request(spec, api_name, default_encoding)?;
+    // Pure Rust launch result owning the process tree and unique Node snapshot cleanup.
+    // 拥有进程树与唯一 Node 快照清理的纯 Rust 启动结果。
+    let launch = launch_managed_node_session(package.as_ref(), request, observer)
+        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
+    // Live session id activated only after the process core is fully constructed.
+    // 仅在进程核心完整构造后激活的活动会话 id。
+    let (session_id, cleanup) = reservation
+        .activate(&launch.core, launch.cleanup)
+        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
+    create_managed_process_session_userdata(lua, launch.core, Some(cleanup), Some(session_id))
+}
+
 /// Default maximum number of warm workers kept for one managed runtime pool key.
 /// 单个受管运行时池键默认保留的最大热 worker 数量。
 const MANAGED_RUNTIME_WORKER_POOL_MAX_SIZE: usize = 4;
@@ -2993,6 +3441,15 @@ const MANAGED_RUNTIME_WORKER_POOL_MAX_SIZE: usize = 4;
 /// Default idle time before one excess managed runtime worker can be retired.
 /// 多余受管运行时 worker 默认可回收的空闲时间。
 const MANAGED_RUNTIME_WORKER_IDLE_TTL_SECS: u64 = 60;
+/// Maximum best-effort wait for one worker child or its pipe readers during teardown.
+/// Worker 清理期间等待单个子进程或其管道读取器的最大尽力时长。
+const MANAGED_RUNTIME_WORKER_TEARDOWN_TIMEOUT_SECS: u64 = 2;
+/// Maximum UTF-8 bytes accepted for one line-delimited Worker protocol record.
+/// 单条逐行 Worker 协议记录允许的最大 UTF-8 字节数。
+const MANAGED_RUNTIME_WORKER_PROTOCOL_LINE_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum queued protocol lines per Worker stream before reader backpressure is applied.
+/// 应用读取器背压前每个 Worker 流最多排队的协议行数。
+const MANAGED_RUNTIME_WORKER_CHANNEL_CAPACITY: usize = 4;
 
 /// Resolved invocation request for one managed child runtime.
 /// 单个受管子运行时的已解析调用请求。
@@ -3011,9 +3468,9 @@ struct ManagedRuntimeInvokeRequest {
     timeout_ms: Option<u64>,
 }
 
-/// Stable key that partitions managed runtime workers by kind, environment, and skill.
-/// 按类型、环境和 skill 隔离受管运行时 worker 的稳定键。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Stable key that partitions managed runtime workers by runtime, environment, and package.
+/// 按运行时、环境与包隔离受管运行时 Worker 的稳定键。
+#[derive(Debug, Clone)]
 struct ManagedRuntimeWorkerKey {
     /// Runtime kind name such as `python` or `node`.
     /// 运行时类型名称，例如 `python` 或 `node`。
@@ -3021,9 +3478,73 @@ struct ManagedRuntimeWorkerKey {
     /// Environment identity hash produced from dependency inputs.
     /// 基于依赖输入生成的环境身份哈希。
     env_hash: String,
-    /// Skill directory used to isolate module globals across skills.
-    /// 用于隔离不同 skill 模块全局状态的 skill 目录。
-    skill_dir: PathBuf,
+    /// Canonical environment directory preventing cross-runtime-root hash collisions.
+    /// 防止跨运行时根哈希碰撞的规范环境目录。
+    env_dir: PathBuf,
+    /// Stable trusted package identity isolating module globals across packages.
+    /// 在不同包之间隔离模块全局状态的稳定可信包身份。
+    package_identity: ManagedRuntimePackageIdentity,
+    /// Exact package-lifetime token preventing reuse after reload, close, or replace.
+    /// 防止在重载、关闭或替换后复用的精确包生命周期令牌。
+    owner_token: u64,
+    /// Weak retirement state that rejects stale in-flight VM calls without retaining the package.
+    /// 在不保留包的前提下拒绝陈旧执行中 VM 调用的弱退役状态。
+    owner_state: Weak<ManagedRuntimeOwnerState>,
+}
+
+impl ManagedRuntimeWorkerKey {
+    /// Verify that the exact package owner is still live and has not crossed retirement.
+    /// 验证精确包所有者仍然存活且尚未跨越退役边界。
+    ///
+    /// The function has no parameters and returns a stable lifecycle error for stale requests.
+    /// 此函数不接收参数，并针对陈旧请求返回稳定生命周期错误。
+    fn ensure_owner_active(&self) -> Result<(), String> {
+        let owner_state = self.owner_state.upgrade().ok_or_else(|| {
+            format!(
+                "managed runtime worker owner `{}` is no longer active",
+                self.owner_token
+            )
+        })?;
+        if owner_state.is_retired() {
+            return Err(format!(
+                "managed runtime worker owner `{}` is retired",
+                self.owner_token
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl PartialEq for ManagedRuntimeWorkerKey {
+    /// Compare stable partition fields while intentionally excluding the weak lifecycle handle.
+    /// 比较稳定分区字段，同时有意排除弱生命周期句柄。
+    ///
+    /// `other` is another worker key; the result is true only for the same exact pool partition.
+    /// `other` 是另一个 Worker 键；仅精确属于同一池分区时结果为 true。
+    fn eq(&self, other: &Self) -> bool {
+        self.runtime == other.runtime
+            && self.env_hash == other.env_hash
+            && self.env_dir == other.env_dir
+            && self.package_identity == other.package_identity
+            && self.owner_token == other.owner_token
+    }
+}
+
+impl Eq for ManagedRuntimeWorkerKey {}
+
+impl Hash for ManagedRuntimeWorkerKey {
+    /// Hash the same stable fields used by equality and exclude the non-identity weak handle.
+    /// 对与相等比较一致的稳定字段求哈希，并排除不属于身份的弱句柄。
+    ///
+    /// `state` receives deterministic partition bytes; this function returns no value.
+    /// `state` 接收确定性的分区字节；此函数不返回值。
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.runtime.hash(state);
+        self.env_hash.hash(state);
+        self.env_dir.hash(state);
+        self.package_identity.hash(state);
+        self.owner_token.hash(state);
+    }
 }
 
 /// Result returned by one managed runtime worker invocation.
@@ -3043,21 +3564,38 @@ struct ManagedRuntimeWorkerInvokeResult {
     discard_worker: bool,
 }
 
+/// Inseparable direct-child ownership and its pre-reserved final-reaper capacity.
+/// 不可分割的直接子进程所有权及其预留最终回收容量。
+struct ManagedRuntimeWorkerChildOwnership {
+    /// Direct child retained until definitive reap or static-reaper handoff.
+    /// 保留到确定回收或静态回收器交接为止的直接子进程。
+    child: Child,
+    /// Capacity guaranteeing that final handoff cannot fail after the process exists.
+    /// 保证进程存在后最终交接不会失败的容量许可。
+    reaper_permit: DetachedChildReaperPermit,
+}
+
 /// Worker process kept warm for repeated managed runtime invocations.
 /// 为重复受管运行时调用保持热状态的 worker 进程。
 struct ManagedRuntimeWorker {
-    /// Child process backing this worker.
-    /// 支撑当前 worker 的子进程。
-    child: Child,
+    /// Atomic child/permit ownership retained through final teardown.
+    /// 贯穿最终清理阶段保留的原子子进程与许可所有权。
+    child_ownership: Option<ManagedRuntimeWorkerChildOwnership>,
+    /// Full process-tree controller retained until the worker is destroyed.
+    /// 保留到 Worker 销毁为止的完整进程树控制器。
+    process_tree: ManagedChildProcessTree,
+    /// Optional immutable package snapshot retained for the complete worker lifetime.
+    /// 在完整 Worker 生命周期内保留的可选不可变包快照。
+    package_snapshot: Option<Arc<ManagedPackageSnapshot>>,
     /// Writable stdin pipe used to send line-delimited JSON requests.
     /// 用于发送按行分隔 JSON 请求的可写标准输入管道。
     stdin: ChildStdin,
     /// Receiver for line-delimited stdout envelopes.
     /// 接收按行分隔 stdout 信封的通道。
-    stdout_rx: mpsc::Receiver<String>,
+    stdout_rx: mpsc::Receiver<Result<String, String>>,
     /// Receiver for line-delimited stderr messages.
     /// 接收按行分隔 stderr 消息的通道。
-    stderr_rx: mpsc::Receiver<String>,
+    stderr_rx: mpsc::Receiver<Result<String, String>>,
     /// Background stdout reader handle.
     /// stdout 后台读取线程句柄。
     stdout_reader: Option<thread::JoinHandle<()>>,
@@ -3083,13 +3621,32 @@ struct ManagedRuntimeWorkerBucket {
     total_count: usize,
 }
 
-/// Process-wide managed runtime worker pool.
-/// 进程级受管运行时 worker 池。
+/// Lock-scoped worker checkout decision completed before any process creation.
+/// 在任何进程创建前于锁作用域内完成的 Worker 借出决策。
+enum ManagedRuntimeWorkerCheckout {
+    /// Existing idle worker detached for immediate reuse.
+    /// 为立即复用而分离的既有空闲 Worker。
+    Reused(Box<ManagedRuntimeWorker>),
+    /// Capacity slot reserved for one worker that must be spawned outside the pool lock.
+    /// 为必须在池锁外启动的 Worker 预留的容量槽。
+    SpawnReserved,
+}
+
+/// Mutable worker pool owned by one managed runtime worker service.
+/// 由单个受管运行时 Worker 服务拥有的可变 Worker 池。
 struct ManagedRuntimeWorkerPool {
-    /// Worker buckets partitioned by runtime kind, env hash, and skill directory.
-    /// 按运行时类型、环境哈希和 skill 目录分区的 worker 桶。
+    /// Worker buckets partitioned by runtime, environment, package, and owner lifetime.
+    /// 按运行时、环境、包及所有者生命周期分区的 Worker 桶。
     buckets: HashMap<ManagedRuntimeWorkerKey, ManagedRuntimeWorkerBucket>,
 }
+
+/// One shared lazy package snapshot initialization cell.
+/// 单个共享的延迟包快照初始化单元。
+type ManagedPackageSnapshotCell = Arc<OnceLock<Result<Arc<ManagedPackageSnapshot>, String>>>;
+
+/// Owner-partitioned immutable package snapshots retained by one worker service.
+/// 由单个 Worker 服务保留并按所有者分区的不可变包快照。
+type ManagedPackageSnapshotMap = HashMap<ManagedRuntimeWorkerKey, ManagedPackageSnapshotCell>;
 
 impl ManagedRuntimeWorkerPool {
     /// Create an empty managed runtime worker pool.
@@ -3102,67 +3659,84 @@ impl ManagedRuntimeWorkerPool {
 
     /// Reap idle workers beyond the minimum warm count for one key.
     /// 回收单个键下超过最小保温数量的空闲 worker。
-    fn reap_idle_locked(bucket: &mut ManagedRuntimeWorkerBucket) {
+    fn reap_idle_locked(bucket: &mut ManagedRuntimeWorkerBucket) -> Vec<ManagedRuntimeWorker> {
         let idle_limit = Duration::from_secs(MANAGED_RUNTIME_WORKER_IDLE_TTL_SECS);
         let now = Instant::now();
         let mut index = 0usize;
+        // Detached workers returned to the service for process teardown after unlocking.
+        // 返回给服务以便解锁后执行进程清理的分离 Worker。
+        let mut retired_workers = Vec::new();
         while index < bucket.available.len() {
             let should_remove = now
                 .checked_duration_since(bucket.available[index].last_used_at)
                 .map(|idle| idle >= idle_limit)
                 .unwrap_or(false);
             if should_remove {
-                bucket.available.swap_remove(index);
+                retired_workers.push(bucket.available.swap_remove(index));
                 bucket.total_count = bucket.total_count.saturating_sub(1);
             } else {
                 index += 1;
             }
         }
+        retired_workers
     }
 
-    /// Acquire one worker, returning whether it was reused from the pool.
-    /// 获取一个 worker，并返回它是否来自池复用。
-    fn acquire<F>(
+    /// Reserve one checkout decision without spawning or destroying a process under the pool lock.
+    /// 在池锁内预留一次借出决策，但不启动或销毁任何进程。
+    ///
+    /// `key` identifies the exact environment and package owner requesting a worker.
+    /// `key` 标识请求 Worker 的精确环境与包所有者。
+    ///
+    /// Returns a reuse/spawn decision plus idle workers that must be destroyed after unlocking.
+    /// 返回复用或启动决策，以及必须在解锁后销毁的空闲 Worker。
+    fn reserve(
         &mut self,
-        key: ManagedRuntimeWorkerKey,
-        mut factory: F,
-    ) -> Result<(ManagedRuntimeWorker, bool), String>
-    where
-        F: FnMut() -> Result<ManagedRuntimeWorker, String>,
-    {
-        let bucket = self
-            .buckets
-            .entry(key)
-            .or_insert_with(|| ManagedRuntimeWorkerBucket {
-                available: Vec::new(),
-                total_count: 0,
-            });
-        Self::reap_idle_locked(bucket);
+        key: &ManagedRuntimeWorkerKey,
+    ) -> Result<(ManagedRuntimeWorkerCheckout, Vec<ManagedRuntimeWorker>), String> {
+        key.ensure_owner_active()?;
+        let bucket =
+            self.buckets
+                .entry(key.clone())
+                .or_insert_with(|| ManagedRuntimeWorkerBucket {
+                    available: Vec::new(),
+                    total_count: 0,
+                });
+        let retired_workers = Self::reap_idle_locked(bucket);
         if let Some(mut worker) = bucket.available.pop() {
             worker.last_used_at = Instant::now();
-            return Ok((worker, true));
+            return Ok((
+                ManagedRuntimeWorkerCheckout::Reused(Box::new(worker)),
+                retired_workers,
+            ));
         }
         if bucket.total_count >= MANAGED_RUNTIME_WORKER_POOL_MAX_SIZE {
             return Err(format!(
                 "managed runtime worker pool is exhausted for this environment; max_size={MANAGED_RUNTIME_WORKER_POOL_MAX_SIZE}"
             ));
         }
-        bucket.total_count += 1;
-        match factory() {
-            Ok(mut worker) => {
-                worker.last_used_at = Instant::now();
-                Ok((worker, false))
-            }
-            Err(error) => {
-                bucket.total_count = bucket.total_count.saturating_sub(1);
-                Err(error)
-            }
-        }
+        bucket.total_count = bucket
+            .total_count
+            .checked_add(1)
+            .ok_or_else(|| "managed runtime worker pool count exhausted".to_string())?;
+        Ok((ManagedRuntimeWorkerCheckout::SpawnReserved, retired_workers))
     }
 
-    /// Return one healthy worker back into the pool.
-    /// 将一个健康 worker 归还到池中。
-    fn release(&mut self, key: ManagedRuntimeWorkerKey, mut worker: ManagedRuntimeWorker) {
+    /// Return one healthy worker or detach it when its exact owner has retired.
+    /// 归还一个健康 Worker；其精确所有者已退役时则将其分离。
+    ///
+    /// `key` identifies the original checkout bucket and `worker` is the completed worker.
+    /// `key` 标识原始借出桶，`worker` 是已完成调用的 Worker。
+    ///
+    /// Return detached workers that must be destroyed outside the pool lock.
+    /// 返回需要在池锁外销毁的分离 Worker 集合。
+    fn release(
+        &mut self,
+        key: ManagedRuntimeWorkerKey,
+        mut worker: ManagedRuntimeWorker,
+    ) -> Vec<ManagedRuntimeWorker> {
+        if key.ensure_owner_active().is_err() {
+            return vec![worker];
+        }
         worker.last_used_at = Instant::now();
         worker.fresh = false;
         let bucket = self
@@ -3170,10 +3744,13 @@ impl ManagedRuntimeWorkerPool {
             .entry(key)
             .or_insert_with(|| ManagedRuntimeWorkerBucket {
                 available: Vec::new(),
-                total_count: 0,
+                total_count: 1,
             });
+        if bucket.total_count == 0 {
+            bucket.total_count = 1;
+        }
         bucket.available.push(worker);
-        Self::reap_idle_locked(bucket);
+        Self::reap_idle_locked(bucket)
     }
 
     /// Discard one worker slot for a key after the worker exits or becomes invalid.
@@ -3186,105 +3763,652 @@ impl ManagedRuntimeWorkerPool {
             }
         }
     }
+
+    /// Retire one exact owner and detach every idle worker owned by it.
+    /// 退役一个精确所有者，并分离其拥有的全部空闲 Worker。
+    ///
+    /// `owner_token` is the immutable package-lifetime token being retired.
+    /// `owner_token` 是正在退役的不可变包生命周期令牌。
+    ///
+    /// Return idle workers that must be destroyed after releasing the pool lock.
+    /// 返回必须在释放池锁后销毁的空闲 Worker。
+    fn retire_owner(&mut self, owner_token: u64) -> Vec<ManagedRuntimeWorker> {
+        // Exact bucket keys selected before mutation to keep owner matching deterministic.
+        // 在修改前选出的精确桶键，用于保持所有者匹配的确定性。
+        let retired_keys: Vec<_> = self
+            .buckets
+            .keys()
+            .filter(|key| key.owner_token == owner_token)
+            .cloned()
+            .collect();
+        // Idle workers detached without running process teardown under the pool lock.
+        // 在不于池锁内执行进程清理的前提下分离的空闲 Worker。
+        let mut retired_workers = Vec::new();
+        for key in retired_keys {
+            if let Some(bucket) = self.buckets.remove(&key) {
+                retired_workers.extend(bucket.available);
+            }
+        }
+        retired_workers
+    }
+}
+
+/// Engine-owned service providing one isolated short-lived managed runtime worker pool.
+/// 提供单个隔离短期受管运行时 Worker 池的引擎所有服务。
+struct ManagedRuntimeWorkerService {
+    /// Mutable pool state isolated to the owning engine.
+    /// 隔离到所属引擎的可变池状态。
+    pool: Mutex<ManagedRuntimeWorkerPool>,
+    /// Lazily initialized immutable package snapshots keyed by exact worker ownership.
+    /// 按精确 Worker 所有权键控并延迟初始化的不可变包快照。
+    package_snapshots: Mutex<ManagedPackageSnapshotMap>,
+}
+
+impl ManagedRuntimeWorkerService {
+    /// Create one empty engine-owned worker service.
+    /// 创建一个空的引擎所有 Worker 服务。
+    ///
+    /// Return a shared service suitable for injection into every VM of one engine.
+    /// 返回适合注入单个引擎全部 VM 的共享服务。
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            pool: Mutex::new(ManagedRuntimeWorkerPool::new()),
+            package_snapshots: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Return one immutable owner-scoped package snapshot, creating it outside service locks.
+    /// 返回一个不可变的所有者作用域包快照，并在服务锁外创建它。
+    ///
+    /// `key` is the exact Worker key; `plan` and `package` are its authoritative source inputs.
+    /// `key` 是精确 Worker 键；`plan` 与 `package` 是其权威源输入。
+    ///
+    /// Returns the shared snapshot retained by both the service and every spawned Worker.
+    /// 返回由服务及每个已启动 Worker 共同保留的共享快照。
+    fn package_snapshot(
+        &self,
+        key: &ManagedRuntimeWorkerKey,
+        plan: &ManagedRuntimeEnvPlan,
+        package: &ManagedRuntimePackageContext,
+    ) -> Result<Arc<ManagedPackageSnapshot>, String> {
+        key.ensure_owner_active()?;
+        // Once cell selected under lock; recursive package copying happens only after unlock.
+        // 在锁内选择 Once 单元；递归包复制仅在解锁后发生。
+        let snapshot_cell = {
+            let mut snapshots = self.lock_package_snapshots();
+            Arc::clone(
+                snapshots
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(OnceLock::new())),
+            )
+        };
+        let result = snapshot_cell
+            .get_or_init(|| prepare_managed_package_snapshot(plan, package, ".ls-w").map(Arc::new))
+            .clone();
+        // A failed initialization is not cached for the owner lifetime because filesystem failures
+        // can be transient; pointer identity prevents an older waiter from deleting a newer retry cell.
+        // 初始化失败不会在整个所有者生命周期内缓存，因为文件系统故障可能是瞬态；指针身份可防止
+        // 旧等待方删除更新的重试单元。
+        if result.is_err() {
+            let mut snapshots = self.lock_package_snapshots();
+            if snapshots
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, &snapshot_cell))
+            {
+                snapshots.remove(key);
+            }
+            return result;
+        }
+        // Retirement can race snapshot construction while no service lock is held.
+        // 退役可能在未持有服务锁的快照构造期间发生竞态。
+        if let Err(error) = key.ensure_owner_active() {
+            let mut snapshots = self.lock_package_snapshots();
+            if snapshots
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, &snapshot_cell))
+            {
+                snapshots.remove(key);
+            }
+            return Err(error);
+        }
+        result
+    }
+
+    /// Acquire one worker from this engine's isolated pool.
+    /// 从当前引擎的隔离池中获取一个 Worker。
+    ///
+    /// `key` identifies the exact environment and owner; `factory` starts a missing worker.
+    /// `key` 标识精确环境与所有者，`factory` 在缺少 Worker 时启动新实例。
+    ///
+    /// Return the worker together with whether it was reused.
+    /// 返回 Worker 及其是否被复用。
+    fn acquire<F>(
+        &self,
+        key: ManagedRuntimeWorkerKey,
+        mut factory: F,
+    ) -> Result<(ManagedRuntimeWorker, bool), String>
+    where
+        F: FnMut() -> Result<ManagedRuntimeWorker, String>,
+    {
+        // Checkout decision and idle detachment finish before any blocking process work.
+        // 借出决策与空闲分离会在任何阻塞进程操作前完成。
+        let (checkout, retired_workers) = self.lock_pool().reserve(&key)?;
+        drop(retired_workers);
+        match checkout {
+            ManagedRuntimeWorkerCheckout::Reused(worker) => Ok((*worker, true)),
+            ManagedRuntimeWorkerCheckout::SpawnReserved => match factory() {
+                Ok(mut worker) => {
+                    worker.last_used_at = Instant::now();
+                    // Retirement may race the unlocked spawn and must invalidate the new worker.
+                    // 退役可能与解锁后的启动竞态，因此必须使新 Worker 失效。
+                    let owner_retired = {
+                        let mut pool = self.lock_pool();
+                        if key.ensure_owner_active().is_err() {
+                            pool.discard(&key);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if owner_retired {
+                        drop(worker);
+                        Err(format!(
+                            "managed runtime worker owner `{}` retired during worker startup",
+                            key.owner_token
+                        ))
+                    } else {
+                        Ok((worker, false))
+                    }
+                }
+                Err(error) => {
+                    self.lock_pool().discard(&key);
+                    Err(error)
+                }
+            },
+        }
+    }
+
+    /// Return one healthy worker, destroying it when its owner retired while it was active.
+    /// 归还一个健康 Worker；其所有者在活动期间退役时销毁该 Worker。
+    ///
+    /// `key` is the original checkout key and `worker` is the completed worker.
+    /// `key` 是原始借出键，`worker` 是已完成调用的 Worker。
+    fn release(&self, key: ManagedRuntimeWorkerKey, worker: ManagedRuntimeWorker) {
+        // Retired worker detached while holding the pool lock and dropped only after unlock.
+        // 持有池锁时分离、仅在解锁后释放的已退役 Worker。
+        let retired_workers = self.lock_pool().release(key, worker);
+        drop(retired_workers);
+    }
+
+    /// Discard one invalid worker and release its reserved pool slot.
+    /// 丢弃一个无效 Worker 并释放其预留池槽位。
+    ///
+    /// `key` identifies the checkout accounting entry and `worker` is always destroyed.
+    /// `key` 标识借出记账条目，`worker` 始终会被销毁。
+    fn discard(&self, key: &ManagedRuntimeWorkerKey, worker: ManagedRuntimeWorker) {
+        {
+            let mut pool = self.lock_pool();
+            pool.discard(key);
+        }
+        drop(worker);
+    }
+
+    /// Retire every worker belonging to one exact package lifetime.
+    /// 退役属于一个精确包生命周期的全部 Worker。
+    ///
+    /// `owner_token` irreversibly marks the live package state before pooled resources are detached.
+    /// `owner_token` 在分离池资源前不可逆地标记活动包状态。
+    fn retire_owner(&self, owner_token: u64) {
+        // Atomic retirement publication closes the race before either service lock is acquired.
+        // 原子退役发布会在获取任一服务锁前关闭竞态窗口。
+        let _ = retire_managed_runtime_owner_state(owner_token);
+        // Idle workers detached atomically before their potentially blocking process teardown.
+        // 在可能阻塞的进程清理前以原子方式分离的空闲 Worker。
+        let retired_workers = self.lock_pool().retire_owner(owner_token);
+        drop(retired_workers);
+        // Service ownership is removed after idle workers so active workers alone retain snapshots.
+        // 在空闲 Worker 之后移除服务所有权，使活动 Worker 成为快照的唯一保留方。
+        let retired_snapshots = {
+            let mut snapshots = self.lock_package_snapshots();
+            let retired_keys = snapshots
+                .keys()
+                .filter(|key| key.owner_token == owner_token)
+                .cloned()
+                .collect::<Vec<_>>();
+            retired_keys
+                .into_iter()
+                .filter_map(|key| snapshots.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        drop(retired_snapshots);
+    }
+
+    /// Acquire the isolated pool lock and recover any poisoned state.
+    /// 获取隔离池锁，并恢复任何中毒状态。
+    ///
+    /// Return the mutable pool guard scoped to this service.
+    /// 返回作用域限定于当前服务的可变池保护对象。
+    fn lock_pool(&self) -> MutexGuard<'_, ManagedRuntimeWorkerPool> {
+        self.pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Acquire the package snapshot registry lock and recover any poisoned state.
+    /// 获取包快照注册表锁，并恢复任何中毒状态。
+    fn lock_package_snapshots(&self) -> MutexGuard<'_, ManagedPackageSnapshotMap> {
+        self.package_snapshots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for ManagedRuntimeWorkerService {
+    /// Destroy every remaining idle worker when the owning engine service is released.
+    /// 当所属引擎服务被释放时销毁全部剩余空闲 Worker。
+    fn drop(&mut self) {
+        // Exclusive pool access available because the final Arc owner is being destroyed.
+        // 因最终 Arc 所有者正在销毁而可用的池独占访问。
+        let pool = self
+            .pool
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pool.buckets.clear();
+        self.package_snapshots
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
 }
 
 impl Drop for ManagedRuntimeWorker {
-    /// Terminate the worker child process when the Rust handle is dropped.
-    /// 当 Rust 句柄释放时终止 worker 子进程。
+    /// Terminate the full worker process tree and bound every teardown wait.
+    /// 终止完整 Worker 进程树，并限制每次清理等待。
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(ManagedRuntimeWorkerChildOwnership {
+            mut child,
+            reaper_permit,
+        }) = self.child_ownership.take()
+        {
+            let (errors, reaped) =
+                terminate_managed_runtime_worker_child_bounded(&mut child, &self.process_tree);
+            for error in errors {
+                log_warn(format!(
+                    "[LuaSkill:warn] managed runtime worker teardown failed: {error}"
+                ));
+            }
+            if reaped {
+                self.process_tree.clear_detached_guard();
+                drop(reaper_permit);
+            } else {
+                let keepalive = self
+                    .package_snapshot
+                    .take()
+                    .map(|snapshot| Box::new(move || drop(snapshot)) as Box<dyn FnOnce() + Send>);
+                self.process_tree
+                    .handoff_to_reaper(reaper_permit, child, keepalive);
+            }
+        }
+        let reader_deadline = Instant::now()
+            .checked_add(Duration::from_secs(
+                MANAGED_RUNTIME_WORKER_TEARDOWN_TIMEOUT_SECS,
+            ))
+            .unwrap_or_else(Instant::now);
         if let Some(handle) = self.stdout_reader.take() {
-            let _ = handle.join();
+            join_managed_runtime_reader_bounded(handle, "stdout", reader_deadline);
         }
         if let Some(handle) = self.stderr_reader.take() {
-            let _ = handle.join();
+            join_managed_runtime_reader_bounded(handle, "stderr", reader_deadline);
         }
     }
 }
 
-/// Return the process-wide managed runtime worker pool.
-/// 返回进程级受管运行时 worker 池。
-fn managed_runtime_worker_pool() -> &'static Mutex<ManagedRuntimeWorkerPool> {
-    static POOL: OnceLock<Mutex<ManagedRuntimeWorkerPool>> = OnceLock::new();
-    POOL.get_or_init(|| Mutex::new(ManagedRuntimeWorkerPool::new()))
+/// Terminate and reap one Worker process tree without any unbounded wait.
+/// 在不进行任何无界等待的前提下终止并回收一棵 Worker 进程树。
+///
+/// `child` is the direct process handle and `process_tree` owns every platform descendant strategy.
+/// `child` 是直接进程句柄，`process_tree` 拥有每个平台的后代进程策略。
+///
+/// Returns every teardown diagnostic while still attempting all fallback operations.
+/// 在仍尝试全部后备操作的同时返回每条清理诊断。
+fn terminate_managed_runtime_worker_child_bounded(
+    child: &mut Child,
+    process_tree: &ManagedChildProcessTree,
+) -> (Vec<String>, bool) {
+    let mut errors = Vec::new();
+    if let Err(error) = process_tree.terminate(child) {
+        errors.push(format!("process-tree termination: {error}"));
+    }
+    // Direct-child kill remains an independent fallback for a partially failed tree strategy.
+    // 直接子进程 kill 仍是进程树策略部分失败时的独立后备路径。
+    let direct_child_already_reaped = match child.try_wait() {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            if let Err(error) = child.kill() {
+                errors.push(format!("direct-child kill: {error}"));
+            }
+            false
+        }
+        Err(error) => {
+            errors.push(format!("initial direct-child status probe: {error}"));
+            false
+        }
+    };
+    let direct_child_reaped = if direct_child_already_reaped {
+        true
+    } else {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(
+                MANAGED_RUNTIME_WORKER_TEARDOWN_TIMEOUT_SECS,
+            ))
+            .unwrap_or_else(Instant::now);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Ok(None) => {
+                    errors.push("direct child did not exit before teardown deadline".to_string());
+                    break false;
+                }
+                Err(error) => {
+                    errors.push(format!("direct-child status probe: {error}"));
+                    break false;
+                }
+            }
+        }
+    };
+    // Snapshot ownership may be released only after both the direct Child and authoritative Job
+    // accounting converge. A failed tree probe deliberately forces static-reaper handoff.
+    // 仅当直接 Child 与权威 Job 记账均收敛后才可释放快照所有权；进程树探测失败会刻意强制
+    // 交接静态回收器。
+    let descendant_tree_empty = match process_tree.detached_tree_is_empty() {
+        Ok(empty) => empty,
+        Err(error) => {
+            errors.push(format!("process-tree convergence probe: {error}"));
+            false
+        }
+    };
+    (errors, direct_child_reaped && descendant_tree_empty)
 }
 
-/// Acquire the process-wide managed runtime worker pool and return its guard, recovering after lock poisoning.
-/// 获取并返回进程级受管运行时 worker 池保护对象；如果锁已 poison，则恢复继续使用。
-fn lock_managed_runtime_worker_pool() -> MutexGuard<'static, ManagedRuntimeWorkerPool> {
-    managed_runtime_worker_pool()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// Tear down an unpublished worker child and preserve ownership after a bounded timeout.
+/// 清理一个尚未发布的 Worker 子进程，并在有界超时后继续保留其所有权。
+///
+/// `child`, `process_tree`, and `permit` are the inseparable spawn result. Returns teardown
+/// diagnostics after either definitive reap or static-reaper handoff.
+/// `child`、`process_tree` 与 `permit` 是不可分割的启动结果。确定回收或交接静态回收器后，
+/// 返回清理诊断。
+fn teardown_unpublished_managed_runtime_worker(
+    mut child: Child,
+    process_tree: &ManagedChildProcessTree,
+    permit: DetachedChildReaperPermit,
+    keepalive: Option<Box<dyn FnOnce() + Send>>,
+) -> Vec<String> {
+    let (errors, reaped) = terminate_managed_runtime_worker_child_bounded(&mut child, process_tree);
+    if reaped {
+        process_tree.clear_detached_guard();
+        drop(permit);
+    } else {
+        process_tree.handoff_to_reaper(permit, child, keepalive);
+    }
+    errors
 }
 
-/// Spawn a line reader that forwards every line into a channel.
-/// 启动一个逐行读取器，并将每一行转发到通道。
+/// Join one worker pipe reader only within the shared teardown deadline.
+/// 仅在共享清理截止时间内等待一个 Worker 管道读取器。
+///
+/// `handle` owns the reader thread, `stream_name` labels diagnostics, and `deadline` bounds waiting.
+/// `handle` 拥有读取线程，`stream_name` 标识诊断，`deadline` 限制等待。
+fn join_managed_runtime_reader_bounded(
+    handle: thread::JoinHandle<()>,
+    stream_name: &str,
+    deadline: Instant,
+) {
+    while !handle.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if handle.is_finished() {
+        if handle.join().is_err() {
+            log_warn(format!(
+                "[LuaSkill:warn] managed runtime worker {stream_name} reader panicked"
+            ));
+        }
+    } else {
+        // Dropping a still-running handle detaches it so engine teardown can never block forever.
+        // 释放仍在运行的句柄会将其分离，使引擎清理永远不会无限阻塞。
+        log_warn(format!(
+            "[LuaSkill:warn] managed runtime worker {stream_name} reader exceeded teardown deadline and was detached"
+        ));
+        drop(handle);
+    }
+}
+
+/// Spawn one bounded line reader that forwards protocol records into a finite channel.
+/// 启动一个有界逐行读取器，并将协议记录转发到有限通道。
+///
+/// `reader` is one child pipe, `sender` applies bounded backpressure, and `stream_name` labels errors.
+/// `reader` 是一个子进程管道，`sender` 应用有界背压，`stream_name` 标识错误。
+///
+/// Returns a join handle or a thread-creation error without panicking.
+/// 返回线程 join 句柄，或返回线程创建错误且不触发 panic。
 fn spawn_managed_runtime_line_reader<R>(
     reader: R,
-    sender: mpsc::Sender<String>,
-) -> thread::JoinHandle<()>
+    sender: mpsc::SyncSender<Result<String, String>>,
+    stream_name: &'static str,
+) -> Result<thread::JoinHandle<()>, String>
 where
     R: std::io::Read + Send + 'static,
 {
-    thread::spawn(move || {
-        let reader = BufReader::new(reader);
-        for line in reader.lines() {
-            match line {
-                Ok(line) => {
-                    if sender.send(line).is_err() {
-                        break;
-                    }
+    thread::Builder::new()
+        .name(format!("managed-runtime-worker-{stream_name}"))
+        .spawn(move || {
+            let mut reader = BufReader::new(reader);
+            loop {
+                let record = match read_managed_runtime_worker_line(&mut reader) {
+                    Ok(Some(record)) => record,
+                    Ok(None) => break,
+                    Err(error) => Err(format!(
+                        "managed runtime worker {stream_name} read failed: {error}"
+                    )),
+                };
+                let terminal_error = record.is_err();
+                if sender.send(record).is_err() || terminal_error {
+                    break;
                 }
-                Err(_) => break,
             }
-        }
-    })
+        })
+        .map_err(|error| format!("spawn managed runtime worker {stream_name} reader: {error}"))
 }
 
-/// Build one worker pool key for a managed runtime plan and active skill directory.
-/// 基于受管运行时计划与当前 skill 目录构造一个 worker 池键。
+/// Read one newline-delimited Worker record while discarding bytes beyond the hard limit.
+/// 读取一条换行分隔 Worker 记录，同时丢弃超过硬上限的字节。
+///
+/// `reader` remains positioned immediately after the consumed newline or EOF.
+/// `reader` 在返回时定位于已消费换行符之后或 EOF。
+///
+/// Returns `None` only for clean EOF before any byte, otherwise one UTF-8 record or bounded error.
+/// 仅在读取任何字节前遇到干净 EOF 时返回 `None`，否则返回一条 UTF-8 记录或有界错误。
+fn read_managed_runtime_worker_line<R>(
+    reader: &mut R,
+) -> Result<Option<Result<String, String>>, std::io::Error>
+where
+    R: BufRead,
+{
+    // Retained prefix never grows beyond the protocol limit even for a missing newline.
+    // 即使缺少换行符，保留前缀也永远不会超过协议上限。
+    let mut retained = Vec::new();
+    let mut saw_input = false;
+    let mut overflowed = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if !saw_input {
+                return Ok(None);
+            }
+            break;
+        }
+        saw_input = true;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        let content_len = newline.unwrap_or(consumed);
+        if !overflowed {
+            let remaining =
+                MANAGED_RUNTIME_WORKER_PROTOCOL_LINE_LIMIT_BYTES.saturating_sub(retained.len());
+            let copied = content_len.min(remaining);
+            retained.extend_from_slice(&available[..copied]);
+            overflowed = copied < content_len;
+        }
+        reader.consume(consumed);
+        if newline.is_some() {
+            break;
+        }
+    }
+    if retained.last() == Some(&b'\r') {
+        retained.pop();
+    }
+    if overflowed {
+        return Ok(Some(Err(format!(
+            "managed runtime worker protocol line exceeded {MANAGED_RUNTIME_WORKER_PROTOCOL_LINE_LIMIT_BYTES} bytes"
+        ))));
+    }
+    match String::from_utf8(retained) {
+        Ok(line) => Ok(Some(Ok(line))),
+        Err(error) => Ok(Some(Err(format!(
+            "managed runtime worker protocol line is not valid UTF-8: {error}"
+        )))),
+    }
+}
+
+/// Build one worker-pool key from a managed runtime plan and trusted package identity.
+/// 根据受管运行时计划与可信包身份构造 Worker 池键。
 fn managed_runtime_worker_key(
     plan: &ManagedRuntimeEnvPlan,
-    skill_dir: &Path,
+    package: &ManagedRuntimePackageContext,
 ) -> ManagedRuntimeWorkerKey {
     ManagedRuntimeWorkerKey {
         runtime: plan.runtime.as_str().to_string(),
         env_hash: plan.env_hash.clone(),
-        skill_dir: normalize_runtime_root_path(skill_dir),
+        env_dir: normalize_runtime_root_path(&plan.env_dir),
+        package_identity: package.identity().clone(),
+        owner_token: package.owner_token(),
+        owner_state: package.owner_state(),
     }
 }
 
 /// Spawn a new managed runtime worker from a prepared command.
 /// 从已准备好的命令启动一个新的受管运行时 worker。
+#[cfg(test)]
 fn spawn_managed_runtime_worker(command: &mut Command) -> Result<ManagedRuntimeWorker, String> {
+    spawn_managed_runtime_worker_with_snapshot(command, None)
+}
+
+/// Spawn one Worker while retaining its immutable package snapshot through partial rollback.
+/// 启动一个 Worker，并让其不可变包快照跨越部分回滚继续保留。
+fn spawn_managed_runtime_worker_with_snapshot(
+    command: &mut Command,
+    package_snapshot: Option<Arc<ManagedPackageSnapshot>>,
+) -> Result<ManagedRuntimeWorker, String> {
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("failed to spawn managed runtime worker: {error}"))?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "managed runtime worker stdin pipe is unavailable".to_string())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "managed runtime worker stdout pipe is unavailable".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "managed runtime worker stderr pipe is unavailable".to_string())?;
-    let (stdout_tx, stdout_rx) = mpsc::channel();
-    let (stderr_tx, stderr_rx) = mpsc::channel();
+    let attach_keepalive = package_snapshot.as_ref().map(|snapshot| {
+        let snapshot = Arc::clone(snapshot);
+        Box::new(move || drop(snapshot)) as Box<dyn FnOnce() + Send>
+    });
+    let (mut child, process_tree, reaper_permit) = ManagedChildProcessTree::spawn_with_keepalive(
+        command,
+        "managed runtime worker",
+        attach_keepalive,
+    )?;
+    let (stdin, stdout, stderr) =
+        match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
+            (Some(stdin), Some(stdout), Some(stderr)) => (stdin, stdout, stderr),
+            _ => {
+                let cleanup_errors = teardown_unpublished_managed_runtime_worker(
+                    child,
+                    &process_tree,
+                    reaper_permit,
+                    package_snapshot.as_ref().map(|snapshot| {
+                        let snapshot = Arc::clone(snapshot);
+                        Box::new(move || drop(snapshot)) as Box<dyn FnOnce() + Send>
+                    }),
+                );
+                return Err(if cleanup_errors.is_empty() {
+                    "managed runtime worker pipe is unavailable".to_string()
+                } else {
+                    format!(
+                        "managed runtime worker pipe is unavailable; cleanup also failed: {}",
+                        cleanup_errors.join("; ")
+                    )
+                });
+            }
+        };
+    let (stdout_tx, stdout_rx) = mpsc::sync_channel(MANAGED_RUNTIME_WORKER_CHANNEL_CAPACITY);
+    let (stderr_tx, stderr_rx) = mpsc::sync_channel(MANAGED_RUNTIME_WORKER_CHANNEL_CAPACITY);
+    // Reader creation is fallible so an OS thread limit cannot strand the already spawned tree.
+    // 读取器创建是可失败的，因此操作系统线程限制不会遗留已经启动的进程树。
+    let stdout_reader = match spawn_managed_runtime_line_reader(stdout, stdout_tx, "stdout") {
+        Ok(handle) => handle,
+        Err(error) => {
+            let cleanup_errors = teardown_unpublished_managed_runtime_worker(
+                child,
+                &process_tree,
+                reaper_permit,
+                package_snapshot.as_ref().map(|snapshot| {
+                    let snapshot = Arc::clone(snapshot);
+                    Box::new(move || drop(snapshot)) as Box<dyn FnOnce() + Send>
+                }),
+            );
+            return Err(if cleanup_errors.is_empty() {
+                error
+            } else {
+                format!(
+                    "{error}; cleanup also failed: {}",
+                    cleanup_errors.join("; ")
+                )
+            });
+        }
+    };
+    let stderr_reader = match spawn_managed_runtime_line_reader(stderr, stderr_tx, "stderr") {
+        Ok(handle) => handle,
+        Err(error) => {
+            let cleanup_errors = teardown_unpublished_managed_runtime_worker(
+                child,
+                &process_tree,
+                reaper_permit,
+                package_snapshot.as_ref().map(|snapshot| {
+                    let snapshot = Arc::clone(snapshot);
+                    Box::new(move || drop(snapshot)) as Box<dyn FnOnce() + Send>
+                }),
+            );
+            let reader_deadline = Instant::now()
+                .checked_add(Duration::from_secs(
+                    MANAGED_RUNTIME_WORKER_TEARDOWN_TIMEOUT_SECS,
+                ))
+                .unwrap_or_else(Instant::now);
+            join_managed_runtime_reader_bounded(stdout_reader, "stdout", reader_deadline);
+            return Err(if cleanup_errors.is_empty() {
+                error
+            } else {
+                format!(
+                    "{error}; cleanup also failed: {}",
+                    cleanup_errors.join("; ")
+                )
+            });
+        }
+    };
     Ok(ManagedRuntimeWorker {
-        child,
+        child_ownership: Some(ManagedRuntimeWorkerChildOwnership {
+            child,
+            reaper_permit,
+        }),
+        process_tree,
+        package_snapshot,
         stdin,
         stdout_rx,
         stderr_rx,
-        stdout_reader: Some(spawn_managed_runtime_line_reader(stdout, stdout_tx)),
-        stderr_reader: Some(spawn_managed_runtime_line_reader(stderr, stderr_tx)),
+        stdout_reader: Some(stdout_reader),
+        stderr_reader: Some(stderr_reader),
         last_used_at: Instant::now(),
         fresh: true,
     })
@@ -3293,11 +4417,68 @@ fn spawn_managed_runtime_worker(command: &mut Command) -> Result<ManagedRuntimeW
 /// Drain any currently buffered stderr lines from one managed runtime worker.
 /// 排空一个受管运行时 worker 当前已缓冲的 stderr 行。
 fn drain_managed_runtime_worker_stderr(worker: &ManagedRuntimeWorker) -> String {
-    let mut lines = Vec::new();
-    while let Ok(line) = worker.stderr_rx.try_recv() {
-        lines.push(line);
+    let mut output = String::new();
+    let mut dropped_bytes = 0usize;
+    while let Ok(record) = worker.stderr_rx.try_recv() {
+        let line = match record {
+            Ok(line) => line,
+            Err(error) => format!("[worker stderr reader error: {error}]"),
+        };
+        if !output.is_empty() {
+            append_bounded_worker_diagnostic(&mut output, "\n", &mut dropped_bytes);
+        }
+        append_bounded_worker_diagnostic(&mut output, &line, &mut dropped_bytes);
     }
-    lines.join("\n")
+    if dropped_bytes > 0 {
+        let marker = format!("\n[worker stderr truncated; dropped_bytes={dropped_bytes}]");
+        // Marker replaces the tail if necessary so diagnostics remain within the same hard bound.
+        // 必要时标记会替换尾部，使诊断仍保持在同一硬上限内。
+        while output.len().saturating_add(marker.len())
+            > MANAGED_RUNTIME_WORKER_PROTOCOL_LINE_LIMIT_BYTES
+        {
+            output.pop();
+        }
+        output.push_str(&marker);
+    }
+    output
+}
+
+/// Append UTF-8 diagnostic text without allowing the destination to exceed the protocol bound.
+/// 追加 UTF-8 诊断文本，同时不允许目标超过协议上限。
+///
+/// `output` is retained text, `text` is the incoming fragment, and `dropped_bytes` accumulates loss.
+/// `output` 是保留文本，`text` 是传入片段，`dropped_bytes` 累计丢弃量。
+fn append_bounded_worker_diagnostic(output: &mut String, text: &str, dropped_bytes: &mut usize) {
+    let remaining = MANAGED_RUNTIME_WORKER_PROTOCOL_LINE_LIMIT_BYTES.saturating_sub(output.len());
+    if text.len() <= remaining {
+        output.push_str(text);
+        return;
+    }
+    let mut retained_bytes = remaining.min(text.len());
+    while retained_bytes > 0 && !text.is_char_boundary(retained_bytes) {
+        retained_bytes -= 1;
+    }
+    output.push_str(&text[..retained_bytes]);
+    *dropped_bytes = dropped_bytes.saturating_add(text.len().saturating_sub(retained_bytes));
+}
+
+/// Build one explicit diagnostic after the managed worker stdout protocol closes unexpectedly.
+/// 在受管 Worker stdout 协议意外关闭后构造一条显式诊断。
+///
+/// `worker` retains the authoritative direct-child handle. Returns a message including its
+/// nonblocking exit status probe without converting an observation failure into a panic.
+/// `worker` 保留权威直接子进程句柄；返回包含非阻塞退出状态探测的消息，且不会把观察失败
+/// 转换为 panic。
+fn managed_runtime_worker_stdout_closed_error(worker: &mut ManagedRuntimeWorker) -> String {
+    let status = match worker.child_ownership.as_mut() {
+        Some(ownership) => match ownership.child.try_wait() {
+            Ok(Some(status)) => format!("exited with {status}"),
+            Ok(None) => "is still running".to_string(),
+            Err(error) => format!("status probe failed: {error}"),
+        },
+        None => "has no direct-child ownership".to_string(),
+    };
+    format!("managed runtime worker stdout closed; child {status}")
 }
 
 /// Invoke one already leased managed runtime worker with one JSON request.
@@ -3310,6 +4491,27 @@ fn invoke_managed_runtime_worker(
 ) -> (ManagedRuntimeWorker, ManagedRuntimeWorkerInvokeResult) {
     let mut discard_worker = false;
     let mut timed_out = false;
+    // Stale raw stderr proves a prior protocol cycle was not clean and prevents unsafe reuse.
+    // 陈旧原始 stderr 证明上一协议周期不干净，因此阻止不安全复用。
+    let stale_stderr = drain_managed_runtime_worker_stderr(&worker);
+    if !stale_stderr.is_empty() {
+        let envelope = json!({
+            "ok": false,
+            "value": null,
+            "stdout": "",
+            "stderr": stale_stderr,
+            "error": "managed runtime worker produced raw stderr outside its response envelope",
+        });
+        return (
+            worker,
+            ManagedRuntimeWorkerInvokeResult {
+                envelope,
+                timed_out,
+                worker_reused,
+                discard_worker: true,
+            },
+        );
+    }
     let payload_text = match serde_json::to_string(payload) {
         Ok(payload_text) => payload_text,
         Err(error) => {
@@ -3375,27 +4577,29 @@ fn invoke_managed_runtime_worker(
             .stdout_rx
             .recv_timeout(Duration::from_millis(timeout_ms))
         {
-            Ok(line) => Ok(line),
+            Ok(line) => line,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 timed_out = true;
                 discard_worker = true;
-                let _ = worker.child.kill();
+                if let Some(child_ownership) = worker.child_ownership.as_mut() {
+                    let _ = child_ownership.child.kill();
+                }
                 Err("managed runtime worker timed out".to_string())
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 discard_worker = true;
-                Err("managed runtime worker stdout closed".to_string())
+                Err(managed_runtime_worker_stdout_closed_error(&mut worker))
             }
         },
         None => match worker.stdout_rx.recv() {
-            Ok(line) => Ok(line),
+            Ok(line) => line,
             Err(_) => {
                 discard_worker = true;
-                Err("managed runtime worker stdout closed".to_string())
+                Err(managed_runtime_worker_stdout_closed_error(&mut worker))
             }
         },
     };
-    let envelope = match line_result {
+    let mut envelope = match line_result {
         Ok(line) => match serde_json::from_str::<Value>(&line) {
             // Worker envelope parsed from the line-delimited stdout protocol.
             // 从按行分隔 stdout 协议解析得到的 worker 信封。
@@ -3427,6 +4631,13 @@ fn invoke_managed_runtime_worker(
             "error": error,
         }),
     };
+    // Raw child stderr is surfaced on every cycle and makes the Worker non-reusable.
+    // 每个协议周期都会暴露子进程原始 stderr，并使该 Worker 不可复用。
+    let raw_stderr = drain_managed_runtime_worker_stderr(&worker);
+    if !raw_stderr.is_empty() {
+        discard_worker = true;
+        merge_managed_runtime_worker_raw_stderr(&mut envelope, &raw_stderr);
+    }
     (
         worker,
         ManagedRuntimeWorkerInvokeResult {
@@ -3436,6 +4647,38 @@ fn invoke_managed_runtime_worker(
             discard_worker,
         },
     )
+}
+
+/// Merge bounded raw child stderr into one Worker envelope without growing it without limit.
+/// 将有界子进程原始 stderr 合并到一个 Worker 信封中，且不允许其无限增长。
+///
+/// `envelope` is the current protocol object and `raw_stderr` is already host-side bounded text.
+/// `envelope` 是当前协议对象，`raw_stderr` 是已在宿主侧限制大小的文本。
+fn merge_managed_runtime_worker_raw_stderr(envelope: &mut Value, raw_stderr: &str) {
+    let Some(object) = envelope.as_object_mut() else {
+        return;
+    };
+    let existing = object
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut merged = String::new();
+    let mut dropped_bytes = 0usize;
+    append_bounded_worker_diagnostic(&mut merged, existing, &mut dropped_bytes);
+    if !merged.is_empty() {
+        append_bounded_worker_diagnostic(&mut merged, "\n", &mut dropped_bytes);
+    }
+    append_bounded_worker_diagnostic(&mut merged, raw_stderr, &mut dropped_bytes);
+    if dropped_bytes > 0 {
+        let marker = format!("\n[combined stderr truncated; dropped_bytes={dropped_bytes}]");
+        while merged.len().saturating_add(marker.len())
+            > MANAGED_RUNTIME_WORKER_PROTOCOL_LINE_LIMIT_BYTES
+        {
+            merged.pop();
+        }
+        merged.push_str(&marker);
+    }
+    object.insert("stderr".to_string(), Value::String(merged));
 }
 
 /// Build one explicit managed runtime worker protocol error envelope.
@@ -3563,6 +4806,23 @@ fn validate_managed_runtime_worker_optional_nullable_string_field(
     }
 }
 
+/// Read one optional non-negative byte counter from a Worker envelope, defaulting to zero.
+/// 从 Worker 信封读取一个可选非负字节计数器，缺失时默认为零。
+///
+/// `object` is the validated envelope map and `field_name` identifies the counter.
+/// `object` 是已校验信封映射，`field_name` 标识计数器。
+fn managed_runtime_worker_optional_u64_envelope_field(
+    object: &serde_json::Map<String, Value>,
+    field_name: &str,
+) -> Result<u64, String> {
+    match object.get(field_name) {
+        None => Ok(0),
+        Some(value) => value.as_u64().ok_or_else(|| {
+            format!("managed runtime worker envelope field `{field_name}` must be a non-negative integer")
+        }),
+    }
+}
+
 /// Validate one managed runtime worker JSON envelope before pooling decisions are made.
 /// 在作出池化决策之前校验单个受管运行时 worker JSON 信封。
 ///
@@ -3582,6 +4842,8 @@ fn validate_managed_runtime_worker_envelope(envelope: &Value) -> Result<(), Stri
     managed_runtime_worker_required_envelope_field(object, "value")?;
     managed_runtime_worker_required_string_envelope_field(object, "stdout")?;
     managed_runtime_worker_required_string_envelope_field(object, "stderr")?;
+    managed_runtime_worker_optional_u64_envelope_field(object, "stdout_dropped_bytes")?;
+    managed_runtime_worker_optional_u64_envelope_field(object, "stderr_dropped_bytes")?;
     validate_managed_runtime_worker_optional_nullable_string_field(object, "trace")?;
     if !ok {
         // Error text required when the worker reports a failed handler invocation.
@@ -3633,6 +4895,12 @@ fn managed_runtime_worker_validated_result_to_json(
     let stderr = Value::String(
         managed_runtime_worker_required_string_envelope_field(object, "stderr")?.to_string(),
     );
+    // Bounded capture diagnostics report bytes omitted inside the language wrapper.
+    // 有界捕获诊断报告语言包装器内部省略的字节数。
+    let stdout_dropped_bytes =
+        managed_runtime_worker_optional_u64_envelope_field(object, "stdout_dropped_bytes")?;
+    let stderr_dropped_bytes =
+        managed_runtime_worker_optional_u64_envelope_field(object, "stderr_dropped_bytes")?;
     // Optional worker error value exposed only when the envelope included it.
     // 仅在信封包含时暴露的可选 worker 错误值。
     let error = match object.get("error") {
@@ -3651,6 +4919,8 @@ fn managed_runtime_worker_validated_result_to_json(
         "value": value,
         "stdout": stdout,
         "stderr": stderr,
+        "stdout_dropped_bytes": stdout_dropped_bytes,
+        "stderr_dropped_bytes": stderr_dropped_bytes,
         "error": error,
         "trace": trace,
         "status": if result.timed_out { Value::Null } else { json!(0) },
@@ -3685,6 +4955,8 @@ fn managed_runtime_worker_protocol_result_json(
         "value": null,
         "stdout": "",
         "stderr": "",
+        "stdout_dropped_bytes": 0,
+        "stderr_dropped_bytes": 0,
         "error": error,
         "trace": Value::Null,
         "status": if result.timed_out { Value::Null } else { json!(0) },
@@ -3769,6 +5041,9 @@ fn parse_managed_runtime_invoke_request(
 /// Return a status object that preserves readiness-check errors instead of hiding them as not-ready state.
 /// 返回一个保留就绪检查错误的状态对象，而不是把错误隐藏成未就绪状态。
 fn managed_runtime_status_from_plan(plan: &ManagedRuntimeEnvPlan) -> Value {
+    // Side-effect-free target capability included regardless of environment readiness.
+    // 无论环境是否就绪都包含的无副作用目标能力。
+    let persistent_session = current_managed_runtime_persistent_session_capability();
     // Readiness check result returned by inspecting the managed environment marker.
     // 通过检查受管环境标记得到的就绪检测结果。
     let readiness_result = managed_env_is_ready(plan);
@@ -3785,6 +5060,7 @@ fn managed_runtime_status_from_plan(plan: &ManagedRuntimeEnvPlan) -> Value {
             "package_manager_executable": render_host_visible_path(&plan.package_manager_executable),
             "env_hash": plan.env_hash,
             "env_dir": render_host_visible_path(&plan.env_dir),
+            "persistent_session": persistent_session,
             "message": if ready {
                 "managed runtime environment is ready"
             } else {
@@ -3803,6 +5079,7 @@ fn managed_runtime_status_from_plan(plan: &ManagedRuntimeEnvPlan) -> Value {
             "package_manager_executable": render_host_visible_path(&plan.package_manager_executable),
             "env_hash": plan.env_hash,
             "env_dir": render_host_visible_path(&plan.env_dir),
+            "persistent_session": persistent_session,
             "message": "managed runtime environment status check failed",
             "error": error,
         }),
@@ -3821,11 +5098,82 @@ import sys
 import traceback
 
 MODULE_CACHE = {}
+ACTIVE_SNAPSHOT_ROOT = None
+MAX_CAPTURE_BYTES = 256 * 1024
+MAX_ENVELOPE_BYTES = 2 * 1024 * 1024
+
+class BoundedTextCapture(io.TextIOBase):
+    """Retain a bounded UTF-8 prefix while accounting for dropped bytes.
+    保留有界 UTF-8 前缀并统计丢弃字节。"""
+
+    def __init__(self):
+        """Initialize one empty bounded capture.
+        初始化一个空的有界捕获器。"""
+        self._bytes = bytearray()
+        self.dropped_bytes = 0
+
+    def write(self, value):
+        """Append text without allowing retained memory to exceed the hard limit.
+        追加文本且不允许保留内存超过硬上限。"""
+        text = str(value)
+        encoded = text.encode("utf-8", errors="replace")
+        remaining = max(0, MAX_CAPTURE_BYTES - len(self._bytes))
+        retained = min(remaining, len(encoded))
+        self._bytes.extend(encoded[:retained])
+        self.dropped_bytes += len(encoded) - retained
+        return len(text)
+
+    def flush(self):
+        """Provide the TextIO flush contract without external buffering.
+        提供 TextIO flush 契约且不使用外部缓冲。"""
+        return None
+
+    def getvalue(self):
+        """Decode the retained UTF-8 prefix for the response envelope.
+        为响应信封解码保留的 UTF-8 前缀。"""
+        return bytes(self._bytes).decode("utf-8", errors="replace")
+
+def encode_envelope(envelope, stdout_buffer, stderr_buffer):
+    """Serialize one bounded response and replace oversized or invalid values with an error.
+    序列化一个有界响应，并用错误替换过大或无效的值。"""
+    try:
+        encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) <= MAX_ENVELOPE_BYTES:
+            return encoded
+        error = f"managed runtime worker envelope exceeded {MAX_ENVELOPE_BYTES} bytes"
+    except Exception as exc:
+        error = f"handler result is not JSON serializable: {exc}"
+    fallback = {
+        "ok": False,
+        "value": None,
+        "stdout": stdout_buffer.getvalue(),
+        "stderr": stderr_buffer.getvalue(),
+        "stdout_dropped_bytes": stdout_buffer.dropped_bytes,
+        "stderr_dropped_bytes": stderr_buffer.dropped_bytes,
+        "error": error,
+        "trace": traceback.format_exc(),
+    }
+    return json.dumps(fallback, ensure_ascii=False, separators=(",", ":"))
+
+def configure_snapshot_root(request):
+    """Install exactly one immutable package import root for this pooled worker.
+    为当前池化 Worker 安装唯一不可变包导入根。"""
+    global ACTIVE_SNAPSHOT_ROOT
+    snapshot_root = request.get("snapshot_root")
+    if not isinstance(snapshot_root, str) or not snapshot_root:
+        raise RuntimeError("managed Python worker snapshot_root must be a non-empty string")
+    if ACTIVE_SNAPSHOT_ROOT is None:
+        sys.path[:] = [entry for entry in sys.path if entry not in ("", snapshot_root)]
+        sys.path.insert(0, snapshot_root)
+        ACTIVE_SNAPSHOT_ROOT = snapshot_root
+    elif ACTIVE_SNAPSHOT_ROOT != snapshot_root:
+        raise RuntimeError("managed Python worker snapshot_root changed within one worker")
 
 def handle(request):
-    stdout_buffer = io.StringIO()
-    stderr_buffer = io.StringIO()
+    stdout_buffer = BoundedTextCapture()
+    stderr_buffer = BoundedTextCapture()
     try:
+        configure_snapshot_root(request)
         file_path = request["file"]
         module = MODULE_CACHE.get(file_path)
         if module is None:
@@ -3839,27 +5187,26 @@ def handle(request):
         handler = getattr(module, request.get("handler") or "main")
         with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
             value = handler(request.get("args") or {}, request.get("ctx") or {})
-        envelope = {"ok": True, "value": value, "stdout": stdout_buffer.getvalue(), "stderr": stderr_buffer.getvalue()}
+        envelope = {
+            "ok": True,
+            "value": value,
+            "stdout": stdout_buffer.getvalue(),
+            "stderr": stderr_buffer.getvalue(),
+            "stdout_dropped_bytes": stdout_buffer.dropped_bytes,
+            "stderr_dropped_bytes": stderr_buffer.dropped_bytes,
+        }
     except Exception as exc:
         envelope = {
             "ok": False,
             "value": None,
             "stdout": stdout_buffer.getvalue(),
             "stderr": stderr_buffer.getvalue(),
+            "stdout_dropped_bytes": stdout_buffer.dropped_bytes,
+            "stderr_dropped_bytes": stderr_buffer.dropped_bytes,
             "error": str(exc),
             "trace": traceback.format_exc(),
         }
-    try:
-        return json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
-    except Exception as exc:
-        return json.dumps({
-            "ok": False,
-            "value": None,
-            "stdout": stdout_buffer.getvalue(),
-            "stderr": stderr_buffer.getvalue(),
-            "error": f"handler result is not JSON serializable: {exc}",
-            "trace": traceback.format_exc(),
-        }, ensure_ascii=False, separators=(",", ":"))
+    return encode_envelope(envelope, stdout_buffer, stderr_buffer)
 
 for line in sys.stdin:
     try:
@@ -3871,6 +5218,8 @@ for line in sys.stdin:
             "value": None,
             "stdout": "",
             "stderr": "",
+            "stdout_dropped_bytes": 0,
+            "stderr_dropped_bytes": 0,
             "error": str(exc),
             "trace": traceback.format_exc(),
         }, ensure_ascii=False, separators=(",", ":"))
@@ -3887,15 +5236,83 @@ const readline = require("readline");
 const { pathToFileURL } = require("url");
 
 const moduleCache = new Map();
+const MAX_CAPTURE_BYTES = 256 * 1024;
+const MAX_ENVELOPE_BYTES = 2 * 1024 * 1024;
+
+// Create one bounded UTF-8 capture with explicit dropped-byte accounting.
+// 创建一个带显式丢弃字节统计的有界 UTF-8 捕获器。
+function createBoundedCapture() {
+  const chunks = [];
+  let retainedBytes = 0;
+  let droppedBytes = 0;
+  let lineCount = 0;
+  return {
+    write(value) {
+      const encoded = Buffer.from(String(value), "utf8");
+      const remaining = Math.max(0, MAX_CAPTURE_BYTES - retainedBytes);
+      const retained = Math.min(remaining, encoded.length);
+      if (retained > 0) {
+        chunks.push(encoded.subarray(0, retained));
+        retainedBytes += retained;
+      }
+      droppedBytes += encoded.length - retained;
+    },
+    writeLine(value) {
+      if (lineCount > 0) {
+        this.write("\n");
+      }
+      this.write(value);
+      lineCount += 1;
+    },
+    text() {
+      return Buffer.concat(chunks, retainedBytes).toString("utf8");
+    },
+    droppedBytes() {
+      return droppedBytes;
+    },
+  };
+}
+
+// Serialize one bounded response and replace oversized or invalid values with an error.
+// 序列化一个有界响应，并用错误替换过大或无效的值。
+function encodeEnvelope(envelope, stdout, stderr) {
+  try {
+    const encoded = JSON.stringify(envelope);
+    if (Buffer.byteLength(encoded, "utf8") <= MAX_ENVELOPE_BYTES) {
+      return encoded;
+    }
+    throw new Error(`managed runtime worker envelope exceeded ${MAX_ENVELOPE_BYTES} bytes`);
+  } catch (error) {
+    return JSON.stringify({
+      ok: false,
+      value: null,
+      stdout: stdout.text(),
+      stderr: stderr.text(),
+      stdout_dropped_bytes: stdout.droppedBytes(),
+      stderr_dropped_bytes: stderr.droppedBytes(),
+      error: error && error.message ? error.message : String(error),
+      trace: error && error.stack ? error.stack : null,
+    });
+  }
+}
 
 async function handle(request) {
-  const stdout = [];
-  const stderr = [];
-  const originalConsole = { ...console };
-  console.log = (...args) => stdout.push(args.map(String).join(" "));
-  console.info = (...args) => stdout.push(args.map(String).join(" "));
-  console.warn = (...args) => stderr.push(args.map(String).join(" "));
-  console.error = (...args) => stderr.push(args.map(String).join(" "));
+  const stdout = createBoundedCapture();
+  const stderr = createBoundedCapture();
+  // Preserve only the four methods replaced below. Copying and assigning the complete native
+  // Console object also rewrites its internal stream state and can crash Node 18.
+  // 仅保留下方会替换的四个方法。复制并回写完整原生 Console 对象还会改写其内部流状态，
+  // 并可能导致 Node 18 崩溃。
+  const originalConsole = {
+    log: console.log,
+    info: console.info,
+    warn: console.warn,
+    error: console.error,
+  };
+  console.log = (...args) => stdout.writeLine(args.map(String).join(" "));
+  console.info = (...args) => stdout.writeLine(args.map(String).join(" "));
+  console.warn = (...args) => stderr.writeLine(args.map(String).join(" "));
+  console.error = (...args) => stderr.writeLine(args.map(String).join(" "));
   try {
     let module = moduleCache.get(request.file);
     if (!module) {
@@ -3911,18 +5328,30 @@ async function handle(request) {
     // JSON.stringify omits undefined object properties, so normalize absent handler results to null.
     // JSON.stringify 会省略 undefined 对象属性，因此将 handler 的空返回归一化为 null。
     const normalizedValue = value === undefined ? null : value;
-    return JSON.stringify({ ok: true, value: normalizedValue, stdout: stdout.join("\n"), stderr: stderr.join("\n") });
+    return encodeEnvelope({
+      ok: true,
+      value: normalizedValue,
+      stdout: stdout.text(),
+      stderr: stderr.text(),
+      stdout_dropped_bytes: stdout.droppedBytes(),
+      stderr_dropped_bytes: stderr.droppedBytes(),
+    }, stdout, stderr);
   } catch (error) {
-    return JSON.stringify({
+    return encodeEnvelope({
       ok: false,
       value: null,
-      stdout: stdout.join("\n"),
-      stderr: stderr.join("\n"),
+      stdout: stdout.text(),
+      stderr: stderr.text(),
+      stdout_dropped_bytes: stdout.droppedBytes(),
+      stderr_dropped_bytes: stderr.droppedBytes(),
       error: error && error.message ? error.message : String(error),
       trace: error && error.stack ? error.stack : null,
-    });
+    }, stdout, stderr);
   } finally {
-    Object.assign(console, originalConsole);
+    console.log = originalConsole.log;
+    console.info = originalConsole.info;
+    console.warn = originalConsole.warn;
+    console.error = originalConsole.error;
   }
 }
 
@@ -3937,6 +5366,8 @@ rl.on("line", async (line) => {
       value: null,
       stdout: "",
       stderr: "",
+      stdout_dropped_bytes: 0,
+      stderr_dropped_bytes: 0,
       error: error && error.message ? error.message : String(error),
       trace: error && error.stack ? error.stack : null,
     }) + "\n");
@@ -3945,151 +5376,27 @@ rl.on("line", async (line) => {
 "#
 }
 
-/// Prepare one Node.js import root that keeps native ESM bare-import resolution inside the managed env.
-/// 准备一个 Node.js import 根目录，使原生 ESM bare import 解析停留在受管环境内。
+/// Prepare one test-only Node package snapshot through the production RAII implementation.
+/// 通过生产 RAII 实现准备一个仅用于测试的 Node 包快照。
+#[cfg(test)]
 fn prepare_managed_node_import_root(
     plan: &ManagedRuntimeEnvPlan,
-    skill_dir: &Path,
-) -> Result<PathBuf, String> {
-    let import_root = plan.env_dir.join(".luaskills-skill");
-    remove_managed_node_import_root_if_present(&import_root)?;
-    copy_managed_node_skill_import_root(skill_dir, &import_root)?;
-    Ok(import_root)
+    package: &ManagedRuntimePackageContext,
+) -> Result<ManagedPackageSnapshot, String> {
+    prepare_unleased_managed_package_snapshot(plan, package, ".ls-t")
 }
 
-/// Remove one stale managed Node import root before recreating it for the current skill.
-/// 在为当前 skill 重新创建前删除单个陈旧的受管 Node import 根目录。
-///
-/// The import_root parameter is the concrete `.luaskills-skill` path inside one managed Node env.
-/// import_root 参数是单个受管 Node 环境内具体的 `.luaskills-skill` 路径。
-///
-/// Return Ok when the root is absent or removed, and return an explicit error for probe or removal failures.
-/// 根目录不存在或已删除时返回 Ok；探测或删除失败时返回显式错误。
-fn remove_managed_node_import_root_if_present(import_root: &Path) -> Result<(), String> {
-    let metadata = match fs::symlink_metadata(import_root) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(format!(
-                "Failed to inspect {}: {}",
-                render_log_friendly_path(import_root),
-                error
-            ));
-        }
-    };
-
-    if managed_node_import_root_should_remove_as_file(import_root, &metadata)? {
-        fs::remove_file(import_root).map_err(|error| {
-            format!(
-                "Failed to remove {}: {}",
-                render_log_friendly_path(import_root),
-                error
-            )
-        })?;
-    } else {
-        fs::remove_dir_all(import_root).map_err(|error| {
-            format!(
-                "Failed to remove {}: {}",
-                render_log_friendly_path(import_root),
-                error
-            )
-        })?;
-    }
-    Ok(())
-}
-
-/// Decide whether one existing managed Node import root should be removed as a file.
-/// 判断单个既有受管 Node import 根目录是否应按文件方式删除。
-///
-/// The import_root parameter is the concrete `.luaskills-skill` path being cleaned.
-/// import_root 参数是正在清理的具体 `.luaskills-skill` 路径。
-///
-/// The metadata parameter is the non-following metadata already read for the import root path.
-/// metadata 参数是已经为 import root 路径读取到的不跟随符号链接元数据。
-///
-/// Return true for symlinks that should be removed with remove_file, false for directory-style removal.
-/// 应通过 remove_file 删除的符号链接返回 true；应按目录方式删除时返回 false。
-fn managed_node_import_root_should_remove_as_file(
-    import_root: &Path,
-    metadata: &fs::Metadata,
-) -> Result<bool, String> {
-    if !metadata.file_type().is_symlink() {
-        return Ok(false);
-    }
-    match fs::metadata(import_root) {
-        Ok(target_metadata) => Ok(!target_metadata.is_dir()),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
-        Err(error) => Err(format!(
-            "Failed to inspect {}: {}",
-            render_log_friendly_path(import_root),
-            error
-        )),
-    }
-}
-
-/// Recursively copy one skill directory into a managed Node.js import root.
-/// 将单个 skill 目录递归复制到受管 Node.js import 根目录。
-fn copy_managed_node_skill_import_root(source: &Path, destination: &Path) -> Result<(), String> {
-    fs::create_dir_all(destination).map_err(|error| {
-        format!(
-            "Failed to create {}: {}",
-            render_log_friendly_path(destination),
-            error
-        )
-    })?;
-    for entry in fs::read_dir(source).map_err(|error| {
-        format!(
-            "Failed to read {}: {}",
-            render_log_friendly_path(source),
-            error
-        )
-    })? {
-        let entry = entry.map_err(|error| {
-            format!(
-                "Failed to read directory entry under {}: {}",
-                render_log_friendly_path(source),
-                error
-            )
-        })?;
-        let name = entry.file_name();
-        if name == "node_modules" {
-            continue;
-        }
-        let source_path = entry.path();
-        let destination_path = destination.join(&name);
-        let file_type = entry.file_type().map_err(|error| {
-            format!(
-                "Failed to inspect {} under {}: {}",
-                render_log_friendly_path(&source_path),
-                render_log_friendly_path(source),
-                error
-            )
-        })?;
-        if file_type.is_dir() {
-            copy_managed_node_skill_import_root(&source_path, &destination_path)?;
-        } else if file_type.is_file() {
-            fs::copy(&source_path, &destination_path).map_err(|error| {
-                format!(
-                    "Failed to copy {} to {}: {}",
-                    render_log_friendly_path(&source_path),
-                    render_log_friendly_path(&destination_path),
-                    error
-                )
-            })?;
-        } else {
-            return Err(format!(
-                "Failed to copy {} to {}: unsupported file type",
-                render_log_friendly_path(&source_path),
-                render_log_friendly_path(&destination_path)
-            ));
-        }
-    }
-    Ok(())
+/// Recursively copy one package directory into a managed Node.js import root.
+/// 将单个包目录递归复制到受管 Node.js import 根目录。
+#[cfg(test)]
+fn copy_managed_node_package_import_root(source: &Path, destination: &Path) -> Result<(), String> {
+    crate::runtime::managed_runtime_session::copy_managed_package_tree(source, destination)
 }
 
 /// Invoke one managed runtime payload through a pooled worker.
 /// 通过池化 worker 调用一个受管运行时载荷。
 fn invoke_pooled_managed_runtime<F>(
+    worker_service: &ManagedRuntimeWorkerService,
     key: ManagedRuntimeWorkerKey,
     plan: &ManagedRuntimeEnvPlan,
     payload: &Value,
@@ -4099,20 +5406,15 @@ fn invoke_pooled_managed_runtime<F>(
 where
     F: FnMut() -> Result<ManagedRuntimeWorker, String>,
 {
-    let (worker, worker_reused) = {
-        let mut pool = lock_managed_runtime_worker_pool();
-        pool.acquire(key.clone(), &mut factory)?
-    };
+    let (worker, worker_reused) = worker_service.acquire(key.clone(), &mut factory)?;
     let (worker, result) =
         invoke_managed_runtime_worker(worker, payload, timeout_ms, worker_reused);
     let discard_worker = result.discard_worker;
     let result_json = managed_runtime_worker_result_to_json(result, plan);
-    let mut pool = lock_managed_runtime_worker_pool();
     if discard_worker {
-        drop(worker);
-        pool.discard(&key);
+        worker_service.discard(&key, worker);
     } else {
-        pool.release(key, worker);
+        worker_service.release(key, worker);
     }
     Ok(result_json)
 }
@@ -4120,33 +5422,81 @@ where
 /// Invoke one Python handler through the managed Python environment.
 /// 通过受管 Python 环境调用一个 Python 处理函数。
 fn invoke_managed_python(lua: &Lua, spec: LuaValue) -> Result<LuaValue, mlua::Error> {
+    // Stable API name used by every validation and runtime diagnostic.
+    // 所有校验与运行时诊断使用的稳定 API 名称。
     let api_name = "vulcan.runtime.python.invoke";
+    // Strict invocation request decoded from the Lua value.
+    // 从 Lua 值严格解码得到的调用请求。
     let request = parse_managed_runtime_invoke_request(spec, api_name, "main")?;
-    let skill_dir = current_vulcan_skill_dir(lua, api_name)?;
-    let runtime_root = runtime_root_from_skill_dir(&skill_dir, api_name)?;
-    let manifest = load_current_managed_runtime_manifest(&skill_dir, api_name)?;
+    // Trusted package context installed by the engine before entering package code.
+    // 引擎在进入包代码前安装的可信包上下文。
+    let package = current_lua_managed_package_context(lua, api_name)?;
+    // Engine-owned worker service installed in every VM created by this engine.
+    // 安装在当前引擎所创建全部 VM 中的引擎所有 Worker 服务。
+    let worker_service = current_lua_managed_runtime_worker_service(lua, api_name)?;
+    // Authoritative package manifest captured when the package was loaded.
+    // 加载包时捕获的权威包清单。
+    let manifest = package.dependency_manifest().ok_or_else(|| {
+        mlua::Error::runtime(format!("{api_name}: dependencies.yaml is not present"))
+    })?;
+    // Declared Python runtime specification for this exact package.
+    // 当前精确包声明的 Python 运行时规范。
     let runtime_spec = manifest.python_runtime.as_ref().ok_or_else(|| {
         mlua::Error::runtime(format!("{api_name}: python_runtime is not declared"))
     })?;
-    let plan = resolve_python_env_plan(&runtime_root, &skill_dir, runtime_spec)
+    // Environment plan resolved only from the trusted package context.
+    // 仅从可信包上下文解析得到的环境计划。
+    let plan = resolve_python_env_plan(package.as_ref(), runtime_spec)
         .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
     ensure_managed_env(&plan)
         .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
-    let source_file =
-        resolve_managed_runtime_skill_file(&skill_dir, &request.file, api_name, "file")?;
+    // Canonical source file proven to remain inside the package root.
+    // 已证明仍位于包根目录内的规范源码文件。
+    let _source_file = package
+        .resolve_existing_file(&request.file, "file")
+        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
+    let key = managed_runtime_worker_key(&plan, package.as_ref());
+    let package_snapshot = worker_service
+        .package_snapshot(&key, &plan, package.as_ref())
+        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
+    let import_file = package_snapshot
+        .worker_source_path(&request.file)
+        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
+    let snapshot_root = package_snapshot
+        .python_worker_import_root()
+        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
+    // Controlled worker payload containing package metadata but no host secrets.
+    // 包含包元数据但不包含宿主密钥的受控 Worker 载荷。
     let payload = json!({
-        "file": source_file,
+        "file": import_file,
+        "snapshot_root": snapshot_root,
         "handler": request.handler,
         "args": request.args,
-        "ctx": {},
+        "ctx": package.worker_context_json(),
     });
-    let key = managed_runtime_worker_key(&plan, &skill_dir);
-    let result = invoke_pooled_managed_runtime(key, &plan, &payload, request.timeout_ms, || {
-        let mut command = Command::new(managed_python_venv_executable(&plan));
-        command.arg("-c").arg(managed_python_worker_source());
-        command.current_dir(skill_dir.as_path());
-        spawn_managed_runtime_worker(&mut command)
-    })
+    // Package-partitioned worker-pool key.
+    // 按包隔离的 Worker 池键。
+    // JSON result returned by the managed Python worker.
+    // 受管 Python Worker 返回的 JSON 结果。
+    let result = invoke_pooled_managed_runtime(
+        worker_service.as_ref(),
+        key,
+        &plan,
+        &payload,
+        request.timeout_ms,
+        || {
+            // Command pinned to the environment-specific Python executable.
+            // 固定使用环境专属 Python 可执行文件的命令。
+            let mut command = Command::new(managed_python_venv_executable(&plan));
+            command.arg("-c").arg(managed_python_worker_source());
+            package_snapshot.configure_worker_command(&mut command)?;
+            configure_managed_python_command_environment(&mut command, &plan)?;
+            spawn_managed_runtime_worker_with_snapshot(
+                &mut command,
+                Some(Arc::clone(&package_snapshot)),
+            )
+        },
+    )
     .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
     json_value_to_lua(lua, &result)
 }
@@ -4154,38 +5504,87 @@ fn invoke_managed_python(lua: &Lua, spec: LuaValue) -> Result<LuaValue, mlua::Er
 /// Invoke one Node.js handler through the managed Node.js environment.
 /// 通过受管 Node.js 环境调用一个 Node.js 处理函数。
 fn invoke_managed_node(lua: &Lua, spec: LuaValue) -> Result<LuaValue, mlua::Error> {
+    // Stable API name used by every validation and runtime diagnostic.
+    // 所有校验与运行时诊断使用的稳定 API 名称。
     let api_name = "vulcan.runtime.node.invoke";
+    // Strict invocation request decoded from the Lua value.
+    // 从 Lua 值严格解码得到的调用请求。
     let request = parse_managed_runtime_invoke_request(spec, api_name, "default")?;
-    let skill_dir = current_vulcan_skill_dir(lua, api_name)?;
-    let runtime_root = runtime_root_from_skill_dir(&skill_dir, api_name)?;
-    let manifest = load_current_managed_runtime_manifest(&skill_dir, api_name)?;
+    // Trusted package context installed by the engine before entering package code.
+    // 引擎在进入包代码前安装的可信包上下文。
+    let package = current_lua_managed_package_context(lua, api_name)?;
+    // Engine-owned worker service installed in every VM created by this engine.
+    // 安装在当前引擎所创建全部 VM 中的引擎所有 Worker 服务。
+    let worker_service = current_lua_managed_runtime_worker_service(lua, api_name)?;
+    // Authoritative package manifest captured when the package was loaded.
+    // 加载包时捕获的权威包清单。
+    let manifest = package.dependency_manifest().ok_or_else(|| {
+        mlua::Error::runtime(format!("{api_name}: dependencies.yaml is not present"))
+    })?;
+    // Declared Node runtime specification for this exact package.
+    // 当前精确包声明的 Node 运行时规范。
     let runtime_spec = manifest
         .node_runtime
         .as_ref()
         .ok_or_else(|| mlua::Error::runtime(format!("{api_name}: node_runtime is not declared")))?;
-    let plan = resolve_node_env_plan(&runtime_root, &skill_dir, runtime_spec)
+    // Environment plan resolved only from the trusted package context.
+    // 仅从可信包上下文解析得到的环境计划。
+    let plan = resolve_node_env_plan(package.as_ref(), runtime_spec)
         .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
     ensure_managed_env(&plan)
         .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
-    let _ = resolve_managed_runtime_skill_file(&skill_dir, &request.file, api_name, "file")?;
-    let import_root = prepare_managed_node_import_root(&plan, &skill_dir)
+    // Canonical source file validation performed before creating the import snapshot.
+    // 创建导入快照前执行的规范源码文件校验。
+    let _source_file = package
+        .resolve_existing_file(&request.file, "file")
         .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
-    let import_file = import_root.join(&request.file);
+    // Exact owner-partitioned worker key also owns the immutable package snapshot identity.
+    // 同时拥有不可变包快照身份的精确所有者隔离 Worker 键。
+    let key = managed_runtime_worker_key(&plan, package.as_ref());
+    // Immutable package snapshot retained by the service and every worker using it.
+    // 由服务及每个使用它的 Worker 共同保留的不可变包快照。
+    let package_snapshot = worker_service
+        .package_snapshot(&key, &plan, package.as_ref())
+        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
+    // Source path inside the validated package snapshot.
+    // 已校验包快照内的源码路径。
+    let import_file = package_snapshot
+        .node_worker_source_path(&request.file)
+        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
+    // Controlled worker payload containing package metadata but no host secrets.
+    // 包含包元数据但不包含宿主密钥的受控 Worker 载荷。
     let payload = json!({
+        // Unix uses the validated relative name after object-pinned `fchdir`; Windows uses the
+        // validated absolute share-locked source independently from its neutral short cwd.
+        // Unix 会在对象固定的 `fchdir` 后使用已校验相对名称；Windows 则独立于中立短 cwd 使用
+        // 已校验且受共享锁保护的绝对源码。
         "file": import_file,
         "env_dir": plan.env_dir,
         "handler": request.handler,
         "args": request.args,
-        "ctx": {},
+        "ctx": package.worker_context_json(),
     });
-    let key = managed_runtime_worker_key(&plan, &skill_dir);
-    let result = invoke_pooled_managed_runtime(key, &plan, &payload, request.timeout_ms, || {
-        let mut command = Command::new(&plan.runtime_executable);
-        command.arg("-e").arg(managed_node_worker_source());
-        command.current_dir(skill_dir.as_path());
-        command.env("NODE_PATH", plan.env_dir.join("node_modules"));
-        spawn_managed_runtime_worker(&mut command)
-    })
+    // JSON result returned by the managed Node worker.
+    // 受管 Node Worker 返回的 JSON 结果。
+    let result = invoke_pooled_managed_runtime(
+        worker_service.as_ref(),
+        key,
+        &plan,
+        &payload,
+        request.timeout_ms,
+        || {
+            // Command pinned to the declared managed Node executable.
+            // 固定使用已声明受管 Node 可执行文件的命令。
+            let mut command = Command::new(&plan.runtime_executable);
+            command.arg("-e").arg(managed_node_worker_source());
+            package_snapshot.configure_worker_command(&mut command)?;
+            configure_managed_node_command_environment(&mut command, &plan)?;
+            spawn_managed_runtime_worker_with_snapshot(
+                &mut command,
+                Some(Arc::clone(&package_snapshot)),
+            )
+        },
+    )
     .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
     json_value_to_lua(lua, &result)
 }
@@ -4193,11 +5592,15 @@ fn invoke_managed_node(lua: &Lua, spec: LuaValue) -> Result<LuaValue, mlua::Erro
 /// Return status for the active skill's managed Python declaration.
 /// 返回当前 skill 的受管 Python 声明状态。
 fn managed_python_status(lua: &Lua) -> Result<LuaValue, mlua::Error> {
+    // Stable API name used by every validation diagnostic.
+    // 所有校验诊断使用的稳定 API 名称。
     let api_name = "vulcan.runtime.python.status";
-    let skill_dir = current_vulcan_skill_dir(lua, api_name)?;
-    let runtime_root = runtime_root_from_skill_dir(&skill_dir, api_name)?;
-    let Some(manifest) = load_optional_current_managed_runtime_manifest(&skill_dir, api_name)?
-    else {
+    // Trusted package context installed by the engine before entering package code.
+    // 引擎在进入包代码前安装的可信包上下文。
+    let package = current_lua_managed_package_context(lua, api_name)?;
+    // Optional package manifest captured at package-load time.
+    // 加载包时捕获的可选包清单。
+    let Some(manifest) = package.dependency_manifest() else {
         return json_value_to_lua(
             lua,
             &json!({
@@ -4205,10 +5608,13 @@ fn managed_python_status(lua: &Lua) -> Result<LuaValue, mlua::Error> {
                 "configured": false,
                 "ready": false,
                 "runtime": "python",
+                "persistent_session": current_managed_runtime_persistent_session_capability(),
                 "message": "dependencies.yaml is not present",
             }),
         );
     };
+    // Optional Python runtime declaration from the authoritative manifest.
+    // 权威清单中的可选 Python 运行时声明。
     let Some(spec) = manifest.python_runtime.as_ref() else {
         return json_value_to_lua(
             lua,
@@ -4217,11 +5623,12 @@ fn managed_python_status(lua: &Lua) -> Result<LuaValue, mlua::Error> {
                 "configured": false,
                 "ready": false,
                 "runtime": "python",
+                "persistent_session": current_managed_runtime_persistent_session_capability(),
                 "message": "python_runtime is not declared",
             }),
         );
     };
-    match resolve_python_env_plan(&runtime_root, &skill_dir, spec) {
+    match resolve_python_env_plan(package.as_ref(), spec) {
         Ok(plan) => json_value_to_lua(lua, &managed_runtime_status_from_plan(&plan)),
         Err(error) => json_value_to_lua(
             lua,
@@ -4230,6 +5637,7 @@ fn managed_python_status(lua: &Lua) -> Result<LuaValue, mlua::Error> {
                 "configured": true,
                 "ready": false,
                 "runtime": "python",
+                "persistent_session": current_managed_runtime_persistent_session_capability(),
                 "error": error,
             }),
         ),
@@ -4239,11 +5647,15 @@ fn managed_python_status(lua: &Lua) -> Result<LuaValue, mlua::Error> {
 /// Return status for the active skill's managed Node.js declaration.
 /// 返回当前 skill 的受管 Node.js 声明状态。
 fn managed_node_status(lua: &Lua) -> Result<LuaValue, mlua::Error> {
+    // Stable API name used by every validation diagnostic.
+    // 所有校验诊断使用的稳定 API 名称。
     let api_name = "vulcan.runtime.node.status";
-    let skill_dir = current_vulcan_skill_dir(lua, api_name)?;
-    let runtime_root = runtime_root_from_skill_dir(&skill_dir, api_name)?;
-    let Some(manifest) = load_optional_current_managed_runtime_manifest(&skill_dir, api_name)?
-    else {
+    // Trusted package context installed by the engine before entering package code.
+    // 引擎在进入包代码前安装的可信包上下文。
+    let package = current_lua_managed_package_context(lua, api_name)?;
+    // Optional package manifest captured at package-load time.
+    // 加载包时捕获的可选包清单。
+    let Some(manifest) = package.dependency_manifest() else {
         return json_value_to_lua(
             lua,
             &json!({
@@ -4251,10 +5663,13 @@ fn managed_node_status(lua: &Lua) -> Result<LuaValue, mlua::Error> {
                 "configured": false,
                 "ready": false,
                 "runtime": "node",
+                "persistent_session": current_managed_runtime_persistent_session_capability(),
                 "message": "dependencies.yaml is not present",
             }),
         );
     };
+    // Optional Node runtime declaration from the authoritative manifest.
+    // 权威清单中的可选 Node 运行时声明。
     let Some(spec) = manifest.node_runtime.as_ref() else {
         return json_value_to_lua(
             lua,
@@ -4263,11 +5678,12 @@ fn managed_node_status(lua: &Lua) -> Result<LuaValue, mlua::Error> {
                 "configured": false,
                 "ready": false,
                 "runtime": "node",
+                "persistent_session": current_managed_runtime_persistent_session_capability(),
                 "message": "node_runtime is not declared",
             }),
         );
     };
-    match resolve_node_env_plan(&runtime_root, &skill_dir, spec) {
+    match resolve_node_env_plan(package.as_ref(), spec) {
         Ok(plan) => json_value_to_lua(lua, &managed_runtime_status_from_plan(&plan)),
         Err(error) => json_value_to_lua(
             lua,
@@ -4276,6 +5692,7 @@ fn managed_node_status(lua: &Lua) -> Result<LuaValue, mlua::Error> {
                 "configured": true,
                 "ready": false,
                 "runtime": "node",
+                "persistent_session": current_managed_runtime_persistent_session_capability(),
                 "error": error,
             }),
         ),
@@ -4779,6 +6196,7 @@ fn reset_pooled_vm_request_scope(
             internal_context: VulcanInternalExecutionContext::default(),
             entry_file: None,
             dependency_context: AnonymousLuaDependencyContext::ClearWithHostOptions(host_options),
+            managed_package_context: AnonymousLuaManagedPackageContext::Clear,
         },
     )?;
     clear_runlua_args_global(lua)?;
@@ -4992,6 +6410,9 @@ impl LuaNestedCallScopeGuard {
     /// Restore the outer `vulcan` execution state captured before the nested call began.
     /// 恢复嵌套调用开始前捕获到的外层 `vulcan` 执行状态。
     fn restore_previous_state(&self) -> Result<(), String> {
+        // Exact outer package restored before any fallible Lua-state restoration step.
+        // 在任何可能失败的 Lua 状态恢复步骤前恢复精确外层包。
+        replace_lua_managed_package_context(&self.lua, self.previous_state.managed_package.clone());
         self.previous_state.core_state.restore(&self.lua)?;
         restore_lua_nested_provider_contexts(
             &self.lua,
@@ -5278,6 +6699,116 @@ impl LuaVmPool {
 }
 
 impl LuaEngine {
+    /// Poll a bounded batch of managed-session events without waiting.
+    /// 以非等待方式轮询一批有界受管会话事件。
+    ///
+    /// `max_events` must be positive and limits the number of destructively drained events.
+    /// `max_events` 必须为正数，并限制破坏性取出的事件数量。
+    ///
+    /// Returns sequence-ordered events, the remaining queue size, and a false timeout flag.
+    /// 返回按序号排序的事件、剩余队列大小以及 false 超时标记。
+    pub fn poll_managed_session_events(
+        &self,
+        max_events: usize,
+    ) -> Result<RuntimeManagedSessionEventBatch, String> {
+        self.managed_runtime_services
+            .event_center()
+            .poll(max_events)
+    }
+
+    /// Wait for and destructively drain a bounded batch of managed-session events.
+    /// 等待并破坏性取出一批有界受管会话事件。
+    ///
+    /// `max_events` must be positive; `timeout` is rounded up to the next whole millisecond.
+    /// `max_events` 必须为正数；`timeout` 会向上取整到下一个整毫秒。
+    ///
+    /// Returns immediately for zero timeout, on an event, or when the event center closes.
+    /// 在零超时、事件到达或事件中心关闭时立即返回。
+    pub fn wait_managed_session_events(
+        &self,
+        max_events: usize,
+        timeout: Duration,
+    ) -> Result<RuntimeManagedSessionEventBatch, String> {
+        // Millisecond transport precision rounded upward so a positive duration never becomes polling.
+        // 毫秒传输精度向上取整，确保正时长不会退化为轮询。
+        let timeout_ms = timeout.as_nanos().div_ceil(1_000_000);
+        let timeout_ms = u64::try_from(timeout_ms)
+            .map_err(|_| "managed session event timeout is too large".to_string())?;
+        self.managed_runtime_services
+            .event_center()
+            .wait(max_events, timeout_ms)
+    }
+
+    /// Replace or clear the host wake callback for managed-session event queue edges.
+    /// 替换或清除受管会话事件队列边沿的宿主唤醒回调。
+    ///
+    /// `callback` runs outside event-center locks and must only schedule host work, never enter Lua.
+    /// `callback` 在事件中心锁外运行，并且只能调度宿主工作，禁止进入 Lua。
+    ///
+    /// Returns after every callback generation retired by this operation has quiesced.
+    /// 在当前操作退役的全部回调代际收敛后返回。
+    pub fn set_managed_session_wake_callback(
+        &self,
+        callback: Option<RuntimeManagedSessionWakeCallback>,
+    ) -> Result<(), String> {
+        self.managed_runtime_services
+            .event_center()
+            .set_wake_callback(callback)
+    }
+
+    /// Clone the engine event center for FFI waits performed outside the registry mutex.
+    /// 克隆引擎事件中心，供 FFI 在注册表互斥锁外执行等待。
+    pub(crate) fn managed_session_event_center(&self) -> Arc<ManagedSessionEventCenter> {
+        self.managed_runtime_services.event_center()
+    }
+
+    /// Retire long-lived sessions and short-lived workers for one exact package owner.
+    /// 退役一个精确包所有者的长期会话与短期 Worker。
+    ///
+    /// `owner_token` is the immutable lifetime token shared by both managed runtime services.
+    /// `owner_token` 是两个受管运行时服务共享的不可变生命周期令牌。
+    ///
+    /// Return any long-lived session teardown failure after always retiring worker reuse.
+    /// 始终退役 Worker 复用后，返回任何长期会话清理失败。
+    fn retire_managed_runtime_owner(&self, owner_token: u64) -> Result<(), String> {
+        // Session teardown result retained while worker retirement is guaranteed to run.
+        // 在保证执行 Worker 退役的同时保留的会话清理结果。
+        let session_result = self.managed_runtime_services.retire_owner(owner_token);
+        self.managed_runtime_workers.retire_owner(owner_token);
+        session_result
+    }
+
+    /// Drain manager retirements and apply them to both engine-owned managed runtime services.
+    /// 排空管理器退役项，并将其应用到两个引擎所有受管运行时服务。
+    ///
+    /// `manager` owns the committed retirement queue and `operation` labels cleanup diagnostics.
+    /// `manager` 拥有已提交退役队列，`operation` 标记清理诊断。
+    fn retire_runtime_session_manager_owners(
+        &self,
+        manager: &RuntimeSessionManager,
+        operation: &str,
+    ) {
+        // Exact owner tokens detached by pruning, replacement, or explicit close.
+        // 因清理、替换或显式关闭而分离的精确所有者令牌。
+        let owner_tokens = match manager.take_retired_owner_tokens() {
+            Ok(owner_tokens) => owner_tokens,
+            Err(error) => {
+                log_error(format!(
+                    "[LuaSkill] Failed to drain managed runtime owner retirements after {operation}: {}",
+                    error.message
+                ));
+                return;
+            }
+        };
+        for owner_token in owner_tokens {
+            if let Err(error) = self.retire_managed_runtime_owner(owner_token) {
+                log_error(format!(
+                    "[LuaSkill] Failed to retire managed runtime owner {owner_token} after {operation}: {error}"
+                ));
+            }
+        }
+    }
+
     /// Return the normalized formal label for one raw runtime skill root name.
     /// 返回单个原始运行时技能根名称的规范化正式标签。
     fn normalized_skill_root_name(root_name: &str) -> String {
@@ -5501,13 +7032,23 @@ impl LuaEngine {
             NativeLibrarySearchGuard::new(&host_options).map_err(std::io::Error::other)?;
         let database_provider_callbacks =
             Arc::new(RuntimeDatabaseProviderCallbacks::capture_process_defaults());
+        // Engine-owned lifecycle service shared by every VM created from this engine.
+        // 由当前引擎创建的每个 VM 共享的引擎所有生命周期服务。
+        let managed_runtime_services =
+            ManagedRuntimeServices::new().map_err(std::io::Error::other)?;
+        // Engine-owned worker service isolated from every other LuaEngine instance.
+        // 与其他所有 LuaEngine 实例隔离的引擎所有 Worker 服务。
+        let managed_runtime_workers = ManagedRuntimeWorkerService::new();
         Ok(Self {
             skills: HashMap::new(),
             entry_registry: BTreeMap::new(),
             runtime_skill_roots: Vec::new(),
             pool: Arc::new(LuaVmPool::new(pool_config)),
             runlua_pool: Arc::new(LuaVmPool::new(runlua_pool_config)),
-            runtime_sessions: Arc::new(RuntimeSessionManager::new()),
+            public_runtime_sessions: Arc::new(RuntimeSessionManager::new()),
+            system_runtime_sessions: Arc::new(RuntimeSessionManager::new()),
+            managed_runtime_services,
+            managed_runtime_workers,
             skill_config_store: Arc::new(
                 SkillConfigStore::new(host_options.skill_config_file_path.clone())
                     .map_err(std::io::Error::other)?,
@@ -5620,7 +7161,10 @@ impl LuaEngine {
             runtime_skill_roots: Vec::new(),
             pool: Arc::new(LuaVmPool::new(self.pool.config)),
             runlua_pool: Arc::new(LuaVmPool::new(self.runlua_pool.config)),
-            runtime_sessions: Arc::new(RuntimeSessionManager::new()),
+            public_runtime_sessions: Arc::new(RuntimeSessionManager::new()),
+            system_runtime_sessions: Arc::clone(&self.system_runtime_sessions),
+            managed_runtime_services: Arc::clone(&self.managed_runtime_services),
+            managed_runtime_workers: Arc::clone(&self.managed_runtime_workers),
             skill_config_store: Arc::new(
                 SkillConfigStore::new(explicit_skill_config_file_path)
                     .map_err(std::io::Error::other)?,
@@ -5642,7 +7186,7 @@ impl LuaEngine {
         self.runtime_skill_roots = next.runtime_skill_roots;
         self.pool = next.pool;
         self.runlua_pool = next.runlua_pool;
-        self.runtime_sessions = next.runtime_sessions;
+        self.public_runtime_sessions = next.public_runtime_sessions;
         self.skill_config_store = next.skill_config_store;
         self.lancedb_host = next.lancedb_host;
         self.sqlite_host = next.sqlite_host;
@@ -5781,12 +7325,12 @@ impl LuaEngine {
         &self,
         skill_root: &RuntimeSkillRoot,
         skill_dir: &Path,
-    ) -> Result<(), String> {
+    ) -> Result<Option<PackageDependencyManifest>, String> {
         let Some(manifest) = self.load_skill_dependency_manifest(skill_dir)? else {
-            return Ok(());
+            return Ok(None);
         };
         if manifest.is_empty() {
-            return Ok(());
+            return Ok(Some(manifest));
         }
 
         let skill_name = skill_dir
@@ -5794,7 +7338,8 @@ impl LuaEngine {
             .and_then(|value| value.to_str())
             .unwrap_or("unknown-skill");
         let manager = DependencyManager::new(self.dependency_manager_config_for(skill_root)?);
-        manager.ensure_skill_dependencies(skill_name, &manifest)
+        manager.ensure_skill_dependencies(skill_name, &manifest)?;
+        Ok(Some(manifest))
     }
 
     /// Load one optional dependency manifest from one skill directory when the file exists.
@@ -5802,12 +7347,12 @@ impl LuaEngine {
     fn load_skill_dependency_manifest(
         &self,
         skill_dir: &Path,
-    ) -> Result<Option<SkillDependencyManifest>, String> {
+    ) -> Result<Option<PackageDependencyManifest>, String> {
         let dependencies_path = skill_dir.join("dependencies.yaml");
         if !skill_dependency_manifest_path_exists(&dependencies_path)? {
             return Ok(None);
         }
-        SkillDependencyManifest::load_from_path(&dependencies_path).map(Some)
+        PackageDependencyManifest::load_from_path(&dependencies_path).map(Some)
     }
 
     /// Return whether two runtime skill roots refer to the same configured root entry.
@@ -6134,15 +7679,25 @@ impl LuaEngine {
                 skill_name, resolved_instance.root_name
             ));
 
-            if let Err(error) = self.ensure_skill_dependencies(&resolved_root, &actual_dir) {
-                log_error(format!(
-                    "[LuaSkill] Failed to prepare dependencies for {}: {}",
-                    skill_name, error
-                ));
-                continue;
-            }
+            // Parsed manifest returned by dependency preparation and retained without a second read.
+            // 由依赖准备返回并在不二次读取的情况下保留的已解析清单。
+            let dependency_manifest =
+                match self.ensure_skill_dependencies(&resolved_root, &actual_dir) {
+                    Ok(manifest) => manifest,
+                    Err(error) => {
+                        log_error(format!(
+                            "[LuaSkill] Failed to prepare dependencies for {}: {}",
+                            skill_name, error
+                        ));
+                        continue;
+                    }
+                };
 
-            if let Err(e) = self.load_single_skill(&actual_dir, &resolved_instance.root_name) {
+            if let Err(e) = self.load_single_skill(
+                &actual_dir,
+                &resolved_instance.root_name,
+                dependency_manifest,
+            ) {
                 log_error(format!("[LuaSkill] Failed to load {}: {}", skill_name, e));
             }
         }
@@ -6155,15 +7710,11 @@ impl LuaEngine {
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
         self.runlua_pool
             .prewarm(|| {
-                Self::create_runlua_vm(
+                Self::create_runlua_vm(RunLuaVmBuildContext::from_engine(
+                    self,
                     &self.skills,
                     &self.entry_registry,
-                    self.host_options.clone(),
-                    self.skill_config_store.clone(),
-                    self.runtime_skill_roots.clone(),
-                    self.lancedb_host.clone(),
-                    self.sqlite_host.clone(),
-                )
+                ))
             })
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
 
@@ -6182,9 +7733,23 @@ impl LuaEngine {
         let previous_entries = self
             .list_entries()
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        // Exact ordinary Skill owners retired only after the replacement state is ready.
+        // 仅在替换状态准备完成后退役的精确普通 Skill 所有者。
+        let retired_skill_owner_tokens: Vec<_> = self
+            .skills
+            .values()
+            .map(|skill| skill.managed_package.owner_token())
+            .collect();
         let mut next = self.empty_reload_candidate()?;
         next.load_from_roots(skill_roots)?;
         self.replace_runtime_state_from(next);
+        for owner_token in retired_skill_owner_tokens {
+            if let Err(error) = self.retire_managed_runtime_owner(owner_token) {
+                log_error(format!(
+                    "[LuaSkill] Failed to retire managed runtime owner {owner_token} after Skill reload: {error}"
+                ));
+            }
+        }
         self.emit_entry_registry_delta(previous_entries)
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
         Ok(())
@@ -7175,6 +8740,7 @@ impl LuaEngine {
         &mut self,
         dir: &Path,
         root_name: &str,
+        dependency_manifest: Option<PackageDependencyManifest>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let skill_yaml = dir.join("skill.yaml");
         // Skill manifest existence probe that preserves filesystem errors before reading YAML.
@@ -7349,12 +8915,32 @@ impl LuaEngine {
             None
         };
 
+        // Authoritative named root selected by the loader before package construction.
+        // 包构造前由加载器选择的权威命名根。
+        let skill_root = self
+            .runtime_skill_roots
+            .iter()
+            .find(|skill_root| skill_root.name == root_name)
+            .ok_or_else(|| format!("runtime skill root `{root_name}` is not registered"))?;
+        // Runtime root derived from the selected host-provided RuntimeSkillRoot.
+        // 从选定宿主提供 RuntimeSkillRoot 派生的运行时根。
+        let runtime_root = self.runtime_root_for(skill_root);
+        // Canonical managed package context shared by every entry of this Skill.
+        // 由当前 Skill 所有入口共享的规范受管包上下文。
+        let managed_package = ManagedRuntimePackageContext::for_skill(
+            meta.effective_skill_id(),
+            dir,
+            &runtime_root,
+            dependency_manifest,
+        )?;
+
         self.skills.insert(
             meta.effective_skill_id().to_string(),
             LoadedSkill {
                 meta,
                 dir: dir.to_path_buf(),
                 root_name: root_name.to_string(),
+                managed_package,
                 lancedb_binding,
                 sqlite_binding,
                 resolved_entry_names: HashMap::new(),
@@ -7374,6 +8960,8 @@ impl LuaEngine {
         let skills = Arc::new(skills);
         let entry_registry = Arc::new(entry_registry);
         let lua = unsafe { Lua::unsafe_new() };
+        lua.set_app_data(Arc::clone(&self.managed_runtime_services));
+        lua.set_app_data(Arc::clone(&self.managed_runtime_workers));
         Self::setup_package_paths(&lua, self.host_options.as_ref())
             .map_err(|error| error.to_string())?;
         Self::register_vulcan_module(
@@ -7416,16 +9004,23 @@ impl LuaEngine {
 
     /// Build a fresh isolated runlua VM instance with current runtime state registered.
     /// 创建一个带有当前运行时状态注册信息的全新隔离 runlua 虚拟机实例。
-    fn create_runlua_vm(
-        skills: &HashMap<String, LoadedSkill>,
-        entry_registry: &BTreeMap<String, ResolvedEntryTarget>,
-        host_options: Arc<LuaRuntimeHostOptions>,
-        skill_config_store: Arc<SkillConfigStore>,
-        runtime_skill_roots: Vec<RuntimeSkillRoot>,
-        lancedb_host: Option<Arc<LanceDbSkillHost>>,
-        sqlite_host: Option<Arc<SqliteSkillHost>>,
-    ) -> Result<LuaVm, String> {
+    fn create_runlua_vm(context: RunLuaVmBuildContext<'_>) -> Result<LuaVm, String> {
+        // Complete engine snapshot destructured once for deterministic VM initialization.
+        // 为确定性 VM 初始化仅解构一次的完整引擎快照。
+        let RunLuaVmBuildContext {
+            skills,
+            entry_registry,
+            host_options,
+            skill_config_store,
+            runtime_skill_roots,
+            lancedb_host,
+            sqlite_host,
+            managed_runtime_services,
+            managed_runtime_workers,
+        } = context;
         let lua = unsafe { Lua::unsafe_new() };
+        lua.set_app_data(managed_runtime_services);
+        lua.set_app_data(managed_runtime_workers);
         Self::setup_package_paths(&lua, host_options.as_ref())
             .map_err(|error| error.to_string())?;
         Self::register_vulcan_module(
@@ -7448,6 +9043,32 @@ impl LuaEngine {
             lua,
             last_used_at: Instant::now(),
         })
+    }
+
+    /// Build a dedicated System runtime VM without capturing ordinary Skill state.
+    /// 构造不捕获普通 Skill 状态的专用 System 运行时 VM。
+    fn create_system_runtime_vm(&self) -> Result<LuaVm, String> {
+        // Empty Skill registry prevents System leases from retaining reloadable dispatch entries.
+        // 空 Skill 注册表阻止 System 租约保留可重载分发入口。
+        let skills = HashMap::new();
+        // Empty entry registry keeps `vulcan.call` detached from ordinary Skill targets.
+        // 空入口注册表使 `vulcan.call` 与普通 Skill 目标解耦。
+        let entry_registry = BTreeMap::new();
+        let vm = Self::create_runlua_vm(RunLuaVmBuildContext {
+            skills: &skills,
+            entry_registry: &entry_registry,
+            host_options: Arc::clone(&self.host_options),
+            skill_config_store: Arc::clone(&self.skill_config_store),
+            runtime_skill_roots: Vec::new(),
+            lancedb_host: None,
+            sqlite_host: None,
+            managed_runtime_services: Arc::clone(&self.managed_runtime_services),
+            managed_runtime_workers: Arc::clone(&self.managed_runtime_workers),
+        })?;
+        // Dedicated System VMs permanently protect host-owned context fields before plugin code runs.
+        // 专用 System VM 会在插件代码运行前永久保护宿主所有上下文字段。
+        lease::install_system_runtime_context_boundary(&vm.lua)?;
+        Ok(vm)
     }
 
     /// Register all tool-bearing skill entries into a specific Lua VM.
@@ -8478,6 +10099,9 @@ impl LuaEngine {
         // Reuse the effective skill id for every subcontext that must agree on skill identity.
         // 对所有必须共享 skill 身份的子上下文复用 effective skill id。
         let skill_name = skill.meta.effective_skill_id();
+        // Trusted package installed before the Skill can call managed Python or Node APIs.
+        // 在 Skill 调用受管 Python 或 Node API 前安装的可信包。
+        replace_lua_managed_package_context(lua, Some(skill.managed_package.clone()));
         Self::populate_vulcan_request_context(lua, context.invocation_context)?;
         populate_vulcan_internal_execution_context(
             lua,
@@ -8531,6 +10155,15 @@ impl LuaEngine {
                 populate_vulcan_dependency_context(lua, host_options, None, None)?;
             }
             AnonymousLuaDependencyContext::PreserveCurrent => {}
+        }
+        match context.managed_package_context {
+            AnonymousLuaManagedPackageContext::Clear => {
+                replace_lua_managed_package_context(lua, None);
+            }
+            AnonymousLuaManagedPackageContext::Set(package) => {
+                replace_lua_managed_package_context(lua, Some(package.clone()));
+            }
+            AnonymousLuaManagedPackageContext::PreserveCurrent => {}
         }
         Self::populate_vulcan_lancedb_context(lua, None, None)?;
         Self::populate_vulcan_sqlite_context(lua, None, None)?;
@@ -9250,12 +10883,28 @@ impl LuaEngine {
         let python_invoke_fn =
             lua.create_function(|lua, spec: LuaValue| invoke_managed_python(lua, spec))?;
         runtime_python.set("invoke", python_invoke_fn)?;
+        // Persistent Python session namespace backed by the shared process core.
+        // 由共享进程核心支撑的持久 Python 会话命名空间。
+        let runtime_python_session = lua.create_table()?;
+        let python_session_open_fn = lua.create_function(move |lua, spec: LuaValue| {
+            open_managed_python_session(lua, spec, default_text_encoding)
+        })?;
+        runtime_python_session.set("open", python_session_open_fn)?;
+        runtime_python.set("session", runtime_python_session)?;
 
         let node_status_fn = lua.create_function(|lua, ()| managed_node_status(lua))?;
         runtime_node.set("status", node_status_fn)?;
         let node_invoke_fn =
             lua.create_function(|lua, spec: LuaValue| invoke_managed_node(lua, spec))?;
         runtime_node.set("invoke", node_invoke_fn)?;
+        // Persistent Node session namespace backed by the shared process core.
+        // 由共享进程核心支撑的持久 Node 会话命名空间。
+        let runtime_node_session = lua.create_table()?;
+        let node_session_open_fn = lua.create_function(move |lua, spec: LuaValue| {
+            open_managed_node_session(lua, spec, default_text_encoding)
+        })?;
+        runtime_node_session.set("open", node_session_open_fn)?;
+        runtime_node.set("session", runtime_node_session)?;
 
         match host_options.temp_dir.as_ref() {
             Some(path_buf) => runtime.set("temp_dir", render_host_visible_path(path_buf))?,
@@ -9933,7 +11582,12 @@ fn lua_value_to_json(val: &LuaValue) -> Result<Value, String> {
         }
         LuaValue::Function(_) => Err("Cannot convert Lua function to JSON".to_string()),
         LuaValue::Thread(_) => Err("Cannot convert Lua thread to JSON".to_string()),
-        LuaValue::UserData(_) => Err("Cannot convert Lua userdata to JSON".to_string()),
+        LuaValue::UserData(userdata) => {
+            if let Ok(context) = userdata.borrow::<self::lease::ReadonlyJsonContextValue>() {
+                return Ok(context.json_value().clone());
+            }
+            Err("Cannot convert Lua userdata to JSON".to_string())
+        }
         LuaValue::LightUserData(_) => Err("Cannot convert light userdata to JSON".to_string()),
         _ => Err("Unknown Lua value type".to_string()),
     }
@@ -9968,4 +11622,4 @@ fn lua_table_to_object(t: &Table) -> Result<Value, String> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

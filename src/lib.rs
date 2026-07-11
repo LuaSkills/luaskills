@@ -47,10 +47,15 @@ pub use runtime::logging::{
 pub use runtime::managed_runtime::{
     MANAGED_RUNTIME_ENV_MARKER_SCHEMA_VERSION, ManagedRuntimeEnvHashInput, ManagedRuntimeEnvMarker,
     ManagedRuntimeEnvPlan, ManagedRuntimeInstallManifest, ManagedRuntimeKind,
-    compute_managed_runtime_env_hash, current_managed_runtime_platform_key, ensure_managed_env,
-    managed_env_dir, managed_env_is_ready, managed_env_marker_matches, managed_env_marker_path,
-    read_install_manifest, read_managed_env_marker, resolve_node_env_plan, resolve_python_env_plan,
-    sha256_file, sha256_hex,
+    ManagedRuntimePersistentSessionCapability, WINDOWS_ARM_PERSISTENT_SESSION_UNSUPPORTED_REASON,
+    compute_managed_runtime_env_hash, current_managed_runtime_persistent_session_capability,
+    current_managed_runtime_platform_key, ensure_managed_env, managed_env_dir,
+    managed_env_is_ready, managed_env_marker_matches, managed_env_marker_path,
+    read_install_manifest, read_managed_env_marker, sha256_file, sha256_hex,
+};
+pub use runtime::managed_session_events::{
+    RuntimeManagedSessionEvent, RuntimeManagedSessionEventBatch, RuntimeManagedSessionEventKind,
+    RuntimeManagedSessionWakeCallback,
 };
 pub use runtime::result::{
     NON_STRING_TOOL_RESULT_ERROR, RuntimeInvocationResult, ToolOverflowMode,
@@ -58,8 +63,8 @@ pub use runtime::result::{
 pub use skill::dependencies::{
     DependencyArchiveType, DependencyExportSpec, DependencyPackageSpec, DependencySourceSpec,
     FfiDependencySpec, GithubReleaseSourceSpec, LuaDependencySpec, NodeRuntimeDependencySpec,
-    NodeRuntimePackageManager, PythonRuntimeDependencySpec, PythonRuntimePackageManager,
-    SkillDependencyManifest, SkillListPackageManifest, SkillListSourceSpec, ToolDependencySpec,
+    NodeRuntimePackageManager, PackageDependencyManifest, PythonRuntimeDependencySpec,
+    PythonRuntimePackageManager, SkillListPackageManifest, SkillListSourceSpec, ToolDependencySpec,
     UrlSourceSpec,
 };
 pub use skill::manager::{

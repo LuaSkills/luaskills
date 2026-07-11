@@ -284,6 +284,28 @@ Close one persistent runtime lease using one system JSON request with host-injec
 FfiOwnedBuffer luaskills_ffi_system_runtime_lease_close_json(FfiBorrowedBuffer input_json);
 
 /*
+Poll one bounded managed-session event batch using a strict JSON request.
+使用严格 JSON 请求轮询一批有界的受管会话事件。
+The request requires engine_id, positive max_events, and host-injected authority; unknown fields fail.
+请求要求 engine_id、正数 max_events 与宿主注入 authority；未知字段会导致失败。
+The result envelope's result field contains events, remaining, and timed_out; closed and empty centers return an error.
+结果包络的 result 字段包含 events、remaining 与 timed_out；关闭且空队列的事件中心返回错误。
+*/
+FfiOwnedBuffer luaskills_ffi_managed_session_events_poll_json(FfiBorrowedBuffer input_json);
+
+/*
+Wait for one bounded managed-session event batch using a strict JSON request.
+使用严格 JSON 请求等待一批有界的受管会话事件。
+The request additionally requires timeout_ms; zero performs a true nonblocking poll.
+请求还要求 timeout_ms；零表示真正的非阻塞轮询。
+Timeout returns a successful empty batch with timed_out=true.
+超时返回 timed_out=true 的成功空批次。
+Closed and empty centers return an explicit error instead of a timeout batch.
+关闭且队列为空的事件中心返回显式错误，而不是超时批次。
+*/
+FfiOwnedBuffer luaskills_ffi_managed_session_events_wait_json(FfiBorrowedBuffer input_json);
+
+/*
 Disable one skill through one ordered root chain.
 通过一条有序根链停用单个技能。
 */

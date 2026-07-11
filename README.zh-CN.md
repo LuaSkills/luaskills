@@ -87,6 +87,7 @@ LuaSkills 不试图接管宿主产品本身。
 - [英文文档入口](docs/index.md)：英文产品级文档导航。
 - [为什么是 LuaSkills](docs/zh-CN/product/why-luaskills.md)：产品化叙事、能力分类、适用场景和生态定位。
 - [Lua Skill 开发手册](docs/zh-CN/skill-development.md)：Skill 作者应优先阅读。
+- [System Plugin 受管运行时使用指南](docs/zh-CN/system-plugin-managed-runtime.md)：从严格包配置、持久 Python/Node 会话到宿主事件与关闭的完整流程。
 - [FFI 对接文档](docs/zh-CN/ffi/integration-guide.md)：非 Rust 宿主集成细节。
 - [FFI 宿主接入检查清单](docs/zh-CN/ffi/host-checklist.md)：第一次联调前的最短自检路径。
 - [宿主数据库 Provider 对接说明](docs/zh-CN/providers/host-database-provider-guide.md)：SQLite / LanceDB ownership 与 provider 模式。
@@ -146,6 +147,8 @@ cargo run --bin luaskills-debug -- call \
 1. [FFI Beta 发布说明](docs/zh-CN/ffi/beta-release-notes.md)
 2. [FFI 宿主接入检查清单](docs/zh-CN/ffi/host-checklist.md)
 3. [FFI 对接文档](docs/zh-CN/ffi/integration-guide.md)
+
+需要接入 System Plugin 受管 Python/Node 长期会话时，在完成上述基础链路后继续阅读 [System Plugin 受管运行时使用指南](docs/zh-CN/system-plugin-managed-runtime.md)。
 
 ## Skill 命名规则
 

@@ -218,12 +218,12 @@ pub enum NodeRuntimePackageManager {
     Pnpm,
 }
 
-/// Managed Python runtime dependency declared by one skill package.
-/// 单个 skill 包声明的受管 Python 运行时依赖。
+/// Managed Python runtime dependency declared by one runtime package.
+/// 单个运行时包声明的受管 Python 运行时依赖。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PythonRuntimeDependencySpec {
-    /// Exact Python runtime version requested by the skill.
-    /// 当前 skill 请求的精确 Python 运行时版本。
+    /// Exact Python runtime version requested by the package.
+    /// 当前包请求的精确 Python 运行时版本。
     pub version: String,
     /// Python package manager selected for environment creation.
     /// 用于创建环境的 Python 包管理器。
@@ -231,22 +231,22 @@ pub struct PythonRuntimeDependencySpec {
     /// Exact package-manager version requested by the skill.
     /// 当前 skill 请求的精确包管理器版本。
     pub package_manager_version: String,
-    /// Lockfile path under the current skill directory.
-    /// 当前 skill 目录下的锁文件路径。
+    /// Lockfile path under the current package root.
+    /// 当前包根目录下的锁文件路径。
     #[serde(default)]
     pub lockfile: String,
-    /// Whether this managed runtime is required for the skill to load.
-    /// 当前受管运行时是否为 skill 加载所必需。
+    /// Whether this managed runtime is required for the package to load.
+    /// 当前受管运行时是否为包加载所必需。
     #[serde(default = "default_required_dependency")]
     pub required: bool,
 }
 
-/// Managed Node.js runtime dependency declared by one skill package.
-/// 单个 skill 包声明的受管 Node.js 运行时依赖。
+/// Managed Node.js runtime dependency declared by one runtime package.
+/// 单个运行时包声明的受管 Node.js 运行时依赖。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeRuntimeDependencySpec {
-    /// Exact Node.js runtime version requested by the skill.
-    /// 当前 skill 请求的精确 Node.js 运行时版本。
+    /// Exact Node.js runtime version requested by the package.
+    /// 当前包请求的精确 Node.js 运行时版本。
     pub version: String,
     /// Node.js package manager selected for environment creation.
     /// 用于创建环境的 Node.js 包管理器。
@@ -254,24 +254,24 @@ pub struct NodeRuntimeDependencySpec {
     /// Exact package-manager version requested by the skill.
     /// 当前 skill 请求的精确包管理器版本。
     pub package_manager_version: String,
-    /// Optional package.json path under the current skill directory.
-    /// 当前 skill 目录下的可选 package.json 路径。
+    /// Optional package.json path under the current package root.
+    /// 当前包根目录下的可选 package.json 路径。
     #[serde(default)]
     pub package_json: String,
-    /// Lockfile path under the current skill directory.
-    /// 当前 skill 目录下的锁文件路径。
+    /// Lockfile path under the current package root.
+    /// 当前包根目录下的锁文件路径。
     #[serde(default)]
     pub lockfile: String,
-    /// Whether this managed runtime is required for the skill to load.
-    /// 当前受管运行时是否为 skill 加载所必需。
+    /// Whether this managed runtime is required for the package to load.
+    /// 当前受管运行时是否为包加载所必需。
     #[serde(default = "default_required_dependency")]
     pub required: bool,
 }
 
-/// Full dependencies.yaml payload loaded from one skill package.
-/// 从单个 skill 包加载的完整 dependencies.yaml 载荷。
+/// Full dependencies.yaml payload loaded from one managed runtime package.
+/// 从单个受管运行时包加载的完整 dependencies.yaml 载荷。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct SkillDependencyManifest {
+pub struct PackageDependencyManifest {
     /// Tool dependencies such as rg or ast-grep.
     /// 例如 rg 或 ast-grep 一类的工具依赖。
     #[serde(default)]
@@ -336,7 +336,7 @@ fn default_runtime_library_scope() -> DependencyScope {
     DependencyScope::Skill
 }
 
-impl SkillDependencyManifest {
+impl PackageDependencyManifest {
     /// Load one dependency manifest from `dependencies.yaml`.
     /// 从 `dependencies.yaml` 加载一份依赖清单。
     pub fn load_from_path(path: &Path) -> Result<Self, String> {
@@ -393,7 +393,7 @@ impl FfiDependencySpec {
 
 #[cfg(test)]
 mod tests {
-    use super::SkillDependencyManifest;
+    use super::PackageDependencyManifest;
     use crate::runtime::path::render_host_visible_path;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -423,7 +423,7 @@ mod tests {
             .expect("invalid dependency manifest should be written");
         // Error returned by the real dependency manifest loader.
         // 真实依赖清单加载器返回的错误。
-        let error = SkillDependencyManifest::load_from_path(&manifest_path)
+        let error = PackageDependencyManifest::load_from_path(&manifest_path)
             .expect_err("invalid dependency manifest should fail");
         // Expected diagnostic prefix rendered with the shared host-visible path formatter.
         // 使用共享宿主可见路径渲染器生成的期望诊断前缀。
@@ -483,7 +483,7 @@ ffi_dependencies:
         url: https://example.com/index.yaml
         package: example-lib
 "#;
-        let manifest: SkillDependencyManifest =
+        let manifest: PackageDependencyManifest =
             serde_yaml::from_str(yaml_text).expect("manifest should parse");
         assert_eq!(manifest.tool_dependencies.len(), 1);
         assert_eq!(manifest.lua_dependencies.len(), 1);
@@ -530,7 +530,7 @@ ffi_dependencies:
       url: {}
     packages: {}
 "#;
-        let manifest: SkillDependencyManifest =
+        let manifest: PackageDependencyManifest =
             serde_yaml::from_str(yaml_text).expect("manifest should parse");
         assert_eq!(
             manifest.tool_dependencies[0].scope,
@@ -563,7 +563,7 @@ node_runtime:
   package_json: node/package.json
   lockfile: node/pnpm-lock.yaml
 "#;
-        let manifest: SkillDependencyManifest =
+        let manifest: PackageDependencyManifest =
             serde_yaml::from_str(yaml_text).expect("manifest should parse");
         let python_runtime = manifest
             .python_runtime
@@ -586,10 +586,10 @@ node_runtime:
         assert_eq!(node_runtime.lockfile, "node/pnpm-lock.yaml");
         assert!(node_runtime.required);
         assert!(
-            !SkillDependencyManifest {
+            !PackageDependencyManifest {
                 python_runtime: Some(python_runtime),
                 node_runtime: Some(node_runtime),
-                ..SkillDependencyManifest::default()
+                ..PackageDependencyManifest::default()
             }
             .is_empty()
         );
