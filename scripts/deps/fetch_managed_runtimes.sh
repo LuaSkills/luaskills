@@ -356,6 +356,9 @@ PY
   fi
   ensure_dir "$(dirname "$pnpm_target")"
   mv "$package_root" "$pnpm_target"
+  # The npm tarball does not preserve an executable bit, but the managed manifest exposes this shebang entry.
+  # npm tarball 不保留可执行位，但受管清单会将这个含 shebang 的入口作为可执行文件暴露。
+  chmod +x "$pnpm_entry"
   write_runtime_manifest "$pnpm_target" "pnpm" "$PNPM_VERSION" "any" "bin/pnpm.cjs" "$tarball_url"
   "$node_exe" "$pnpm_entry" --version >&2
 }
