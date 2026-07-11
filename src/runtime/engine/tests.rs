@@ -7288,7 +7288,9 @@ fn write_managed_session_install_manifest(
             .expect("copy real executable into managed installation");
     }
     #[cfg(windows)]
-    if runtime == "python" {
+    if matches!(runtime, "python" | "uv") {
+        // PythonFixtureExecutables cover both the interpreter and the lightweight uv stand-in.
+        // PythonFixtureExecutables 同时覆盖解释器与轻量 uv 占位程序。
         install_managed_session_windows_python_companions(
             source_executable,
             installed_executable
@@ -7297,7 +7299,9 @@ fn write_managed_session_install_manifest(
         );
     }
     #[cfg(target_os = "macos")]
-    if runtime == "python" {
+    if matches!(runtime, "python" | "uv") {
+        // PythonFixtureExecutables cover both the interpreter and the lightweight uv stand-in.
+        // PythonFixtureExecutables 同时覆盖解释器与轻量 uv 占位程序。
         install_managed_session_macos_python_companions(source_executable, install_dir);
     }
     // Manifest mirrors the exact runtime asset contract consumed by plan resolution.
