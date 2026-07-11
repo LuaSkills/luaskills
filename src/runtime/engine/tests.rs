@@ -9853,13 +9853,13 @@ fn run_managed_session_isolation_integration(runtime: ManagedSessionTestRuntime)
         &format!("system-managed-isolation-{}", runtime.label()),
         false,
     );
-    // OpenBoth creates two distinct userdata instances in the same persistent VM.
-    // OpenBoth 在同一持久 VM 中创建两个不同 userdata 实例。
+    // OpenBoth creates two userdata instances and waits for both sidecars before the first write.
+    // OpenBoth 创建两个 userdata 实例，并在首次写入前等待两个 sidecar 就绪。
     let open_both = eval_managed_session_test_lease(
         &engine,
         &lease,
         &format!(
-            "session_a = {}({{ file = '{}', cwd = 'runtime', buffer_limit_bytes = 4096 }})\nsession_b = {}({{ file = '{}', cwd = 'runtime', buffer_limit_bytes = 4096 }})\nreturn true",
+            "session_a = {}({{ file = '{}', cwd = 'runtime', buffer_limit_bytes = 4096 }})\nsession_b = {}({{ file = '{}', cwd = 'runtime', buffer_limit_bytes = 4096 }})\nlocal a = session_a:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = 'started' }})\nif not string.find(a.stderr, 'stderr-started', 1, true) then local extra_a = session_a:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = 'stderr-started' }}); a.stderr = a.stderr .. extra_a.stderr end\nlocal b = session_b:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = 'started' }})\nif not string.find(b.stderr, 'stderr-started', 1, true) then local extra_b = session_b:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = 'stderr-started' }}); b.stderr = b.stderr .. extra_b.stderr end\nreturn {{ a = a, b = b }}",
             layout.lua_open_api(),
             layout.sidecar_file(),
             layout.lua_open_api(),
@@ -9870,6 +9870,12 @@ fn run_managed_session_isolation_integration(runtime: ManagedSessionTestRuntime)
         open_both["ok"], true,
         "open two sessions failed: {open_both}"
     );
+    // StartupTrees prove both processes are distinct before any request data is sent.
+    // StartupTrees 在发送任何请求数据前证明两个进程彼此独立。
+    let (tree_a, _) = parse_managed_session_started(&open_both["result"]["a"]);
+    let (tree_b, _) = parse_managed_session_started(&open_both["result"]["b"]);
+    assert_ne!(tree_a.root_pid, tree_b.root_pid);
+    assert_ne!(tree_a.child_pid, tree_b.child_pid);
     // WriteBoth sends different values without relying on worker-pool affinity.
     // WriteBoth 在不依赖 Worker Pool 亲和性的情况下发送不同值。
     let write_both = eval_managed_session_test_lease(
@@ -9878,21 +9884,17 @@ fn run_managed_session_isolation_integration(runtime: ManagedSessionTestRuntime)
         r#"session_a:write('{"action":"echo","value":"isolation-a"}\n'); session_b:write('{"action":"echo","value":"isolation-b"}\n'); return true"#,
     );
     assert_eq!(write_both["ok"], true);
-    // ReadBoth returns each stream separately after its own marker appears.
-    // ReadBoth 在各自标记出现后分别返回两个流。
+    // ReadBoth returns each stream separately after its own echo marker appears.
+    // ReadBoth 在各自 echo 标记出现后分别返回两个流。
     let read_both = eval_managed_session_test_lease(
         &engine,
         &lease,
-        "local a = session_a:read({ timeout_ms = 5000, max_bytes = 4096, until_text = 'isolation-a' }); if not string.find(a.stderr, 'stderr-started', 1, true) then local extra_a = session_a:read({ timeout_ms = 5000, max_bytes = 4096, until_text = 'stderr-started' }); a.stderr = a.stderr .. extra_a.stderr end; local b = session_b:read({ timeout_ms = 5000, max_bytes = 4096, until_text = 'isolation-b' }); if not string.find(b.stderr, 'stderr-started', 1, true) then local extra_b = session_b:read({ timeout_ms = 5000, max_bytes = 4096, until_text = 'stderr-started' }); b.stderr = b.stderr .. extra_b.stderr end; return { a = a, b = b }",
+        "local a = session_a:read({ timeout_ms = 5000, max_bytes = 4096, until_text = 'isolation-a' }); local b = session_b:read({ timeout_ms = 5000, max_bytes = 4096, until_text = 'isolation-b' }); return { a = a, b = b }",
     );
     assert_eq!(
         read_both["ok"], true,
         "read two sessions failed: {read_both}"
     );
-    let (tree_a, _) = parse_managed_session_started(&read_both["result"]["a"]);
-    let (tree_b, _) = parse_managed_session_started(&read_both["result"]["b"]);
-    assert_ne!(tree_a.root_pid, tree_b.root_pid);
-    assert_ne!(tree_a.child_pid, tree_b.child_pid);
     // StdoutA and StdoutB prove data never crosses session buffers.
     // StdoutA 与 StdoutB 证明数据不会跨越会话缓冲区。
     let stdout_a = read_both["result"]["a"]["stdout"]
