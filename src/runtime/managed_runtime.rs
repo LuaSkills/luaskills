@@ -2693,7 +2693,7 @@ mod tests {
             runtime_version: "3.12.8".to_string(),
             platform: "windows-x64".to_string(),
             package_manager: "uv".to_string(),
-            package_manager_version: "0.11.17".to_string(),
+            package_manager_version: "0.11.28".to_string(),
             lock_hash: sha256_hex(b"requests==2.32.3"),
             package_manifest_hash: None,
         };
@@ -2743,10 +2743,10 @@ mod tests {
     fn marker_match_requires_exact_identity() {
         let input = ManagedRuntimeEnvHashInput {
             runtime: ManagedRuntimeKind::Node,
-            runtime_version: "22.11.0".to_string(),
+            runtime_version: "24.18.0".to_string(),
             platform: "linux-x64".to_string(),
             package_manager: "pnpm".to_string(),
-            package_manager_version: "9.15.0".to_string(),
+            package_manager_version: "11.11.0".to_string(),
             lock_hash: "lock".to_string(),
             package_manifest_hash: Some("package".to_string()),
         };
@@ -2789,18 +2789,18 @@ mod tests {
         write_install_manifest(
             &runtime_root
                 .join("dependencies/runtimes/python")
-                .join(format!("cpython-3.12.7-{}", platform)),
+                .join(format!("cpython-3.14.4-{}", platform)),
             "python",
-            "3.12.7",
+            "3.14.4",
             &platform,
             platform_executable("python"),
         );
         write_install_manifest(
             &runtime_root
                 .join("dependencies/runtimes/python")
-                .join(format!("uv-0.11.17-{}", platform)),
+                .join(format!("uv-0.11.28-{}", platform)),
             "uv",
-            "0.11.17",
+            "0.11.28",
             &platform,
             platform_executable("uv"),
         );
@@ -2808,9 +2808,9 @@ mod tests {
         let plan = resolve_python_env_plan(
             package.as_ref(),
             &PythonRuntimeDependencySpec {
-                version: "3.12.7".to_string(),
+                version: "3.14.4".to_string(),
                 package_manager: PythonRuntimePackageManager::Uv,
-                package_manager_version: "0.11.17".to_string(),
+                package_manager_version: "0.11.28".to_string(),
                 lockfile: "python/requirements.lock".to_string(),
                 required: true,
             },
@@ -2900,18 +2900,18 @@ mod tests {
         write_install_manifest(
             &runtime_root
                 .join("dependencies/runtimes/python")
-                .join(format!("cpython-3.12.7-{}", platform)),
+                .join(format!("cpython-3.14.4-{}", platform)),
             "python",
-            "3.12.7",
+            "3.14.4",
             &platform,
             platform_executable("python"),
         );
         write_install_manifest(
             &runtime_root
                 .join("dependencies/runtimes/python")
-                .join(format!("uv-0.11.17-{}", platform)),
+                .join(format!("uv-0.11.28-{}", platform)),
             "uv",
-            "0.11.17",
+            "0.11.28",
             &platform,
             platform_executable("uv"),
         );
@@ -2921,9 +2921,9 @@ mod tests {
         let plan = resolve_python_env_plan(
             package.as_ref(),
             &PythonRuntimeDependencySpec {
-                version: "3.12.7".to_string(),
+                version: "3.14.4".to_string(),
                 package_manager: PythonRuntimePackageManager::Uv,
-                package_manager_version: "0.11.17".to_string(),
+                package_manager_version: "0.11.28".to_string(),
                 lockfile: "python/requirements.lock".to_string(),
                 required: true,
             },
@@ -3184,10 +3184,10 @@ mod tests {
     fn make_environment_file_lock_test_plan(root: &Path) -> ManagedRuntimeEnvPlan {
         let hash_input = ManagedRuntimeEnvHashInput {
             runtime: ManagedRuntimeKind::Python,
-            runtime_version: "3.12.7".to_string(),
+            runtime_version: "3.14.4".to_string(),
             platform: "test-platform".to_string(),
             package_manager: "uv".to_string(),
-            package_manager_version: "0.11.17".to_string(),
+            package_manager_version: "0.11.28".to_string(),
             lock_hash: "lock".to_string(),
             package_manifest_hash: None,
         };
@@ -3601,10 +3601,10 @@ mod tests {
         // 用于为这个合成计划构造期望标记的可复现输入。
         let hash_input = ManagedRuntimeEnvHashInput {
             runtime: ManagedRuntimeKind::Python,
-            runtime_version: "3.12.7".to_string(),
+            runtime_version: "3.14.4".to_string(),
             platform: "test-platform".to_string(),
             package_manager: "uv".to_string(),
-            package_manager_version: "0.11.17".to_string(),
+            package_manager_version: "0.11.28".to_string(),
             lock_hash: "lock".to_string(),
             package_manifest_hash: None,
         };
@@ -3777,18 +3777,18 @@ mod tests {
         write_install_manifest(
             &runtime_root
                 .join("dependencies/runtimes/python")
-                .join(format!("cpython-3.12.7-{}", platform)),
+                .join(format!("cpython-3.14.4-{}", platform)),
             "python",
-            "3.12.7",
+            "3.14.4",
             &platform,
             platform_executable("python"),
         );
         write_install_manifest(
             &runtime_root
                 .join("dependencies/runtimes/python")
-                .join(format!("uv-0.11.17-{}", platform)),
+                .join(format!("uv-0.11.28-{}", platform)),
             "uv",
-            "0.11.17",
+            "0.11.28",
             &platform,
             platform_executable("uv"),
         );
@@ -3797,9 +3797,9 @@ mod tests {
         let plan = resolve_python_env_plan(
             package.as_ref(),
             &PythonRuntimeDependencySpec {
-                version: "3.12.7".to_string(),
+                version: "3.14.4".to_string(),
                 package_manager: PythonRuntimePackageManager::Uv,
-                package_manager_version: "0.11.17".to_string(),
+                package_manager_version: "0.11.28".to_string(),
                 lockfile: "python/requirements.lock".to_string(),
                 required: true,
             },
@@ -3845,7 +3845,7 @@ mod tests {
             .join("dependencies")
             .join("runtimes")
             .join("python")
-            .join(format!("cpython-3.12.7-{}", platform));
+            .join(format!("cpython-3.14.4-{}", platform));
         // Manifest-declared executable path that must be a file.
         // 清单声明且必须为文件的 executable 路径。
         let executable_path = python_install_dir.join(platform_executable("python"));
@@ -3855,7 +3855,7 @@ mod tests {
         let payload = serde_json::json!({
             "schema_version": 1,
             "runtime": "python",
-            "version": "3.12.7",
+            "version": "3.14.4",
             "platform": platform,
             "executable": platform_executable("python"),
         });
@@ -3867,9 +3867,9 @@ mod tests {
         write_install_manifest(
             &runtime_root
                 .join("dependencies/runtimes/python")
-                .join(format!("uv-0.11.17-{}", platform)),
+                .join(format!("uv-0.11.28-{}", platform)),
             "uv",
-            "0.11.17",
+            "0.11.28",
             &platform,
             platform_executable("uv"),
         );
@@ -3880,9 +3880,9 @@ mod tests {
         let error = resolve_python_env_plan(
             package.as_ref(),
             &PythonRuntimeDependencySpec {
-                version: "3.12.7".to_string(),
+                version: "3.14.4".to_string(),
                 package_manager: PythonRuntimePackageManager::Uv,
-                package_manager_version: "0.11.17".to_string(),
+                package_manager_version: "0.11.28".to_string(),
                 lockfile: "python/requirements.lock".to_string(),
                 required: true,
             },
@@ -3927,16 +3927,16 @@ mod tests {
         write_install_manifest(
             &runtime_root
                 .join("dependencies/runtimes/node")
-                .join(format!("node-22.11.0-{}", platform)),
+                .join(format!("node-24.18.0-{}", platform)),
             "node",
-            "22.11.0",
+            "24.18.0",
             &platform,
             platform_executable("node"),
         );
         write_install_manifest(
-            &runtime_root.join("dependencies/runtimes/node/pnpm-9.15.0"),
+            &runtime_root.join("dependencies/runtimes/node/pnpm-11.11.0"),
             "pnpm",
-            "9.15.0",
+            "11.11.0",
             "any",
             "bin/pnpm.cjs",
         );
@@ -3945,9 +3945,9 @@ mod tests {
         let plan = resolve_node_env_plan(
             package.as_ref(),
             &NodeRuntimeDependencySpec {
-                version: "22.11.0".to_string(),
+                version: "24.18.0".to_string(),
                 package_manager: NodeRuntimePackageManager::Pnpm,
-                package_manager_version: "9.15.0".to_string(),
+                package_manager_version: "11.11.0".to_string(),
                 package_json: "node/package.json".to_string(),
                 lockfile: "node/pnpm-lock.yaml".to_string(),
                 required: true,
@@ -3984,7 +3984,7 @@ mod tests {
             &NodeRuntimeDependencySpec {
                 version: "18.19.1".to_string(),
                 package_manager: NodeRuntimePackageManager::Pnpm,
-                package_manager_version: "9.15.0".to_string(),
+                package_manager_version: "11.11.0".to_string(),
                 package_json: "node/package.json".to_string(),
                 lockfile: "node/pnpm-lock.yaml".to_string(),
                 required: true,
@@ -4012,7 +4012,7 @@ mod tests {
             &NodeRuntimeDependencySpec {
                 version: "current".to_string(),
                 package_manager: NodeRuntimePackageManager::Pnpm,
-                package_manager_version: "9.15.0".to_string(),
+                package_manager_version: "11.11.0".to_string(),
                 package_json: "node/package.json".to_string(),
                 lockfile: "node/pnpm-lock.yaml".to_string(),
                 required: true,
@@ -4034,18 +4034,18 @@ mod tests {
         write_install_manifest(
             &runtime_root
                 .join("dependencies/runtimes/python")
-                .join(format!("cpython-3.12.7-{}", platform)),
+                .join(format!("cpython-3.14.4-{}", platform)),
             "python",
-            "3.12.7",
+            "3.14.4",
             &platform,
             platform_executable("python"),
         );
         write_install_manifest(
             &runtime_root
                 .join("dependencies/runtimes/python")
-                .join(format!("uv-0.11.17-{}", platform)),
+                .join(format!("uv-0.11.28-{}", platform)),
             "uv",
-            "0.11.17",
+            "0.11.28",
             &platform,
             platform_executable("uv"),
         );
@@ -4054,9 +4054,9 @@ mod tests {
         let error = resolve_python_env_plan(
             package.as_ref(),
             &PythonRuntimeDependencySpec {
-                version: "3.12.7".to_string(),
+                version: "3.14.4".to_string(),
                 package_manager: PythonRuntimePackageManager::Uv,
-                package_manager_version: "0.11.17".to_string(),
+                package_manager_version: "0.11.28".to_string(),
                 lockfile: "../outside.lock".to_string(),
                 required: true,
             },
@@ -4086,18 +4086,18 @@ mod tests {
         write_install_manifest(
             &runtime_root
                 .join("dependencies/runtimes/python")
-                .join(format!("cpython-3.12.7-{}", platform)),
+                .join(format!("cpython-3.14.4-{}", platform)),
             "python",
-            "3.12.7",
+            "3.14.4",
             &platform,
             platform_executable("python"),
         );
         write_install_manifest(
             &runtime_root
                 .join("dependencies/runtimes/python")
-                .join(format!("uv-0.11.17-{}", platform)),
+                .join(format!("uv-0.11.28-{}", platform)),
             "uv",
-            "0.11.17",
+            "0.11.28",
             &platform,
             platform_executable("uv"),
         );
@@ -4111,9 +4111,9 @@ mod tests {
         let error = resolve_python_env_plan(
             package.as_ref(),
             &PythonRuntimeDependencySpec {
-                version: "3.12.7".to_string(),
+                version: "3.14.4".to_string(),
                 package_manager: PythonRuntimePackageManager::Uv,
-                package_manager_version: "0.11.17".to_string(),
+                package_manager_version: "0.11.28".to_string(),
                 lockfile: "python/missing.lock".to_string(),
                 required: true,
             },
@@ -4151,18 +4151,18 @@ mod tests {
         write_install_manifest(
             &runtime_root
                 .join("dependencies/runtimes/python")
-                .join(format!("cpython-3.12.7-{}", platform)),
+                .join(format!("cpython-3.14.4-{}", platform)),
             "python",
-            "3.12.7",
+            "3.14.4",
             &platform,
             platform_executable("python"),
         );
         write_install_manifest(
             &runtime_root
                 .join("dependencies/runtimes/python")
-                .join(format!("uv-0.11.17-{}", platform)),
+                .join(format!("uv-0.11.28-{}", platform)),
             "uv",
-            "0.11.17",
+            "0.11.28",
             &platform,
             platform_executable("uv"),
         );
@@ -4177,9 +4177,9 @@ mod tests {
         let error = resolve_python_env_plan(
             package.as_ref(),
             &PythonRuntimeDependencySpec {
-                version: "3.12.7".to_string(),
+                version: "3.14.4".to_string(),
                 package_manager: PythonRuntimePackageManager::Uv,
-                package_manager_version: "0.11.17".to_string(),
+                package_manager_version: "0.11.28".to_string(),
                 lockfile: "python/requirements.lock".to_string(),
                 required: true,
             },

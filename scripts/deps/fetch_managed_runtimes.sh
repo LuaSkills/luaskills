@@ -16,19 +16,19 @@ RUNTIME_ROOT="${RUNTIME_ROOT:-output}"
 
 # PythonVersion selects the managed CPython version installed through uv.
 # PythonVersion 选择通过 uv 安装的受管 CPython 版本。
-PYTHON_VERSION="${PYTHON_VERSION:-3.12.7}"
+PYTHON_VERSION="${PYTHON_VERSION:-3.14.4}"
 
 # UvVersion selects the standalone uv binary version.
 # UvVersion 选择独立 uv 二进制版本。
-UV_VERSION="${UV_VERSION:-0.11.17}"
+UV_VERSION="${UV_VERSION:-0.11.28}"
 
 # NodeVersion selects the managed Node.js version.
 # NodeVersion 选择受管 Node.js 版本。
-NODE_VERSION="${NODE_VERSION:-22.11.0}"
+NODE_VERSION="${NODE_VERSION:-24.18.0}"
 
 # PnpmVersion selects the pnpm package-manager version.
 # PnpmVersion 选择 pnpm 包管理器版本。
-PNPM_VERSION="${PNPM_VERSION:-9.15.0}"
+PNPM_VERSION="${PNPM_VERSION:-11.11.0}"
 
 # Force removes existing targets before reinstalling them.
 # Force 会在重新安装前删除已有目标目录。

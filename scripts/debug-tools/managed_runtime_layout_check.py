@@ -15,10 +15,10 @@ import sys
 from pathlib import Path
 
 
-PYTHON_VERSION = "3.12.7"
-UV_VERSION = "0.11.17"
-NODE_VERSION = "22.11.0"
-PNPM_VERSION = "9.15.0"
+PYTHON_VERSION = "3.14.4"
+UV_VERSION = "0.11.28"
+NODE_VERSION = "24.18.0"
+PNPM_VERSION = "11.11.0"
 
 
 def current_platform_key() -> str:

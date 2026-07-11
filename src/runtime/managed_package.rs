@@ -1463,7 +1463,7 @@ mod tests {
             .expect("parse prepared manifest");
         fs::write(
             &manifest_path,
-            "node_runtime:\n  version: '22.11.0'\n  package_manager: pnpm\n  package_manager_version: '9.15.0'\n  package_json: package.json\n  lockfile: pnpm-lock.yaml\n",
+            "node_runtime:\n  version: '24.18.0'\n  package_manager: pnpm\n  package_manager_version: '11.11.0'\n  package_json: package.json\n  lockfile: pnpm-lock.yaml\n",
         )
         .expect("replace prepared manifest contents");
 

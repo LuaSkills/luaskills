@@ -112,8 +112,8 @@ El host debe decidir roots, skills instalables, acciones de gestión, modo de da
 | --- | --- |
 | Núcleo LuaSkills, FFI SDK y línea de SDK de lenguajes | `0.5.0` |
 | Serie compatible de paquetes del runtime Lua | `0.1` |
-| Python / uv gestionados | `3.12.7` / `0.11.17` |
-| Node.js / pnpm gestionados | `22.11.0` / `9.15.0` |
+| Python / uv gestionados | `3.14.4` / `0.11.28` |
+| Node.js / pnpm gestionados | `24.18.0` / `11.11.0` |
 | vldb-controller | `0.2.1` |
 | vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
 

@@ -112,8 +112,8 @@ asset은 `{skill_id}-v{version}-skill.zip`과 `{skill_id}-v{version}-checksums.t
 | --- | --- |
 | LuaSkills core, FFI SDK 및 언어 SDK 계열 | `0.5.0` |
 | Lua runtime packages 호환 계열 | `0.1` |
-| 관리형 Python / uv | `3.12.7` / `0.11.17` |
-| 관리형 Node.js / pnpm | `22.11.0` / `9.15.0` |
+| 관리형 Python / uv | `3.14.4` / `0.11.28` |
+| 관리형 Node.js / pnpm | `24.18.0` / `11.11.0` |
 | vldb-controller | `0.2.1` |
 | vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
 

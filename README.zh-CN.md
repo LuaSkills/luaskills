@@ -189,8 +189,8 @@ GitHub 托管 skill 的仓库派生或显式 `skill_id`、release zip 前缀、c
 | --- | --- |
 | LuaSkills core、FFI SDK 与多语言 SDK 版本线 | `0.5.0` |
 | Lua runtime packages 兼容协议线 | `0.1` |
-| 受管 Python / uv | `3.12.7` / `0.11.17` |
-| 受管 Node.js / pnpm | `22.11.0` / `9.15.0` |
+| 受管 Python / uv | `3.14.4` / `0.11.28` |
+| 受管 Node.js / pnpm | `24.18.0` / `11.11.0` |
 | vldb-controller | `0.2.1` |
 | vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
 

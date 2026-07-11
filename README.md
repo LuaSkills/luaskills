@@ -258,8 +258,8 @@ This order keeps every installer and examples workflow pointed at already-publis
 | --- | --- |
 | LuaSkills core, FFI SDK, and language SDK line | `0.5.0` |
 | Lua runtime packages compatible series | `0.1` |
-| Managed Python / uv | `3.12.7` / `0.11.17` |
-| Managed Node.js / pnpm | `22.11.0` / `9.15.0` |
+| Managed Python / uv | `3.14.4` / `0.11.28` |
+| Managed Node.js / pnpm | `24.18.0` / `11.11.0` |
 | vldb-controller | `0.2.1` |
 | vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
 

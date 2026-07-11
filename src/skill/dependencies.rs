@@ -554,12 +554,12 @@ ffi_dependencies:
 python_runtime:
   version: "3.12.8"
   package_manager: uv
-  package_manager_version: "0.11.17"
+  package_manager_version: "0.11.28"
   lockfile: python/requirements.lock
 node_runtime:
-  version: "22.11.0"
+  version: "24.18.0"
   package_manager: pnpm
-  package_manager_version: "9.15.0"
+  package_manager_version: "11.11.0"
   package_json: node/package.json
   lockfile: node/pnpm-lock.yaml
 "#;
@@ -577,7 +577,7 @@ node_runtime:
         );
         assert_eq!(python_runtime.lockfile, "python/requirements.lock");
         assert!(python_runtime.required);
-        assert_eq!(node_runtime.version, "22.11.0");
+        assert_eq!(node_runtime.version, "24.18.0");
         assert_eq!(
             node_runtime.package_manager,
             super::NodeRuntimePackageManager::Pnpm

@@ -1,4 +1,4 @@
-﻿param(
+param(
     # Target selects which managed runtime group to fetch.
     # Target 选择需要拉取的受管运行时分组。
     [ValidateSet("all", "python", "node", "package-managers")]
@@ -8,16 +8,16 @@
     [string]$RuntimeRoot = "output",
     # PythonVersion selects the managed CPython version installed through uv.
     # PythonVersion 选择通过 uv 安装的受管 CPython 版本。
-    [string]$PythonVersion = "3.12.7",
+    [string]$PythonVersion = "3.14.4",
     # UvVersion selects the standalone uv binary version.
     # UvVersion 选择独立 uv 二进制版本。
-    [string]$UvVersion = "0.11.17",
+    [string]$UvVersion = "0.11.28",
     # NodeVersion selects the managed Node.js version.
     # NodeVersion 选择受管 Node.js 版本。
-    [string]$NodeVersion = "22.11.0",
+    [string]$NodeVersion = "24.18.0",
     # PnpmVersion selects the pnpm package-manager version.
     # PnpmVersion 选择 pnpm 包管理器版本。
-    [string]$PnpmVersion = "9.15.0",
+    [string]$PnpmVersion = "11.11.0",
     # Force removes existing targets before reinstalling them.
     # Force 会在重新安装前删除已有目标目录。
     [switch]$Force
