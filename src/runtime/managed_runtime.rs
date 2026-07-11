@@ -15,7 +15,7 @@ use crate::runtime::managed_package::{
     ManagedFilesystemObjectIdentity, ManagedRuntimePackageContext,
     capture_managed_directory_identity, validate_managed_directory_identity,
 };
-use crate::runtime::path::render_host_visible_path;
+use crate::runtime::path::{host_process_path_argument, render_host_visible_path};
 use crate::skill::dependencies::{
     NodeRuntimeDependencySpec, NodeRuntimePackageManager, PythonRuntimeDependencySpec,
     PythonRuntimePackageManager,
@@ -1603,11 +1603,18 @@ fn create_node_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
             // 通过精确受管 Node 可执行文件启动的 pnpm 命令。
             let mut install_command = Command::new(&plan.runtime_executable);
             install_command
-                .arg(&plan.package_manager_executable)
+                .arg(host_process_path_argument(&plan.package_manager_executable))
                 .arg("install")
                 .arg("--frozen-lockfile")
+                // Hoisted installs avoid Windows absolute junctions that would retain the unpublished
+                // build-directory name after atomic publication.
+                // Hoisted 安装可避免 Windows 绝对目录联接在原子发布后仍指向未发布构建目录名。
+                .arg("--node-linker")
+                .arg("hoisted")
                 .arg("--store-dir")
-                .arg(package_store_dir_for_plan(plan))
+                .arg(host_process_path_argument(&package_store_dir_for_plan(
+                    plan,
+                )))
                 .current_dir(&build_dir);
             configure_managed_command_base_environment(
                 &mut install_command,
@@ -1622,7 +1629,9 @@ fn create_node_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
             // pnpm 主目录保存在未发布受管环境内部。
             install_command.env(
                 "PNPM_HOME",
-                managed_executable_parent(&plan.package_manager_executable)?,
+                host_process_path_argument(managed_executable_parent(
+                    &plan.package_manager_executable,
+                )?),
             );
             run_command(&mut install_command, "install managed Node environment")
         })
@@ -1981,15 +1990,24 @@ pub(crate) fn configure_managed_command_base_environment(
     // loader overrides, and every other host variable stay unavailable to package processes.
     // 首先清空是安全边界：代理凭据、云令牌、启动钩子、加载器覆盖及其他全部宿主变量均不会暴露给包进程。
     command.env_clear();
-    command.env("HOME", controlled_home);
-    command.env("TMPDIR", controlled_home);
+    // ChildHome uses the equivalent non-verbatim spelling accepted by Node.js 24 path parsers.
+    // ChildHome 使用 Node.js 24 路径解析器可接受的等价非 verbatim 写法。
+    let child_home = host_process_path_argument(controlled_home);
+    command.env("HOME", &child_home);
+    command.env("TMPDIR", &child_home);
     // Platform-native PATH assembled exclusively from caller-authorized managed directories.
     // 仅根据调用方授权受管目录组装的平台原生 PATH。
-    let joined_path = env::join_paths(path_entries.iter())
+    // ChildPathEntries keep the validated directories while removing only Windows verbatim syntax.
+    // ChildPathEntries 保留已校验目录，仅移除 Windows verbatim 语法。
+    let child_path_entries = path_entries
+        .iter()
+        .map(|path| host_process_path_argument(path))
+        .collect::<Vec<_>>();
+    let joined_path = env::join_paths(child_path_entries.iter())
         .map_err(|error| format!("failed to construct controlled managed-runtime PATH: {error}"))?;
     command.env("PATH", joined_path);
     #[cfg(windows)]
-    install_required_windows_command_environment(command, controlled_home)?;
+    install_required_windows_command_environment(command, &child_home)?;
     Ok(())
 }
 

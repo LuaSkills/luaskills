@@ -47,7 +47,7 @@ use crate::runtime::managed_runtime::{
     current_managed_runtime_persistent_session_capability, ensure_managed_env,
     resolve_node_env_plan, resolve_python_env_plan,
 };
-use crate::runtime::path::render_host_visible_path;
+use crate::runtime::path::{host_process_path_argument, render_host_visible_path};
 use crate::runtime::process_session::{
     ManagedProcessSessionCleanup, ManagedProcessSessionCore, ManagedProcessSessionLaunchOptions,
     ManagedProcessSessionObserver,
@@ -1109,7 +1109,9 @@ pub(crate) fn launch_managed_python_session(
     )?;
     ensure_regular_file(&snapshot_source, "managed Python snapshot source")?;
     let execution_cwd = cwd.canonical.clone();
-    command.arg(&snapshot_source).args(&request.args);
+    command
+        .arg(host_process_path_argument(&snapshot_source))
+        .args(&request.args);
     configure_managed_command_cwd(&mut command, &cwd)?;
     // Canonical Python virtual-environment directory.
     // 规范 Python 虚拟环境目录。

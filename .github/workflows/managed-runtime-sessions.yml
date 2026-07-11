@@ -1,7 +1,7 @@
 name: Managed Runtime Sessions
 
-# Validate real persistent Python and Node sessions on every supported native target.
-# 在每个受支持原生目标上验证真实 Python 与 Node 持久会话。
+# Validate exact managed Python and Node assets on every supported native target.
+# 在每个受支持原生目标上验证精确版本的受管 Python 与 Node 资产。
 on:
   pull_request:
   push:
@@ -15,9 +15,15 @@ concurrency:
   group: managed-runtime-sessions-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  PYTHON_VERSION: "3.14.4"
+  UV_VERSION: "0.11.28"
+  NODE_VERSION: "24.18.0"
+  PNPM_VERSION: "11.11.0"
+
 jobs:
   native-sessions:
-    name: ${{ matrix.platform }} managed sessions
+    name: ${{ matrix.platform }} exact managed sessions
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -37,6 +43,7 @@ jobs:
       # Missing interpreters are fatal in this native acceptance matrix instead of silent skips.
       # 在该原生验收矩阵中，缺少解释器必须失败而不是静默跳过。
       LUASKILLS_REQUIRE_MANAGED_SESSION_RUNTIMES: "1"
+      MANAGED_RUNTIME_ROOT: ${{ runner.temp }}/luaskills-managed-runtimes
     steps:
       - uses: actions/checkout@v4
 
@@ -46,15 +53,105 @@ jobs:
           toolchain: 1.94.0
           components: clippy, rustfmt
 
-      - name: Setup Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: Fetch exact managed runtimes on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          ./scripts/deps/fetch_managed_runtimes.ps1
+          -RuntimeRoot $env:MANAGED_RUNTIME_ROOT
+          -Target all
+          -PythonVersion $env:PYTHON_VERSION
+          -UvVersion $env:UV_VERSION
+          -NodeVersion $env:NODE_VERSION
+          -PnpmVersion $env:PNPM_VERSION
+          -Force
 
-      - name: Setup Node 22
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22.11.0"
+      - name: Fetch exact managed runtimes on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          RUNTIME_ROOT="$MANAGED_RUNTIME_ROOT"
+          PYTHON_VERSION="$PYTHON_VERSION"
+          UV_VERSION="$UV_VERSION"
+          NODE_VERSION="$NODE_VERSION"
+          PNPM_VERSION="$PNPM_VERSION"
+          FORCE=1
+          ./scripts/deps/fetch_managed_runtimes.sh all
+
+      - name: Validate exact runtime layout on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python scripts/debug-tools/managed_runtime_layout_check.py $env:MANAGED_RUNTIME_ROOT
+
+      - name: Validate exact runtime layout on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: python3 scripts/debug-tools/managed_runtime_layout_check.py "$MANAGED_RUNTIME_ROOT"
+
+      - name: Run exact managed-runtime smoke on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          ./scripts/debug-tools/managed_runtime_smoke.ps1
+          -RuntimeRoot $env:MANAGED_RUNTIME_ROOT
+          -SkipFetch
+          -KeepRuntimeRoot
+
+      - name: Run exact managed-runtime smoke on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          ./scripts/debug-tools/managed_runtime_smoke.sh
+          --runtime-root "$MANAGED_RUNTIME_ROOT"
+          --skip-fetch
+          --keep-runtime-root
+
+      - name: Bind exact managed runtimes to PATH on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $PlatformKey = "windows-x64"
+          $PythonRoot = Join-Path $env:MANAGED_RUNTIME_ROOT "dependencies/runtimes/python/cpython-$env:PYTHON_VERSION-$PlatformKey"
+          $PythonManifest = Get-Content -Raw (Join-Path $PythonRoot "runtime-manifest.json") | ConvertFrom-Json
+          $PythonDirectory = Split-Path -Parent (Join-Path $PythonRoot $PythonManifest.executable)
+          $NodeDirectory = Join-Path $env:MANAGED_RUNTIME_ROOT "dependencies/runtimes/node/node-$env:NODE_VERSION-$PlatformKey"
+          $PythonDirectory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $NodeDirectory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Bind exact managed runtimes to PATH on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          case "${{ matrix.platform }}" in
+            linux-x64) platform_key="linux-x64" ;;
+            linux-arm64) platform_key="linux-arm64" ;;
+            macos-x64) platform_key="macos-x64" ;;
+            macos-arm64) platform_key="macos-arm64" ;;
+            *) echo "Unsupported matrix platform: ${{ matrix.platform }}" >&2; exit 1 ;;
+          esac
+          python_root="$MANAGED_RUNTIME_ROOT/dependencies/runtimes/python/cpython-$PYTHON_VERSION-$platform_key"
+          python_executable="$(python3 - "$python_root/runtime-manifest.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8-sig") as handle:
+              print(json.load(handle)["executable"])
+          PY
+          )"
+          echo "$python_root/$(dirname "$python_executable")" >> "$GITHUB_PATH"
+          echo "$MANAGED_RUNTIME_ROOT/dependencies/runtimes/node/node-$NODE_VERSION-$platform_key/bin" >> "$GITHUB_PATH"
+
+      - name: Verify exact runtime versions
+        shell: pwsh
+        run: |
+          python --version
+          node --version
+          if ((python --version) -notmatch "Python $([regex]::Escape($env:PYTHON_VERSION))") {
+              throw "PATH does not resolve Python $env:PYTHON_VERSION"
+          }
+          if ((node --version) -ne "v$env:NODE_VERSION") {
+              throw "PATH does not resolve Node.js $env:NODE_VERSION"
+          }
 
       - name: Verify formatting
         shell: pwsh
@@ -69,20 +166,20 @@ jobs:
         run: cargo test --all-targets -- --test-threads=1
 
   ffi-examples:
-    name: FFI example static checks
+    name: FFI examples on Python 3.14 and Node 24
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python 3.12
+      - name: Setup Python 3.14
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14.4"
 
-      - name: Setup Node 22
+      - name: Setup Node 24
         uses: actions/setup-node@v4
         with:
-          node-version: "22.11.0"
+          node-version: "24.18.0"
 
       - name: Compile Python FFI examples
         shell: bash
