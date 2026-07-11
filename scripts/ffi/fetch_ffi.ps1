@@ -37,7 +37,11 @@ function Resolve-ProjectRoot {
     foreach ($Candidate in $Candidates) {
         $Current = $Candidate
         while ($Current) {
-            if ((Test-Path -LiteralPath (Join-Path $Current "Cargo.toml")) -and (Test-Path -LiteralPath (Join-Path $Current "scripts"))) {
+            $RepositoryMarkers = @("Cargo.toml", "pyproject.toml", "package.json", "go.mod")
+            $IsRepositoryRoot = (Test-Path -LiteralPath (Join-Path $Current "scripts")) -and ($RepositoryMarkers | Where-Object {
+                Test-Path -LiteralPath (Join-Path $Current $_)
+            } | Select-Object -First 1)
+            if ($IsRepositoryRoot) {
                 return $Current
             }
             $PackagedFetchScript = Join-Path $Current "scripts\ffi\fetch_ffi.ps1"
@@ -359,16 +363,21 @@ $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($PSCommandPath) { Spli
 $ProjectRoot = Resolve-ProjectRoot -ScriptDirectory $ScriptDir
 Set-Location $ProjectRoot
 if ([string]::IsNullOrWhiteSpace($LuaSkillsVersion)) {
-    $CargoTomlPath = Join-Path $ProjectRoot "Cargo.toml"
-    if (-not (Test-Path -LiteralPath $CargoTomlPath)) {
-        throw "LuaSkills FFI SDK version was not provided. Pass -LuaSkillsVersion when running from a packaged runtime."
+    $VersionPath = Join-Path $ProjectRoot "VERSION"
+    if (Test-Path -LiteralPath $VersionPath) {
+        $LuaSkillsVersion = "v$((Get-Content -Raw -LiteralPath $VersionPath).Trim())"
+    } else {
+        $CargoTomlPath = Join-Path $ProjectRoot "Cargo.toml"
+        if (-not (Test-Path -LiteralPath $CargoTomlPath)) {
+            throw "LuaSkills FFI SDK version was not provided. Pass -LuaSkillsVersion when running from a packaged runtime."
+        }
+        $CargoTomlText = Get-Content -Raw -LiteralPath $CargoTomlPath
+        $CargoVersionMatch = [regex]::Match($CargoTomlText, '(?m)^version\s*=\s*"([^"]+)"')
+        if (-not $CargoVersionMatch.Success) {
+            throw "Unable to resolve fallback LuaSkills version from Cargo.toml."
+        }
+        $LuaSkillsVersion = "v$($CargoVersionMatch.Groups[1].Value)"
     }
-    $CargoTomlText = Get-Content -Raw -LiteralPath $CargoTomlPath
-    $CargoVersionMatch = [regex]::Match($CargoTomlText, '(?m)^version\s*=\s*"([^"]+)"')
-    if (-not $CargoVersionMatch.Success) {
-        throw "Unable to resolve fallback LuaSkills version from Cargo.toml."
-    }
-    $LuaSkillsVersion = "v$($CargoVersionMatch.Groups[1].Value)"
 }
 Ensure-Dir $RuntimeRoot
 Install-LuaSkillsFfi -RuntimeRootPath $RuntimeRoot

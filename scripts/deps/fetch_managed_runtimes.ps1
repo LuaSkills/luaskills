@@ -159,7 +159,23 @@ function Get-Sha256File {
     #>
     param([string]$Path)
 
-    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+    # Stream keeps checksum verification available on Windows PowerShell hosts without Get-FileHash.
+    # Stream 使缺少 Get-FileHash 的 Windows PowerShell 宿主仍可执行校验和验证。
+    $Stream = [System.IO.File]::OpenRead((Resolve-Path -LiteralPath $Path).Path)
+    try {
+        # Hasher computes the exact archive digest used by upstream checksum manifests.
+        # Hasher 计算上游校验和清单使用的精确归档摘要。
+        $Hasher = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return ([System.BitConverter]::ToString($Hasher.ComputeHash($Stream))).Replace("-", "").ToLowerInvariant()
+        }
+        finally {
+            $Hasher.Dispose()
+        }
+    }
+    finally {
+        $Stream.Dispose()
+    }
 }
 
 function Get-Sha512Base64File {
@@ -534,7 +550,12 @@ function Install-NodeRuntime {
 
     # ExpectedLine stores the checksum manifest line for the target archive.
     # ExpectedLine 保存目标归档在校验清单中的行。
-    $ExpectedLine = Get-Content -LiteralPath $ShasumsPath | Where-Object { $_ -match "\s$([regex]::Escape($AssetName))$" } | Select-Object -First 1
+    # ShasumsText reads the manifest eagerly so older Windows PowerShell does not retain a pipeline file handle.
+    # ShasumsText 预先完整读取清单，避免旧版 Windows PowerShell 保留管道文件句柄。
+    $ShasumsText = [System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $ShasumsPath).Path)
+    # ExpectedLine selects the unique checksum row from the in-memory manifest.
+    # ExpectedLine 从内存清单中选择唯一的校验和记录。
+    $ExpectedLine = @($ShasumsText -split "`r?`n" | Where-Object { $_ -match "\s$([regex]::Escape($AssetName))$" })[0]
     if (-not $ExpectedLine) {
         throw "Checksum entry for $AssetName not found in SHASUMS256.txt"
     }

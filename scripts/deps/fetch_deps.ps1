@@ -45,7 +45,11 @@ function Resolve-ProjectRoot {
     foreach ($Candidate in $Candidates) {
         $Current = $Candidate
         while ($Current) {
-            if ((Test-Path -LiteralPath (Join-Path $Current "Cargo.toml")) -and (Test-Path -LiteralPath (Join-Path $Current "scripts"))) {
+            $RepositoryMarkers = @("Cargo.toml", "pyproject.toml", "package.json", "go.mod")
+            $IsRepositoryRoot = (Test-Path -LiteralPath (Join-Path $Current "scripts")) -and ($RepositoryMarkers | Where-Object {
+                Test-Path -LiteralPath (Join-Path $Current $_)
+            } | Select-Object -First 1)
+            if ($IsRepositoryRoot) {
                 return $Current
             }
             $PackagedFetchScript = Join-Path $Current "scripts\deps\fetch_deps.ps1"

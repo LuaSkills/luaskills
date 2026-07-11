@@ -20,6 +20,8 @@ Demo and debug-tool packages no longer bundle `lua-runtime-{platform}.tar.gz` or
 
 Demo packages provide standalone dependency upgrade scripts with four targets. The `run` script only runs the demo and does not download dependencies automatically. Windows packages include `upgrade_deps.bat`, `scripts/deps/fetch_deps.ps1`, and `run.ps1`; FFI packages also include `scripts/ffi/fetch_ffi.ps1`. Linux/macOS packages include the matching `.sh` scripts.
 
+SDK repositories additionally publish `scripts/deps/sync_runtime_assets.ps1` and `scripts/deps/sync_runtime_assets.sh` as one direct entrypoint for LuaSkills FFI, Lua runtime packages, and VLDB. Use target `all`, `luaskills`, `lua`, or `vldb`; select `none`, `vldb-controller`, `vldb-direct`, or `host-callback` as the database preset. The default LuaSkills tag is `v0.5.0`, and release tags can be overridden explicitly for controlled validation.
+
 - `all`: Fetch `lua-runtime-packages-{platform}.tar.gz`, optional vldb-controller, and the FFI SDK when the package contains `scripts/ffi`.
 - `lua`: Fetch `lua-runtime-packages-{platform}.tar.gz` and install it into the demo `runtime/` directory.
 - `vldb`: Fetch only vldb-controller and place it under the demo runtime `bin/` directory.
@@ -54,6 +56,8 @@ demo 包与 debug-tool 包不再从本仓库发布 `lua-runtime-{platform}.tar.g
 ### Demo 依赖拉取方式
 
 demo 包内的独立依赖升级脚本支持四个目标。`run` 脚本只负责运行 demo，不会自动下载依赖。Windows 包携带 `upgrade_deps.bat`、`scripts/deps/fetch_deps.ps1` 和 `run.ps1`；FFI 包额外携带 `scripts/ffi/fetch_ffi.ps1`。Linux/macOS 包携带对应的 `.sh` 脚本。
+
+三个 SDK 仓库还会发布 `scripts/deps/sync_runtime_assets.ps1` 与 `scripts/deps/sync_runtime_assets.sh`，作为 LuaSkills FFI、Lua runtime packages 与 VLDB 的统一直接同步入口。目标支持 `all`、`luaskills`、`lua`、`vldb`；数据库预设支持 `none`、`vldb-controller`、`vldb-direct`、`host-callback`。默认 LuaSkills 标签固定为 `v0.5.0`，受控验证时可显式覆盖发布标签。
 
 - `all`：拉取 `lua-runtime-packages-{platform}.tar.gz`、可选 vldb-controller，并在包内存在 `scripts/ffi` 时额外拉取 FFI SDK。
 - `lua`：只拉取并安装 `lua-runtime-packages-{platform}.tar.gz` 到 demo 的 `runtime/` 目录。
