@@ -690,7 +690,7 @@ fn macos_file_identity_from_fd(fd: RawFd) -> Result<MacosFileIdentity, io::Error
     if unsafe { libc::fstat(fd, &mut stat) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let (device, inode) = unix_stat_device_inode(&stat).map_err(|error| io::Error::other(error))?;
+    let (device, inode) = unix_stat_device_inode(&stat).map_err(io::Error::other)?;
     Ok(MacosFileIdentity { device, inode })
 }
 
