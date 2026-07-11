@@ -2272,6 +2272,10 @@ impl ProcessTreeController {
             if error.raw_os_error() == Some(ESRCH) {
                 return Ok(());
             }
+            #[cfg(target_os = "macos")]
+            if error.raw_os_error() == Some(libc::EPERM) && macos_direct_child_has_exited(_child)? {
+                return Ok(());
+            }
             Err(format!("kill process group: {error}"))
         }
         #[cfg(windows)]
@@ -2315,6 +2319,43 @@ impl ProcessTreeController {
     fn clear_detached_guard(&self) {
         let _released_guard = self.take_detached_guard();
     }
+}
+
+#[cfg(target_os = "macos")]
+/// Return whether Darwin reports the direct child as exited without reaping its process identity.
+/// 返回 Darwin 是否报告直接子进程已经退出，同时不回收其进程身份。
+///
+/// `child` is the still-owned process-group leader. The result distinguishes Darwin's `EPERM`
+/// for an exited zombie-only group from a live process tree whose termination must remain retryable.
+/// `child` 是仍被持有的进程组组长。返回值用于区分 Darwin 对仅含已退出僵尸进程的组返回的
+/// `EPERM`，以及终止操作必须保持可重试的存活进程树。
+fn macos_direct_child_has_exited(child: &Child) -> Result<bool, String> {
+    // Info is initialized by waitid while WNOWAIT preserves the child for authoritative reaping.
+    // Info 由 waitid 初始化，同时 WNOWAIT 会保留子进程，供后续权威回收。
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // Result performs a nonblocking identity-specific Darwin lifecycle query.
+    // Result 执行一次非阻塞且绑定具体进程身份的 Darwin 生命周期查询。
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        // Error preserves every unexpected native lifecycle failure.
+        // Error 保留每个非预期的原生生命周期失败。
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            return Ok(true);
+        }
+        return Err(format!("waitid after macOS process-group EPERM: {error}"));
+    }
+    // Info is initialized after successful waitid; a zero pid means the child is still running.
+    // waitid 成功后 Info 已初始化；pid 为零表示子进程仍在运行。
+    let info = unsafe { info.assume_init() };
+    Ok(unsafe { info.si_pid() } != 0)
 }
 
 /// Terminate and reap a child whose process-tree attachment failed after spawn.
