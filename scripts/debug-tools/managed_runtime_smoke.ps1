@@ -105,9 +105,15 @@ function Invoke-CheckedProcess {
     $Process = New-Object System.Diagnostics.Process
     $Process.StartInfo = $StartInfo
     [void]$Process.Start()
-    $Stdout = $Process.StandardOutput.ReadToEnd()
-    $Stderr = $Process.StandardError.ReadToEnd()
+    # StdoutTask and StderrTask drain both redirected pipes concurrently to prevent buffer deadlocks.
+    # StdoutTask 与 StderrTask 并发排空两个重定向管道，防止缓冲区死锁。
+    $StdoutTask = $Process.StandardOutput.ReadToEndAsync()
+    $StderrTask = $Process.StandardError.ReadToEndAsync()
     $Process.WaitForExit()
+    # Stdout and Stderr resolve only after process exit guarantees both writers are closed.
+    # Stdout 与 Stderr 仅在进程退出并保证两个写端关闭后解析。
+    $Stdout = $StdoutTask.GetAwaiter().GetResult()
+    $Stderr = $StderrTask.GetAwaiter().GetResult()
 
     if ($Process.ExitCode -ne 0) {
         throw "Process failed: $FilePath $($ArgumentList -join ' ')`nstdout:`n$Stdout`nstderr:`n$Stderr"
