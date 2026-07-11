@@ -76,7 +76,7 @@ jobs:
           NODE_VERSION="$NODE_VERSION"
           PNPM_VERSION="$PNPM_VERSION"
           FORCE=1
-          ./scripts/deps/fetch_managed_runtimes.sh all
+          bash ./scripts/deps/fetch_managed_runtimes.sh all
 
       - name: Validate exact runtime layout on Windows
         if: runner.os == 'Windows'
@@ -101,7 +101,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: >-
-          ./scripts/debug-tools/managed_runtime_smoke.sh
+          bash ./scripts/debug-tools/managed_runtime_smoke.sh
           --runtime-root "$MANAGED_RUNTIME_ROOT"
           --skip-fetch
           --keep-runtime-root
