@@ -63,7 +63,7 @@ use mlua::{Lua, Table, Value as LuaValue};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink as create_unix_symlink};
