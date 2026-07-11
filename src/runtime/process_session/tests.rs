@@ -1,7 +1,9 @@
 use super::*;
 use crate::runtime::encoding::default_runtime_text_encoding;
 use crate::runtime::test_support::process_env_test_guard;
+use std::fs;
 use std::panic::{self, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicUsize;
 use std::thread;
@@ -19,6 +21,10 @@ const WINDOWS_SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 /// Maximum startup allowance for a descendant probe under full-suite process pressure.
 /// 全量测试进程压力下后代探针允许的最大启动时长。
 const DESCENDANT_PROBE_START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Monotonic suffix that isolates descendant pid fixtures inside one parallel test process.
+/// 在单个并行测试进程内隔离后代 pid 夹具的单调后缀。
+static DESCENDANT_FIXTURE_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
 
 /// A direct-child reap helper must honor its absolute deadline without calling blocking wait.
 /// 直接子进程回收辅助函数必须遵守绝对截止时间，且不得调用阻塞式 wait。
@@ -85,10 +91,10 @@ fn make_drop_cleanup_request() -> ProcessSessionOpenRequest {
 
 /// Build one process request whose direct child exits after spawning one descendant.
 /// 构建一个直接子进程在拉起后代后立即退出的进程请求。
-fn make_descendant_cleanup_request() -> ProcessSessionOpenRequest {
+fn make_descendant_cleanup_request() -> (ProcessSessionOpenRequest, Option<PathBuf>) {
     let encoding = default_runtime_text_encoding();
     if cfg!(windows) {
-        ProcessSessionOpenRequest {
+        (ProcessSessionOpenRequest {
                 program: "python".to_string(),
                 args: vec![
                     "-c".to_string(),
@@ -99,21 +105,32 @@ fn make_descendant_cleanup_request() -> ProcessSessionOpenRequest {
                 stderr_encoding: encoding,
                 stdin_encoding: encoding,
                 buffer_limit_bytes: DEFAULT_SESSION_BUFFER_LIMIT_BYTES,
-            }
+            }, None)
     } else {
-        ProcessSessionOpenRequest {
+        // FixtureSequence gives each parallel Unix process-tree test a private pid file.
+        // FixtureSequence 为每个并行 Unix 进程树测试提供私有 pid 文件。
+        let fixture_sequence = DESCENDANT_FIXTURE_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+        // PidPath is an out-of-band identity channel independent of stdout-reader scheduling.
+        // PidPath 是独立于 stdout reader 调度的带外身份通道。
+        let pid_path = std::env::temp_dir().join(format!(
+            "luaskills-process-descendant-{}-{fixture_sequence}.pid",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&pid_path);
+        (ProcessSessionOpenRequest {
             program: "/bin/sh".to_string(),
             args: vec![
                 "-c".to_string(),
-                "/bin/sleep 30 </dev/null >/dev/null 2>&1 & echo $!; /bin/sleep 0.3; exit 0"
-                    .to_string(),
+                "/bin/sleep 30 </dev/null >/dev/null 2>&1 & echo $!; echo $! > \"$1\"; /bin/sleep 0.3; exit 0".to_string(),
+                "managed-descendant-fixture".to_string(),
+                pid_path.to_string_lossy().into_owned(),
             ],
             cwd: None,
             stdout_encoding: encoding,
             stderr_encoding: encoding,
             stdin_encoding: encoding,
             buffer_limit_bytes: DEFAULT_SESSION_BUFFER_LIMIT_BYTES,
-        }
+        }, Some(pid_path))
     }
 }
 
@@ -433,7 +450,11 @@ fn assert_process_exits(pid: u32, timeout: Duration) {
 
 /// Wait for one session to publish a descendant pid to stdout.
 /// 等待某个会话把后代进程 pid 输出到 stdout。
-fn wait_for_descendant_pid(session: &ManagedProcessSession, timeout: Duration) -> u32 {
+fn wait_for_descendant_pid(
+    session: &ManagedProcessSession,
+    pid_path: Option<&Path>,
+    timeout: Duration,
+) -> u32 {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         let stdout = session
@@ -462,6 +483,12 @@ fn wait_for_descendant_pid(session: &ManagedProcessSession, timeout: Duration) -
                     return pid;
                 }
             }
+        }
+        if let Some(pid_path) = pid_path
+            && let Ok(pid_text) = fs::read_to_string(pid_path)
+            && let Ok(pid) = pid_text.trim().parse::<u32>()
+        {
+            return pid;
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -524,9 +551,13 @@ fn killing_process_session_terminates_descendants_and_releases_readers() {
     // Hold the shared PATH guard while the test spawns and probes named executables.
     // 在测试按名称启动并探测可执行文件期间持有共享 PATH 保护锁。
     let _env_guard = process_env_test_guard();
-    let session = ManagedProcessSession::open(make_descendant_cleanup_request())
-        .expect("open descendant cleanup session");
-    let descendant_pid = wait_for_descendant_pid(&session, DESCENDANT_PROBE_START_TIMEOUT);
+    let (request, pid_path) = make_descendant_cleanup_request();
+    let session = ManagedProcessSession::open(request).expect("open descendant cleanup session");
+    let descendant_pid = wait_for_descendant_pid(
+        &session,
+        pid_path.as_deref(),
+        DESCENDANT_PROBE_START_TIMEOUT,
+    );
     assert!(
         process_exists(descendant_pid).expect("probe descendant before cleanup"),
         "descendant process should be running before cleanup"
@@ -548,6 +579,9 @@ fn killing_process_session_terminates_descendants_and_releases_readers() {
     );
 
     assert_process_exits(descendant_pid, Duration::from_secs(5));
+    if let Some(pid_path) = pid_path {
+        let _ = fs::remove_file(pid_path);
+    }
 }
 
 #[cfg(windows)]
@@ -558,11 +592,16 @@ fn windows_suspended_root_and_descendant_share_managed_job() {
     // Hold the shared PATH guard while PowerShell and its descendant are launched and probed.
     // 启动并探测 PowerShell 及其后代期间持有共享 PATH 保护锁。
     let _env_guard = process_env_test_guard();
-    let session = ManagedProcessSession::open(make_descendant_cleanup_request())
-        .expect("open Windows Job containment session");
+    let (request, pid_path) = make_descendant_cleanup_request();
+    let session =
+        ManagedProcessSession::open(request).expect("open Windows Job containment session");
     // Descendant output proves the CREATE_SUSPENDED root was resumed successfully.
     // 后代输出证明 CREATE_SUSPENDED 根进程已成功恢复。
-    let descendant_pid = wait_for_descendant_pid(&session, DESCENDANT_PROBE_START_TIMEOUT);
+    let descendant_pid = wait_for_descendant_pid(
+        &session,
+        pid_path.as_deref(),
+        DESCENDANT_PROBE_START_TIMEOUT,
+    );
     let child_guard = session
         .core
         .state
@@ -1506,9 +1545,14 @@ fn closing_process_session_after_child_exit_still_cleans_descendants() {
     // 在测试按名称启动并探测可执行文件期间持有共享 PATH 保护锁。
     let _env_guard = process_env_test_guard();
     let lua = Lua::new();
-    let session = ManagedProcessSession::open(make_descendant_cleanup_request())
-        .expect("open close descendant cleanup session");
-    let descendant_pid = wait_for_descendant_pid(&session, DESCENDANT_PROBE_START_TIMEOUT);
+    let (request, pid_path) = make_descendant_cleanup_request();
+    let session =
+        ManagedProcessSession::open(request).expect("open close descendant cleanup session");
+    let descendant_pid = wait_for_descendant_pid(
+        &session,
+        pid_path.as_deref(),
+        DESCENDANT_PROBE_START_TIMEOUT,
+    );
     wait_for_root_exit(&session, Duration::from_secs(5));
     assert!(
         process_exists(descendant_pid).expect("probe descendant before close cleanup"),
@@ -1546,6 +1590,9 @@ fn closing_process_session_after_child_exit_still_cleans_descendants() {
     let exited: bool = status.get("exited").expect("read close exited flag");
     assert!(exited, "close should report one exited process status");
     assert_process_exits(descendant_pid, Duration::from_secs(5));
+    if let Some(pid_path) = pid_path {
+        let _ = fs::remove_file(pid_path);
+    }
 }
 
 /// Verify read() keeps waiting for descendant output even after the root process exits.
