@@ -1430,8 +1430,19 @@ fn ffi_managed_session_wake_callback_poll_bypasses_engine_mutex() {
     });
     // Completion while the engine guard is held proves nested poll uses only the cached center.
     // 在持有引擎保护对象期间完成，可证明嵌套轮询仅使用缓存事件中心。
-    let first_publish_result = publish_done_rx.recv_timeout(Duration::from_millis(500));
-    let completed_while_engine_locked = first_publish_result.is_ok();
+    let first_publish_result = publish_done_rx.recv_timeout(Duration::from_secs(2));
+    // CallbackDeadline keeps the engine locked until the detached callback proves nested polling.
+    // CallbackDeadline 会保持引擎锁，直到分离式回调证明嵌套轮询已经完成。
+    let callback_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while callback_state.callback_count.load(Ordering::Acquire) == 0
+        && std::time::Instant::now() < callback_deadline
+    {
+        std::thread::yield_now();
+    }
+    // CompletedWhileEngineLocked requires both publication and callback completion before unlock.
+    // CompletedWhileEngineLocked 要求发布与回调均在解锁前完成。
+    let completed_while_engine_locked =
+        first_publish_result.is_ok() && callback_state.callback_count.load(Ordering::Acquire) == 1;
     drop(engine_guard);
     let publish_result = match first_publish_result {
         Ok(publish_result) => publish_result,
