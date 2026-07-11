@@ -3629,6 +3629,7 @@ mod tests {
         assert!(raw_fd >= 0, "open macOS snapshot root");
         let directory = unsafe { OwnedFd::from_raw_fd(raw_fd) };
         fs::rename(&snapshot, &moved).expect("move pinned macOS snapshot root");
+        let canonical_moved = fs::canonicalize(&moved).expect("canonicalize moved macOS snapshot");
         fs::create_dir_all(snapshot.join("runtime")).expect("create replacement snapshot root");
         fs::write(snapshot.join("runtime/entry.py"), b"replacement\n")
             .expect("write replacement macOS source");
@@ -3644,7 +3645,7 @@ mod tests {
             fs::read(&execution_path).expect("read object-derived macOS source"),
             b"trusted\n"
         );
-        assert!(execution_path.starts_with(&moved));
+        assert!(execution_path.starts_with(&canonical_moved));
         fs::remove_dir_all(&root).expect("remove macOS execution object test root");
     }
 

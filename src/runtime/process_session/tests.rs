@@ -102,10 +102,11 @@ fn make_descendant_cleanup_request() -> ProcessSessionOpenRequest {
             }
     } else {
         ProcessSessionOpenRequest {
-            program: "sh".to_string(),
+            program: "/bin/sh".to_string(),
             args: vec![
                 "-c".to_string(),
-                "sleep 30 </dev/null >/dev/null 2>&1 & echo $!; sleep 0.3; exit 0".to_string(),
+                "/bin/sleep 30 </dev/null >/dev/null 2>&1 & echo $!; /bin/sleep 0.3; exit 0"
+                    .to_string(),
             ],
             cwd: None,
             stdout_encoding: encoding,

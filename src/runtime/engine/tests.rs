@@ -3942,6 +3942,11 @@ fn reload_from_roots_keeps_frozen_relative_explicit_skill_config_path() {
     }
     let relative_config_path = PathBuf::from("config").join("skill_config.json");
     std::env::set_current_dir(&first_cwd).expect("switch to first cwd");
+    #[cfg(target_os = "macos")]
+    let expected_config_path = fs::canonicalize(&first_cwd)
+        .expect("canonicalize first cwd")
+        .join(&relative_config_path);
+    #[cfg(not(target_os = "macos"))]
     let expected_config_path = first_cwd.join(&relative_config_path);
 
     let mut engine = try_make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions {
@@ -5905,7 +5910,7 @@ fn execute_runlua_request_inline_uses_managed_io_default_output() {
 
 /// Verify `vulcan.fs.list` reports non-UTF-8 directory entries with one host-visible directory path.
 /// 验证 `vulcan.fs.list` 会用宿主可见目录路径报告非 UTF-8 目录项。
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn execute_runlua_request_inline_fs_list_non_utf8_entry_error_uses_host_visible_path() {
     let engine = make_runtime_test_engine();
@@ -6962,13 +6967,13 @@ fn execute_runlua_request_inline_uses_process_session_write_read() {
     let engine = make_runtime_test_engine();
     let result = engine
             .execute_runlua_request_json_inline(
-                r#"{"code":"local info = vulcan.os.info(); local spec; if info.os == 'windows' then spec = { program = 'cmd', args = { '/V:ON', '/C', 'set /P line=&echo session:!line!' }, encoding = 'utf-8' } else spec = { program = 'sh', args = { '-c', 'read line; echo session:$line' }, encoding = 'utf-8' } end; local session = vulcan.process.session.open(spec); session:write('ok\\n'); local status = session:close({ timeout_ms = 3000 }); local output = session:read({ timeout_ms = 3000 }); return output.stdout, status.exited, status.success"}"#,
+                r#"{"code":"local info = vulcan.os.info(); local spec; if info.os == 'windows' then spec = { program = 'cmd', args = { '/V:ON', '/C', 'set /P line=&echo session:!line!' }, encoding = 'utf-8' } else spec = { program = '/bin/sh', args = { '-c', 'read line; echo session:$line' }, encoding = 'utf-8' } end; local session = vulcan.process.session.open(spec); session:write('ok\\n'); local status = session:close({ timeout_ms = 3000 }); local output = session:read({ timeout_ms = 3000 }); return output.stdout, status.exited,status.success"}"#,
             )
             .expect("inline runlua should exercise process session");
 
-    assert!(result.contains("SUCCESS"));
-    assert!(result.contains("session:ok"));
-    assert!(result.contains("true"));
+    assert!(result.contains("SUCCESS"), "unexpected result: {result}");
+    assert!(result.contains("session:ok"), "unexpected result: {result}");
+    assert!(result.contains("true"), "unexpected result: {result}");
 }
 
 /// Verify persistent runtime sessions keep Lua VM globals across eval calls.
