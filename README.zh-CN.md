@@ -112,7 +112,7 @@ Rust 宿主可直接依赖 crate：
 
 ```toml
 [dependencies]
-luaskills = "0.4"
+luaskills = "0.5"
 ```
 
 仓库开发常用命令：
@@ -172,16 +172,29 @@ GitHub 托管 skill 的仓库派生或显式 `skill_id`、release zip 前缀、c
 
 ## 生态统一发布顺序
 
-如果要做一次类似 `0.4.6` 的生态统一发布，推荐顺序如下：
+如果要做一次 `0.5.0` 生态统一发布，推荐顺序如下：
 
 1. 先发布 `LuaSkills/luaskills-packages`，确保新的兼容协议线下 `lua-runtime-packages-*` 与 `lua-deps-*` 已经存在。
-2. 再发布 `LuaSkills/luaskills`，完成 crate 版本以及主仓库 `luaskills-ffi-sdk-*` 和 demo 资产的 `v0.4.6` release。
-3. 再发布 TypeScript SDK `@luaskills/sdk@0.4.6`。
-4. 再发布 Python SDK `luaskills-sdk==0.4.6`。
-5. 再发布 Go SDK module tag `v0.4.6`。
+2. 再发布 `LuaSkills/luaskills`，完成 crate 版本以及主仓库 `luaskills-ffi-sdk-*` 和 demo 资产的 `v0.5.0` release。
+3. 再发布 TypeScript SDK `@luaskills/sdk@0.5.0`。
+4. 再发布 Python SDK `luaskills-sdk==0.5.0`。
+5. 再发布 Go SDK module tag `v0.5.0`。
 6. 最后分别运行各 SDK 仓库的 **Examples Release** 工作流，并确保对应包或 module tag 已经在上游可见。
 
 这样可以保证安装器、示例工作流和默认 runtime 资产都只会指向已经发布完成的 packages 资产、core 资产和 SDK 包。
+
+## 当前版本矩阵
+
+| 组件 | 当前版本 |
+| --- | --- |
+| LuaSkills core、FFI SDK 与多语言 SDK 版本线 | `0.5.0` |
+| Lua runtime packages 兼容协议线 | `0.1` |
+| 受管 Python / uv | `3.12.7` / `0.11.17` |
+| 受管 Node.js / pnpm | `22.11.0` / `9.15.0` |
+| vldb-controller | `0.2.1` |
+| vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
+
+实际可执行默认值由 `scripts/deps/fetch_managed_runtimes.*`、`scripts/deps/fetch_deps.*` 与 `scripts/deps/sync_runtime_assets.*` 定义。除非宿主有意安装并声明其他受支持的精确版本，否则 `dependencies.yaml` 必须使用上表中的受管运行时和包管理器精确版本。
 
 ## License
 

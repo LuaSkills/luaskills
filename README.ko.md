@@ -19,6 +19,7 @@ LuaSkills는 LuaSkills 생태계의 핵심 런타임 계층입니다.
 - skill 발견, 로드, entry 목록화, 호출.
 - 문서, 명령 팔레트, tool, UI로 렌더링 가능한 strict help tree.
 - `vulcan.*` 및 `vulcan.runtime.*` 표준 Lua API 주입.
+- Windows x64, Linux x64/ARM64, macOS x64/ARM64에서 skill과 System Plugin이 사용하는 패키지 격리형 영구 Python/Node.js 세션. Windows ARM은 명시적으로 지원하지 않습니다.
 - 요청, skill 디렉터리, 리소스, 의존성 루트, 클라이언트 정보에 대한 런타임 컨텍스트 주입.
 - 상태형 또는 memory skill을 위한 SQLite / LanceDB 연동.
 - Rust API, 표준 C ABI, public `_json` FFI.
@@ -74,7 +75,7 @@ Rust 호스트:
 
 ```toml
 [dependencies]
-luaskills = "0.3"
+luaskills = "0.5"
 ```
 
 개발 명령:
@@ -104,6 +105,19 @@ asset은 `{skill_id}-v{version}-skill.zip`과 `{skill_id}-v{version}-checksums.t
 임의의 신뢰할 수 없는 Lua package에 대한 sandbox 보장은 제공하지 않습니다.
 
 호스트는 root, 설치 가능한 skill, 관리 동작, database provider mode, operation authority를 명확히 결정해야 합니다.
+
+## 현재 버전 매트릭스
+
+| 구성 요소 | 현재 버전 |
+| --- | --- |
+| LuaSkills core, FFI SDK 및 언어 SDK 계열 | `0.5.0` |
+| Lua runtime packages 호환 계열 | `0.1` |
+| 관리형 Python / uv | `3.12.7` / `0.11.17` |
+| 관리형 Node.js / pnpm | `22.11.0` / `9.15.0` |
+| vldb-controller | `0.2.1` |
+| vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
+
+실제 기본값은 `scripts/deps/fetch_managed_runtimes.*`, `scripts/deps/fetch_deps.*`, `scripts/deps/sync_runtime_assets.*`에 정의됩니다. 호스트가 다른 정확한 지원 버전을 의도적으로 설치하고 선언하지 않는 한 `dependencies.yaml`에는 위 관리형 runtime 및 패키지 관리자 버전을 정확히 선언해야 합니다.
 
 ## License
 

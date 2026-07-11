@@ -19,6 +19,7 @@ Il fournit :
 - Découverte, chargement, énumération et invocation de skills.
 - Strict help trees que l'hôte peut afficher comme documentation, palette de commandes, tools ou UI.
 - Injection des APIs standard `vulcan.*` et `vulcan.runtime.*`.
+- Sessions Python et Node.js persistantes et isolées par paquet pour les skills et System Plugins sous Windows x64, Linux x64/ARM64 et macOS x64/ARM64 ; Windows ARM est explicitement non pris en charge.
 - Contexte de runtime pour la requête courante, les dossiers de skill, les ressources, les dépendances et les métadonnées client.
 - Intégration optionnelle SQLite et LanceDB pour des skills avec état ou mémoire.
 - API Rust, C ABI standard et FFI publique `_json`.
@@ -74,7 +75,7 @@ Hôte Rust :
 
 ```toml
 [dependencies]
-luaskills = "0.3"
+luaskills = "0.5"
 ```
 
 Commandes de développement :
@@ -104,6 +105,19 @@ LuaSkills traite actuellement les skills comme du code fiable par défaut.
 Il ne fournit pas de promesse sandbox pour des packages Lua arbitraires et non fiables.
 
 L'hôte doit décider des roots, des skills installables, des actions de gestion, du mode database provider et de l'authority de chaque opération.
+
+## Matrice Des Versions Actuelles
+
+| Composant | Version actuelle |
+| --- | --- |
+| Cœur LuaSkills, SDK FFI et gamme de SDK de langage | `0.5.0` |
+| Série compatible des paquets du runtime Lua | `0.1` |
+| Python / uv gérés | `3.12.7` / `0.11.17` |
+| Node.js / pnpm gérés | `22.11.0` / `9.15.0` |
+| vldb-controller | `0.2.1` |
+| vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
+
+Les valeurs exécutables par défaut sont définies dans `scripts/deps/fetch_managed_runtimes.*`, `scripts/deps/fetch_deps.*` et `scripts/deps/sync_runtime_assets.*`. `dependencies.yaml` doit déclarer ces versions exactes du runtime et du gestionnaire de paquets, sauf si l’hôte installe et déclare volontairement une autre version exacte prise en charge.
 
 ## License
 

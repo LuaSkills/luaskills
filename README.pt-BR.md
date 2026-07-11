@@ -19,6 +19,7 @@ Ele fornece:
 - Descoberta, carregamento, listagem e chamada de skills.
 - Strict help trees que o host pode renderizar como documentação, comandos, tools ou UI.
 - Injeção de APIs padrão `vulcan.*` e `vulcan.runtime.*`.
+- Sessões persistentes de Python e Node.js isoladas por pacote para skills e System Plugins no Windows x64, Linux x64/ARM64 e macOS x64/ARM64; Windows ARM não é explicitamente suportado.
 - Contexto de runtime para request atual, diretórios de skill, recursos, dependências e metadados do cliente.
 - Integração opcional com SQLite e LanceDB para skills com estado ou memória.
 - API Rust, C ABI padrão e FFI pública `_json`.
@@ -74,7 +75,7 @@ Host Rust:
 
 ```toml
 [dependencies]
-luaskills = "0.3"
+luaskills = "0.5"
 ```
 
 Comandos de desenvolvimento:
@@ -104,6 +105,19 @@ Atualmente LuaSkills trata skills como código confiável por padrão.
 Ele não oferece uma promessa de sandbox para pacotes Lua arbitrários e não confiáveis.
 
 O host deve decidir roots, skills instaláveis, ações de gerenciamento, modo de database provider e authority de cada operação.
+
+## Matriz De Versões Atual
+
+| Componente | Versão atual |
+| --- | --- |
+| Núcleo LuaSkills, SDK FFI e linha dos SDKs de linguagem | `0.5.0` |
+| Série compatível dos pacotes do runtime Lua | `0.1` |
+| Python / uv gerenciados | `3.12.7` / `0.11.17` |
+| Node.js / pnpm gerenciados | `22.11.0` / `9.15.0` |
+| vldb-controller | `0.2.1` |
+| vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
+
+Os valores executáveis padrão são definidos em `scripts/deps/fetch_managed_runtimes.*`, `scripts/deps/fetch_deps.*` e `scripts/deps/sync_runtime_assets.*`. O `dependencies.yaml` deve declarar essas versões exatas do runtime e do gerenciador de pacotes, a menos que o host instale e declare deliberadamente outra versão exata compatível.
 
 ## License
 

@@ -138,7 +138,7 @@ Rust hosts can depend on the crate directly:
 
 ```toml
 [dependencies]
-luaskills = "0.4"
+luaskills = "0.5"
 ```
 
 Repository development uses the normal Rust workflow:
@@ -251,6 +251,19 @@ For one unified ecosystem release such as `0.5.0`, publish in this order:
 6. Run the **Examples Release** workflow for each SDK only after its package or module tag is already visible upstream.
 
 This order keeps every installer and examples workflow pointed at already-published packages assets, core assets, and SDK packages.
+
+## Current Version Matrix
+
+| Component | Current version |
+| --- | --- |
+| LuaSkills core, FFI SDK, and language SDK line | `0.5.0` |
+| Lua runtime packages compatible series | `0.1` |
+| Managed Python / uv | `3.12.7` / `0.11.17` |
+| Managed Node.js / pnpm | `22.11.0` / `9.15.0` |
+| vldb-controller | `0.2.1` |
+| vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
+
+The executable defaults are defined by `scripts/deps/fetch_managed_runtimes.*`, `scripts/deps/fetch_deps.*`, and `scripts/deps/sync_runtime_assets.*`. `dependencies.yaml` must declare the exact managed runtime and package-manager versions shown above unless the host deliberately installs and declares another exact supported version.
 
 ## License
 
