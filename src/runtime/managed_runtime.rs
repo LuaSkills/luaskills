@@ -3890,9 +3890,13 @@ mod tests {
         .expect_err("directory runtime executable should be rejected");
         // Error text expected from the shared host-visible path formatter.
         // 由共享宿主可见路径渲染器生成的期望错误文本。
+        // Canonical directory path matching the production resolver diagnostic.
+        // 与生产解析器诊断一致的规范目录路径。
+        let canonical_executable_path = fs::canonicalize(&executable_path)
+            .expect("canonicalize directory runtime executable fixture");
         let expected_error = format!(
             "managed runtime executable is not a file: {}",
-            render_host_visible_path(&executable_path)
+            render_host_visible_path(&canonical_executable_path)
         );
 
         assert_eq!(error, expected_error);

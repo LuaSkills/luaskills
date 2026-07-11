@@ -479,13 +479,15 @@ impl ManagedPackageSnapshot {
             };
             let directory_fd = directory.as_raw_fd();
             let source = path_to_c_string(source_path, "managed snapshot execution source")?;
-            let expected_root = macos_file_identity_from_fd(directory_fd)?;
+            let expected_root =
+                macos_file_identity_from_fd(directory_fd).map_err(|error| error.to_string())?;
             let expected_source = macos_file_identity_from_snapshot(
                 directory_fd,
                 Path::new(relative_path),
                 self.root(),
             )?;
-            macos_validate_named_execution_source(&source, expected_source)?;
+            macos_validate_named_execution_source(&source, expected_source)
+                .map_err(|error| error.to_string())?;
             unsafe {
                 command.pre_exec(move || {
                     let actual_root = macos_file_identity_from_fd(directory_fd)?;
@@ -688,10 +690,37 @@ fn macos_file_identity_from_fd(fd: RawFd) -> Result<MacosFileIdentity, io::Error
     if unsafe { libc::fstat(fd, &mut stat) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(MacosFileIdentity {
-        device: stat.st_dev as u64,
-        inode: stat.st_ino,
-    })
+    let (device, inode) = unix_stat_device_inode(&stat).map_err(|error| io::Error::other(error))?;
+    Ok(MacosFileIdentity { device, inode })
+}
+
+/// Convert native Unix stat identity fields without silent sign or width changes.
+/// 在不发生静默符号或位宽变化的前提下转换 Unix 原生 stat 身份字段。
+///
+/// `stat` is the successful result of `fstat`. The returned tuple contains the device and inode
+/// identifiers as stable unsigned values, or an error when the native representation is invalid.
+/// `stat` 是成功的 `fstat` 结果。返回元组包含稳定的无符号设备号与 inode；原生表示无效时返回错误。
+#[cfg(unix)]
+fn unix_stat_device_inode(stat: &libc::stat) -> Result<(u64, u64), String> {
+    let device = unix_identity_component_to_u64(stat.st_dev, "device")?;
+    let inode = unix_identity_component_to_u64(stat.st_ino, "inode")?;
+    Ok((device, inode))
+}
+
+/// Convert one platform-native Unix identity component into the stable representation.
+/// 将一个平台原生 Unix 身份组件转换为稳定表示。
+///
+/// `value` is a device or inode identifier and `component` labels conversion failures. The generic
+/// boundary keeps same-width platforms lossless while retaining checked conversion on other ABIs.
+/// `value` 是设备号或 inode，`component` 标记转换失败。泛型边界让同位宽平台保持无损，
+/// 同时在其他 ABI 上保留检查式转换。
+#[cfg(unix)]
+fn unix_identity_component_to_u64<T>(value: T, component: &str) -> Result<u64, String>
+where
+    u64: TryFrom<T>,
+{
+    u64::try_from(value)
+        .map_err(|_| format!("Unix filesystem {component} identifier cannot be represented as u64"))
 }
 
 /// Open one snapshot-relative macOS source component-by-component and return its identity.
@@ -1369,10 +1398,8 @@ fn unix_managed_package_identity(
             std::io::Error::last_os_error()
         ));
     }
-    Ok(ManagedFilesystemObjectIdentity {
-        device: stat.st_dev as u64,
-        inode: stat.st_ino as u64,
-    })
+    let (device, inode) = unix_stat_device_inode(&stat)?;
+    Ok(ManagedFilesystemObjectIdentity { device, inode })
 }
 
 /// Recursively copy one Unix package directory through descriptor-relative no-follow opens.
@@ -2863,10 +2890,8 @@ fn remove_verified_managed_snapshot_tree(
                 std::io::Error::last_os_error()
             ));
         }
-        let actual_identity = ManagedPackageSnapshotIdentity {
-            device: stat.st_dev as u64,
-            inode: stat.st_ino as u64,
-        };
+        let (device, inode) = unix_stat_device_inode(&stat)?;
+        let actual_identity = ManagedPackageSnapshotIdentity { device, inode };
         if &actual_identity != expected_identity {
             return Err(format!(
                 "isolated managed snapshot handle identity changed: {}",
