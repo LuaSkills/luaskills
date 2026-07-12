@@ -243,13 +243,51 @@ jobs:
           mkdir -p "$RELEASE_PACKAGE_DIR"
           cp docs/lua-runtime-release-notes.md "$RELEASE_PACKAGE_DIR/RELEASE_NOTES.md"
 
+      - name: Write SHA-256 sidecars
+        shell: pwsh
+        run: |
+          # ErrorActionPreference makes checksum failures terminating outside GitHub's pwsh wrapper too.
+          # ErrorActionPreference 让校验和失败在 GitHub 的 pwsh 包装器之外也成为终止错误。
+          $ErrorActionPreference = "Stop"
+          # ReleasePackageDir is the verified platform-local release asset directory.
+          # ReleasePackageDir 是已经验证的平台本地发布资产目录。
+          $releasePackageDir = Join-Path $env:GITHUB_WORKSPACE $env:RELEASE_PACKAGE_DIR
+          # Archives is the exact four-archive platform set consumed by SDK installers.
+          # Archives 是 SDK 安装器消费的精确四项平台归档集合。
+          $archives = @(Get-ChildItem -LiteralPath $releasePackageDir -Filter "*.tar.gz" -File)
+          if ($archives.Count -ne 4) {
+            throw "Expected exactly four release archives, found $($archives.Count): $releasePackageDir"
+          }
+
+          foreach ($archive in $archives) {
+            # Digest is the lowercase SHA-256 value written as the first sidecar token.
+            # Digest 是作为 sidecar 首个字段写入的小写 SHA-256 值。
+            $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive.FullName).Hash.ToLowerInvariant()
+            # SidecarPath is the stable archive-name-plus-.sha256 release asset path.
+            # SidecarPath 是稳定的“归档名称加 .sha256”发布资产路径。
+            $sidecarPath = "$($archive.FullName).sha256"
+            # SidecarText follows the sha256sum-compatible format accepted by every SDK.
+            # SidecarText 使用所有 SDK 均接受的 sha256sum 兼容格式。
+            $sidecarText = "$digest  $($archive.Name)$([Environment]::NewLine)"
+            [System.IO.File]::WriteAllText(
+              $sidecarPath,
+              $sidecarText,
+              [System.Text.UTF8Encoding]::new($false)
+            )
+            if (-not (Test-Path -LiteralPath $sidecarPath -PathType Leaf)) {
+              throw "Missing generated SHA-256 sidecar: $sidecarPath"
+            }
+          }
+
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             ${{ env.RELEASE_PACKAGE_DIR }}/*.tar.gz
+            ${{ env.RELEASE_PACKAGE_DIR }}/*.tar.gz.sha256
           tag_name: ${{ needs.prepare-matrix.outputs.release_tag }}
           body_path: ${{ env.RELEASE_PACKAGE_DIR }}/RELEASE_NOTES.md
           fail_on_unmatched_files: true
+          overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
