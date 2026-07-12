@@ -45,7 +45,14 @@
   - `LuaSkills/luaskills-packages` 提供 `lua-runtime-packages-*` 与 `lua-deps-*`
 - 已经准备好独立的 LuaSkills `runtime_root`，不要复用宿主程序安装目录
 - JSON FFI 宿主直接在 host options 里传 `runtime_root`
-- 标准 C ABI 宿主如果要传 `runtime_root`，使用 `FfiLuaRuntimeHostOptionsV2` 与 `luaskills_ffi_engine_new_v2`
+- 标准 C ABI 宿主如果只传 `runtime_root`，使用 `FfiLuaRuntimeHostOptionsV2` 与 `luaskills_ffi_engine_new_v2`
+- 标准 C ABI 宿主如果独立传受管发行根/环境根或 B3-B7 策略，使用 `FfiLuaRuntimeHostOptionsV3` 与 `luaskills_ffi_engine_new_v3`，不得扩大 V1/V2 结构体
+- JSON FFI 宿主可直接设置 `managed_runtime_distribution_root`、`managed_runtime_environment_root` 与 `managed_runtime_config`
+- 已确认 B3-B7 引擎默认值：每精确环境/包所有者池 `4` 个 Worker、空闲 `60` 秒、每引擎 `256` 个持久会话、每输出流 `1 MiB`、invoke 无默认超时；自定义数值全部大于零
+- 标准 C ABI V3 的空 `managed_runtime_config` 指针表示完整默认策略；存在标记严格为 `0/1`；单次 `invoke.timeout_ms` 与 `session.open.buffer_limit_bytes` 分别优先于对应引擎默认值
+- 显式发行根必须是现有绝对目录并直接包含 `python/`、`node/`；显式环境根必须是绝对路径且可安全创建
+- 未显式设置时才使用 `<runtime_root>/dependencies/runtimes` 与 `<runtime_root>/dependencies/envs`
+- 若宿主自身需要定位同一解释器，调用 `luaskills_ffi_managed_runtime_resolve_json`，不要重复实现目录拼接或回退 `PATH`
 - `runtime_root` 固定包含或允许运行时创建这些目录：
   - `bin`
   - `libs`

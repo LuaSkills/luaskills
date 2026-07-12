@@ -179,6 +179,46 @@ class JsonFfiClient:
             self._describe_cache = described
         return self._describe_cache
 
+    def resolve_managed_runtime_install(
+        self,
+        distribution_root: Path,
+        runtime: Literal["python", "node"],
+        version: str,
+        platform: str,
+    ) -> JsonMap:
+        """
+        Resolve one host-shared managed interpreter through the public read-only JSON FFI endpoint.
+        通过公共只读 JSON FFI 入口解析一个由宿主共享的受管解释器。
+
+        Args:
+            distribution_root: Existing absolute root that directly contains python and node.
+            runtime: Exact managed interpreter family.
+            version: Exact semantic runtime version.
+            platform: Exact normalized LuaSkills platform key.
+        Returns:
+            Canonical installation paths and SHA-256 identities validated by LuaSkills.
+
+        参数：
+            distribution_root：直接包含 python 与 node 的现有绝对根。
+            runtime：精确受管解释器类型。
+            version：精确语义化运行时版本。
+            platform：精确规范化 LuaSkills 平台键。
+        返回：
+            LuaSkills 校验后的规范安装路径与 SHA-256 身份。
+        """
+
+        if not distribution_root.is_absolute():
+            raise ValueError("distribution_root must be an absolute path")
+        return self.call(
+            "luaskills_ffi_managed_runtime_resolve_json",
+            {
+                "distribution_root": normalized_path(distribution_root),
+                "runtime": runtime,
+                "version": version,
+                "platform": platform,
+            },
+        )
+
 
 class StandardFixtureRuntimeClient:
     """
@@ -377,6 +417,23 @@ class StandardFixtureRuntimeClient:
                     "idle_ttl_secs": 30,
                 },
                 "host_options": {
+                    "runtime_root": normalized_path(self.runtime_root),
+                    "managed_runtime_distribution_root": normalized_path(
+                        self.runtime_root / "dependencies" / "runtimes"
+                    ),
+                    "managed_runtime_environment_root": normalized_path(
+                        self.runtime_root / "dependencies" / "envs"
+                    ),
+                    # ManagedRuntimeConfig explicitly demonstrates the stable B3-B7 JSON engine defaults.
+                    # ManagedRuntimeConfig 显式演示稳定的 B3-B7 JSON 引擎默认值。
+                    "managed_runtime_config": {
+                        "worker_pool_max_size_per_environment": 4,
+                        "worker_idle_ttl_secs": 60,
+                        "persistent_session_limit_per_engine": 256,
+                        "persistent_session_default_buffer_limit_bytes_per_stream": 1024
+                        * 1024,
+                        "invoke_default_timeout_ms": None,
+                    },
                     "temp_dir": normalized_path(self.runtime_root / "temp"),
                     "resources_dir": normalized_path(self.runtime_root / "resources"),
                     "lua_packages_dir": normalized_path(self.runtime_root / "lua_packages"),

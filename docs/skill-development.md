@@ -882,7 +882,7 @@ Minimal `dependencies.yaml`:
 
 ```yaml
 python_runtime:
-  version: "3.14.4"
+version: "3.14.6"
   package_manager: uv
   package_manager_version: "0.11.28"
   lockfile: python/requirements.lock
@@ -977,7 +977,7 @@ Invoke input:
 | `file` | `string` | yes | safe relative path inside the current skill directory |
 | `handler` | `string` | no | Python defaults to `main`; Node defaults to `default` with `main` fallback |
 | `args` | JSON-compatible Lua value | no | passed to the child handler |
-| `timeout_ms` | positive integer | no | per-call timeout; timed-out workers are discarded |
+| `timeout_ms` | positive integer | no | per-call timeout; overrides the engine `managed_runtime_config.invoke_default_timeout_ms`; both omitted means unlimited; timed-out workers are discarded |
 
 Invoke result:
 
@@ -1022,7 +1022,7 @@ Strict open input:
 | `stdout_encoding` | `string` | no | stdout decoding; defaults to the host runtime encoding |
 | `stderr_encoding` | `string` | no | stderr decoding; defaults to the host runtime encoding |
 | `stdin_encoding` | `string` | no | stdin encoding; defaults to the host runtime encoding |
-| `buffer_limit_bytes` | positive integer | no | retained byte limit per output stream; defaults to 1 MiB |
+| `buffer_limit_bytes` | positive integer | no | retained byte limit per output stream; overrides the engine `managed_runtime_config.persistent_session_default_buffer_limit_bytes_per_stream`, whose stable default is 1 MiB |
 
 Unknown fields are rejected. Python and Node both execute from a unique immutable per-session package snapshot copied through fixed, no-follow filesystem objects. Python uses the package's managed virtual environment without inherited `PYTHONHOME`, `PYTHONPATH`, or user-site packages; Node resolves bare dependencies from the exact managed `node_modules`. Symbolic links and unsupported objects in the copied package tree are rejected, and the authorized `cwd` object is pinned during process creation. Child code receives controlled package and lease metadata through `LUASKILLS_MANAGED_CONTEXT_JSON`, not an arbitrary copy of host request state.
 

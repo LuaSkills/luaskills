@@ -24,6 +24,7 @@ It provides:
 - Host-owned structured result bridging through `host_result`, including the first canonical `change_set` result kind.
 - Optional SQLite and LanceDB bindings for stateful or memory-oriented skills.
 - Managed Python and Node.js child runtimes that Lua skills and System Plugins can invoke through `vulcan.runtime.python.*` and `vulcan.runtime.node.*`; persistent cross-eval sessions are restricted to dedicated System Plugin leases.
+- Host-selected read-only Python/Node distribution roots and writable environment roots, with Rust and JSON FFI read-only resolution plus standard C ABI V3 engine creation.
 - Bounded host-side managed-session events with destructive poll/wait APIs and an edge-triggered wake callback that never executes Lua.
 - Rust API integration for Rust hosts.
 - Standard C ABI and public `_json` FFI for non-Rust hosts.
@@ -102,6 +103,8 @@ Start here:
 - [Skill development manual](docs/skill-development.md): full English manual for skill authors.
 - [FFI and SDK overview](docs/ffi/overview.md): English overview for host integrators.
 - [System Plugin managed runtime guide](docs/system-plugin-managed-runtime.md): end-to-end package, persistent Python/Node session, event, and cleanup workflow.
+- [Host-selected managed runtime roots](docs/managed-runtime-host-roots.md): independent roots, B3-B7 engine policy, asset identity hashes, Rust/JSON resolvers, and C ABI V3.
+- [LuaSkills 0.5.1 upgrade guide](docs/upgrade-0.5.1.md): host-root, resource-policy, FFI, SDK, and validation migration checklist.
 - [Database provider overview](docs/providers/database-providers.md): English overview for SQLite and LanceDB ownership.
 - [Runtime architecture overview](docs/architecture/runtime-model.md): English overview of host/runtime boundaries.
 - [Chinese docs index](docs/zh-CN/index.md): full Chinese technical documentation map.
@@ -112,6 +115,8 @@ Important technical docs:
 - [Chinese Lua Skill developer manual](docs/zh-CN/skill-development.md)
 - [System Plugin managed runtime guide](docs/system-plugin-managed-runtime.md)
 - [System Plugin 受管运行时使用指南](docs/zh-CN/system-plugin-managed-runtime.md)
+- [Host-selected managed runtime roots](docs/managed-runtime-host-roots.md)
+- [宿主指定受管运行时根目录](docs/zh-CN/managed-runtime-host-roots.md)
 - [FFI integration guide](docs/zh-CN/ffi/integration-guide.md)
 - [FFI host checklist](docs/zh-CN/ffi/host-checklist.md)
 - [Host database provider guide](docs/zh-CN/providers/host-database-provider-guide.md)
@@ -138,7 +143,7 @@ Rust hosts can depend on the crate directly:
 
 ```toml
 [dependencies]
-luaskills = "0.5"
+luaskills = "0.5.1"
 ```
 
 Repository development uses the normal Rust workflow:
@@ -241,13 +246,13 @@ examples/
 
 ## Ecosystem Release Order
 
-For one unified ecosystem release such as `0.5.0`, publish in this order:
+For one unified ecosystem release such as `0.5.1`, publish in this order:
 
 1. Release `LuaSkills/luaskills-packages` first so `lua-runtime-packages-*` and `lua-deps-*` already exist for the new compatible series.
-2. Release `LuaSkills/luaskills` next, including the crate version plus the main-repo `luaskills-ffi-sdk-*` and demo assets under tag `v0.5.0`.
-3. Publish the TypeScript SDK `@luaskills/sdk@0.5.0`.
-4. Publish the Python SDK `luaskills-sdk==0.5.0`.
-5. Publish the Go SDK module tag `v0.5.0`.
+2. Release `LuaSkills/luaskills` next, including the crate version plus the main-repo `luaskills-ffi-sdk-*` and demo assets under tag `v0.5.1`.
+3. Publish the TypeScript SDK `@luaskills/sdk@0.5.1`.
+4. Publish the Python SDK `luaskills-sdk==0.5.1`.
+5. Publish the Go SDK module tag `v0.5.1`.
 6. Run the **Examples Release** workflow for each SDK only after its package or module tag is already visible upstream.
 
 This order keeps every installer and examples workflow pointed at already-published packages assets, core assets, and SDK packages.
@@ -256,10 +261,11 @@ This order keeps every installer and examples workflow pointed at already-publis
 
 | Component | Current version |
 | --- | --- |
-| LuaSkills core, FFI SDK, and language SDK line | `0.5.0` |
+| LuaSkills core, FFI SDK, and language SDK line | `0.5.1` |
 | Lua runtime packages compatible series | `0.1` |
-| Managed Python / uv | `3.14.4` / `0.11.28` |
+| Managed Python / uv | `3.14.6` / `0.11.28` |
 | Managed Node.js / pnpm | `24.18.0` / `11.11.0` |
+| Managed-runtime engine defaults | `workers=4 / idle=60s / sessions=256 / buffer=1MiB/stream / invoke=unlimited` |
 | vldb-controller | `0.2.1` |
 | vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
 

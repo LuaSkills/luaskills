@@ -186,6 +186,48 @@ pub struct FfiLuaRuntimeHostOptionsV2 {
     pub runtime_root: *const c_char,
 }
 
+/// Plain C ABI managed Python/Node resource policy used by v3 engine creation.
+/// 标准 C ABI v3 引擎创建使用的受管 Python/Node 资源策略。
+#[repr(C)]
+pub struct FfiLuaRuntimeManagedRuntimeConfig {
+    /// Maximum live workers for one exact environment and package-owner pool key.
+    /// 单个精确环境与包所有者池键允许的最大活动 Worker 数量。
+    pub worker_pool_max_size_per_environment: usize,
+    /// Idle seconds after which an unused worker may be retired.
+    /// 未使用 Worker 可被回收前的空闲秒数。
+    pub worker_idle_ttl_secs: u64,
+    /// Maximum launching or live persistent sessions retained by one engine.
+    /// 单个引擎允许保留的启动中或活动持久会话最大数量。
+    pub persistent_session_limit_per_engine: usize,
+    /// Default retained bytes for each persistent-session stdout or stderr stream.
+    /// 每个持久会话 stdout 或 stderr 流默认保留的字节数。
+    pub persistent_session_default_buffer_limit_bytes_per_stream: usize,
+    /// Whether `invoke_default_timeout_ms` contains one configured positive timeout.
+    /// `invoke_default_timeout_ms` 是否包含一个已配置的正数超时。
+    pub has_invoke_default_timeout_ms: u8,
+    /// Default invoke timeout in milliseconds when the matching presence flag is one.
+    /// 对应存在标记为一时使用的默认 invoke 超时毫秒数。
+    pub invoke_default_timeout_ms: u64,
+}
+
+/// Plain C ABI v3 host options adding independent managed roots and an optional B3-B7 policy.
+/// 新增独立受管根与可选 B3-B7 策略的标准非 JSON C ABI v3 宿主选项。
+#[repr(C)]
+pub struct FfiLuaRuntimeHostOptionsV3 {
+    /// Stable v2 host options kept byte-for-byte compatible with the published v2 ABI.
+    /// 与已发布 v2 ABI 保持逐字节兼容的稳定 v2 宿主选项。
+    pub base: FfiLuaRuntimeHostOptionsV2,
+    /// Optional existing absolute root containing managed Python, Node, uv, and pnpm distributions.
+    /// 包含受管 Python、Node、uv 与 pnpm 发行包的可选现有绝对根目录。
+    pub managed_runtime_distribution_root: *const c_char,
+    /// Optional absolute writable root containing reusable managed Python and Node environments.
+    /// 包含可复用受管 Python 与 Node 环境的可选绝对可写根目录。
+    pub managed_runtime_environment_root: *const c_char,
+    /// Optional managed Worker/session policy; null preserves all stable defaults.
+    /// 可选的受管 Worker/会话策略；空指针保留全部稳定默认值。
+    pub managed_runtime_config: *const FfiLuaRuntimeManagedRuntimeConfig,
+}
+
 /// C ABI JSON provider callback used by non-Rust hosts to bridge database requests.
 /// 供非 Rust 宿主桥接数据库请求使用的 C ABI JSON provider 回调。
 pub type FfiJsonProviderCallback = unsafe extern "C" fn(
@@ -256,6 +298,18 @@ pub struct FfiLuaEngineOptionsV2 {
     /// V2 host options applied to the runtime engine.
     /// 应用于运行时引擎的 v2 宿主选项。
     pub host: FfiLuaRuntimeHostOptionsV2,
+}
+
+/// Plain C ABI v3 engine options carrying independent managed roots and an optional B3-B7 policy.
+/// 携带独立受管根与可选 B3-B7 策略的标准非 JSON C ABI v3 引擎选项。
+#[repr(C)]
+pub struct FfiLuaEngineOptionsV3 {
+    /// Pool config applied to the runtime engine.
+    /// 应用于运行时引擎的池配置。
+    pub pool: FfiLuaVmPoolConfig,
+    /// V3 host options applied to the runtime engine.
+    /// 应用于运行时引擎的 v3 宿主选项。
+    pub host: FfiLuaRuntimeHostOptionsV3,
 }
 
 /// Plain C ABI skill root used by standard non-JSON lifecycle and load calls.

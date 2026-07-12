@@ -190,6 +190,8 @@ export function ensureStandardFixtureLayout(root: string): void {
   for (const relativePath of [
     "skills",
     "dependencies",
+    path.join("dependencies", "runtimes"),
+    path.join("dependencies", "envs"),
     "state",
     "databases",
     "temp",
@@ -318,6 +320,38 @@ export class JsonFfiClient {
       this.describeCache = described as JsonMap;
     }
     return this.describeCache;
+  }
+
+  /**
+  Resolve one host-shared managed interpreter through the public read-only JSON FFI endpoint.
+  通过公共只读 JSON FFI 入口解析一个由宿主共享的受管解释器。
+
+  @param distributionRoot Existing absolute root that directly contains python and node.
+  distributionRoot 参数：直接包含 python 与 node 的现有绝对根。
+  @param runtime Exact managed interpreter family.
+  runtime 参数：精确受管解释器类型。
+  @param version Exact semantic runtime version.
+  version 参数：精确语义化运行时版本。
+  @param platform Exact normalized LuaSkills platform key.
+  platform 参数：精确规范化 LuaSkills 平台键。
+  @returns Canonical installation paths and SHA-256 identities validated by LuaSkills.
+  返回值：LuaSkills 校验后的规范安装路径与 SHA-256 身份。
+   */
+  resolveManagedRuntimeInstall(
+    distributionRoot: string,
+    runtime: "python" | "node",
+    version: string,
+    platform: string,
+  ): JsonMap {
+    if (!path.isAbsolute(distributionRoot)) {
+      throw new Error("distributionRoot must be an absolute path");
+    }
+    return this.call("luaskills_ffi_managed_runtime_resolve_json", {
+      distribution_root: path.resolve(distributionRoot),
+      runtime,
+      version,
+      platform,
+    });
   }
 }
 
@@ -487,6 +521,18 @@ export class StandardFixtureRuntimeClient {
           idle_ttl_secs: 30,
         },
         host_options: {
+          runtime_root: path.resolve(this.runtimeRoot),
+          managed_runtime_distribution_root: path.join(this.runtimeRoot, "dependencies", "runtimes"),
+          managed_runtime_environment_root: path.join(this.runtimeRoot, "dependencies", "envs"),
+          // ManagedRuntimeConfig explicitly demonstrates the stable B3-B7 JSON engine defaults.
+          // ManagedRuntimeConfig 显式演示稳定的 B3-B7 JSON 引擎默认值。
+          managed_runtime_config: {
+            worker_pool_max_size_per_environment: 4,
+            worker_idle_ttl_secs: 60,
+            persistent_session_limit_per_engine: 256,
+            persistent_session_default_buffer_limit_bytes_per_stream: 1024 * 1024,
+            invoke_default_timeout_ms: null,
+          },
           temp_dir: path.join(this.runtimeRoot, "temp"),
           resources_dir: path.join(this.runtimeRoot, "resources"),
           lua_packages_dir: path.join(this.runtimeRoot, "lua_packages"),

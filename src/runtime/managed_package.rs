@@ -72,6 +72,7 @@ struct ManagedDependencyManifestContext {
     manifest: PackageDependencyManifest,
 }
 
+use crate::runtime::managed_runtime::ManagedRuntimeRoots;
 use crate::runtime::path::render_host_visible_path;
 use crate::skill::dependencies::PackageDependencyManifest;
 use crate::skill::manifest::validate_luaskills_identifier;
@@ -258,12 +259,9 @@ pub(crate) struct ManagedRuntimePackageContext {
     /// Activation-time native identity of the canonical package root.
     /// 规范包根目录在激活时的平台原生身份。
     package_root_filesystem_identity: ManagedFilesystemObjectIdentity,
-    /// Canonical runtime root that owns runtimes, package managers, and environments.
-    /// 拥有运行时、包管理器和环境的规范运行时根目录。
-    canonical_runtime_root: PathBuf,
-    /// Activation-time native identity of the canonical runtime root.
-    /// 规范运行时根目录在激活时的平台原生身份。
-    runtime_root_filesystem_identity: ManagedFilesystemObjectIdentity,
+    /// Immutable engine-selected roots separating data, distributions, and writable environments.
+    /// 分离数据、发行包与可写环境的不可变引擎选定根集合。
+    managed_runtime_roots: Arc<ManagedRuntimeRoots>,
     /// Canonical dependency manifest path when the package declares one.
     /// 包声明依赖清单时对应的规范清单路径。
     dependency_manifest_path: Option<PathBuf>,
@@ -316,18 +314,44 @@ impl ManagedRuntimeOwnerState {
 impl ManagedRuntimePackageContext {
     /// Build one ordinary Skill package context from authoritative loader inputs.
     /// 根据加载器权威输入构造普通 Skill 包上下文。
+    #[cfg(test)]
     pub(crate) fn for_skill(
         package_id: &str,
         package_root: &Path,
         runtime_root: &Path,
         dependency_manifest: Option<PackageDependencyManifest>,
     ) -> Result<Arc<Self>, String> {
+        // CompatibleRoots preserves the legacy runtime-root-derived layout for internal callers.
+        // CompatibleRoots 为内部调用方保留旧有的 runtime-root 派生布局。
+        let compatible_roots = Arc::new(ManagedRuntimeRoots::new(runtime_root, None, None)?);
+        Self::for_skill_with_roots(
+            package_id,
+            package_root,
+            compatible_roots,
+            dependency_manifest,
+        )
+    }
+
+    /// Build one ordinary Skill package context from authoritative loader inputs and engine roots.
+    /// 根据加载器权威输入与引擎根集合构造普通 Skill 包上下文。
+    ///
+    /// `package_id`, `package_root`, and `dependency_manifest` describe the trusted package, while
+    /// `managed_runtime_roots` is the immutable host-selected root set shared by the engine.
+    /// `package_id`、`package_root` 与 `dependency_manifest` 描述可信包，`managed_runtime_roots`
+    /// 是由引擎共享的不可变宿主选定根集合。
+    ///
+    /// Returns one identity-pinned package context or a package, manifest, or root validation error.
+    /// 返回固定身份的包上下文，或包、清单及根校验错误。
+    pub(crate) fn for_skill_with_roots(
+        package_id: &str,
+        package_root: &Path,
+        managed_runtime_roots: Arc<ManagedRuntimeRoots>,
+        dependency_manifest: Option<PackageDependencyManifest>,
+    ) -> Result<Arc<Self>, String> {
         // Canonical package root verified as a real directory.
         // 已验证为真实目录的规范包根。
         let canonical_package_root = canonicalize_existing_directory(package_root, "package root")?;
-        // Canonical runtime root verified as a real directory.
-        // 已验证为真实目录的规范运行时根。
-        let canonical_runtime_root = canonicalize_existing_directory(runtime_root, "runtime root")?;
+        managed_runtime_roots.validate_live_filesystem_identity()?;
         // Optional canonical manifest path derived only from the declared fixed location.
         // 仅从声明的固定位置派生的可选规范清单路径。
         let dependency_manifest_path = dependency_manifest
@@ -368,7 +392,7 @@ impl ManagedRuntimePackageContext {
             ManagedRuntimePackageKind::Skill,
             package_id,
             canonical_package_root,
-            canonical_runtime_root,
+            managed_runtime_roots,
             dependency_manifest_context,
             None,
         )
@@ -376,10 +400,42 @@ impl ManagedRuntimePackageContext {
 
     /// Build one System Plugin context inside the host-owned system Lua trust root.
     /// 在宿主所有的 System Lua 信任根内构造 System Plugin 上下文。
+    #[cfg(test)]
     pub(crate) fn for_system_plugin(
         package_id: &str,
         package_root: &Path,
         runtime_root: &Path,
+        system_lua_root: &Path,
+        dependency_file: &str,
+        lease_binding: Arc<ManagedRuntimeLeaseBinding>,
+    ) -> Result<Arc<Self>, String> {
+        // CompatibleRoots preserves the legacy runtime-root-derived layout for internal callers.
+        // CompatibleRoots 为内部调用方保留旧有的 runtime-root 派生布局。
+        let compatible_roots = Arc::new(ManagedRuntimeRoots::new(runtime_root, None, None)?);
+        Self::for_system_plugin_with_roots(
+            package_id,
+            package_root,
+            compatible_roots,
+            system_lua_root,
+            dependency_file,
+            lease_binding,
+        )
+    }
+
+    /// Build one System Plugin context inside the trust root with engine-selected runtime roots.
+    /// 使用引擎选定运行时根在信任根内构造 System Plugin 上下文。
+    ///
+    /// `managed_runtime_roots` supplies the immutable host authority for runtime assets and writable
+    /// environments; the remaining parameters bind the package to the System lease trust boundary.
+    /// `managed_runtime_roots` 提供运行时资产和可写环境的不可变宿主授权，其余参数把包绑定到
+    /// System 租约信任边界。
+    ///
+    /// Returns one identity-pinned System package context or an explicit containment/identity error.
+    /// 返回固定身份的 System 包上下文，或显式包含关系及身份错误。
+    pub(crate) fn for_system_plugin_with_roots(
+        package_id: &str,
+        package_root: &Path,
+        managed_runtime_roots: Arc<ManagedRuntimeRoots>,
         system_lua_root: &Path,
         dependency_file: &str,
         lease_binding: Arc<ManagedRuntimeLeaseBinding>,
@@ -405,9 +461,7 @@ impl ManagedRuntimePackageContext {
             ));
         }
         validate_lua_search_root_path(&canonical_package_root, "system_package.root")?;
-        // Canonical runtime root supplied by the engine host options.
-        // 由引擎宿主选项提供的规范运行时根。
-        let canonical_runtime_root = canonicalize_existing_directory(runtime_root, "runtime root")?;
+        managed_runtime_roots.validate_live_filesystem_identity()?;
         // Canonical dependency manifest constrained to the System Plugin root.
         // 限制在 System Plugin 根内的规范依赖清单。
         let dependency_manifest_path = resolve_existing_package_file(
@@ -423,7 +477,7 @@ impl ManagedRuntimePackageContext {
             ManagedRuntimePackageKind::SystemPlugin,
             package_id,
             canonical_package_root,
-            canonical_runtime_root,
+            managed_runtime_roots,
             Some(ManagedDependencyManifestContext {
                 path: dependency_manifest_path,
                 filesystem_identity: dependency_manifest_filesystem_identity,
@@ -439,7 +493,7 @@ impl ManagedRuntimePackageContext {
         kind: ManagedRuntimePackageKind,
         package_id: &str,
         canonical_package_root: PathBuf,
-        canonical_runtime_root: PathBuf,
+        managed_runtime_roots: Arc<ManagedRuntimeRoots>,
         dependency_manifest_context: Option<ManagedDependencyManifestContext>,
         lease_binding: Option<Arc<ManagedRuntimeLeaseBinding>>,
     ) -> Result<Arc<Self>, String> {
@@ -450,11 +504,6 @@ impl ManagedRuntimePackageContext {
         let package_root_filesystem_identity = managed_filesystem_object_identity(
             &canonical_package_root,
             "package root",
-            ManagedFilesystemObjectKind::Directory,
-        )?;
-        let runtime_root_filesystem_identity = managed_filesystem_object_identity(
-            &canonical_runtime_root,
-            "runtime root",
             ManagedFilesystemObjectKind::Directory,
         )?;
         let (
@@ -485,8 +534,7 @@ impl ManagedRuntimePackageContext {
                 canonical_package_root,
             },
             package_root_filesystem_identity,
-            canonical_runtime_root,
-            runtime_root_filesystem_identity,
+            managed_runtime_roots,
             dependency_manifest_path,
             dependency_manifest_filesystem_identity,
             dependency_manifest: dependency_manifest.map(Arc::new),
@@ -516,8 +564,15 @@ impl ManagedRuntimePackageContext {
 
     /// Return the canonical runtime root.
     /// 返回规范运行时根目录。
+    #[cfg(test)]
     pub(crate) fn runtime_root(&self) -> &Path {
-        &self.canonical_runtime_root
+        self.managed_runtime_roots.runtime_root()
+    }
+
+    /// Return the immutable host-selected managed runtime root set.
+    /// 返回不可变的宿主选定受管运行时根集合。
+    pub(crate) fn managed_runtime_roots(&self) -> Arc<ManagedRuntimeRoots> {
+        Arc::clone(&self.managed_runtime_roots)
     }
 
     /// Return the canonical dependency manifest path when present.
@@ -566,12 +621,8 @@ impl ManagedRuntimePackageContext {
             "package root",
             ManagedFilesystemObjectKind::Directory,
         )?;
-        validate_unchanged_filesystem_identity(
-            self.runtime_root(),
-            &self.runtime_root_filesystem_identity,
-            "runtime root",
-            ManagedFilesystemObjectKind::Directory,
-        )?;
+        self.managed_runtime_roots
+            .validate_live_filesystem_identity()?;
         if let Some(manifest_path) = self.dependency_manifest_path() {
             let expected_identity = self
                 .dependency_manifest_filesystem_identity

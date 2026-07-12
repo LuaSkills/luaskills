@@ -110,10 +110,11 @@ O host deve decidir roots, skills instaláveis, ações de gerenciamento, modo d
 
 | Componente | Versão atual |
 | --- | --- |
-| Núcleo LuaSkills, SDK FFI e linha dos SDKs de linguagem | `0.5.0` |
+| Núcleo LuaSkills, SDK FFI e linha dos SDKs de linguagem | `0.5.1` |
 | Série compatível dos pacotes do runtime Lua | `0.1` |
-| Python / uv gerenciados | `3.14.4` / `0.11.28` |
+| Python / uv gerenciados | `3.14.6` / `0.11.28` |
 | Node.js / pnpm gerenciados | `24.18.0` / `11.11.0` |
+| Padrões do motor gerenciado | `workers=4 / ociosidade=60s / sessões=256 / buffer=1MiB/fluxo / invoke=ilimitado` |
 | vldb-controller | `0.2.1` |
 | vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
 

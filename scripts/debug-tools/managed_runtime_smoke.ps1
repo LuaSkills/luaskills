@@ -2,6 +2,12 @@
     # RuntimeRoot stores an isolated LuaSkills runtime root for this smoke run.
     # RuntimeRoot 保存本次冒烟运行使用的隔离 LuaSkills 运行时根目录。
     [string]$RuntimeRoot = "",
+    # DistributionRoot stores a host-selected managed interpreter distribution root.
+    # DistributionRoot 保存宿主指定的受管解释器发行根。
+    [string]$DistributionRoot = "",
+    # EnvironmentRoot stores a host-selected writable managed environment root.
+    # EnvironmentRoot 保存宿主指定的可写受管环境根。
+    [string]$EnvironmentRoot = "",
     # SkipFetch allows reusing an already prepared runtime root during local iteration.
     # SkipFetch 允许本地迭代时复用已经准备好的运行时根目录。
     [switch]$SkipFetch,
@@ -48,6 +54,28 @@ if ([System.IO.Path]::IsPathRooted($RuntimeRoot)) {
     $RuntimeRootPath = [System.IO.Path]::GetFullPath($RuntimeRoot)
 } else {
     $RuntimeRootPath = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot $RuntimeRoot))
+}
+
+# DistributionRootPath stores the independent absolute interpreter distribution root.
+# DistributionRootPath 保存独立的解释器发行根绝对路径。
+$DistributionRootPath = ""
+if ([string]::IsNullOrWhiteSpace($DistributionRoot)) {
+    $DistributionRootPath = $RuntimeRootPath + "-distributions"
+} elseif ([System.IO.Path]::IsPathRooted($DistributionRoot)) {
+    $DistributionRootPath = [System.IO.Path]::GetFullPath($DistributionRoot)
+} else {
+    $DistributionRootPath = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot $DistributionRoot))
+}
+
+# EnvironmentRootPath stores the independent absolute writable environment root.
+# EnvironmentRootPath 保存独立的可写环境根绝对路径。
+$EnvironmentRootPath = ""
+if ([string]::IsNullOrWhiteSpace($EnvironmentRoot)) {
+    $EnvironmentRootPath = $RuntimeRootPath + "-environments"
+} elseif ([System.IO.Path]::IsPathRooted($EnvironmentRoot)) {
+    $EnvironmentRootPath = [System.IO.Path]::GetFullPath($EnvironmentRoot)
+} else {
+    $EnvironmentRootPath = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot $EnvironmentRoot))
 }
 
 # SkillPath stores the example skill used for end-to-end managed runtime verification.
@@ -150,25 +178,34 @@ function ConvertTo-ProcessArgument {
 try {
     if (-not $SkipFetch) {
         Write-Host "Fetching managed runtimes into $RuntimeRootPath"
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $FetchScript -RuntimeRoot $RuntimeRootPath -Target all -Force
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $FetchScript -RuntimeRoot $RuntimeRootPath -DistributionRoot $DistributionRootPath -Target all -Force
         if ($LASTEXITCODE -ne 0) {
             throw "managed runtime fetch failed"
         }
     }
 
     Write-Host "Validating managed runtime layout"
-    & python $LayoutCheckScript $RuntimeRootPath
+    & python $LayoutCheckScript $RuntimeRootPath --distribution-root $DistributionRootPath --environment-root $EnvironmentRootPath
     if ($LASTEXITCODE -ne 0) {
         throw "managed runtime layout validation failed"
     }
 
     Write-Host "Calling managed runtime debug skill"
+    # Non-default B3-B7 values prove that host initialization policy reaches a real Python/Node invocation.
+    # 非默认 B3-B7 值用于证明宿主初始化策略能够传递到真实 Python/Node 调用。
     $Output = Invoke-CheckedProcess `
         -FilePath "cargo" `
         -ArgumentList @(
             "run", "--bin", "luaskills-debug", "--",
             "call",
             "--runtime-root", $RuntimeRootPath,
+            "--managed-runtime-distribution-root", $DistributionRootPath,
+            "--managed-runtime-environment-root", $EnvironmentRootPath,
+            "--managed-runtime-worker-pool-max-size", "3",
+            "--managed-runtime-worker-idle-ttl-secs", "45",
+            "--managed-runtime-session-limit", "64",
+            "--managed-runtime-session-buffer-limit-bytes", "2097152",
+            "--managed-runtime-invoke-timeout-ms", "60000",
             "--skill-path", $SkillPath,
             "--tool", "smoke",
             "--args-json", '{"text":"smoke-script"}',
@@ -199,15 +236,24 @@ try {
 
     Write-Host "Managed runtime smoke passed"
     Write-Host "Runtime root: $RuntimeRootPath"
+    Write-Host "Distribution root: $DistributionRootPath"
+    Write-Host "Environment root: $EnvironmentRootPath"
 }
 finally {
-    if ((-not $KeepRuntimeRoot) -and ($RuntimeRootPath.StartsWith((Join-Path $RepoRoot "target\managed-runtime-smoke")))) {
-        if (Test-Path -LiteralPath $RuntimeRootPath) {
-            try {
-                Remove-Item -Recurse -Force -LiteralPath $RuntimeRootPath -ErrorAction Stop
-            }
-            catch {
-                Write-Warning "Managed runtime smoke passed, but cleanup failed for ${RuntimeRootPath}: $($_.Exception.Message)"
+    if (-not $KeepRuntimeRoot) {
+        # CleanupRoot is the verified absolute parent that owns disposable smoke directories.
+        # CleanupRoot 是拥有可丢弃冒烟目录的已校验绝对父目录。
+        $CleanupRoot = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot "target\managed-runtime-smoke"))
+        $CleanupPrefix = $CleanupRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+        foreach ($CleanupPath in @($RuntimeRootPath, $DistributionRootPath, $EnvironmentRootPath)) {
+            $ResolvedCleanupPath = [System.IO.Path]::GetFullPath($CleanupPath)
+            if ($ResolvedCleanupPath.StartsWith($CleanupPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $ResolvedCleanupPath)) {
+                try {
+                    Remove-Item -Recurse -Force -LiteralPath $ResolvedCleanupPath -ErrorAction Stop
+                }
+                catch {
+                    Write-Warning "Managed runtime smoke passed, but cleanup failed for ${ResolvedCleanupPath}: $($_.Exception.Message)"
+                }
             }
         }
     }

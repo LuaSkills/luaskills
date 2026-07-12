@@ -1,4 +1,5 @@
 use super::{default_ffi_runtime_session_timeout_ms, default_json_object};
+use crate::runtime::managed_runtime::ManagedRuntimeKind;
 use crate::runtime_context::RuntimeRequestContext;
 use crate::runtime_options::{LuaInvocationContext, RuntimeSkillRoot};
 use crate::{
@@ -6,6 +7,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 
 /// One JSON request used to create one runtime engine instance.
 /// 用于创建单个运行时引擎实例的 JSON 请求。
@@ -14,6 +16,24 @@ pub(super) struct EngineNewJsonRequest {
     /// Engine construction options forwarded to the Rust runtime.
     /// 直接转发给 Rust 运行时的引擎构造选项。
     pub(super) options: LuaEngineOptions,
+}
+
+/// One JSON request used to resolve a host-visible managed runtime installation.
+/// 用于解析宿主可见受管运行时安装的 JSON 请求。
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct ManagedRuntimeResolveJsonRequest {
+    /// Existing absolute root containing the fixed `python` and `node` distribution families.
+    /// 包含固定 `python` 与 `node` 发行资产族的现有绝对根目录。
+    pub(super) distribution_root: PathBuf,
+    /// Managed Python or Node runtime kind selected by the host.
+    /// 宿主选择的受管 Python 或 Node 运行时类型。
+    pub(super) runtime: ManagedRuntimeKind,
+    /// Exact semantic runtime version used by the installation name and manifest.
+    /// 安装名称与清单使用的精确语义化运行时版本。
+    pub(super) version: String,
+    /// Exact normalized supported platform key such as `windows-x64` or `macos-arm64`.
+    /// 精确的受支持规范平台键，例如 `windows-x64` 或 `macos-arm64`。
+    pub(super) platform: String,
 }
 
 /// One JSON result containing one stable engine handle id.

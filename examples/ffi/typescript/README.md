@@ -7,6 +7,8 @@
 - `query_demo.ts`
 - `runtime_lease_demo.ts`
 
+`demo.ts` 使用标准 C ABI V3：完整嵌套 V1/V2 Host Options，设置 `managed_runtime_distribution_root`、`managed_runtime_environment_root` 与 `FfiLuaRuntimeManagedRuntimeConfig` 指针，并通过 `luaskills_ffi_engine_new_v3` 创建引擎。策略示例使用非默认 Worker 容量、空闲回收、Session 上限、默认输出缓冲与默认 invoke 超时；空策略指针则保留 `4 / 60 秒 / 256 / 1 MiB 每流 / invoke 无限制`。`json_runtime.ts` 同时示范 JSON Host Options 与只读 `luaskills_ffi_managed_runtime_resolve_json` 绑定。
+
 ## 1. 安装依赖
 
 示例要求 Node.js `24.18.0` 或更高版本，并使用 Node 原生 TypeScript 类型剥离执行，不依赖额外的开发服务器或转译运行器。从当前目录执行：

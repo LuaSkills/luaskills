@@ -50,7 +50,7 @@ System Plugin 可以使用以下最小布局：
 
 ```yaml
 python_runtime:
-  version: "3.14.4"
+version: "3.14.6"
   package_manager: uv
   package_manager_version: "0.11.28"
   lockfile: python/requirements.lock
@@ -64,7 +64,7 @@ node_runtime:
 
 `node_runtime.version` 必须是大于等于 `22.0.0` 的精确 SemVer；版本范围、标签、不完整版本与更旧版本都会在创建环境前被拒绝。lockfile 与包元数据会复制到私有构建输入，并在包管理器消费前重新计算哈希。
 
-使用创建引擎时的同一个 `runtime_root` 准备可携带运行时：
+默认使用创建引擎时的同一个 `runtime_root` 准备可携带运行时：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deps/fetch_managed_runtimes.ps1 -RuntimeRoot <runtime_root> -Target all
@@ -74,7 +74,41 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deps/fetch_managed_r
 RUNTIME_ROOT=<runtime_root> scripts/deps/fetch_managed_runtimes.sh all
 ```
 
+LuaSkills 0.5.1 也允许宿主把发行包与可写环境放在 `runtime_root` 外：
+
+```rust
+let mut host_options = LuaRuntimeHostOptions::with_runtime_root(runtime_data_root);
+host_options.managed_runtime_distribution_root = Some(application_root.join("dependencies/runtimes"));
+host_options.managed_runtime_environment_root = Some(user_data_root.join("managed-runtime-envs"));
+```
+
+拉取脚本可以直接接收精确发行根，而不改变引擎数据根：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deps/fetch_managed_runtimes.ps1 -RuntimeRoot <build_cache_root> -DistributionRoot <distribution_root> -Target all
+```
+
+```bash
+RUNTIME_ROOT=<build_cache_root> MANAGED_RUNTIME_DISTRIBUTION_ROOT=<distribution_root> scripts/deps/fetch_managed_runtimes.sh all
+```
+
+创建引擎时，显式发行根必须已经存在；显式环境根会被安全创建并固定身份。Rust、JSON FFI、C ABI V3、哈希与迁移细节见[宿主指定受管运行时根目录](managed-runtime-host-roots.md)。
+
 LuaSkills 不会回退使用系统 Python、系统 Node.js、外部 `node_modules` 或未声明依赖。
+
+### 引擎初始化策略
+
+宿主必须在创建 `LuaEngine` 前通过 `LuaRuntimeHostOptions.managed_runtime_config` 固定以下策略；System Plugin Lua 代码不能修改：
+
+| 策略 | 默认值 |
+| --- | ---: |
+| 单个精确环境/包所有者池的 Worker 数量 | `4` |
+| Worker 空闲回收 | `60` 秒 |
+| 单引擎持久会话数量 | `256` |
+| 每个 Session stdout/stderr 流保留输出 | `1 MiB` |
+| `python.invoke` / `node.invoke` 超时 | 无限制 |
+
+所有已配置数值都必须为正数。单次正数 `invoke.timeout_ms` 优先于引擎 invoke 默认值；单个 Session 的正数 `session.open.buffer_limit_bytes` 优先于引擎输出缓冲默认值。Rust、JSON FFI、标准 C ABI V3 与 SDK 示例见[宿主指定受管运行时根目录](managed-runtime-host-roots.md#引擎级资源策略)。
 
 ## 3. 创建严格 System 租约
 
@@ -170,7 +204,7 @@ sidecar = vulcan.runtime.node.session.open({
 return sidecar:status()
 ```
 
-`session.open(...)` 只接受 `file`、`args`、`cwd`、三种流编码与正数 `buffer_limit_bytes`。`file` 必须是包相对的既有源文件；`args` 必须是稠密字符串数组，并会直接传递而不做 shell 展开。
+`session.open(...)` 只接受 `file`、`args`、`cwd`、三种流编码与正数 `buffer_limit_bytes`。省略 `buffer_limit_bytes` 时使用引擎策略（默认每流 1 MiB）；显式正数值只覆盖当前 Session。`file` 必须是包相对的既有源文件；`args` 必须是稠密字符串数组，并会直接传递而不做 shell 展开。
 
 子进程从每会话独立的不可变包快照执行，并通过 `LUASKILLS_MANAGED_CONTEXT_JSON` 接收受控包/租约元数据。Python 使用声明对应的受管虚拟环境，继承的 `PYTHONHOME`、`PYTHONPATH` 与用户 site-packages 会被移除；Node 从精确受管 `node_modules` 解析裸导入。
 
@@ -330,7 +364,7 @@ callback 在每个 engine 的单个串行后台调度器上运行，可以发信
 | --- | --- | --- |
 | System create 拒绝 `system_package.root` | root 不是 `system_lua_lib` 的规范严格子目录，或含 Lua 路径元字符 | 把包放入引擎派生的 `system_lua_lib`，并传规范绝对路径 |
 | `dependencies_file` 被拒绝 | 路径是绝对路径、用 `..` 逃逸、是符号链接或不是普通文件 | 使用 `dependencies.yaml` 这类包内相对普通文件 |
-| 运行时已配置但不可用 | 没有为精确声明版本拉取可携带运行时/包管理器 | 对引擎 `runtime_root` 执行受管运行时拉取脚本 |
+| 运行时已配置但不可用 | 没有为精确声明版本拉取可携带运行时/包管理器 | 对所选发行根执行受管运行时拉取脚本，并检查 `distribution_source` |
 | Node 版本被拒绝 | 使用范围、标签、不完整版本或低于 `22.0.0` | 固定一个受支持的精确 SemVer |
 | `session.open(...)` 返回 `windows_arm_is_not_supported` | 宿主目标是 Windows ARM/aarch64 | 不创建持久会话，也不回退系统解释器；改用受支持原生目标 |
 | 普通 Skill 中 `session.open(...)` 被拒绝 | 持久受管会话要求专用 System 包上下文 | Skill 内使用 `invoke`，或把长期 sidecar 移到授权 System Plugin |
@@ -341,7 +375,7 @@ callback 在每个 engine 的单个串行后台调度器上运行，可以发信
 
 ## 10. 发布前检查清单
 
-- 引擎使用预期 `runtime_root` 创建，可携带运行时布局已经存在。
+- 引擎使用预期数据根、发行根、环境根与 B3-B7 资源策略创建；状态中的来源符合 `host_configured` 或 `runtime_root_default`。
 - 每个 System 包都有唯一 id、严格包根、包内依赖清单与锁定依赖。
 - 宿主注入 authority，并把 `lease_id + sid + generation` 作为一个句柄保存。
 - 在 Windows x86_64、Linux x86_64/aarch64、macOS x86_64/aarch64 上原生运行持久会话验收；Windows ARM 由结构化能力拒绝。

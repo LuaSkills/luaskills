@@ -13,6 +13,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # RuntimeRoot 保存本次冒烟运行使用的隔离 LuaSkills 运行时根目录。
 RUNTIME_ROOT=""
 
+# DistributionRoot stores a host-selected managed interpreter distribution root.
+# DistributionRoot 保存宿主指定的受管解释器发行根。
+DISTRIBUTION_ROOT=""
+
+# EnvironmentRoot stores a host-selected writable managed environment root.
+# EnvironmentRoot 保存宿主指定的可写受管环境根。
+ENVIRONMENT_ROOT=""
+
 # SkipFetch allows reusing an already prepared runtime root during local iteration.
 # SkipFetch 允许本地迭代时复用已经准备好的运行时根目录。
 SKIP_FETCH=0
@@ -26,10 +34,12 @@ usage() {
   # 输出 POSIX 受管运行时冒烟脚本的命令用法。
   cat <<'USAGE'
 Usage:
-  managed_runtime_smoke.sh [--runtime-root <dir>] [--skip-fetch] [--keep-runtime-root]
+  managed_runtime_smoke.sh [--runtime-root <dir>] [--distribution-root <dir>] [--environment-root <dir>] [--skip-fetch] [--keep-runtime-root]
 
 Options:
   --runtime-root <dir>   Use this runtime root instead of an isolated target directory.
+  --distribution-root <dir> Use this managed Python/Node distribution root.
+  --environment-root <dir>  Use this writable managed environment root.
   --skip-fetch           Reuse an already prepared runtime root.
   --keep-runtime-root    Do not remove an isolated runtime root after success.
 USAGE
@@ -39,6 +49,14 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --runtime-root)
       RUNTIME_ROOT="${2:?--runtime-root requires a directory}"
+      shift 2
+      ;;
+    --distribution-root)
+      DISTRIBUTION_ROOT="${2:?--distribution-root requires a directory}"
+      shift 2
+      ;;
+    --environment-root)
+      ENVIRONMENT_ROOT="${2:?--environment-root requires a directory}"
       shift 2
       ;;
     --skip-fetch)
@@ -77,6 +95,32 @@ print(os.path.abspath(sys.argv[1]))
 PY
 )"
 
+if [ -z "$DISTRIBUTION_ROOT" ]; then
+  DISTRIBUTION_ROOT="$RUNTIME_ROOT-distributions"
+fi
+# DistributionRoot stores the normalized absolute interpreter distribution root.
+# DistributionRoot 保存规范化后的解释器发行根绝对路径。
+DISTRIBUTION_ROOT="$(python3 - "$DISTRIBUTION_ROOT" <<'PY'
+import os
+import sys
+
+print(os.path.abspath(sys.argv[1]))
+PY
+)"
+
+if [ -z "$ENVIRONMENT_ROOT" ]; then
+  ENVIRONMENT_ROOT="$RUNTIME_ROOT-environments"
+fi
+# EnvironmentRoot stores the normalized absolute writable environment root.
+# EnvironmentRoot 保存规范化后的可写环境根绝对路径。
+ENVIRONMENT_ROOT="$(python3 - "$ENVIRONMENT_ROOT" <<'PY'
+import os
+import sys
+
+print(os.path.abspath(sys.argv[1]))
+PY
+)"
+
 # SkillPath stores the example skill used for end-to-end managed runtime verification.
 # SkillPath 保存用于端到端受管运行时验证的示例 skill。
 SKILL_PATH="$REPO_ROOT/examples/managed_runtime/managed-child-runtime-debug"
@@ -94,11 +138,13 @@ cleanup() {
   # 在安全情况下于成功后移除隔离运行时根目录。
   local status="$1"
   if [ "$status" -eq 0 ] && [ "$KEEP_RUNTIME_ROOT" -ne 1 ]; then
-    case "$RUNTIME_ROOT" in
-      "$REPO_ROOT"/target/managed-runtime-smoke/*)
-        rm -rf "$RUNTIME_ROOT" || true
-        ;;
-    esac
+    for cleanup_path in "$RUNTIME_ROOT" "$DISTRIBUTION_ROOT" "$ENVIRONMENT_ROOT"; do
+      case "$cleanup_path" in
+        "$REPO_ROOT"/target/managed-runtime-smoke/*)
+          rm -rf "$cleanup_path" || true
+          ;;
+      esac
+    done
   fi
 }
 
@@ -106,18 +152,27 @@ trap 'cleanup $?' EXIT
 
 if [ "$SKIP_FETCH" -ne 1 ]; then
   echo "Fetching managed runtimes into $RUNTIME_ROOT"
-  RUNTIME_ROOT="$RUNTIME_ROOT" FORCE=1 "$FETCH_SCRIPT" all
+  RUNTIME_ROOT="$RUNTIME_ROOT" MANAGED_RUNTIME_DISTRIBUTION_ROOT="$DISTRIBUTION_ROOT" FORCE=1 "$FETCH_SCRIPT" all
 fi
 
 echo "Validating managed runtime layout"
-python3 "$LAYOUT_CHECK_SCRIPT" "$RUNTIME_ROOT"
+python3 "$LAYOUT_CHECK_SCRIPT" "$RUNTIME_ROOT" --distribution-root "$DISTRIBUTION_ROOT" --environment-root "$ENVIRONMENT_ROOT"
 
 echo "Calling managed runtime debug skill"
+# Non-default B3-B7 values prove that host initialization policy reaches a real Python/Node invocation.
+# 非默认 B3-B7 值用于证明宿主初始化策略能够传递到真实 Python/Node 调用。
 OUTPUT="$(
   cd "$REPO_ROOT"
   cargo run --bin luaskills-debug -- \
     call \
     --runtime-root "$RUNTIME_ROOT" \
+    --managed-runtime-distribution-root "$DISTRIBUTION_ROOT" \
+    --managed-runtime-environment-root "$ENVIRONMENT_ROOT" \
+    --managed-runtime-worker-pool-max-size 3 \
+    --managed-runtime-worker-idle-ttl-secs 45 \
+    --managed-runtime-session-limit 64 \
+    --managed-runtime-session-buffer-limit-bytes 2097152 \
+    --managed-runtime-invoke-timeout-ms 60000 \
     --skill-path "$SKILL_PATH" \
     --tool smoke \
     --args-json '{"text":"smoke-script"}' \
@@ -155,3 +210,5 @@ PY
 
 echo "Managed runtime smoke passed"
 echo "Runtime root: $RUNTIME_ROOT"
+echo "Distribution root: $DISTRIBUTION_ROOT"
+echo "Environment root: $ENVIRONMENT_ROOT"

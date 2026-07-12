@@ -14,10 +14,7 @@ use crate::runtime::process_session::{
     ManagedProcessSessionObserver,
 };
 use crate::runtime_logging::warn as log_warn;
-
-/// Maximum number of live managed runtime sessions owned by one engine.
-/// 单个引擎最多拥有的活动受管运行时会话数量。
-const MANAGED_RUNTIME_SESSION_LIMIT: usize = 256;
+use crate::runtime_options::LuaRuntimeManagedRuntimeConfig;
 
 /// Delay between retries after one owner teardown attempt fails.
 /// 单次所有者清理尝试失败后的重试间隔。
@@ -53,6 +50,9 @@ pub(crate) struct ManagedRuntimeTransactionContext {
 /// Engine-owned service coordinating managed sessions, transactions, and background events.
 /// 引擎拥有的服务，用于协调受管会话、事务与后台事件。
 pub(crate) struct ManagedRuntimeServices {
+    /// Validated host-selected persistent-session limits and defaults.
+    /// 已校验的宿主选择持久会话上限与默认值。
+    config: LuaRuntimeManagedRuntimeConfig,
     /// Mutable resource registry protected across Lua and background lifecycle calls.
     /// 在 Lua 与后台生命周期调用之间受保护的可变资源注册表。
     state: Mutex<ManagedRuntimeServicesState>,
@@ -196,16 +196,34 @@ struct ManagedRuntimeSessionEventObserver {
 }
 
 impl ManagedRuntimeServices {
-    /// Create one empty engine-owned resource service and bounded event center.
-    /// 创建一个空的引擎所有资源服务与有界事件中心。
+    /// Create one empty engine-owned resource service with stable default limits.
+    /// 使用稳定默认上限创建一个空的引擎所有资源服务。
+    #[cfg(test)]
     pub(crate) fn new() -> Result<Arc<Self>, String> {
+        Self::new_with_config(LuaRuntimeManagedRuntimeConfig::default())
+    }
+
+    /// Create one empty engine-owned resource service with a host-selected validated policy.
+    /// 使用宿主选择且已校验的策略创建一个空的引擎所有资源服务。
+    ///
+    /// `config` controls the engine session capacity and the per-stream default buffer size.
+    /// `config` 控制引擎会话容量与每个流的默认缓冲大小。
+    ///
+    /// Returns a live service or a configuration/event-worker initialization error.
+    /// 返回活动服务，或配置及事件工作线程初始化错误。
+    pub(crate) fn new_with_config(
+        config: LuaRuntimeManagedRuntimeConfig,
+    ) -> Result<Arc<Self>, String> {
+        config.validate()?;
         // Event center reserves four reliable logical slots for every possible session.
         // 事件中心为每个可能会话预留四个可靠逻辑槽。
-        let event_center = ManagedSessionEventCenter::new(MANAGED_RUNTIME_SESSION_LIMIT)?;
+        let event_center =
+            ManagedSessionEventCenter::new(config.persistent_session_limit_per_engine)?;
         // Independent retry center lets its worker wait without extending engine lifetime.
         // 独立重试中心使工作线程能够在不延长引擎生命周期的情况下等待。
         let retirement_retry_center = Arc::new(ManagedRuntimeRetirementRetryCenter::new());
         let services = Arc::new(Self {
+            config,
             state: Mutex::new(ManagedRuntimeServicesState {
                 next_session_id: 0,
                 next_transaction_id: 0,
@@ -230,6 +248,20 @@ impl ManagedRuntimeServices {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(retry_worker);
         Ok(services)
+    }
+
+    /// Return the host-selected default retained bytes for each persistent-session output stream.
+    /// 返回宿主选择的每个持久会话输出流默认保留字节数。
+    pub(crate) fn persistent_session_default_buffer_limit_bytes_per_stream(&self) -> usize {
+        self.config
+            .persistent_session_default_buffer_limit_bytes_per_stream
+    }
+
+    /// Return the host-selected maximum launching or live persistent sessions for this engine.
+    /// 返回宿主选择的当前引擎启动中或活动持久会话最大数量。
+    #[cfg(test)]
+    pub(crate) fn persistent_session_limit_per_engine(&self) -> usize {
+        self.config.persistent_session_limit_per_engine
     }
 
     /// Return the durable event center used by Engine and FFI host APIs.
@@ -282,9 +314,10 @@ impl ManagedRuntimeServices {
         // 在注册表锁内分配并验证事务所有权的会话 id。
         let session_id = {
             let mut state = self.lock_state();
-            if state.sessions.len() >= MANAGED_RUNTIME_SESSION_LIMIT {
+            if state.sessions.len() >= self.config.persistent_session_limit_per_engine {
                 return Err(format!(
-                    "managed runtime session limit exceeded: {MANAGED_RUNTIME_SESSION_LIMIT}"
+                    "managed runtime session limit exceeded: {}",
+                    self.config.persistent_session_limit_per_engine
                 ));
             }
             if let Some(transaction) = transaction {
@@ -935,6 +968,36 @@ impl Drop for ManagedRuntimeServices {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// Verify the host-selected per-engine persistent-session limit applies before process launch.
+    /// 验证宿主选择的单引擎持久会话上限会在进程启动前生效。
+    #[test]
+    fn configured_session_limit_bounds_prelaunch_reservations() {
+        // Config limits the engine to one launching or live persistent session.
+        // Config 将引擎限制为一个启动中或活动持久会话。
+        let config = LuaRuntimeManagedRuntimeConfig {
+            persistent_session_limit_per_engine: 1,
+            ..LuaRuntimeManagedRuntimeConfig::default()
+        };
+        // Services is the production registry and event-center path configured by the host.
+        // Services 是由宿主配置的生产注册表与事件中心路径。
+        let services = ManagedRuntimeServices::new_with_config(config)
+            .expect("create single-session managed services");
+        // FirstReservation consumes the sole capacity slot without spawning a child.
+        // FirstReservation 在不启动子进程的情况下占用唯一容量槽。
+        let first_reservation = services
+            .reserve_session(71, None, None)
+            .expect("reserve first managed session");
+        // Error proves a second prelaunch reservation cannot exceed the configured engine limit.
+        // Error 证明第二个启动前预留不能超过已配置引擎上限。
+        let error = services
+            .reserve_session(71, None, None)
+            .err()
+            .expect("second managed session must exceed configured limit");
+
+        assert_eq!(error, "managed runtime session limit exceeded: 1");
+        drop(first_reservation);
+    }
 
     /// A failed first owner teardown must be retried without another lease retirement notification.
     /// 所有者首次清理失败后必须在没有另一条租约退役通知的情况下自动重试。

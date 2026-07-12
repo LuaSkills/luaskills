@@ -110,10 +110,11 @@ asset은 `{skill_id}-v{version}-skill.zip`과 `{skill_id}-v{version}-checksums.t
 
 | 구성 요소 | 현재 버전 |
 | --- | --- |
-| LuaSkills core, FFI SDK 및 언어 SDK 계열 | `0.5.0` |
+| LuaSkills core, FFI SDK 및 언어 SDK 계열 | `0.5.1` |
 | Lua runtime packages 호환 계열 | `0.1` |
-| 관리형 Python / uv | `3.14.4` / `0.11.28` |
+| 관리형 Python / uv | `3.14.6` / `0.11.28` |
 | 관리형 Node.js / pnpm | `24.18.0` / `11.11.0` |
+| 관리형 런타임 엔진 기본값 | `Worker=4 / 유휴=60초 / 세션=256 / 버퍼=1MiB/스트림 / invoke=무제한` |
 | vldb-controller | `0.2.1` |
 | vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
 

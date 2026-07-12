@@ -1,14 +1,17 @@
-param(
+﻿param(
     # Target selects which managed runtime group to fetch.
     # Target 选择需要拉取的受管运行时分组。
     [ValidateSet("all", "python", "node", "package-managers")]
     [string]$Target = "all",
-    # RuntimeRoot receives managed runtime executables and package managers.
-    # RuntimeRoot 接收受管运行时可执行程序与包管理器。
+    # RuntimeRoot selects the LuaSkills/build root used for compatible defaults and staging.
+    # RuntimeRoot 选择用于兼容默认布局与暂存的 LuaSkills/构建根。
     [string]$RuntimeRoot = "output",
+    # DistributionRoot optionally targets the directory that directly contains python and node.
+    # DistributionRoot 可选指定直接包含 python 与 node 的目录。
+    [string]$DistributionRoot = "",
     # PythonVersion selects the managed CPython version installed through uv.
     # PythonVersion 选择通过 uv 安装的受管 CPython 版本。
-    [string]$PythonVersion = "3.14.4",
+    [string]$PythonVersion = "3.14.6",
     # UvVersion selects the standalone uv binary version.
     # UvVersion 选择独立 uv 二进制版本。
     [string]$UvVersion = "0.11.28",
@@ -346,7 +349,7 @@ function Install-UvRuntime {
 
     # UvTarget stores the versioned uv installation directory.
     # UvTarget 保存带版本的 uv 安装目录。
-    $UvTarget = Join-Path $RuntimeRoot "dependencies\runtimes\python\uv-$UvVersion-$($Platform.key)"
+    $UvTarget = Join-Path $DistributionRoot "python\uv-$UvVersion-$($Platform.key)"
     # UvExeName stores the platform-specific uv executable name.
     # UvExeName 保存平台对应的 uv 可执行文件名。
     $UvExeName = if ($Platform.key.StartsWith("windows")) { "uv.exe" } else { "uv" }
@@ -440,7 +443,7 @@ function Install-PythonRuntime {
     $UvExe = Install-UvRuntime -Platform $Platform
     # PythonRoot stores uv-managed Python installations for this exact platform.
     # PythonRoot 保存当前平台下由 uv 管理的 Python 安装。
-    $PythonRoot = Join-Path $RuntimeRoot "dependencies\runtimes\python\cpython-$PythonVersion-$($Platform.key)"
+    $PythonRoot = Join-Path $DistributionRoot "python\cpython-$PythonVersion-$($Platform.key)"
     if ((Test-Path -LiteralPath (Join-Path $PythonRoot "runtime-manifest.json")) -and -not $Force) {
         return
     }
@@ -502,7 +505,7 @@ function Install-NodeRuntime {
 
     # NodeTarget stores the final versioned Node.js directory.
     # NodeTarget 保存最终带版本的 Node.js 目录。
-    $NodeTarget = Join-Path $RuntimeRoot "dependencies\runtimes\node\node-$NodeVersion-$($Platform.key)"
+    $NodeTarget = Join-Path $DistributionRoot "node\node-$NodeVersion-$($Platform.key)"
     # NodeExeName stores the platform-specific Node executable name.
     # NodeExeName 保存平台对应的 Node 可执行文件名。
     $NodeExeName = if ($Platform.key.StartsWith("windows")) { "node.exe" } else { "bin/node" }
@@ -610,7 +613,7 @@ function Install-PnpmRuntime {
     $NodeExe = Install-NodeRuntime -Platform $Platform
     # PnpmTarget stores the versioned pnpm installation directory.
     # PnpmTarget 保存带版本的 pnpm 安装目录。
-    $PnpmTarget = Join-Path $RuntimeRoot "dependencies\runtimes\node\pnpm-$PnpmVersion"
+    $PnpmTarget = Join-Path $DistributionRoot "node\pnpm-$PnpmVersion"
     # PnpmEntry stores the pnpm CommonJS entry file.
     # PnpmEntry 保存 pnpm 的 CommonJS 入口文件。
     $PnpmEntry = Join-Path $PnpmTarget "bin\pnpm.cjs"
@@ -693,6 +696,12 @@ Set-Location $ProjectRoot
 # RuntimeRoot is normalized after the project root has been resolved.
 # RuntimeRoot 会在项目根目录解析后被规范化。
 $RuntimeRoot = (New-Item -ItemType Directory -Force -Path $RuntimeRoot).FullName
+# DistributionRoot defaults to the compatible runtime-root layout and otherwise uses the exact host path.
+# DistributionRoot 默认使用兼容的 runtime-root 布局，否则使用精确宿主路径。
+if ([string]::IsNullOrWhiteSpace($DistributionRoot)) {
+    $DistributionRoot = Join-Path $RuntimeRoot "dependencies\runtimes"
+}
+$DistributionRoot = (New-Item -ItemType Directory -Force -Path $DistributionRoot).FullName
 # Platform stores the current managed runtime platform metadata.
 # Platform 保存当前受管运行时平台元数据。
 $Platform = Get-ManagedRuntimePlatform

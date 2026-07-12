@@ -29,7 +29,11 @@ pub use host::database::{
     set_sqlite_provider_callback, set_sqlite_provider_json_callback,
 };
 pub use host::options::{
-    LuaInvocationContext, LuaRuntimeCapabilityOptions, LuaRuntimeHostOptions,
+    DEFAULT_MANAGED_RUNTIME_PERSISTENT_SESSION_BUFFER_LIMIT_BYTES_PER_STREAM,
+    DEFAULT_MANAGED_RUNTIME_PERSISTENT_SESSION_LIMIT_PER_ENGINE,
+    DEFAULT_MANAGED_RUNTIME_WORKER_IDLE_TTL_SECS,
+    DEFAULT_MANAGED_RUNTIME_WORKER_POOL_MAX_SIZE_PER_ENVIRONMENT, LuaInvocationContext,
+    LuaRuntimeCapabilityOptions, LuaRuntimeHostOptions, LuaRuntimeManagedRuntimeConfig,
     LuaRuntimeSpaceControllerOptions, LuaRuntimeSpaceControllerProcessMode, RuntimeSkillRoot,
 };
 pub use runtime::cache::{
@@ -46,12 +50,14 @@ pub use runtime::logging::{
 };
 pub use runtime::managed_runtime::{
     MANAGED_RUNTIME_ENV_MARKER_SCHEMA_VERSION, ManagedRuntimeEnvHashInput, ManagedRuntimeEnvMarker,
-    ManagedRuntimeEnvPlan, ManagedRuntimeInstallManifest, ManagedRuntimeKind,
-    ManagedRuntimePersistentSessionCapability, WINDOWS_ARM_PERSISTENT_SESSION_UNSUPPORTED_REASON,
+    ManagedRuntimeEnvPlan, ManagedRuntimeInstallDescriptor, ManagedRuntimeInstallManifest,
+    ManagedRuntimeKind, ManagedRuntimePersistentSessionCapability, ManagedRuntimeRootSource,
+    ManagedRuntimeRoots, WINDOWS_ARM_PERSISTENT_SESSION_UNSUPPORTED_REASON,
     compute_managed_runtime_env_hash, current_managed_runtime_persistent_session_capability,
     current_managed_runtime_platform_key, ensure_managed_env, managed_env_dir,
     managed_env_is_ready, managed_env_marker_matches, managed_env_marker_path,
-    read_install_manifest, read_managed_env_marker, sha256_file, sha256_hex,
+    read_install_manifest, read_managed_env_marker, resolve_managed_runtime_install, sha256_file,
+    sha256_hex,
 };
 pub use runtime::managed_session_events::{
     RuntimeManagedSessionEvent, RuntimeManagedSessionEventBatch, RuntimeManagedSessionEventKind,

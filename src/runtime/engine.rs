@@ -50,8 +50,9 @@ use crate::runtime::managed_package::{
     replace_lua_managed_package_context, retire_managed_runtime_owner_state,
 };
 use crate::runtime::managed_runtime::{
-    ManagedRuntimeEnvPlan, current_managed_runtime_persistent_session_capability,
-    ensure_managed_env, managed_env_is_ready, resolve_node_env_plan, resolve_python_env_plan,
+    ManagedRuntimeEnvPlan, ManagedRuntimeRoots,
+    current_managed_runtime_persistent_session_capability, ensure_managed_env,
+    managed_env_is_ready, resolve_node_env_plan, resolve_python_env_plan,
 };
 use crate::runtime::managed_runtime_services::{
     ManagedRuntimeServices, ManagedRuntimeSessionEventIdentity, ManagedRuntimeTransactionContext,
@@ -77,7 +78,9 @@ use crate::runtime_help::{
     RuntimeHelpDetail, RuntimeHelpNodeDescriptor, RuntimeSkillHelpDescriptor,
 };
 use crate::runtime_logging::{error as log_error, info as log_info, warn as log_warn};
-use crate::runtime_options::{LuaInvocationContext, LuaRuntimeHostOptions, RuntimeSkillRoot};
+use crate::runtime_options::{
+    LuaInvocationContext, LuaRuntimeHostOptions, LuaRuntimeManagedRuntimeConfig, RuntimeSkillRoot,
+};
 use crate::runtime_result::RuntimeInvocationResult;
 use crate::skill::dependencies::PackageDependencyManifest;
 use crate::skill::manager::{
@@ -765,6 +768,9 @@ pub struct LuaEngine {
     /// Engine-owned short-lived managed runtime worker service shared by every engine VM.
     /// 由每个引擎 VM 共享的引擎所有短期受管运行时 Worker 服务。
     managed_runtime_workers: Arc<ManagedRuntimeWorkerService>,
+    /// Immutable host-selected roots shared by managed runtime package contexts when configured.
+    /// 配置后由受管运行时包上下文共享的不可变宿主选定根集合。
+    managed_runtime_roots: Option<Arc<ManagedRuntimeRoots>>,
     skill_config_store: Arc<SkillConfigStore>,
     lancedb_host: Option<Arc<LanceDbSkillHost>>,
     sqlite_host: Option<Arc<SqliteSkillHost>>,
@@ -811,6 +817,35 @@ impl LuaEngineOptions {
             pool_config,
             host_options,
         }
+    }
+}
+
+/// Resolve the immutable managed runtime roots selected at the engine host boundary.
+/// 解析在引擎宿主边界选定的不可变受管运行时根集合。
+///
+/// `host_options` may provide both explicit managed roots only when its authoritative LuaSkills
+/// data root is also present; otherwise root ownership would be ambiguous before Skill loading.
+/// `host_options` 仅可在权威 LuaSkills 数据根同时存在时提供显式受管根，否则 Skill 加载前的
+/// 根所有权会产生歧义。
+///
+/// Returns a validated shared root set, no set for the legacy per-Skill-root mode, or an explicit
+/// configuration and filesystem error.
+/// 返回已校验共享根集合、旧有逐 Skill 根模式下的空值，或显式配置及文件系统错误。
+fn resolve_engine_managed_runtime_roots(
+    host_options: &LuaRuntimeHostOptions,
+) -> Result<Option<Arc<ManagedRuntimeRoots>>, String> {
+    match host_options.runtime_root.as_deref() {
+        Some(runtime_root) => Ok(Some(Arc::new(ManagedRuntimeRoots::new(
+            runtime_root,
+            host_options.managed_runtime_distribution_root.as_deref(),
+            host_options.managed_runtime_environment_root.as_deref(),
+        )?))),
+        None if host_options.managed_runtime_distribution_root.is_some()
+            || host_options.managed_runtime_environment_root.is_some() =>
+        {
+            Err("runtime_root is required when a managed runtime root is configured".to_string())
+        }
+        None => Ok(None),
     }
 }
 
@@ -3088,16 +3123,20 @@ impl Drop for LuaManagedRuntimeTransactionScopeGuard {
     }
 }
 
-/// Default retained byte limit for each managed runtime session output stream.
-/// 每个受管运行时会话输出流默认保留的字节上限。
-const MANAGED_RUNTIME_SESSION_DEFAULT_BUFFER_LIMIT_BYTES: usize = 1024 * 1024;
-
 /// Parse one strict managed Python or Node persistent-session request.
 /// 解析一个严格的受管 Python 或 Node 持久会话请求。
+///
+/// `spec` is the untrusted Lua table, `api_name` qualifies every diagnostic, and the two defaults
+/// are host-selected values applied only when the matching stream fields are omitted.
+/// `spec` 是不可信 Lua table，`api_name` 限定每条诊断；两个默认值仅在对应流字段省略时应用。
+///
+/// Returns one fully materialized launch request or a strict type, field, path, encoding, or limit error.
+/// 返回完整实体化启动请求，或严格的类型、字段、路径、编码及上限错误。
 fn parse_managed_runtime_session_open_request(
     spec: LuaValue,
     api_name: &str,
     default_encoding: RuntimeTextEncoding,
+    default_buffer_limit_bytes_per_stream: usize,
 ) -> Result<ManagedRuntimeSessionOpenRequest, mlua::Error> {
     // Required Lua request table.
     // 必需的 Lua 请求表。
@@ -3162,7 +3201,7 @@ fn parse_managed_runtime_session_open_request(
                 "{api_name}: buffer_limit_bytes exceeds the platform usize range"
             ))
         })?,
-        None => MANAGED_RUNTIME_SESSION_DEFAULT_BUFFER_LIMIT_BYTES,
+        None => default_buffer_limit_bytes_per_stream,
     };
     Ok(ManagedRuntimeSessionOpenRequest {
         file,
@@ -3366,7 +3405,12 @@ fn open_managed_python_session(
     let observer = reservation.observer();
     // Strict session launch request parsed from Lua.
     // 从 Lua 解析得到的严格会话启动请求。
-    let request = parse_managed_runtime_session_open_request(spec, api_name, default_encoding)?;
+    let request = parse_managed_runtime_session_open_request(
+        spec,
+        api_name,
+        default_encoding,
+        services.persistent_session_default_buffer_limit_bytes_per_stream(),
+    )?;
     // Pure Rust launch result owning the process tree and optional package snapshot cleanup.
     // 拥有进程树与可选包快照清理的纯 Rust 启动结果。
     let launch = launch_managed_python_session(package.as_ref(), request, observer)
@@ -3421,7 +3465,12 @@ fn open_managed_node_session(
     let observer = reservation.observer();
     // Strict session launch request parsed from Lua.
     // 从 Lua 解析得到的严格会话启动请求。
-    let request = parse_managed_runtime_session_open_request(spec, api_name, default_encoding)?;
+    let request = parse_managed_runtime_session_open_request(
+        spec,
+        api_name,
+        default_encoding,
+        services.persistent_session_default_buffer_limit_bytes_per_stream(),
+    )?;
     // Pure Rust launch result owning the process tree and unique Node snapshot cleanup.
     // 拥有进程树与唯一 Node 快照清理的纯 Rust 启动结果。
     let launch = launch_managed_node_session(package.as_ref(), request, observer)
@@ -3434,13 +3483,6 @@ fn open_managed_node_session(
     create_managed_process_session_userdata(lua, launch.core, Some(cleanup), Some(session_id))
 }
 
-/// Default maximum number of warm workers kept for one managed runtime pool key.
-/// 单个受管运行时池键默认保留的最大热 worker 数量。
-const MANAGED_RUNTIME_WORKER_POOL_MAX_SIZE: usize = 4;
-
-/// Default idle time before one excess managed runtime worker can be retired.
-/// 多余受管运行时 worker 默认可回收的空闲时间。
-const MANAGED_RUNTIME_WORKER_IDLE_TTL_SECS: u64 = 60;
 /// Maximum best-effort wait for one worker child or its pipe readers during teardown.
 /// Worker 清理期间等待单个子进程或其管道读取器的最大尽力时长。
 const MANAGED_RUNTIME_WORKER_TEARDOWN_TIMEOUT_SECS: u64 = 2;
@@ -3638,6 +3680,12 @@ struct ManagedRuntimeWorkerPool {
     /// Worker buckets partitioned by runtime, environment, package, and owner lifetime.
     /// 按运行时、环境、包及所有者生命周期分区的 Worker 桶。
     buckets: HashMap<ManagedRuntimeWorkerKey, ManagedRuntimeWorkerBucket>,
+    /// Host-selected maximum live workers for each exact pool key.
+    /// 宿主选择的每个精确池键最大活动 Worker 数量。
+    max_size_per_environment: usize,
+    /// Host-selected idle seconds before one available Worker is retired.
+    /// 宿主选择的可用 Worker 回收前空闲秒数。
+    idle_ttl_secs: u64,
 }
 
 /// One shared lazy package snapshot initialization cell.
@@ -3651,16 +3699,33 @@ type ManagedPackageSnapshotMap = HashMap<ManagedRuntimeWorkerKey, ManagedPackage
 impl ManagedRuntimeWorkerPool {
     /// Create an empty managed runtime worker pool.
     /// 创建一个空的受管运行时 worker 池。
-    fn new() -> Self {
+    ///
+    /// `config` supplies the already validated capacity and idle-retirement values retained by the pool.
+    /// `config` 提供由池保留的已校验容量与空闲回收值。
+    ///
+    /// Returns one empty pool without starting a process or creating an environment.
+    /// 返回一个不会启动进程或创建环境的空池。
+    fn new(config: LuaRuntimeManagedRuntimeConfig) -> Self {
         Self {
             buckets: HashMap::new(),
+            max_size_per_environment: config.worker_pool_max_size_per_environment,
+            idle_ttl_secs: config.worker_idle_ttl_secs,
         }
     }
 
     /// Reap idle workers beyond the minimum warm count for one key.
     /// 回收单个键下超过最小保温数量的空闲 worker。
-    fn reap_idle_locked(bucket: &mut ManagedRuntimeWorkerBucket) -> Vec<ManagedRuntimeWorker> {
-        let idle_limit = Duration::from_secs(MANAGED_RUNTIME_WORKER_IDLE_TTL_SECS);
+    ///
+    /// `bucket` is exclusively borrowed by the pool lock and `idle_ttl_secs` is the host-selected threshold.
+    /// `bucket` 由池锁独占借用，`idle_ttl_secs` 是宿主选择的阈值。
+    ///
+    /// Returns detached workers whose process teardown must run after releasing the pool lock.
+    /// 返回已分离 Worker；其进程清理必须在释放池锁后执行。
+    fn reap_idle_locked(
+        bucket: &mut ManagedRuntimeWorkerBucket,
+        idle_ttl_secs: u64,
+    ) -> Vec<ManagedRuntimeWorker> {
+        let idle_limit = Duration::from_secs(idle_ttl_secs);
         let now = Instant::now();
         let mut index = 0usize;
         // Detached workers returned to the service for process teardown after unlocking.
@@ -3694,6 +3759,10 @@ impl ManagedRuntimeWorkerPool {
         key: &ManagedRuntimeWorkerKey,
     ) -> Result<(ManagedRuntimeWorkerCheckout, Vec<ManagedRuntimeWorker>), String> {
         key.ensure_owner_active()?;
+        // Configured limits are copied before mutably borrowing the selected bucket.
+        // 在可变借用所选桶之前复制已配置上限。
+        let max_size_per_environment = self.max_size_per_environment;
+        let idle_ttl_secs = self.idle_ttl_secs;
         let bucket =
             self.buckets
                 .entry(key.clone())
@@ -3701,7 +3770,7 @@ impl ManagedRuntimeWorkerPool {
                     available: Vec::new(),
                     total_count: 0,
                 });
-        let retired_workers = Self::reap_idle_locked(bucket);
+        let retired_workers = Self::reap_idle_locked(bucket, idle_ttl_secs);
         if let Some(mut worker) = bucket.available.pop() {
             worker.last_used_at = Instant::now();
             return Ok((
@@ -3709,9 +3778,9 @@ impl ManagedRuntimeWorkerPool {
                 retired_workers,
             ));
         }
-        if bucket.total_count >= MANAGED_RUNTIME_WORKER_POOL_MAX_SIZE {
+        if bucket.total_count >= max_size_per_environment {
             return Err(format!(
-                "managed runtime worker pool is exhausted for this environment; max_size={MANAGED_RUNTIME_WORKER_POOL_MAX_SIZE}"
+                "managed runtime worker pool is exhausted for this environment; max_size={max_size_per_environment}"
             ));
         }
         bucket.total_count = bucket
@@ -3734,6 +3803,9 @@ impl ManagedRuntimeWorkerPool {
         key: ManagedRuntimeWorkerKey,
         mut worker: ManagedRuntimeWorker,
     ) -> Vec<ManagedRuntimeWorker> {
+        // Configured idle lifetime copied before mutably borrowing the selected bucket.
+        // 在可变借用所选桶之前复制已配置空闲时长。
+        let idle_ttl_secs = self.idle_ttl_secs;
         if key.ensure_owner_active().is_err() {
             return vec![worker];
         }
@@ -3750,7 +3822,7 @@ impl ManagedRuntimeWorkerPool {
             bucket.total_count = 1;
         }
         bucket.available.push(worker);
-        Self::reap_idle_locked(bucket)
+        Self::reap_idle_locked(bucket, idle_ttl_secs)
     }
 
     /// Discard one worker slot for a key after the worker exits or becomes invalid.
@@ -3796,6 +3868,9 @@ impl ManagedRuntimeWorkerPool {
 /// Engine-owned service providing one isolated short-lived managed runtime worker pool.
 /// 提供单个隔离短期受管运行时 Worker 池的引擎所有服务。
 struct ManagedRuntimeWorkerService {
+    /// Validated host-selected Worker limits and default invoke timeout.
+    /// 已校验的宿主选择 Worker 上限与默认 invoke 超时。
+    config: LuaRuntimeManagedRuntimeConfig,
     /// Mutable pool state isolated to the owning engine.
     /// 隔离到所属引擎的可变池状态。
     pool: Mutex<ManagedRuntimeWorkerPool>,
@@ -3805,16 +3880,38 @@ struct ManagedRuntimeWorkerService {
 }
 
 impl ManagedRuntimeWorkerService {
-    /// Create one empty engine-owned worker service.
-    /// 创建一个空的引擎所有 Worker 服务。
+    /// Create one empty engine-owned worker service with stable defaults.
+    /// 使用稳定默认值创建一个空的引擎所有 Worker 服务。
     ///
     /// Return a shared service suitable for injection into every VM of one engine.
     /// 返回适合注入单个引擎全部 VM 的共享服务。
+    #[cfg(test)]
     fn new() -> Arc<Self> {
-        Arc::new(Self {
-            pool: Mutex::new(ManagedRuntimeWorkerPool::new()),
+        Self::new_with_config(LuaRuntimeManagedRuntimeConfig::default())
+            .expect("default managed runtime config must be valid")
+    }
+
+    /// Create one empty engine-owned worker service with a host-selected policy.
+    /// 使用宿主选择的策略创建一个空的引擎所有 Worker 服务。
+    ///
+    /// `config` controls per-environment capacity, idle retirement, and the omitted invoke timeout.
+    /// `config` 控制每环境容量、空闲回收与省略 invoke 超时时使用的默认值。
+    ///
+    /// Returns a shared service or a stable configuration validation error.
+    /// 返回共享服务，或稳定的配置校验错误。
+    fn new_with_config(config: LuaRuntimeManagedRuntimeConfig) -> Result<Arc<Self>, String> {
+        config.validate()?;
+        Ok(Arc::new(Self {
+            config,
+            pool: Mutex::new(ManagedRuntimeWorkerPool::new(config)),
             package_snapshots: Mutex::new(HashMap::new()),
-        })
+        }))
+    }
+
+    /// Return the host-selected default invoke timeout; absence means unlimited execution.
+    /// 返回宿主选择的默认 invoke 超时；缺失表示无限制执行。
+    fn invoke_default_timeout_ms(&self) -> Option<u64> {
+        self.config.invoke_default_timeout_ms
     }
 
     /// Return one immutable owner-scoped package snapshot, creating it outside service locks.
@@ -5003,10 +5100,19 @@ fn managed_python_venv_executable(plan: &ManagedRuntimeEnvPlan) -> PathBuf {
 
 /// Parse a Lua invocation table for `vulcan.runtime.python/node.invoke`.
 /// 解析 `vulcan.runtime.python/node.invoke` 使用的 Lua 调用表。
+///
+/// `value` is the untrusted request table, `api_name` qualifies diagnostics, `default_handler`
+/// selects the runtime-specific handler, and `default_timeout_ms` applies only when Lua omits `timeout_ms`.
+/// `value` 是不可信请求 table，`api_name` 限定诊断，`default_handler` 选择运行时专属 handler；
+/// `default_timeout_ms` 仅在 Lua 省略 `timeout_ms` 时应用。
+///
+/// Returns one strict Worker request or a field/type/JSON/positive-timeout validation error.
+/// 返回严格 Worker 请求，或字段、类型、JSON 及正数超时校验错误。
 fn parse_managed_runtime_invoke_request(
     value: LuaValue,
     api_name: &str,
     default_handler: &str,
+    default_timeout_ms: Option<u64>,
 ) -> Result<ManagedRuntimeInvokeRequest, mlua::Error> {
     let table = require_table_arg(value, api_name, "spec")?;
     let file = managed_runtime_optional_string_field(&table, api_name, "file")?
@@ -5023,7 +5129,15 @@ fn parse_managed_runtime_invoke_request(
         other => lua_value_to_json(&other)
             .map_err(|error| mlua::Error::runtime(format!("{api_name}: args: {error}")))?,
     };
-    let timeout_ms = managed_runtime_optional_timeout_ms(&table, api_name)?;
+    let timeout_ms = match managed_runtime_optional_timeout_ms(&table, api_name)? {
+        Some(0) => {
+            return Err(mlua::Error::runtime(format!(
+                "{api_name}: timeout_ms must be greater than zero"
+            )));
+        }
+        Some(value) => Some(value),
+        None => default_timeout_ms,
+    };
     Ok(ManagedRuntimeInvokeRequest {
         file,
         handler,
@@ -5058,6 +5172,10 @@ fn managed_runtime_status_from_plan(plan: &ManagedRuntimeEnvPlan) -> Value {
             "package_manager": plan.package_manager,
             "package_manager_version": plan.package_manager_version,
             "package_manager_executable": render_host_visible_path(&plan.package_manager_executable),
+            "distribution_root": render_host_visible_path(&plan.distribution_root),
+            "distribution_source": plan.distribution_source.as_str(),
+            "environment_root": render_host_visible_path(&plan.environment_root),
+            "environment_source": plan.environment_source.as_str(),
             "env_hash": plan.env_hash,
             "env_dir": render_host_visible_path(&plan.env_dir),
             "persistent_session": persistent_session,
@@ -5077,6 +5195,10 @@ fn managed_runtime_status_from_plan(plan: &ManagedRuntimeEnvPlan) -> Value {
             "package_manager": plan.package_manager,
             "package_manager_version": plan.package_manager_version,
             "package_manager_executable": render_host_visible_path(&plan.package_manager_executable),
+            "distribution_root": render_host_visible_path(&plan.distribution_root),
+            "distribution_source": plan.distribution_source.as_str(),
+            "environment_root": render_host_visible_path(&plan.environment_root),
+            "environment_source": plan.environment_source.as_str(),
             "env_hash": plan.env_hash,
             "env_dir": render_host_visible_path(&plan.env_dir),
             "persistent_session": persistent_session,
@@ -5425,15 +5547,20 @@ fn invoke_managed_python(lua: &Lua, spec: LuaValue) -> Result<LuaValue, mlua::Er
     // Stable API name used by every validation and runtime diagnostic.
     // 所有校验与运行时诊断使用的稳定 API 名称。
     let api_name = "vulcan.runtime.python.invoke";
-    // Strict invocation request decoded from the Lua value.
-    // 从 Lua 值严格解码得到的调用请求。
-    let request = parse_managed_runtime_invoke_request(spec, api_name, "main")?;
     // Trusted package context installed by the engine before entering package code.
     // 引擎在进入包代码前安装的可信包上下文。
     let package = current_lua_managed_package_context(lua, api_name)?;
     // Engine-owned worker service installed in every VM created by this engine.
     // 安装在当前引擎所创建全部 VM 中的引擎所有 Worker 服务。
     let worker_service = current_lua_managed_runtime_worker_service(lua, api_name)?;
+    // Strict invocation request applying the host default only when Lua omitted timeout_ms.
+    // 严格调用请求；仅当 Lua 省略 timeout_ms 时应用宿主默认值。
+    let request = parse_managed_runtime_invoke_request(
+        spec,
+        api_name,
+        "main",
+        worker_service.invoke_default_timeout_ms(),
+    )?;
     // Authoritative package manifest captured when the package was loaded.
     // 加载包时捕获的权威包清单。
     let manifest = package.dependency_manifest().ok_or_else(|| {
@@ -5507,15 +5634,20 @@ fn invoke_managed_node(lua: &Lua, spec: LuaValue) -> Result<LuaValue, mlua::Erro
     // Stable API name used by every validation and runtime diagnostic.
     // 所有校验与运行时诊断使用的稳定 API 名称。
     let api_name = "vulcan.runtime.node.invoke";
-    // Strict invocation request decoded from the Lua value.
-    // 从 Lua 值严格解码得到的调用请求。
-    let request = parse_managed_runtime_invoke_request(spec, api_name, "default")?;
     // Trusted package context installed by the engine before entering package code.
     // 引擎在进入包代码前安装的可信包上下文。
     let package = current_lua_managed_package_context(lua, api_name)?;
     // Engine-owned worker service installed in every VM created by this engine.
     // 安装在当前引擎所创建全部 VM 中的引擎所有 Worker 服务。
     let worker_service = current_lua_managed_runtime_worker_service(lua, api_name)?;
+    // Strict invocation request applying the host default only when Lua omitted timeout_ms.
+    // 严格调用请求；仅当 Lua 省略 timeout_ms 时应用宿主默认值。
+    let request = parse_managed_runtime_invoke_request(
+        spec,
+        api_name,
+        "default",
+        worker_service.invoke_default_timeout_ms(),
+    )?;
     // Authoritative package manifest captured when the package was loaded.
     // 加载包时捕获的权威包清单。
     let manifest = package.dependency_manifest().ok_or_else(|| {
@@ -7012,6 +7144,14 @@ impl LuaEngine {
             host_options,
         } = options;
         let host_options = host_options.normalized();
+        host_options
+            .managed_runtime_config
+            .validate()
+            .map_err(std::io::Error::other)?;
+        // ManagedRuntimeRoots is constructed before any worker, session, or environment allocation.
+        // ManagedRuntimeRoots 在任何 Worker、会话或环境分配前完成构造。
+        let managed_runtime_roots =
+            resolve_engine_managed_runtime_roots(&host_options).map_err(std::io::Error::other)?;
         let _default_text_encoding =
             resolve_host_default_text_encoding(&host_options).map_err(std::io::Error::other)?;
         let runlua_pool_config = host_options
@@ -7035,10 +7175,13 @@ impl LuaEngine {
         // Engine-owned lifecycle service shared by every VM created from this engine.
         // 由当前引擎创建的每个 VM 共享的引擎所有生命周期服务。
         let managed_runtime_services =
-            ManagedRuntimeServices::new().map_err(std::io::Error::other)?;
+            ManagedRuntimeServices::new_with_config(host_options.managed_runtime_config)
+                .map_err(std::io::Error::other)?;
         // Engine-owned worker service isolated from every other LuaEngine instance.
         // 与其他所有 LuaEngine 实例隔离的引擎所有 Worker 服务。
-        let managed_runtime_workers = ManagedRuntimeWorkerService::new();
+        let managed_runtime_workers =
+            ManagedRuntimeWorkerService::new_with_config(host_options.managed_runtime_config)
+                .map_err(std::io::Error::other)?;
         Ok(Self {
             skills: HashMap::new(),
             entry_registry: BTreeMap::new(),
@@ -7049,6 +7192,7 @@ impl LuaEngine {
             system_runtime_sessions: Arc::new(RuntimeSessionManager::new()),
             managed_runtime_services,
             managed_runtime_workers,
+            managed_runtime_roots,
             skill_config_store: Arc::new(
                 SkillConfigStore::new(host_options.skill_config_file_path.clone())
                     .map_err(std::io::Error::other)?,
@@ -7069,6 +7213,30 @@ impl LuaEngine {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| skill_root.skills_dir.clone())
+    }
+
+    /// Return the engine-selected roots or construct the legacy layout for one named Skill root.
+    /// 返回引擎选定根集合，或为单个命名 Skill 根构造旧有布局。
+    ///
+    /// `runtime_root` is used only when the host omitted the engine-wide data root, preserving the
+    /// existing per-root behavior without consulting environment variables or `PATH`.
+    /// `runtime_root` 仅在宿主省略引擎级数据根时使用，从而在不读取环境变量或 `PATH` 的前提下
+    /// 保留现有的逐根行为。
+    ///
+    /// Returns one shared immutable root set or an explicit path, type, creation, or identity error.
+    /// 返回共享的不可变根集合，或显式路径、类型、创建及身份错误。
+    fn managed_runtime_roots_for(
+        &self,
+        runtime_root: &Path,
+    ) -> Result<Arc<ManagedRuntimeRoots>, String> {
+        match self.managed_runtime_roots.as_ref() {
+            Some(roots) => Ok(Arc::clone(roots)),
+            None => Ok(Arc::new(ManagedRuntimeRoots::new(
+                runtime_root,
+                None,
+                None,
+            )?)),
+        }
     }
 
     /// Collect the resources directories that may represent packaged runtime layouts for the active root chain.
@@ -7165,6 +7333,7 @@ impl LuaEngine {
             system_runtime_sessions: Arc::clone(&self.system_runtime_sessions),
             managed_runtime_services: Arc::clone(&self.managed_runtime_services),
             managed_runtime_workers: Arc::clone(&self.managed_runtime_workers),
+            managed_runtime_roots: self.managed_runtime_roots.clone(),
             skill_config_store: Arc::new(
                 SkillConfigStore::new(explicit_skill_config_file_path)
                     .map_err(std::io::Error::other)?,
@@ -7187,6 +7356,7 @@ impl LuaEngine {
         self.pool = next.pool;
         self.runlua_pool = next.runlua_pool;
         self.public_runtime_sessions = next.public_runtime_sessions;
+        self.managed_runtime_roots = next.managed_runtime_roots;
         self.skill_config_store = next.skill_config_store;
         self.lancedb_host = next.lancedb_host;
         self.sqlite_host = next.sqlite_host;
@@ -8927,10 +9097,11 @@ impl LuaEngine {
         let runtime_root = self.runtime_root_for(skill_root);
         // Canonical managed package context shared by every entry of this Skill.
         // 由当前 Skill 所有入口共享的规范受管包上下文。
-        let managed_package = ManagedRuntimePackageContext::for_skill(
+        let managed_runtime_roots = self.managed_runtime_roots_for(&runtime_root)?;
+        let managed_package = ManagedRuntimePackageContext::for_skill_with_roots(
             meta.effective_skill_id(),
             dir,
-            &runtime_root,
+            managed_runtime_roots,
             dependency_manifest,
         )?;
 

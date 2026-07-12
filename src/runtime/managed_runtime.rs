@@ -23,11 +23,429 @@ use crate::skill::dependencies::{
 
 /// Schema version used by managed runtime environment markers.
 /// 受管运行时环境标记文件使用的 schema 版本。
-pub const MANAGED_RUNTIME_ENV_MARKER_SCHEMA_VERSION: u32 = 1;
+pub const MANAGED_RUNTIME_ENV_MARKER_SCHEMA_VERSION: u32 = 2;
 
 /// Stable reason code returned when persistent sessions are queried on Windows ARM.
 /// 在 Windows ARM 上查询持久会话能力时返回的稳定原因码。
 pub const WINDOWS_ARM_PERSISTENT_SESSION_UNSUPPORTED_REASON: &str = "windows_arm_is_not_supported";
+
+/// Stable origin of one managed runtime root selected by the host boundary.
+/// 宿主边界所选择单个受管运行时根的稳定来源。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRuntimeRootSource {
+    /// Root explicitly injected by the host during engine creation.
+    /// 引擎创建期间由宿主显式注入的根。
+    HostConfigured,
+    /// Root derived from the compatible fixed layout under `runtime_root`.
+    /// 从 `runtime_root` 下兼容固定布局派生的根。
+    RuntimeRootDefault,
+}
+
+impl ManagedRuntimeRootSource {
+    /// Return the stable machine-readable source identifier used in diagnostics and FFI payloads.
+    /// 返回诊断信息与 FFI 载荷使用的稳定机器可读来源标识。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HostConfigured => "host_configured",
+            Self::RuntimeRootDefault => "runtime_root_default",
+        }
+    }
+}
+
+/// Immutable validated roots used by managed Python and Node resolution.
+/// 受管 Python 与 Node 解析使用的不可变已校验根集合。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedRuntimeRoots {
+    /// Canonical LuaSkills data root retained for compatibility-owned resources.
+    /// 为兼容资源保留的规范 LuaSkills 数据根。
+    runtime_root: PathBuf,
+    /// Canonical read-only distribution root containing `python` and `node`.
+    /// 包含 `python` 与 `node` 的规范只读发行根。
+    distribution_root: PathBuf,
+    /// Canonical writable root containing reusable Python and Node environments.
+    /// 包含可复用 Python 与 Node 环境的规范可写根。
+    environment_root: PathBuf,
+    /// Native identity of the runtime data root captured during construction.
+    /// 构造期间捕获的运行时数据根原生身份。
+    runtime_root_identity: ManagedFilesystemObjectIdentity,
+    /// Native identity of an existing distribution root, mandatory for explicit roots.
+    /// 已存在发行根的原生身份；显式根必须具备该身份。
+    distribution_root_identity: OnceLock<ManagedFilesystemObjectIdentity>,
+    /// Native identity of the safely created environment root.
+    /// 安全创建后的环境根原生身份。
+    environment_root_identity: Option<ManagedFilesystemObjectIdentity>,
+    /// Stable source of the selected distribution root.
+    /// 所选发行根的稳定来源。
+    distribution_source: ManagedRuntimeRootSource,
+    /// Stable source of the selected environment root.
+    /// 所选环境根的稳定来源。
+    environment_source: ManagedRuntimeRootSource,
+}
+
+impl ManagedRuntimeRoots {
+    /// Resolve, validate, and identity-pin all managed runtime roots.
+    /// 解析、校验并固定全部受管运行时根的身份。
+    ///
+    /// `runtime_root` is the LuaSkills data root; explicit distribution and environment roots take
+    /// precedence over compatible paths derived below it. The environment root is safely created.
+    /// `runtime_root` 是 LuaSkills 数据根；显式发行根和环境根优先于其下派生的兼容路径，环境根会被安全创建。
+    ///
+    /// Returns an immutable root set or an explicit absolute-path, type, creation, or identity error.
+    /// 返回不可变根集合，或显式绝对路径、类型、创建及身份错误。
+    pub fn new(
+        runtime_root: &Path,
+        distribution_root: Option<&Path>,
+        environment_root: Option<&Path>,
+    ) -> Result<Self, String> {
+        // CanonicalRuntimeRoot is the authoritative data root and must already exist.
+        // CanonicalRuntimeRoot 是权威数据根且必须已存在。
+        let canonical_runtime_root =
+            canonicalize_managed_runtime_directory(runtime_root, "runtime_root", false)?;
+        // DistributionSource records whether the host overrode the compatible fixed layout.
+        // DistributionSource 记录宿主是否覆盖兼容固定布局。
+        let distribution_source = if distribution_root.is_some() {
+            ManagedRuntimeRootSource::HostConfigured
+        } else {
+            ManagedRuntimeRootSource::RuntimeRootDefault
+        };
+        // DistributionCandidate is never resolved from environment variables or PATH.
+        // DistributionCandidate 绝不会从环境变量或 PATH 解析。
+        let distribution_candidate = distribution_root
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| canonical_runtime_root.join("dependencies").join("runtimes"));
+        if !distribution_candidate.is_absolute() {
+            return Err(format!(
+                "managed runtime distribution source={}: managed_runtime_distribution_root must be an absolute path",
+                distribution_source.as_str()
+            ));
+        }
+        // Explicit distributions are required immediately; the compatible default remains lazy so
+        // engines without managed runtime declarations preserve their existing startup behavior.
+        // 显式发行根必须立即存在；兼容默认根保持延迟，以保留未声明受管运行时的引擎启动行为。
+        let (canonical_distribution_root, distribution_root_identity) = match fs::canonicalize(
+            &distribution_candidate,
+        ) {
+            Ok(path) => {
+                ensure_managed_runtime_directory(&path, "managed runtime distribution root")
+                    .map_err(|error| {
+                        format!(
+                            "managed runtime distribution source={}: {error}",
+                            distribution_source.as_str()
+                        )
+                    })?;
+                let identity =
+                    capture_managed_directory_identity(&path, "managed runtime distribution root")
+                        .map_err(|error| {
+                            format!(
+                                "managed runtime distribution source={}: {error}",
+                                distribution_source.as_str()
+                            )
+                        })?;
+                (path, Some(identity))
+            }
+            Err(error)
+                if distribution_source == ManagedRuntimeRootSource::RuntimeRootDefault
+                    && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                (distribution_candidate, None)
+            }
+            Err(error) => {
+                return Err(format!(
+                    "managed runtime distribution source={}: failed to canonicalize managed runtime distribution root {}: {error}",
+                    distribution_source.as_str(),
+                    render_host_visible_path(&distribution_candidate)
+                ));
+            }
+        };
+        // EnvironmentSource records whether the writable location was explicitly selected.
+        // EnvironmentSource 记录可写位置是否由宿主显式选择。
+        let environment_source = if environment_root.is_some() {
+            ManagedRuntimeRootSource::HostConfigured
+        } else {
+            ManagedRuntimeRootSource::RuntimeRootDefault
+        };
+        // EnvironmentCandidate defaults to the legacy dependencies/envs layout.
+        // EnvironmentCandidate 默认使用旧有 dependencies/envs 布局。
+        let environment_candidate = environment_root
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| canonical_runtime_root.join("dependencies").join("envs"));
+        if !environment_candidate.is_absolute() {
+            return Err(format!(
+                "managed runtime environment source={}: managed_runtime_environment_root must be an absolute path",
+                environment_source.as_str()
+            ));
+        }
+        // PlatformCapability is checked before any writable environment path is created.
+        // PlatformCapability 在创建任何可写环境路径前完成检查。
+        let platform_capability = current_managed_runtime_persistent_session_capability();
+        let (canonical_environment_root, environment_root_identity) = if platform_capability
+            .supported
+        {
+            let canonical = canonicalize_managed_runtime_directory(
+                &environment_candidate,
+                "managed runtime environment root",
+                true,
+            )
+            .map_err(|error| {
+                format!(
+                    "managed runtime environment source={}: {error}",
+                    environment_source.as_str()
+                )
+            })?;
+            let identity =
+                capture_managed_directory_identity(&canonical, "managed runtime environment root")
+                    .map_err(|error| {
+                        format!(
+                            "managed runtime environment source={}: {error}",
+                            environment_source.as_str()
+                        )
+                    })?;
+            (canonical, Some(identity))
+        } else {
+            // UnsupportedEnvironmentRoot is never created; an existing directory may still be
+            // canonicalized read-only so engine configuration remains deterministic.
+            // UnsupportedEnvironmentRoot 绝不会被创建；现有目录仍可只读规范化，以保持引擎
+            // 配置确定性。
+            match fs::canonicalize(&environment_candidate) {
+                Ok(canonical) => {
+                    ensure_managed_runtime_directory(
+                        &canonical,
+                        "managed runtime environment root",
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "managed runtime environment source={}: {error}",
+                            environment_source.as_str()
+                        )
+                    })?;
+                    let identity = capture_managed_directory_identity(
+                        &canonical,
+                        "managed runtime environment root",
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "managed runtime environment source={}: {error}",
+                            environment_source.as_str()
+                        )
+                    })?;
+                    (canonical, Some(identity))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    (environment_candidate, None)
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "managed runtime environment source={}: failed to canonicalize managed runtime environment root {}: {error}",
+                        environment_source.as_str(),
+                        render_host_visible_path(&environment_candidate)
+                    ));
+                }
+            }
+        };
+        // DistributionIdentityCell supports the compatible lazy default while pinning its first
+        // observed real directory object for the remainder of the root-set lifetime.
+        // DistributionIdentityCell 支持兼容的延迟默认目录，并在首次观察到真实目录对象后固定其
+        // 余下根集合生命周期身份。
+        let distribution_identity_cell = OnceLock::new();
+        if let Some(identity) = distribution_root_identity {
+            distribution_identity_cell.set(identity).map_err(|_| {
+                "managed runtime distribution root identity was set twice".to_string()
+            })?;
+        }
+        Ok(Self {
+            runtime_root_identity: capture_managed_directory_identity(
+                &canonical_runtime_root,
+                "runtime_root",
+            )?,
+            distribution_root_identity: distribution_identity_cell,
+            environment_root_identity,
+            runtime_root: canonical_runtime_root,
+            distribution_root: canonical_distribution_root,
+            environment_root: canonical_environment_root,
+            distribution_source,
+            environment_source,
+        })
+    }
+
+    /// Return the canonical LuaSkills data root.
+    /// 返回规范 LuaSkills 数据根。
+    pub fn runtime_root(&self) -> &Path {
+        &self.runtime_root
+    }
+
+    /// Return the canonical managed runtime distribution root.
+    /// 返回规范受管运行时发行根。
+    pub fn distribution_root(&self) -> &Path {
+        &self.distribution_root
+    }
+
+    /// Return the canonical managed environment root.
+    /// 返回规范受管环境根。
+    pub fn environment_root(&self) -> &Path {
+        &self.environment_root
+    }
+
+    /// Return the stable source of the distribution root.
+    /// 返回发行根的稳定来源。
+    pub fn distribution_source(&self) -> ManagedRuntimeRootSource {
+        self.distribution_source
+    }
+
+    /// Return the stable source of the environment root.
+    /// 返回环境根的稳定来源。
+    pub fn environment_source(&self) -> ManagedRuntimeRootSource {
+        self.environment_source
+    }
+
+    /// Revalidate every root whose identity is fixed for this engine or package lifetime.
+    /// 重新校验当前引擎或包生命周期内固定身份的每个根。
+    pub(crate) fn validate_live_filesystem_identity(&self) -> Result<(), String> {
+        validate_managed_directory_identity(
+            &self.runtime_root,
+            &self.runtime_root_identity,
+            "runtime_root",
+        )?;
+        if let Some(identity) = self.distribution_root_identity.get() {
+            validate_managed_directory_identity(
+                &self.distribution_root,
+                identity,
+                "managed runtime distribution root",
+            )
+            .map_err(|error| {
+                format!(
+                    "managed runtime distribution source={}: {error}",
+                    self.distribution_source.as_str()
+                )
+            })?;
+        } else {
+            // MissingDefault remains valid until a package first declares a managed runtime.
+            // MissingDefault 在包首次声明受管运行时前保持合法。
+            let current = match fs::canonicalize(&self.distribution_root) {
+                Ok(current) => Some(current),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(format!(
+                        "managed runtime distribution source={}: failed to resolve managed runtime distribution root {}: {error}",
+                        self.distribution_source.as_str(),
+                        render_host_visible_path(&self.distribution_root)
+                    ));
+                }
+            };
+            if let Some(current) = current {
+                if current != self.distribution_root {
+                    return Err(format!(
+                        "managed runtime distribution source={}: managed runtime distribution root changed identity: expected {}, got {}",
+                        self.distribution_source.as_str(),
+                        render_host_visible_path(&self.distribution_root),
+                        render_host_visible_path(&current)
+                    ));
+                }
+                ensure_managed_runtime_directory(&current, "managed runtime distribution root")
+                    .map_err(|error| {
+                        format!(
+                            "managed runtime distribution source={}: {error}",
+                            self.distribution_source.as_str()
+                        )
+                    })?;
+                // FirstIdentity is captured only after the canonical directory and type are confirmed.
+                // FirstIdentity 仅在规范目录及其类型确认后捕获。
+                let first_identity = capture_managed_directory_identity(
+                    &current,
+                    "managed runtime distribution root",
+                )
+                .map_err(|error| {
+                    format!(
+                        "managed runtime distribution source={}: {error}",
+                        self.distribution_source.as_str()
+                    )
+                })?;
+                let _ = self.distribution_root_identity.set(first_identity);
+                let expected_identity = self.distribution_root_identity.get().ok_or_else(|| {
+                    format!(
+                        "managed runtime distribution source={}: managed runtime distribution root identity is unavailable",
+                        self.distribution_source.as_str()
+                    )
+                })?;
+                validate_managed_directory_identity(
+                    &self.distribution_root,
+                    expected_identity,
+                    "managed runtime distribution root",
+                )
+                .map_err(|error| {
+                    format!(
+                        "managed runtime distribution source={}: {error}",
+                        self.distribution_source.as_str()
+                    )
+                })?;
+            }
+        }
+        match self.environment_root_identity.as_ref() {
+            Some(identity) => validate_managed_directory_identity(
+                &self.environment_root,
+                identity,
+                "managed runtime environment root",
+            )
+            .map_err(|error| {
+                format!(
+                    "managed runtime environment source={}: {error}",
+                    self.environment_source.as_str()
+                )
+            }),
+            None if !current_managed_runtime_persistent_session_capability().supported => Ok(()),
+            None => Err(format!(
+                "managed runtime environment source={}: managed runtime environment root identity is unavailable",
+                self.environment_source.as_str()
+            )),
+        }
+    }
+}
+
+/// Canonicalize one absolute managed runtime directory, optionally creating it first.
+/// 规范化单个绝对受管运行时目录，并可选择先创建该目录。
+fn canonicalize_managed_runtime_directory(
+    path: &Path,
+    label: &str,
+    create: bool,
+) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!("{label} must be an absolute path"));
+    }
+    if create {
+        fs::create_dir_all(path).map_err(|error| {
+            format!(
+                "failed to create {label} {}: {error}",
+                render_host_visible_path(path)
+            )
+        })?;
+    }
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        format!(
+            "failed to canonicalize {label} {}: {error}",
+            render_host_visible_path(path)
+        )
+    })?;
+    ensure_managed_runtime_directory(&canonical, label)?;
+    Ok(canonical)
+}
+
+/// Require one managed runtime root path to identify a real directory.
+/// 要求单个受管运行时根路径标识真实目录。
+fn ensure_managed_runtime_directory(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        format!(
+            "failed to inspect {label} {}: {error}",
+            render_host_visible_path(path)
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "{label} is not a directory: {}",
+            render_host_visible_path(path)
+        ));
+    }
+    Ok(())
+}
 
 /// Machine-readable capability for persistent managed Python and Node sessions.
 /// 受管 Python 与 Node 持久会话的机器可读能力。
@@ -1043,6 +1461,18 @@ pub struct ManagedRuntimeEnvHashInput {
     /// Optional SHA-256 digest of an additional package manifest such as package.json.
     /// package.json 等附加包清单的可选 SHA-256 摘要。
     pub package_manifest_hash: Option<String>,
+    /// SHA-256 digest of the selected runtime installation manifest.
+    /// 所选运行时安装清单的 SHA-256 摘要。
+    pub runtime_install_manifest_hash: String,
+    /// SHA-256 digest of the selected runtime executable.
+    /// 所选运行时可执行文件的 SHA-256 摘要。
+    pub runtime_executable_hash: String,
+    /// SHA-256 digest of the selected package-manager installation manifest.
+    /// 所选包管理器安装清单的 SHA-256 摘要。
+    pub package_manager_install_manifest_hash: String,
+    /// SHA-256 digest of the selected package-manager executable.
+    /// 所选包管理器可执行文件的 SHA-256 摘要。
+    pub package_manager_executable_hash: String,
 }
 
 /// Stable marker written into every managed runtime environment directory.
@@ -1073,6 +1503,18 @@ pub struct ManagedRuntimeEnvMarker {
     /// Optional SHA-256 digest of an additional package manifest such as package.json.
     /// package.json 等附加包清单的可选 SHA-256 摘要。
     pub package_manifest_hash: Option<String>,
+    /// SHA-256 digest of the runtime installation manifest used to build this environment.
+    /// 构建当前环境所用运行时安装清单的 SHA-256 摘要。
+    pub runtime_install_manifest_hash: String,
+    /// SHA-256 digest of the runtime executable used to build this environment.
+    /// 构建当前环境所用运行时可执行文件的 SHA-256 摘要。
+    pub runtime_executable_hash: String,
+    /// SHA-256 digest of the package-manager installation manifest used for this environment.
+    /// 当前环境所用包管理器安装清单的 SHA-256 摘要。
+    pub package_manager_install_manifest_hash: String,
+    /// SHA-256 digest of the package-manager executable used for this environment.
+    /// 当前环境所用包管理器可执行文件的 SHA-256 摘要。
+    pub package_manager_executable_hash: String,
     /// Environment identity hash derived from all reproducibility inputs.
     /// 由全部可复现输入派生出的环境身份哈希。
     pub env_hash: String,
@@ -1099,6 +1541,51 @@ pub struct ManagedRuntimeInstallManifest {
     pub executable: String,
 }
 
+/// Validated descriptor for one host-visible managed Python or Node installation.
+/// 单个宿主可见受管 Python 或 Node 安装的已校验描述符。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedRuntimeInstallDescriptor {
+    /// Managed runtime kind selected by the caller.
+    /// 调用方选择的受管运行时类型。
+    pub runtime: ManagedRuntimeKind,
+    /// Exact runtime version matched by the installation manifest.
+    /// 安装清单精确匹配的运行时版本。
+    pub version: String,
+    /// Exact normalized platform key matched by the installation manifest.
+    /// 安装清单精确匹配的规范平台键。
+    pub platform: String,
+    /// Canonical installation directory strictly contained by the distribution root.
+    /// 严格包含在发行根内的规范安装目录。
+    pub install_root: PathBuf,
+    /// Canonical ordinary executable file strictly contained by the installation directory.
+    /// 严格包含在安装目录内的规范普通可执行文件。
+    pub executable: PathBuf,
+    /// SHA-256 digest of the exact validated `runtime-manifest.json` bytes.
+    /// 精确已校验 `runtime-manifest.json` 字节的 SHA-256 摘要。
+    pub manifest_hash: String,
+    /// SHA-256 digest of the exact resolved executable bytes.
+    /// 精确已解析可执行文件字节的 SHA-256 摘要。
+    pub executable_hash: String,
+}
+
+/// Internal installation identity shared by runtimes and their package managers.
+/// 运行时及其包管理器共享的内部安装身份。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedRuntimeInstallIdentity {
+    /// Canonical installation directory inside the configured distribution root.
+    /// 配置发行根内的规范安装目录。
+    install_root: PathBuf,
+    /// Canonical executable ordinary file inside the installation directory.
+    /// 安装目录内的规范普通可执行文件。
+    executable: PathBuf,
+    /// SHA-256 digest of the installation manifest bytes.
+    /// 安装清单字节的 SHA-256 摘要。
+    manifest_hash: String,
+    /// SHA-256 digest of the resolved executable bytes.
+    /// 已解析可执行文件字节的 SHA-256 摘要。
+    executable_hash: String,
+}
+
 /// Resolved managed runtime environment plan used before creation or invocation.
 /// 创建环境或调用前使用的受管运行时环境解析计划。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1109,15 +1596,36 @@ pub struct ManagedRuntimeEnvPlan {
     /// Current platform key.
     /// 当前平台键。
     pub platform: String,
-    /// Canonical runtime root used to locate shared stores and runtime assets.
-    /// 用于定位共享存储与运行时资产的规范运行时根目录。
+    /// Canonical LuaSkills data root used for package stores, snapshots, and compatible resources.
+    /// 用于包存储、快照与兼容资源的规范 LuaSkills 数据根。
     pub runtime_root: PathBuf,
+    /// Canonical read-only root that supplied runtime and package-manager installations.
+    /// 提供运行时及包管理器安装的规范只读根。
+    pub distribution_root: PathBuf,
+    /// Canonical writable root that owns reusable managed environments.
+    /// 拥有可复用受管环境的规范可写根。
+    pub environment_root: PathBuf,
+    /// Stable source of the selected distribution root.
+    /// 所选发行根的稳定来源。
+    pub distribution_source: ManagedRuntimeRootSource,
+    /// Stable source of the selected environment root.
+    /// 所选环境根的稳定来源。
+    pub environment_source: ManagedRuntimeRootSource,
+    /// Canonical runtime installation directory captured by the plan.
+    /// 计划捕获的规范运行时安装目录。
+    pub runtime_install_root: PathBuf,
     /// Exact interpreter runtime version.
     /// 精确解释器运行时版本。
     pub runtime_version: String,
     /// Absolute interpreter executable path.
     /// 解释器可执行文件绝对路径。
     pub runtime_executable: PathBuf,
+    /// SHA-256 digest of the selected runtime installation manifest.
+    /// 所选运行时安装清单的 SHA-256 摘要。
+    pub runtime_install_manifest_hash: String,
+    /// SHA-256 digest of the selected runtime executable.
+    /// 所选运行时可执行文件的 SHA-256 摘要。
+    pub runtime_executable_hash: String,
     /// Package manager name such as `uv` or `pnpm`.
     /// 包管理器名称，例如 `uv` 或 `pnpm`。
     pub package_manager: String,
@@ -1127,6 +1635,18 @@ pub struct ManagedRuntimeEnvPlan {
     /// Absolute package-manager executable path.
     /// 包管理器可执行文件绝对路径。
     pub package_manager_executable: PathBuf,
+    /// Canonical package-manager installation directory captured by the plan.
+    /// 计划捕获的规范包管理器安装目录。
+    pub package_manager_install_root: PathBuf,
+    /// SHA-256 digest of the selected package-manager installation manifest.
+    /// 所选包管理器安装清单的 SHA-256 摘要。
+    pub package_manager_install_manifest_hash: String,
+    /// SHA-256 digest of the selected package-manager executable.
+    /// 所选包管理器可执行文件的 SHA-256 摘要。
+    pub package_manager_executable_hash: String,
+    /// Shared immutable roots retained for identity revalidation before environment use.
+    /// 在环境使用前保留以重新校验身份的共享不可变根集合。
+    pub(crate) managed_runtime_roots: Arc<ManagedRuntimeRoots>,
     /// Optional package manifest path such as package.json.
     /// package.json 等可选包清单路径。
     pub package_manifest_path: Option<PathBuf>,
@@ -1163,6 +1683,12 @@ impl ManagedRuntimeEnvMarker {
             platform: input.platform.clone(),
             lock_hash: input.lock_hash.clone(),
             package_manifest_hash: input.package_manifest_hash.clone(),
+            runtime_install_manifest_hash: input.runtime_install_manifest_hash.clone(),
+            runtime_executable_hash: input.runtime_executable_hash.clone(),
+            package_manager_install_manifest_hash: input
+                .package_manager_install_manifest_hash
+                .clone(),
+            package_manager_executable_hash: input.package_manager_executable_hash.clone(),
             env_hash,
         }
     }
@@ -1218,6 +1744,99 @@ pub fn current_managed_runtime_platform_key() -> Result<String, String> {
         }
     };
     Ok(format!("{}-{}", os_key, arch_key))
+}
+
+/// Resolve one managed Python or Node installation from a host-selected distribution root.
+/// 从宿主选定发行根解析单个受管 Python 或 Node 安装。
+///
+/// `distribution_root` must be an existing absolute directory, `runtime` selects the fixed asset
+/// family, and `version` plus `platform` must exactly match the installation manifest.
+/// `distribution_root` 必须是现有绝对目录，`runtime` 选择固定资产族，`version` 与 `platform`
+/// 必须精确匹配安装清单。
+///
+/// Returns canonical contained paths and exact manifest/executable SHA-256 identities, or an
+/// explicit input, containment, manifest, file-type, or hashing error without searching `PATH`.
+/// 返回规范包含路径及精确清单与可执行文件 SHA-256 身份；输入、包含关系、清单、文件类型或
+/// 哈希异常时返回显式错误，且绝不搜索 `PATH`。
+pub fn resolve_managed_runtime_install(
+    distribution_root: &Path,
+    runtime: ManagedRuntimeKind,
+    version: &str,
+    platform: &str,
+) -> Result<ManagedRuntimeInstallDescriptor, String> {
+    validate_managed_runtime_resolver_version(version)?;
+    validate_managed_runtime_resolver_platform(platform)?;
+    // CanonicalDistributionRoot is the sole authority boundary for this read-only resolution.
+    // CanonicalDistributionRoot 是本次只读解析的唯一授权边界。
+    let canonical_distribution_root = canonicalize_managed_runtime_directory(
+        distribution_root,
+        "managed runtime distribution root",
+        false,
+    )?;
+    // InstallName follows the stable on-disk asset contract for the selected runtime family.
+    // InstallName 遵循所选运行时资产族的稳定磁盘契约。
+    let (family, install_name, expected_runtime) = match runtime {
+        ManagedRuntimeKind::Python => ("python", format!("cpython-{version}-{platform}"), "python"),
+        ManagedRuntimeKind::Node => ("node", format!("node-{version}-{platform}"), "node"),
+    };
+    // Identity binds the descriptor to exact manifest and executable bytes inside the root.
+    // Identity 将描述符绑定到发行根内精确的清单及可执行文件字节。
+    let identity = resolve_managed_runtime_install_identity(
+        &canonical_distribution_root,
+        &runtime_install_dir(&canonical_distribution_root, family, &install_name),
+        expected_runtime,
+        version,
+        platform,
+    )?;
+    Ok(ManagedRuntimeInstallDescriptor {
+        runtime,
+        version: version.to_string(),
+        platform: platform.to_string(),
+        install_root: identity.install_root,
+        executable: identity.executable,
+        manifest_hash: identity.manifest_hash,
+        executable_hash: identity.executable_hash,
+    })
+}
+
+/// Validate one exact semantic runtime version before deriving an installation path.
+/// 在派生安装路径前校验单个精确语义化运行时版本。
+///
+/// `version` is untrusted host or FFI input and must be a whitespace-free exact semantic version.
+/// `version` 是不可信宿主或 FFI 输入，必须是无首尾空白的精确语义化版本。
+///
+/// Returns unit for valid path-safe input or a stable validation error before filesystem access.
+/// 对合法且路径安全的输入返回空值，否则在文件系统访问前返回稳定校验错误。
+fn validate_managed_runtime_resolver_version(version: &str) -> Result<(), String> {
+    if version.is_empty() || version.trim() != version {
+        return Err(
+            "managed runtime version must be a non-empty exact semantic version".to_string(),
+        );
+    }
+    Version::parse(version)
+        .map(|_| ())
+        .map_err(|error| format!("managed runtime version '{version}' is invalid: {error}"))
+}
+
+/// Validate one supported normalized platform key before deriving an installation path.
+/// 在派生安装路径前校验单个受支持规范平台键。
+///
+/// `platform` is untrusted host or FFI input and must name one supported native asset target.
+/// `platform` 是不可信宿主或 FFI 输入，必须命名一个受支持原生资产目标。
+///
+/// Returns unit for supported targets, the stable Windows ARM reason code for its explicit
+/// exclusion, or a stable unsupported-platform error for every other value.
+/// 对受支持目标返回空值；对明确排除的 Windows ARM 返回稳定原因码；其他值返回稳定不支持错误。
+fn validate_managed_runtime_resolver_platform(platform: &str) -> Result<(), String> {
+    match platform {
+        "windows-x64" | "linux-x64" | "linux-arm64" | "macos-x64" | "macos-arm64" => Ok(()),
+        "windows-arm64" | "windows-aarch64" | "windows-arm64ec" => {
+            Err(WINDOWS_ARM_PERSISTENT_SESSION_UNSUPPORTED_REASON.to_string())
+        }
+        _ => Err(format!(
+            "managed_runtime_platform_is_not_supported: {platform}"
+        )),
+    }
 }
 
 /// Compute the SHA-256 digest of one byte slice as lowercase hex.
@@ -1288,20 +1907,38 @@ pub fn compute_managed_runtime_env_hash(input: &ManagedRuntimeEnvHashInput) -> S
         "package_manifest_hash",
         input.package_manifest_hash.as_deref().unwrap_or(""),
     );
+    hash_field(
+        &mut hasher,
+        "runtime_install_manifest_hash",
+        &input.runtime_install_manifest_hash,
+    );
+    hash_field(
+        &mut hasher,
+        "runtime_executable_hash",
+        &input.runtime_executable_hash,
+    );
+    hash_field(
+        &mut hasher,
+        "package_manager_install_manifest_hash",
+        &input.package_manager_install_manifest_hash,
+    );
+    hash_field(
+        &mut hasher,
+        "package_manager_executable_hash",
+        &input.package_manager_executable_hash,
+    );
     format!("{:x}", hasher.finalize())
 }
 
 /// Return the managed environment root for one runtime version and environment hash.
 /// 返回单个运行时版本与环境哈希对应的受管环境根目录。
 pub fn managed_env_dir(
-    runtime_root: &Path,
+    environment_root: &Path,
     runtime: ManagedRuntimeKind,
     runtime_version: &str,
     env_hash: &str,
 ) -> PathBuf {
-    runtime_root
-        .join("dependencies")
-        .join("envs")
+    environment_root
         .join(runtime.as_str())
         .join(format!("{}-{}", runtime_prefix(runtime), runtime_version))
         .join(env_hash)
@@ -1406,6 +2043,7 @@ pub fn managed_env_marker_matches(
 /// Ensure one managed runtime environment exists and matches its expected marker.
 /// 确保一个受管运行时环境存在并且匹配其期望标记。
 pub fn ensure_managed_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
+    validate_managed_runtime_plan_assets(plan)?;
     if managed_env_is_ready(plan)? {
         return Ok(());
     }
@@ -1450,6 +2088,119 @@ pub fn managed_env_is_ready(plan: &ManagedRuntimeEnvPlan) -> Result<bool, String
     Ok(managed_env_marker_matches(&actual, &plan.expected_marker))
 }
 
+/// Revalidate the roots and exact runtime assets captured by an environment plan.
+/// 重新校验环境计划捕获的根集合与精确运行时资产。
+///
+/// `plan` contains the immutable engine root authority, canonical installation paths, manifest
+/// identities, and executable identities that must remain unchanged before any environment use.
+/// `plan` 包含不可变引擎根授权、规范安装路径、清单身份及可执行文件身份；任何环境使用前这些
+/// 内容都必须保持不变。
+///
+/// Returns unit only when both runtime and package-manager installations still resolve to the exact
+/// captured paths and hashes; otherwise returns an explicit source-qualified identity error.
+/// 仅当运行时与包管理器安装仍解析到精确捕获路径及哈希时返回空值，否则返回带来源的显式身份错误。
+pub(crate) fn validate_managed_runtime_plan_assets(
+    plan: &ManagedRuntimeEnvPlan,
+) -> Result<(), String> {
+    plan.managed_runtime_roots
+        .validate_live_filesystem_identity()?;
+    if plan.runtime_root != plan.managed_runtime_roots.runtime_root()
+        || plan.distribution_root != plan.managed_runtime_roots.distribution_root()
+        || plan.environment_root != plan.managed_runtime_roots.environment_root()
+        || plan.distribution_source != plan.managed_runtime_roots.distribution_source()
+        || plan.environment_source != plan.managed_runtime_roots.environment_source()
+    {
+        return Err("managed runtime plan root authority changed".to_string());
+    }
+    if plan.env_dir == plan.environment_root || !plan.env_dir.starts_with(&plan.environment_root) {
+        return Err(format!(
+            "managed runtime environment source={} produced an env directory outside its root: {}",
+            plan.environment_source.as_str(),
+            render_managed_runtime_path(&plan.env_dir)
+        ));
+    }
+    // RuntimeIdentity re-resolves the exact selected interpreter without any ambient fallback.
+    // RuntimeIdentity 在不使用任何环境回退的前提下重新解析所选精确解释器。
+    let runtime_identity = resolve_managed_runtime_install_identity(
+        &plan.distribution_root,
+        &plan.runtime_install_root,
+        plan.runtime.as_str(),
+        &plan.runtime_version,
+        &plan.platform,
+    )
+    .map_err(|error| {
+        format!(
+            "managed runtime distribution source={}: {error}",
+            plan.distribution_source.as_str()
+        )
+    })?;
+    validate_managed_runtime_install_identity_matches(
+        "runtime",
+        &runtime_identity,
+        &plan.runtime_install_root,
+        &plan.runtime_executable,
+        &plan.runtime_install_manifest_hash,
+        &plan.runtime_executable_hash,
+    )?;
+    // PackageManagerPlatform follows the stable cross-platform `any` contract used only by pnpm.
+    // PackageManagerPlatform 仅对 pnpm 使用稳定的跨平台 `any` 契约。
+    let package_manager_platform = if plan.package_manager == "pnpm" {
+        "any"
+    } else {
+        plan.platform.as_str()
+    };
+    let package_manager_identity = resolve_managed_runtime_install_identity(
+        &plan.distribution_root,
+        &plan.package_manager_install_root,
+        &plan.package_manager,
+        &plan.package_manager_version,
+        package_manager_platform,
+    )
+    .map_err(|error| {
+        format!(
+            "managed runtime distribution source={}: {error}",
+            plan.distribution_source.as_str()
+        )
+    })?;
+    validate_managed_runtime_install_identity_matches(
+        "package manager",
+        &package_manager_identity,
+        &plan.package_manager_install_root,
+        &plan.package_manager_executable,
+        &plan.package_manager_install_manifest_hash,
+        &plan.package_manager_executable_hash,
+    )
+}
+
+/// Compare one freshly resolved installation identity with the exact plan-time identity.
+/// 将单个最新解析安装身份与精确计划时身份进行比较。
+///
+/// `label` identifies the asset in diagnostics; the remaining expected values are immutable plan
+/// fields compared against `actual` without accepting alternate paths or hashes.
+/// `label` 在诊断中标识资产；其余期望值均为不可变计划字段，并与 `actual` 比较且不接受替代路径或哈希。
+///
+/// Returns unit on an exact match or an explicit changed-identity error.
+/// 精确匹配时返回空值，否则返回显式身份已变更错误。
+fn validate_managed_runtime_install_identity_matches(
+    label: &str,
+    actual: &ManagedRuntimeInstallIdentity,
+    expected_install_root: &Path,
+    expected_executable: &Path,
+    expected_manifest_hash: &str,
+    expected_executable_hash: &str,
+) -> Result<(), String> {
+    if actual.install_root != expected_install_root
+        || actual.executable != expected_executable
+        || actual.manifest_hash != expected_manifest_hash
+        || actual.executable_hash != expected_executable_hash
+    {
+        return Err(format!(
+            "managed runtime {label} installation identity changed"
+        ));
+    }
+    Ok(())
+}
+
 /// Create one Python virtual environment and synchronize it from the lockfile.
 /// 创建一个 Python 虚拟环境并按锁文件同步依赖。
 ///
@@ -1460,6 +2211,7 @@ pub fn managed_env_is_ready(plan: &ManagedRuntimeEnvPlan) -> Result<bool, String
 /// Returns unit after atomic publication, or a cleanup-complete build/command error.
 /// 原子发布后返回空值；失败时返回已完成清理的构建或命令错误。
 fn create_python_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
+    validate_managed_runtime_plan_assets(plan)?;
     // Unique unpublished same-parent directory used for the complete isolated uv build.
     // 完整隔离 uv 构建使用的唯一同父级未发布目录。
     let build_dir = prepare_build_dir(plan)?;
@@ -1550,6 +2302,7 @@ fn create_python_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
 /// Returns unit after atomic publication, or a cleanup-complete copy/install error.
 /// 原子发布后返回空值；失败时返回已完成清理的复制或安装错误。
 fn create_node_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
+    validate_managed_runtime_plan_assets(plan)?;
     // Unpublished same-parent build directory used for the entire pnpm installation.
     // 整个 pnpm 安装期间使用的同父级未发布构建目录。
     let build_dir = prepare_build_dir(plan)?;
@@ -2159,29 +2912,50 @@ pub(crate) fn resolve_python_env_plan(
     package: &ManagedRuntimePackageContext,
     spec: &PythonRuntimeDependencySpec,
 ) -> Result<ManagedRuntimeEnvPlan, String> {
-    // Canonical runtime root owned by the trusted package context.
-    // 可信包上下文拥有的规范运行时根。
-    let runtime_root = package.runtime_root();
+    validate_managed_runtime_resolver_version(&spec.version)?;
+    validate_managed_runtime_resolver_version(&spec.package_manager_version)?;
+    // ManagedRuntimeRoots is the single engine-selected authority for all three root roles.
+    // ManagedRuntimeRoots 是三个根角色唯一的引擎选定授权。
+    let managed_runtime_roots = package.managed_runtime_roots();
+    managed_runtime_roots.validate_live_filesystem_identity()?;
     let platform = current_managed_runtime_platform_key()?;
     let runtime_dir = runtime_install_dir(
-        runtime_root,
+        managed_runtime_roots.distribution_root(),
         "python",
         &format!("cpython-{}-{}", spec.version, platform),
     );
-    let runtime_executable =
-        resolve_install_executable(&runtime_dir, "python", &spec.version, &platform)?;
+    let runtime_install = resolve_managed_runtime_install_identity(
+        managed_runtime_roots.distribution_root(),
+        &runtime_dir,
+        "python",
+        &spec.version,
+        &platform,
+    )
+    .map_err(|error| {
+        format!(
+            "managed runtime distribution source={}: {error}",
+            managed_runtime_roots.distribution_source().as_str()
+        )
+    })?;
     let package_manager = spec.package_manager.as_managed_runtime_str().to_string();
     let package_manager_install_dir = runtime_install_dir(
-        runtime_root,
+        managed_runtime_roots.distribution_root(),
         "python",
         &format!("uv-{}-{}", spec.package_manager_version, platform),
     );
-    let package_manager_executable = resolve_install_executable(
+    let package_manager_install = resolve_managed_runtime_install_identity(
+        managed_runtime_roots.distribution_root(),
         &package_manager_install_dir,
         "uv",
         &spec.package_manager_version,
         &platform,
-    )?;
+    )
+    .map_err(|error| {
+        format!(
+            "managed runtime distribution source={}: {error}",
+            managed_runtime_roots.distribution_source().as_str()
+        )
+    })?;
     // Canonical lockfile constrained to the trusted package root.
     // 限制在可信包根内的规范锁文件。
     let lockfile_path = package.resolve_existing_file(&spec.lockfile, "python_runtime.lockfile")?;
@@ -2194,12 +2968,16 @@ pub(crate) fn resolve_python_env_plan(
         package_manager_version: spec.package_manager_version.clone(),
         lock_hash,
         package_manifest_hash: None,
+        runtime_install_manifest_hash: runtime_install.manifest_hash.clone(),
+        runtime_executable_hash: runtime_install.executable_hash.clone(),
+        package_manager_install_manifest_hash: package_manager_install.manifest_hash.clone(),
+        package_manager_executable_hash: package_manager_install.executable_hash.clone(),
     };
     build_env_plan(
-        runtime_root,
+        managed_runtime_roots,
         ManagedRuntimeKind::Python,
-        runtime_executable,
-        package_manager_executable,
+        runtime_install,
+        package_manager_install,
         None,
         lockfile_path,
         hash_input,
@@ -2247,29 +3025,49 @@ pub(crate) fn resolve_node_env_plan(
     spec: &NodeRuntimeDependencySpec,
 ) -> Result<ManagedRuntimeEnvPlan, String> {
     validate_managed_node_runtime_version(&spec.version)?;
-    // Canonical runtime root owned by the trusted package context.
-    // 可信包上下文拥有的规范运行时根。
-    let runtime_root = package.runtime_root();
+    validate_managed_runtime_resolver_version(&spec.package_manager_version)?;
+    // ManagedRuntimeRoots is the single engine-selected authority for all three root roles.
+    // ManagedRuntimeRoots 是三个根角色唯一的引擎选定授权。
+    let managed_runtime_roots = package.managed_runtime_roots();
+    managed_runtime_roots.validate_live_filesystem_identity()?;
     let platform = current_managed_runtime_platform_key()?;
     let runtime_dir = runtime_install_dir(
-        runtime_root,
+        managed_runtime_roots.distribution_root(),
         "node",
         &format!("node-{}-{}", spec.version, platform),
     );
-    let runtime_executable =
-        resolve_install_executable(&runtime_dir, "node", &spec.version, &platform)?;
+    let runtime_install = resolve_managed_runtime_install_identity(
+        managed_runtime_roots.distribution_root(),
+        &runtime_dir,
+        "node",
+        &spec.version,
+        &platform,
+    )
+    .map_err(|error| {
+        format!(
+            "managed runtime distribution source={}: {error}",
+            managed_runtime_roots.distribution_source().as_str()
+        )
+    })?;
     let package_manager = spec.package_manager.as_managed_runtime_str().to_string();
     let package_manager_install_dir = runtime_install_dir(
-        runtime_root,
+        managed_runtime_roots.distribution_root(),
         "node",
         &format!("pnpm-{}", spec.package_manager_version),
     );
-    let package_manager_executable = resolve_install_executable(
+    let package_manager_install = resolve_managed_runtime_install_identity(
+        managed_runtime_roots.distribution_root(),
         &package_manager_install_dir,
         "pnpm",
         &spec.package_manager_version,
         "any",
-    )?;
+    )
+    .map_err(|error| {
+        format!(
+            "managed runtime distribution source={}: {error}",
+            managed_runtime_roots.distribution_source().as_str()
+        )
+    })?;
     // Optional canonical package manifest constrained to the trusted package root.
     // 限制在可信包根内的可选规范包清单。
     let package_manifest_path = if spec.package_json.trim().is_empty() {
@@ -2293,12 +3091,16 @@ pub(crate) fn resolve_node_env_plan(
         package_manager_version: spec.package_manager_version.clone(),
         lock_hash,
         package_manifest_hash,
+        runtime_install_manifest_hash: runtime_install.manifest_hash.clone(),
+        runtime_executable_hash: runtime_install.executable_hash.clone(),
+        package_manager_install_manifest_hash: package_manager_install.manifest_hash.clone(),
+        package_manager_executable_hash: package_manager_install.executable_hash.clone(),
     };
     build_env_plan(
-        runtime_root,
+        managed_runtime_roots,
         ManagedRuntimeKind::Node,
-        runtime_executable,
-        package_manager_executable,
+        runtime_install,
+        package_manager_install,
         package_manifest_path,
         lockfile_path,
         hash_input,
@@ -2308,25 +3110,47 @@ pub(crate) fn resolve_node_env_plan(
 /// Read one managed runtime installation manifest from an installation directory.
 /// 从安装目录读取一个受管运行时安装清单。
 pub fn read_install_manifest(install_dir: &Path) -> Result<ManagedRuntimeInstallManifest, String> {
+    read_install_manifest_with_hash(install_dir).map(|(manifest, _)| manifest)
+}
+
+/// Read and hash one installation manifest from the same exact byte snapshot.
+/// 从同一份精确字节快照读取并哈希单个安装清单。
+///
+/// `install_dir` is the validated installation boundary containing `runtime-manifest.json`.
+/// `install_dir` 是包含 `runtime-manifest.json` 的已校验安装边界。
+///
+/// Returns the parsed manifest with the SHA-256 of its original bytes, or an explicit file/read/
+/// parse error; a UTF-8 BOM is accepted for parsing but remains part of the identity hash.
+/// 返回已解析清单及其原始字节 SHA-256，或显式文件、读取及解析错误；解析接受 UTF-8 BOM，
+/// 但 BOM 仍属于身份哈希的一部分。
+fn read_install_manifest_with_hash(
+    install_dir: &Path,
+) -> Result<(ManagedRuntimeInstallManifest, String), String> {
     let manifest_path = install_dir.join("runtime-manifest.json");
     managed_runtime_install_manifest_path_is_file(&manifest_path)?;
-    let text = fs::read_to_string(&manifest_path).map_err(|error| {
+    // ManifestBytes is hashed before parsing so identity and parsed authority share one read.
+    // ManifestBytes 在解析前完成哈希，使身份与解析授权共享同一次读取。
+    let manifest_bytes = fs::read(&manifest_path).map_err(|error| {
         format!(
             "Failed to read {}: {}",
             render_managed_runtime_path(&manifest_path),
             error
         )
     })?;
+    let manifest_hash = sha256_hex(&manifest_bytes);
     // PowerShell 5.1 may write UTF-8 JSON files with a BOM when Set-Content is used.
     // PowerShell 5.1 使用 Set-Content 写 UTF-8 JSON 时可能带有 BOM。
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    serde_json::from_str(text).map_err(|error| {
+    let parse_bytes = manifest_bytes
+        .strip_prefix(&[0xEF, 0xBB, 0xBF])
+        .unwrap_or(&manifest_bytes);
+    let manifest = serde_json::from_slice(parse_bytes).map_err(|error| {
         format!(
             "Failed to parse {}: {}",
             render_managed_runtime_path(&manifest_path),
             error
         )
-    })
+    })?;
+    Ok((manifest, manifest_hash))
 }
 
 /// Inspect whether one managed-runtime install manifest path is a file without hiding filesystem probe errors.
@@ -2338,7 +3162,11 @@ pub fn read_install_manifest(install_dir: &Path) -> Result<ManagedRuntimeInstall
 /// Return unit for an existing manifest file, or an explicit missing/probe/type error.
 /// 已存在清单文件时返回 unit；缺失、探测或类型异常时返回显式错误。
 fn managed_runtime_install_manifest_path_is_file(manifest_path: &Path) -> Result<(), String> {
-    match fs::metadata(manifest_path) {
+    match fs::symlink_metadata(manifest_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "managed runtime install manifest must not be a symbolic link: {}",
+            render_managed_runtime_path(manifest_path)
+        )),
         Ok(metadata) if metadata.is_file() => Ok(()),
         Ok(_) => Err(format!(
             "managed runtime install manifest is not a file: {}",
@@ -2359,17 +3187,17 @@ fn managed_runtime_install_manifest_path_is_file(manifest_path: &Path) -> Result
 /// Build one complete managed runtime environment plan from normalized inputs.
 /// 基于规范化输入构造一个完整受管运行时环境计划。
 fn build_env_plan(
-    runtime_root: &Path,
+    managed_runtime_roots: Arc<ManagedRuntimeRoots>,
     runtime: ManagedRuntimeKind,
-    runtime_executable: PathBuf,
-    package_manager_executable: PathBuf,
+    runtime_install: ManagedRuntimeInstallIdentity,
+    package_manager_install: ManagedRuntimeInstallIdentity,
     package_manifest_path: Option<PathBuf>,
     lockfile_path: PathBuf,
     hash_input: ManagedRuntimeEnvHashInput,
 ) -> Result<ManagedRuntimeEnvPlan, String> {
     let env_hash = compute_managed_runtime_env_hash(&hash_input);
     let env_dir = managed_env_dir(
-        runtime_root,
+        managed_runtime_roots.environment_root(),
         runtime,
         &hash_input.runtime_version,
         &env_hash,
@@ -2378,12 +3206,23 @@ fn build_env_plan(
     Ok(ManagedRuntimeEnvPlan {
         runtime,
         platform: hash_input.platform,
-        runtime_root: runtime_root.to_path_buf(),
+        runtime_root: managed_runtime_roots.runtime_root().to_path_buf(),
+        distribution_root: managed_runtime_roots.distribution_root().to_path_buf(),
+        environment_root: managed_runtime_roots.environment_root().to_path_buf(),
+        distribution_source: managed_runtime_roots.distribution_source(),
+        environment_source: managed_runtime_roots.environment_source(),
+        runtime_install_root: runtime_install.install_root,
         runtime_version: hash_input.runtime_version,
-        runtime_executable,
+        runtime_executable: runtime_install.executable,
+        runtime_install_manifest_hash: hash_input.runtime_install_manifest_hash,
+        runtime_executable_hash: hash_input.runtime_executable_hash,
         package_manager: hash_input.package_manager,
         package_manager_version: hash_input.package_manager_version,
-        package_manager_executable,
+        package_manager_executable: package_manager_install.executable,
+        package_manager_install_root: package_manager_install.install_root,
+        package_manager_install_manifest_hash: hash_input.package_manager_install_manifest_hash,
+        package_manager_executable_hash: hash_input.package_manager_executable_hash,
+        managed_runtime_roots,
         package_manifest_path,
         lockfile_path,
         lock_hash: hash_input.lock_hash,
@@ -2394,14 +3233,91 @@ fn build_env_plan(
     })
 }
 
-/// Return one managed runtime installation directory under `runtime_root`.
-/// 返回 `runtime_root` 下的单个受管运行时安装目录。
-fn runtime_install_dir(runtime_root: &Path, family: &str, name: &str) -> PathBuf {
-    runtime_root
-        .join("dependencies")
-        .join("runtimes")
-        .join(family)
-        .join(name)
+/// Return one managed runtime installation directory directly under a distribution root.
+/// 返回直接位于发行根下的单个受管运行时安装目录。
+///
+/// `distribution_root` already points at the directory containing fixed `python` and `node`
+/// families; `family` and `name` are trusted fixed or validated path components.
+/// `distribution_root` 已直接指向包含固定 `python` 与 `node` 资产族的目录；`family` 与 `name`
+/// 是可信固定或已校验路径组件。
+///
+/// Returns the lexical installation path without performing filesystem access.
+/// 返回词法安装路径且不执行文件系统访问。
+fn runtime_install_dir(distribution_root: &Path, family: &str, name: &str) -> PathBuf {
+    distribution_root.join(family).join(name)
+}
+
+/// Resolve one runtime or package-manager installation and bind its exact byte identity.
+/// 解析单个运行时或包管理器安装并绑定其精确字节身份。
+///
+/// `distribution_root` is the canonical host authority, `install_dir` is the fixed expected child,
+/// and all expected fields must match the untrusted manifest exactly.
+/// `distribution_root` 是规范宿主授权，`install_dir` 是固定预期子目录，全部期望字段必须与
+/// 不可信清单精确匹配。
+///
+/// Returns canonical contained paths plus manifest/executable hashes, or a containment, manifest,
+/// file-type, or hashing error.
+/// 返回规范包含路径及清单与可执行文件哈希，或包含关系、清单、文件类型及哈希错误。
+fn resolve_managed_runtime_install_identity(
+    distribution_root: &Path,
+    install_dir: &Path,
+    expected_runtime: &str,
+    expected_version: &str,
+    expected_platform: &str,
+) -> Result<ManagedRuntimeInstallIdentity, String> {
+    // LiveDistributionRoot detects same-name redirection before resolving any installation child.
+    // LiveDistributionRoot 在解析任何安装子目录前检测同名重定向。
+    let live_distribution_root = fs::canonicalize(distribution_root).map_err(|error| {
+        format!(
+            "Failed to canonicalize managed runtime distribution root {}: {}",
+            render_managed_runtime_path(distribution_root),
+            error
+        )
+    })?;
+    if live_distribution_root != distribution_root {
+        return Err(format!(
+            "managed runtime distribution root changed canonical identity: expected {}, got {}",
+            render_managed_runtime_path(distribution_root),
+            render_managed_runtime_path(&live_distribution_root)
+        ));
+    }
+    ensure_managed_runtime_directory(&live_distribution_root, "managed runtime distribution root")?;
+    // CanonicalInstallRoot follows links so an installation cannot escape the configured root.
+    // CanonicalInstallRoot 跟随链接，使安装目录无法逃逸配置发行根。
+    let canonical_install_root = fs::canonicalize(install_dir).map_err(|error| {
+        format!(
+            "Failed to canonicalize managed runtime install directory {}: {}",
+            render_managed_runtime_path(install_dir),
+            error
+        )
+    })?;
+    if canonical_install_root == live_distribution_root
+        || !canonical_install_root.starts_with(&live_distribution_root)
+    {
+        return Err(format!(
+            "managed runtime install directory {} escapes distribution root {}",
+            render_managed_runtime_path(&canonical_install_root),
+            render_managed_runtime_path(&live_distribution_root)
+        ));
+    }
+    ensure_managed_runtime_directory(&canonical_install_root, "managed runtime install directory")?;
+    // ManifestSnapshot supplies both parsed authority and hash from the same exact read.
+    // ManifestSnapshot 从同一次精确读取提供解析授权与哈希。
+    let (manifest, manifest_hash) = read_install_manifest_with_hash(&canonical_install_root)?;
+    let executable = resolve_install_executable_from_manifest(
+        &canonical_install_root,
+        &manifest,
+        expected_runtime,
+        expected_version,
+        expected_platform,
+    )?;
+    let executable_hash = sha256_file(&executable)?;
+    Ok(ManagedRuntimeInstallIdentity {
+        install_root: canonical_install_root,
+        executable,
+        manifest_hash,
+        executable_hash,
+    })
 }
 
 /// Resolve and validate one executable from an installation manifest.
@@ -2413,6 +3329,7 @@ fn runtime_install_dir(runtime_root: &Path, family: &str, name: &str) -> PathBuf
 ///
 /// Returns the canonical real ordinary file strictly inside the canonical installation directory.
 /// 返回严格位于规范安装目录内的规范真实普通文件。
+#[cfg(test)]
 fn resolve_install_executable(
     install_dir: &Path,
     expected_runtime: &str,
@@ -2422,6 +3339,32 @@ fn resolve_install_executable(
     // Parsed installation metadata whose identity and executable path remain untrusted.
     // 已解析的安装元数据，其身份与可执行文件路径仍不可信。
     let manifest = read_install_manifest(install_dir)?;
+    resolve_install_executable_from_manifest(
+        install_dir,
+        &manifest,
+        expected_runtime,
+        expected_version,
+        expected_platform,
+    )
+}
+
+/// Resolve one executable from a manifest already parsed from the selected installation object.
+/// 从已由所选安装对象解析的清单中解析单个可执行文件。
+///
+/// `install_dir` is the declared boundary, `manifest` is untrusted parsed data, and the three
+/// expected identity fields are authoritative caller inputs.
+/// `install_dir` 是声明边界，`manifest` 是不可信解析数据，三个期望身份字段是调用方权威输入。
+///
+/// Returns one canonical ordinary file strictly inside the canonical installation directory, or a
+/// schema, identity, path-safety, containment, or file-type error.
+/// 返回严格位于规范安装目录内的规范普通文件，或 schema、身份、路径安全、包含关系及文件类型错误。
+fn resolve_install_executable_from_manifest(
+    install_dir: &Path,
+    manifest: &ManagedRuntimeInstallManifest,
+    expected_runtime: &str,
+    expected_version: &str,
+    expected_platform: &str,
+) -> Result<PathBuf, String> {
     if manifest.schema_version != 1 {
         return Err(format!(
             "managed runtime manifest {} uses unsupported schema_version {}",
@@ -2586,14 +3529,17 @@ mod tests {
     use super::{
         ManagedRuntimeBackupRecoveryAction, ManagedRuntimeBackupRecoveryRecord,
         ManagedRuntimeEnvHashInput, ManagedRuntimeEnvMarker, ManagedRuntimeEnvPlan,
-        ManagedRuntimeKind, acquire_managed_runtime_env_file_lock, acquire_ready_managed_env_lease,
+        ManagedRuntimeKind, ManagedRuntimeRootSource, ManagedRuntimeRoots,
+        acquire_managed_runtime_env_file_lock, acquire_ready_managed_env_lease,
         capture_managed_directory_identity, compute_managed_runtime_env_hash,
         configure_managed_command_base_environment, copy_dir_recursive,
         current_managed_runtime_platform_key, finish_build_dir,
         finish_build_dir_with_backup_remover, managed_env_dir, managed_env_is_ready,
         managed_env_marker_matches, managed_env_marker_path, prepare_build_dir_with_sequence,
         read_install_manifest, reserve_managed_runtime_backup_recovery_slot,
-        resolve_install_executable, resolve_node_env_plan, resolve_python_env_plan, sha256_hex,
+        resolve_install_executable, resolve_managed_runtime_install,
+        resolve_managed_runtime_install_identity, resolve_node_env_plan, resolve_python_env_plan,
+        sha256_file, sha256_hex, validate_managed_runtime_plan_assets,
         verify_managed_runtime_build_input_hash, write_expected_marker,
     };
     use crate::runtime::managed_package::ManagedRuntimePackageContext;
@@ -2714,16 +3660,25 @@ mod tests {
             package_manager_version: "0.11.28".to_string(),
             lock_hash: sha256_hex(b"requests==2.32.3"),
             package_manifest_hash: None,
+            runtime_install_manifest_hash: "python-manifest".to_string(),
+            runtime_executable_hash: "python-executable".to_string(),
+            package_manager_install_manifest_hash: "uv-manifest".to_string(),
+            package_manager_executable_hash: "uv-executable".to_string(),
         };
         let same_hash = compute_managed_runtime_env_hash(&input);
         let repeated_hash = compute_managed_runtime_env_hash(&input);
         let changed_hash = compute_managed_runtime_env_hash(&ManagedRuntimeEnvHashInput {
             lock_hash: sha256_hex(b"requests==2.32.4"),
+            ..input.clone()
+        });
+        let changed_runtime_hash = compute_managed_runtime_env_hash(&ManagedRuntimeEnvHashInput {
+            runtime_executable_hash: "different-python-executable".to_string(),
             ..input
         });
 
         assert_eq!(same_hash, repeated_hash);
         assert_ne!(same_hash, changed_hash);
+        assert_ne!(same_hash, changed_runtime_hash);
     }
 
     /// Verify that a copied build input cannot diverge from its plan-time environment identity.
@@ -2767,6 +3722,10 @@ mod tests {
             package_manager_version: "11.11.0".to_string(),
             lock_hash: "lock".to_string(),
             package_manifest_hash: Some("package".to_string()),
+            runtime_install_manifest_hash: "node-manifest".to_string(),
+            runtime_executable_hash: "node-executable".to_string(),
+            package_manager_install_manifest_hash: "pnpm-manifest".to_string(),
+            package_manager_executable_hash: "pnpm-executable".to_string(),
         };
         let env_hash = compute_managed_runtime_env_hash(&input);
         let expected = ManagedRuntimeEnvMarker::expected(&input, env_hash);
@@ -2787,7 +3746,7 @@ mod tests {
             "3.12.8",
             "abc",
         );
-        assert!(path.ends_with(Path::new("dependencies/envs/python/py-3.12.8/abc")));
+        assert!(path.ends_with(Path::new("python/py-3.12.8/abc")));
     }
 
     /// Verify that marker readiness checks return true only after writing the expected marker.
@@ -3200,6 +4159,55 @@ mod tests {
     /// `root` is the cross-process fixture root and the return value uses one stable env hash.
     /// `root` 是跨进程夹具根，返回值使用一个稳定环境哈希。
     fn make_environment_file_lock_test_plan(root: &Path) -> ManagedRuntimeEnvPlan {
+        // DistributionRoot contains real synthetic assets so lifecycle acquisition exercises the
+        // same identity validation as production plans in both parent and child processes.
+        // DistributionRoot 包含真实合成资产，使父子进程中的生命周期获取执行与生产计划相同的
+        // 身份校验。
+        let distribution_root = root.join("runtimes");
+        let environment_root = root.join("managed-envs");
+        fs::create_dir_all(&environment_root).expect("create lock test environment root");
+        let runtime_install_root = distribution_root
+            .join("python")
+            .join("cpython-3.14.4-test-platform");
+        let package_manager_install_root = distribution_root
+            .join("python")
+            .join("uv-0.11.28-test-platform");
+        write_install_manifest(
+            &runtime_install_root,
+            "python",
+            "3.14.4",
+            "test-platform",
+            platform_executable("python"),
+        );
+        write_install_manifest(
+            &package_manager_install_root,
+            "uv",
+            "0.11.28",
+            "test-platform",
+            platform_executable("uv"),
+        );
+        let managed_runtime_roots = Arc::new(
+            ManagedRuntimeRoots::new(root, Some(&distribution_root), Some(&environment_root))
+                .expect("create lock test managed runtime roots"),
+        );
+        // RuntimeInstall and PackageManagerInstall capture the exact bytes used by plan validation.
+        // RuntimeInstall 与 PackageManagerInstall 捕获计划校验使用的精确字节。
+        let runtime_install = resolve_managed_runtime_install_identity(
+            managed_runtime_roots.distribution_root(),
+            &runtime_install_root,
+            "python",
+            "3.14.4",
+            "test-platform",
+        )
+        .expect("resolve lock test Python install");
+        let package_manager_install = resolve_managed_runtime_install_identity(
+            managed_runtime_roots.distribution_root(),
+            &package_manager_install_root,
+            "uv",
+            "0.11.28",
+            "test-platform",
+        )
+        .expect("resolve lock test uv install");
         let hash_input = ManagedRuntimeEnvHashInput {
             runtime: ManagedRuntimeKind::Python,
             runtime_version: "3.14.4".to_string(),
@@ -3208,23 +4216,45 @@ mod tests {
             package_manager_version: "0.11.28".to_string(),
             lock_hash: "lock".to_string(),
             package_manifest_hash: None,
+            runtime_install_manifest_hash: runtime_install.manifest_hash.clone(),
+            runtime_executable_hash: runtime_install.executable_hash.clone(),
+            package_manager_install_manifest_hash: package_manager_install.manifest_hash.clone(),
+            package_manager_executable_hash: package_manager_install.executable_hash.clone(),
         };
         let env_hash = "cross-process-lock-hash".to_string();
         ManagedRuntimeEnvPlan {
             runtime: ManagedRuntimeKind::Python,
             platform: hash_input.platform.clone(),
-            runtime_root: root.to_path_buf(),
+            runtime_root: managed_runtime_roots.runtime_root().to_path_buf(),
+            distribution_root: managed_runtime_roots.distribution_root().to_path_buf(),
+            environment_root: managed_runtime_roots.environment_root().to_path_buf(),
+            distribution_source: ManagedRuntimeRootSource::HostConfigured,
+            environment_source: ManagedRuntimeRootSource::HostConfigured,
+            runtime_install_root: runtime_install.install_root,
             runtime_version: hash_input.runtime_version.clone(),
-            runtime_executable: PathBuf::from("python"),
+            runtime_executable: runtime_install.executable,
+            runtime_install_manifest_hash: hash_input.runtime_install_manifest_hash.clone(),
+            runtime_executable_hash: hash_input.runtime_executable_hash.clone(),
             package_manager: hash_input.package_manager.clone(),
             package_manager_version: hash_input.package_manager_version.clone(),
-            package_manager_executable: PathBuf::from("uv"),
+            package_manager_executable: package_manager_install.executable,
+            package_manager_install_root: package_manager_install.install_root,
+            package_manager_install_manifest_hash: hash_input
+                .package_manager_install_manifest_hash
+                .clone(),
+            package_manager_executable_hash: hash_input.package_manager_executable_hash.clone(),
+            managed_runtime_roots: Arc::clone(&managed_runtime_roots),
             package_manifest_path: None,
             lockfile_path: root.join("requirements.lock"),
             lock_hash: hash_input.lock_hash.clone(),
             package_manifest_hash: None,
             env_hash: env_hash.clone(),
-            env_dir: root.join("envs").join(&env_hash),
+            env_dir: managed_env_dir(
+                managed_runtime_roots.environment_root(),
+                ManagedRuntimeKind::Python,
+                &hash_input.runtime_version,
+                &env_hash,
+            ),
             expected_marker: ManagedRuntimeEnvMarker::expected(&hash_input, env_hash),
         }
     }
@@ -3615,6 +4645,13 @@ mod tests {
         // Temporary root that isolates the file-backed build directory fixture.
         // 隔离文件型构建目录夹具的临时根目录。
         let root = make_test_root("file-build-dir");
+        fs::create_dir_all(&root).expect("create file-backed build directory root");
+        // ManagedRuntimeRoots supplies a real identity-pinned authority for the synthetic plan.
+        // ManagedRuntimeRoots 为合成计划提供真实固定身份授权。
+        let managed_runtime_roots = Arc::new(
+            ManagedRuntimeRoots::new(&root, Some(&root), Some(&root))
+                .expect("create build-directory test managed runtime roots"),
+        );
         // Reproducibility input used to build the expected marker for this synthetic plan.
         // 用于为这个合成计划构造期望标记的可复现输入。
         let hash_input = ManagedRuntimeEnvHashInput {
@@ -3625,6 +4662,10 @@ mod tests {
             package_manager_version: "0.11.28".to_string(),
             lock_hash: "lock".to_string(),
             package_manifest_hash: None,
+            runtime_install_manifest_hash: "python-manifest".to_string(),
+            runtime_executable_hash: "python-executable".to_string(),
+            package_manager_install_manifest_hash: "uv-manifest".to_string(),
+            package_manager_executable_hash: "uv-executable".to_string(),
         };
         // Fixed environment hash that lets the test occupy the exact derived build directory.
         // 固定环境哈希，便于测试占用精确派生出的构建目录。
@@ -3638,11 +4679,24 @@ mod tests {
             runtime: ManagedRuntimeKind::Python,
             platform: hash_input.platform.clone(),
             runtime_root: root.clone(),
+            distribution_root: root.clone(),
+            environment_root: root.clone(),
+            distribution_source: ManagedRuntimeRootSource::HostConfigured,
+            environment_source: ManagedRuntimeRootSource::HostConfigured,
+            runtime_install_root: root.join("python-install"),
             runtime_version: hash_input.runtime_version.clone(),
             runtime_executable: PathBuf::from("python"),
+            runtime_install_manifest_hash: hash_input.runtime_install_manifest_hash.clone(),
+            runtime_executable_hash: hash_input.runtime_executable_hash.clone(),
             package_manager: hash_input.package_manager.clone(),
             package_manager_version: hash_input.package_manager_version.clone(),
             package_manager_executable: PathBuf::from("uv"),
+            package_manager_install_root: root.join("uv-install"),
+            package_manager_install_manifest_hash: hash_input
+                .package_manager_install_manifest_hash
+                .clone(),
+            package_manager_executable_hash: hash_input.package_manager_executable_hash.clone(),
+            managed_runtime_roots,
             package_manifest_path: None,
             lockfile_path: root.join("requirements.lock"),
             lock_hash: hash_input.lock_hash.clone(),
@@ -3913,7 +4967,7 @@ mod tests {
         let canonical_executable_path = fs::canonicalize(&executable_path)
             .expect("canonicalize directory runtime executable fixture");
         let expected_error = format!(
-            "managed runtime executable is not a file: {}",
+            "managed runtime distribution source=runtime_root_default: managed runtime executable is not a file: {}",
             render_host_visible_path(&canonical_executable_path)
         );
 
@@ -4217,6 +5271,401 @@ mod tests {
         assert_eq!(error, expected_error);
         // Cleanup result is intentionally ignored for best-effort temporary test artifacts.
         // 对临时测试产物的清理结果按最佳努力原则有意忽略。
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verify explicit host roots outside the LuaSkills data root drive Python planning and identity.
+    /// 验证 LuaSkills 数据根外的显式宿主根会驱动 Python 计划与身份。
+    #[test]
+    fn explicit_host_roots_drive_python_plan_and_asset_invalidation() {
+        // Root separates the data, read-only distribution, writable environment, and package trees.
+        // Root 分离数据、只读发行、可写环境及包目录树。
+        let root = make_test_root("explicit-host-roots");
+        let runtime_root = root.join("运行时 数据");
+        let distribution_root = root.join("应用 资产").join("runtimes");
+        let environment_root = root.join("用户 数据").join("managed runtime envs");
+        let package_root = root.join("插件 包");
+        fs::create_dir_all(&runtime_root).expect("create explicit data root");
+        fs::create_dir_all(package_root.join("python")).expect("create explicit package root");
+        fs::write(
+            package_root.join("python/requirements.lock"),
+            b"requests==2.32.3",
+        )
+        .expect("write explicit Python lockfile");
+        let platform = current_managed_runtime_platform_key().expect("resolve native platform");
+        let runtime_install_root = distribution_root
+            .join("python")
+            .join(format!("cpython-3.14.4-{platform}"));
+        let package_manager_install_root = distribution_root
+            .join("python")
+            .join(format!("uv-0.11.28-{platform}"));
+        write_install_manifest(
+            &runtime_install_root,
+            "python",
+            "3.14.4",
+            &platform,
+            platform_executable("python"),
+        );
+        write_install_manifest(
+            &package_manager_install_root,
+            "uv",
+            "0.11.28",
+            &platform,
+            platform_executable("uv"),
+        );
+        // ManagedRuntimeRoots must preserve both explicit roots rather than deriving legacy paths.
+        // ManagedRuntimeRoots 必须保留两个显式根，而不是派生旧路径。
+        let managed_runtime_roots = Arc::new(
+            ManagedRuntimeRoots::new(
+                &runtime_root,
+                Some(&distribution_root),
+                Some(&environment_root),
+            )
+            .expect("build explicit managed runtime roots"),
+        );
+        let package = ManagedRuntimePackageContext::for_skill_with_roots(
+            "explicit-host-roots",
+            &package_root,
+            Arc::clone(&managed_runtime_roots),
+            None,
+        )
+        .expect("build explicit-root package context");
+        let spec = PythonRuntimeDependencySpec {
+            version: "3.14.4".to_string(),
+            package_manager: PythonRuntimePackageManager::Uv,
+            package_manager_version: "0.11.28".to_string(),
+            lockfile: "python/requirements.lock".to_string(),
+            required: true,
+        };
+        let original_plan =
+            resolve_python_env_plan(package.as_ref(), &spec).expect("resolve explicit Python plan");
+
+        assert_eq!(
+            original_plan.distribution_root,
+            fs::canonicalize(&distribution_root).expect("canonical explicit distribution root")
+        );
+        assert_eq!(
+            original_plan.environment_root,
+            fs::canonicalize(&environment_root).expect("canonical explicit environment root")
+        );
+        assert_eq!(
+            original_plan.distribution_source,
+            ManagedRuntimeRootSource::HostConfigured
+        );
+        assert_eq!(
+            original_plan.environment_source,
+            ManagedRuntimeRootSource::HostConfigured
+        );
+        assert!(
+            original_plan
+                .runtime_executable
+                .starts_with(&original_plan.distribution_root)
+        );
+        assert!(
+            original_plan
+                .env_dir
+                .starts_with(original_plan.environment_root.join("python"))
+        );
+
+        // MutatedExecutable models a host asset replacement under the same version and path.
+        // MutatedExecutable 模拟相同版本与路径下的宿主资产替换。
+        fs::write(
+            &original_plan.runtime_executable,
+            b"changed executable bytes",
+        )
+        .expect("mutate explicit Python executable");
+        let changed_plan =
+            resolve_python_env_plan(package.as_ref(), &spec).expect("resolve changed Python plan");
+        assert_ne!(
+            original_plan.runtime_executable_hash,
+            changed_plan.runtime_executable_hash
+        );
+        assert_ne!(original_plan.env_hash, changed_plan.env_hash);
+        let identity_error = validate_managed_runtime_plan_assets(&original_plan)
+            .expect_err("stale plan must reject changed executable identity");
+        assert!(identity_error.contains("installation identity changed"));
+
+        // RuntimeManifestPath identifies the exact manifest captured by the changed executable plan.
+        // RuntimeManifestPath 标识已变更可执行文件计划捕获的精确清单。
+        let runtime_manifest_path = changed_plan
+            .runtime_install_root
+            .join("runtime-manifest.json");
+        // RepackedManifest preserves semantic fields while changing the distribution identity bytes.
+        // RepackedManifest 保留语义字段，同时改变发行身份字节。
+        let repacked_manifest = serde_json::json!({
+            "schema_version": 1,
+            "runtime": "python",
+            "version": "3.14.4",
+            "platform": platform,
+            "executable": platform_executable("python"),
+            "source": "repacked-test-asset",
+        });
+        fs::write(
+            &runtime_manifest_path,
+            serde_json::to_string_pretty(&repacked_manifest)
+                .expect("serialize repacked Python runtime manifest"),
+        )
+        .expect("replace explicit Python runtime manifest bytes");
+        // ManifestChangedPlan must select a fresh environment identity even at the same version/path.
+        // ManifestChangedPlan 即使版本与路径相同，也必须选择新的环境身份。
+        let manifest_changed_plan = resolve_python_env_plan(package.as_ref(), &spec)
+            .expect("resolve manifest-changed Python plan");
+        assert_ne!(
+            changed_plan.runtime_install_manifest_hash,
+            manifest_changed_plan.runtime_install_manifest_hash
+        );
+        assert_ne!(changed_plan.env_hash, manifest_changed_plan.env_hash);
+        // ManifestIdentityError proves an already planned environment cannot accept replaced metadata.
+        // ManifestIdentityError 证明已完成计划的环境不能接受被替换的元数据。
+        let manifest_identity_error = validate_managed_runtime_plan_assets(&changed_plan)
+            .expect_err("stale plan must reject changed manifest identity");
+        assert!(manifest_identity_error.contains("installation identity changed"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verify explicit host roots outside the LuaSkills data root also drive Node planning.
+    /// 验证 LuaSkills 数据根外的显式宿主根同样会驱动 Node 计划。
+    #[test]
+    fn explicit_host_roots_drive_node_plan() {
+        // Root separates the data, distribution, environment, and package trees.
+        // Root 分离数据、发行、环境及包目录树。
+        let root = make_test_root("explicit-node-host-roots");
+        let runtime_root = root.join("runtime data");
+        let distribution_root = root.join("application assets").join("runtimes");
+        let environment_root = root.join("user data").join("managed environments");
+        let package_root = root.join("system plugin");
+        fs::create_dir_all(&runtime_root).expect("create explicit Node data root");
+        fs::create_dir_all(package_root.join("node")).expect("create explicit Node package root");
+        fs::write(
+            package_root.join("node/package.json"),
+            b"{\"private\":true}",
+        )
+        .expect("write explicit Node package manifest");
+        fs::write(
+            package_root.join("node/pnpm-lock.yaml"),
+            b"lockfileVersion: '9.0'",
+        )
+        .expect("write explicit Node lockfile");
+        let platform = current_managed_runtime_platform_key().expect("resolve native platform");
+        let runtime_install_root = distribution_root
+            .join("node")
+            .join(format!("node-24.18.0-{platform}"));
+        let package_manager_install_root = distribution_root.join("node").join("pnpm-11.11.0");
+        write_install_manifest(
+            &runtime_install_root,
+            "node",
+            "24.18.0",
+            &platform,
+            platform_executable("node"),
+        );
+        write_install_manifest(
+            &package_manager_install_root,
+            "pnpm",
+            "11.11.0",
+            "any",
+            "bin/pnpm.cjs",
+        );
+        let managed_runtime_roots = Arc::new(
+            ManagedRuntimeRoots::new(
+                &runtime_root,
+                Some(&distribution_root),
+                Some(&environment_root),
+            )
+            .expect("build explicit Node managed runtime roots"),
+        );
+        let package = ManagedRuntimePackageContext::for_skill_with_roots(
+            "explicit-node-host-roots",
+            &package_root,
+            Arc::clone(&managed_runtime_roots),
+            None,
+        )
+        .expect("build explicit Node package context");
+        let spec = NodeRuntimeDependencySpec {
+            version: "24.18.0".to_string(),
+            package_manager: NodeRuntimePackageManager::Pnpm,
+            package_manager_version: "11.11.0".to_string(),
+            package_json: "node/package.json".to_string(),
+            lockfile: "node/pnpm-lock.yaml".to_string(),
+            required: true,
+        };
+        let plan =
+            resolve_node_env_plan(package.as_ref(), &spec).expect("resolve explicit Node plan");
+
+        assert_eq!(
+            plan.distribution_root,
+            fs::canonicalize(&distribution_root).expect("canonical explicit Node distribution")
+        );
+        assert_eq!(
+            plan.environment_root,
+            fs::canonicalize(&environment_root).expect("canonical explicit Node environment")
+        );
+        assert_eq!(
+            plan.distribution_source,
+            ManagedRuntimeRootSource::HostConfigured
+        );
+        assert_eq!(
+            plan.environment_source,
+            ManagedRuntimeRootSource::HostConfigured
+        );
+        assert!(plan.runtime_executable.starts_with(&plan.distribution_root));
+        assert!(plan.env_dir.starts_with(plan.environment_root.join("node")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verify the public resolver returns canonical contained paths and exact byte hashes.
+    /// 验证公共解析器返回规范包含路径与精确字节哈希。
+    #[test]
+    fn public_managed_runtime_resolver_returns_canonical_descriptor() {
+        let root = make_test_root("public-install-resolver");
+        let distribution_root = root.join("shared runtimes");
+        let install_root = distribution_root
+            .join("node")
+            .join("node-24.18.0-linux-x64");
+        write_install_manifest(&install_root, "node", "24.18.0", "linux-x64", "bin/node");
+
+        let descriptor = resolve_managed_runtime_install(
+            &distribution_root,
+            ManagedRuntimeKind::Node,
+            "24.18.0",
+            "linux-x64",
+        )
+        .expect("resolve public Node descriptor");
+        assert_eq!(descriptor.runtime, ManagedRuntimeKind::Node);
+        assert_eq!(
+            descriptor.install_root,
+            fs::canonicalize(&install_root).expect("canonical public install root")
+        );
+        assert_eq!(
+            descriptor.manifest_hash,
+            sha256_file(&install_root.join("runtime-manifest.json")).expect("hash public manifest")
+        );
+        assert_eq!(
+            descriptor.executable_hash,
+            sha256_file(&descriptor.executable).expect("hash public executable")
+        );
+        assert!(descriptor.executable.starts_with(&descriptor.install_root));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verify explicit root validation rejects relative, missing, and replaced distribution roots.
+    /// 验证显式根校验会拒绝相对、缺失及被替换的发行根。
+    #[test]
+    fn managed_runtime_roots_reject_invalid_and_replaced_distribution_roots() {
+        let root = make_test_root("root-validation");
+        let runtime_root = root.join("runtime");
+        let distribution_root = root.join("distribution");
+        let environment_root = root.join("environment");
+        fs::create_dir_all(&runtime_root).expect("create root-validation data root");
+        fs::create_dir_all(&distribution_root).expect("create root-validation distribution root");
+
+        let relative_error = ManagedRuntimeRoots::new(
+            &runtime_root,
+            Some(Path::new("relative-runtimes")),
+            Some(&environment_root),
+        )
+        .expect_err("relative distribution root must fail");
+        assert!(relative_error.contains("must be an absolute path"));
+        // RelativeEnvironmentError proves the writable authority has the same absolute-path rule.
+        // RelativeEnvironmentError 证明可写授权遵循相同的绝对路径规则。
+        let relative_environment_error = ManagedRuntimeRoots::new(
+            &runtime_root,
+            Some(&distribution_root),
+            Some(Path::new("relative-environments")),
+        )
+        .expect_err("relative environment root must fail");
+        assert!(relative_environment_error.contains("must be an absolute path"));
+        let missing_error = ManagedRuntimeRoots::new(
+            &runtime_root,
+            Some(&root.join("missing-distribution")),
+            Some(&environment_root),
+        )
+        .expect_err("missing explicit distribution root must fail");
+        assert!(missing_error.contains("failed to canonicalize"));
+        // DistributionFile is an existing non-directory object that cannot become an asset root.
+        // DistributionFile 是不能成为资产根的现有非目录对象。
+        let distribution_file = root.join("distribution-file");
+        fs::write(&distribution_file, b"not a directory").expect("write distribution file fixture");
+        // DistributionFileError must be a type error without attempting any PATH fallback.
+        // DistributionFileError 必须是类型错误，且不能尝试任何 PATH 回退。
+        let distribution_file_error = ManagedRuntimeRoots::new(
+            &runtime_root,
+            Some(&distribution_file),
+            Some(&environment_root),
+        )
+        .expect_err("distribution file must fail");
+        assert!(distribution_file_error.contains("is not a directory"));
+        // EnvironmentFile is an existing non-directory object at the requested writable root path.
+        // EnvironmentFile 是位于请求可写根路径上的现有非目录对象。
+        let environment_file = root.join("environment-file");
+        fs::write(&environment_file, b"not a directory").expect("write environment file fixture");
+        // EnvironmentFileError must stop root creation before any managed environment is derived.
+        // EnvironmentFileError 必须在派生任何受管环境前停止根创建。
+        let environment_file_error = ManagedRuntimeRoots::new(
+            &runtime_root,
+            Some(&distribution_root),
+            Some(&environment_file),
+        )
+        .expect_err("environment file must fail");
+        assert!(
+            environment_file_error.contains("failed to create managed runtime environment root")
+        );
+
+        let roots = ManagedRuntimeRoots::new(
+            &runtime_root,
+            Some(&distribution_root),
+            Some(&environment_root),
+        )
+        .expect("build replace-detection roots");
+        let original_distribution = root.join("original-distribution");
+        fs::rename(&distribution_root, &original_distribution)
+            .expect("move original distribution root");
+        fs::create_dir(&distribution_root).expect("create replacement distribution root");
+        let replacement_error = roots
+            .validate_live_filesystem_identity()
+            .expect_err("same-path distribution replacement must fail");
+        assert!(replacement_error.contains("filesystem object changed"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Verify a same-path replacement of the writable environment root is detected independently.
+    /// 验证可写环境根的同路径替换会被独立检测。
+    #[test]
+    fn managed_runtime_roots_reject_replaced_environment_root() {
+        // Root isolates all filesystem objects involved in environment-root identity validation.
+        // Root 隔离环境根身份校验涉及的全部文件系统对象。
+        let root = make_test_root("environment-root-replacement");
+        // RuntimeRoot is the existing LuaSkills data authority required by the root set.
+        // RuntimeRoot 是根集合要求的现有 LuaSkills 数据授权。
+        let runtime_root = root.join("runtime");
+        // DistributionRoot is an existing read-only authority unrelated to the replacement under test.
+        // DistributionRoot 是与本次替换无关的现有只读授权。
+        let distribution_root = root.join("distribution");
+        // EnvironmentRoot is the writable authority whose native object identity is pinned.
+        // EnvironmentRoot 是其平台原生对象身份会被固定的可写授权。
+        let environment_root = root.join("environment");
+        fs::create_dir_all(&runtime_root).expect("create environment replacement runtime root");
+        fs::create_dir_all(&distribution_root)
+            .expect("create environment replacement distribution root");
+        // Roots captures the environment directory object before the same path is replaced.
+        // Roots 在同一路径被替换前捕获环境目录对象。
+        let roots = ManagedRuntimeRoots::new(
+            &runtime_root,
+            Some(&distribution_root),
+            Some(&environment_root),
+        )
+        .expect("build environment replace-detection roots");
+        // OriginalEnvironment retains the first object under a different name for deterministic cleanup.
+        // OriginalEnvironment 以不同名称保留首个对象，以便确定性清理。
+        let original_environment = root.join("original-environment");
+        fs::rename(&environment_root, &original_environment)
+            .expect("move original environment root");
+        fs::create_dir(&environment_root).expect("create replacement environment root");
+        // ReplacementError must identify the native object mismatch rather than accepting the same path.
+        // ReplacementError 必须识别平台原生对象不匹配，而不能接受相同路径。
+        let replacement_error = roots
+            .validate_live_filesystem_identity()
+            .expect_err("same-path environment replacement must fail");
+        assert!(replacement_error.contains("filesystem object changed"));
         let _ = fs::remove_dir_all(root);
     }
 

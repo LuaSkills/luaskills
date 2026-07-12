@@ -9,6 +9,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::ffi_standard::{FfiBorrowedBuffer, FfiOwnedBuffer};
+use crate::runtime::managed_runtime::resolve_managed_runtime_install;
 use crate::runtime::managed_session_events::ManagedSessionEventCenter;
 use crate::runtime_help::{RuntimeHelpDetail, RuntimeSkillHelpDescriptor};
 
@@ -383,6 +384,7 @@ pub(crate) fn exported_ffi_function_names() -> Vec<String> {
         "luaskills_ffi_describe",
         "luaskills_ffi_engine_new",
         "luaskills_ffi_engine_new_v2",
+        "luaskills_ffi_engine_new_v3",
         "luaskills_ffi_engine_free",
         "luaskills_ffi_load_from_roots",
         "luaskills_ffi_reload_from_roots",
@@ -423,6 +425,7 @@ pub(crate) fn exported_ffi_function_names() -> Vec<String> {
         "luaskills_ffi_version_json",
         "luaskills_ffi_describe_json",
         "luaskills_ffi_engine_new_json",
+        "luaskills_ffi_managed_runtime_resolve_json",
         "luaskills_ffi_engine_free_json",
         "luaskills_ffi_load_from_roots_json",
         "luaskills_ffi_reload_from_roots_json",
@@ -542,6 +545,38 @@ pub unsafe extern "C" fn luaskills_ffi_engine_new_json(
             ffi_ok(EngineHandleJsonResult { engine_id })
         }
         Err(error) => ffi_error(error.to_string()),
+    }
+}
+
+/// Resolve one managed Python or Node installation through the read-only JSON FFI surface.
+/// 通过只读 JSON FFI 接口解析单个受管 Python 或 Node 安装。
+/// # Safety
+/// # 安全性
+/// `input_json` must satisfy the borrowed-buffer contract and remain readable for the complete call.
+/// `input_json` 必须满足借用缓冲契约，并在完整调用期间保持可读。
+///
+/// Returns one LuaSkills-owned JSON response envelope that must be released with
+/// `luaskills_ffi_buffer_free`.
+/// 返回一段 LuaSkills 所有的 JSON 响应包络，必须使用 `luaskills_ffi_buffer_free` 释放。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_managed_runtime_resolve_json(
+    input_json: FfiBorrowedBuffer,
+) -> FfiOwnedBuffer {
+    let request = match decode_json_request::<ManagedRuntimeResolveJsonRequest>(
+        input_json,
+        "luaskills_ffi_managed_runtime_resolve_json",
+    ) {
+        Ok(request) => request,
+        Err(error) => return ffi_error(error),
+    };
+    match resolve_managed_runtime_install(
+        &request.distribution_root,
+        request.runtime,
+        &request.version,
+        &request.platform,
+    ) {
+        Ok(descriptor) => ffi_ok(descriptor),
+        Err(error) => ffi_error(error),
     }
 }
 

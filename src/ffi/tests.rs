@@ -4,14 +4,14 @@ use super::{
     SkillConfigSetJsonRequest, encode_json_buffer, ffi_engine_registry, lock_ffi_engine_registry,
     luaskills_ffi_call_skill_json, luaskills_ffi_describe_json, luaskills_ffi_engine_free_json,
     luaskills_ffi_engine_new_json, luaskills_ffi_is_skill_json, luaskills_ffi_list_entries_json,
-    luaskills_ffi_list_skill_help_json, luaskills_ffi_managed_session_events_poll_json,
-    luaskills_ffi_managed_session_events_wait_json, luaskills_ffi_prompt_argument_completions_json,
-    luaskills_ffi_render_skill_help_detail_json, luaskills_ffi_run_lua_json,
-    luaskills_ffi_runtime_lease_close_json, luaskills_ffi_runtime_lease_create_json,
-    luaskills_ffi_runtime_lease_eval_json, luaskills_ffi_runtime_lease_list_json,
-    luaskills_ffi_skill_config_delete_json, luaskills_ffi_skill_config_get_json,
-    luaskills_ffi_skill_config_list_json, luaskills_ffi_skill_config_set_json,
-    luaskills_ffi_skill_name_for_tool_json,
+    luaskills_ffi_list_skill_help_json, luaskills_ffi_managed_runtime_resolve_json,
+    luaskills_ffi_managed_session_events_poll_json, luaskills_ffi_managed_session_events_wait_json,
+    luaskills_ffi_prompt_argument_completions_json, luaskills_ffi_render_skill_help_detail_json,
+    luaskills_ffi_run_lua_json, luaskills_ffi_runtime_lease_close_json,
+    luaskills_ffi_runtime_lease_create_json, luaskills_ffi_runtime_lease_eval_json,
+    luaskills_ffi_runtime_lease_list_json, luaskills_ffi_skill_config_delete_json,
+    luaskills_ffi_skill_config_get_json, luaskills_ffi_skill_config_list_json,
+    luaskills_ffi_skill_config_set_json, luaskills_ffi_skill_name_for_tool_json,
     luaskills_ffi_system_private_install_skill_from_url_manifest_json,
     luaskills_ffi_system_runtime_lease_close_json, luaskills_ffi_system_runtime_lease_create_json,
     luaskills_ffi_system_runtime_lease_eval_json, luaskills_ffi_system_runtime_lease_list_json,
@@ -29,7 +29,8 @@ use crate::runtime::managed_session_events::{
 };
 use crate::runtime::render_host_visible_path;
 use crate::{
-    LuaEngine, LuaEngineOptions, LuaVmPoolConfig, RuntimeSkillRoot, SkillManagementAuthority,
+    LuaEngine, LuaEngineOptions, LuaRuntimeHostOptions, LuaVmPoolConfig, RuntimeSkillRoot,
+    SkillManagementAuthority,
 };
 use serde::ser::{Serialize, Serializer};
 use std::ffi::{CString, c_void};
@@ -996,6 +997,135 @@ fn ffi_describe_json_lists_system_runtime_session_exports() {
         exported_names
             .contains(&"luaskills_ffi_system_private_update_skill_from_url_manifest_json")
     );
+    assert!(exported_names.contains(&"luaskills_ffi_engine_new_v3"));
+    assert!(exported_names.contains(&"luaskills_ffi_managed_runtime_resolve_json"));
+}
+
+/// Verify the read-only JSON FFI resolver returns a canonical managed runtime descriptor.
+/// 验证只读 JSON FFI 解析器会返回规范受管运行时描述符。
+#[test]
+fn ffi_managed_runtime_resolve_json_returns_descriptor() {
+    // DistributionRoot models one host-shared read-only application asset directory.
+    // DistributionRoot 模拟宿主共享的只读应用资产目录。
+    let root = std::env::temp_dir().join(format!(
+        "luaskills_ffi_managed_runtime_resolve_test_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let distribution_root = root.join("application assets").join("runtimes");
+    let install_root = distribution_root
+        .join("node")
+        .join("node-24.18.0-linux-x64");
+    let executable = install_root.join("bin").join("node");
+    std::fs::create_dir_all(executable.parent().expect("Node executable parent"))
+        .expect("create JSON resolver install root");
+    std::fs::write(&executable, b"node executable fixture")
+        .expect("write JSON resolver executable");
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "runtime": "node",
+        "version": "24.18.0",
+        "platform": "linux-x64",
+        "executable": "bin/node"
+    });
+    std::fs::write(
+        install_root.join("runtime-manifest.json"),
+        serde_json::to_vec_pretty(&manifest).expect("encode JSON resolver manifest"),
+    )
+    .expect("write JSON resolver manifest");
+    let request = CString::new(
+        serde_json::json!({
+            "distribution_root": distribution_root,
+            "runtime": "node",
+            "version": "24.18.0",
+            "platform": "linux-x64"
+        })
+        .to_string(),
+    )
+    .expect("encode managed runtime resolver request");
+
+    let response = unsafe {
+        decode_response_json(luaskills_ffi_managed_runtime_resolve_json(
+            borrowed_json_buffer(&request),
+        ))
+    };
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["result"]["runtime"], "node");
+    assert_eq!(response["result"]["version"], "24.18.0");
+    assert_eq!(response["result"]["platform"], "linux-x64");
+    assert_eq!(
+        PathBuf::from(
+            response["result"]["install_root"]
+                .as_str()
+                .expect("descriptor install_root string")
+        ),
+        std::fs::canonicalize(&install_root).expect("canonical JSON resolver install root")
+    );
+    assert_eq!(
+        response["result"]["manifest_hash"].as_str().map(str::len),
+        Some(64)
+    );
+    assert_eq!(
+        response["result"]["executable_hash"].as_str().map(str::len),
+        Some(64)
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Verify JSON engine creation accepts independent managed distribution and environment roots.
+/// 验证 JSON 引擎创建会接受独立受管发行根与环境根。
+#[test]
+fn ffi_engine_new_json_accepts_managed_runtime_roots() {
+    let _guard = ffi_test_guard();
+    // Root owns the distinct JSON-configured data, distribution, and environment boundaries.
+    // Root 拥有 JSON 配置的独立数据、发行与环境边界。
+    let root = std::env::temp_dir().join(format!(
+        "luaskills_ffi_engine_managed_roots_test_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let runtime_root = root.join("runtime data");
+    let distribution_root = root.join("application assets").join("runtimes");
+    let environment_root = root.join("user data").join("managed envs");
+    std::fs::create_dir_all(&runtime_root).expect("create JSON engine runtime root");
+    std::fs::create_dir_all(&distribution_root).expect("create JSON engine distribution root");
+    let mut host_options = LuaRuntimeHostOptions::with_runtime_root(&runtime_root);
+    host_options.managed_runtime_distribution_root = Some(distribution_root.clone());
+    host_options.managed_runtime_environment_root = Some(environment_root.clone());
+    let request = EngineNewJsonRequest {
+        options: LuaEngineOptions::new(
+            LuaVmPoolConfig {
+                min_size: 1,
+                max_size: 1,
+                idle_ttl_secs: 30,
+            },
+            host_options,
+        ),
+    };
+    let request = CString::new(
+        serde_json::to_string(&request).expect("encode JSON engine managed root request"),
+    )
+    .expect("build JSON engine managed root request");
+
+    let response = unsafe {
+        decode_response_json(luaskills_ffi_engine_new_json(borrowed_json_buffer(
+            &request,
+        )))
+    };
+    assert_eq!(response["ok"], true);
+    let engine_id = response["result"]["engine_id"]
+        .as_u64()
+        .expect("JSON managed root engine id");
+    assert!(environment_root.is_dir());
+    let free_request = CString::new(serde_json::json!({ "engine_id": engine_id }).to_string())
+        .expect("encode JSON managed root free request");
+    let free_response = unsafe {
+        decode_response_json(luaskills_ffi_engine_free_json(borrowed_json_buffer(
+            &free_request,
+        )))
+    };
+    assert_eq!(free_response["ok"], true);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 /// Verify strict JSON event requests preserve the bounded batch contract and explicit errors.
@@ -2453,6 +2583,9 @@ fn ffi_engine_new_and_free_roundtrip() {
             },
             crate::LuaRuntimeHostOptions {
                 runtime_root: None,
+                managed_runtime_distribution_root: None,
+                managed_runtime_environment_root: None,
+                managed_runtime_config: Default::default(),
                 temp_dir: Some(temp_root.join("temp")),
                 resources_dir: Some(temp_root.join("resources")),
                 lua_packages_dir: Some(temp_root.join("lua_packages")),
@@ -2511,6 +2644,47 @@ fn ffi_engine_new_and_free_roundtrip() {
     assert_eq!(free_response["ok"], true);
 }
 
+/// Verify JSON engine creation rejects an invalid managed-runtime policy with its stable field name.
+/// 验证 JSON 引擎创建会使用稳定字段名拒绝非法受管运行时策略。
+#[test]
+fn ffi_engine_new_rejects_invalid_managed_runtime_config() {
+    let _guard = ffi_test_guard();
+    // HostOptions carries one invalid zero persistent-session capacity through serde.
+    // HostOptions 通过 serde 携带一个非法的零持久会话容量。
+    let mut host_options = crate::LuaRuntimeHostOptions::default();
+    host_options
+        .managed_runtime_config
+        .persistent_session_limit_per_engine = 0;
+    // Request uses the real JSON FFI engine-construction envelope.
+    // Request 使用真实 JSON FFI 引擎构造包络。
+    let request = EngineNewJsonRequest {
+        options: LuaEngineOptions::new(
+            LuaVmPoolConfig {
+                min_size: 1,
+                max_size: 1,
+                idle_ttl_secs: 30,
+            },
+            host_options,
+        ),
+    };
+    // Input retains the serialized request bytes for the complete borrowed call.
+    // Input 在完整借用调用期间保留序列化请求字节。
+    let input = CString::new(serde_json::to_string(&request).expect("request json"))
+        .expect("request cstring");
+    // Response is the structured error returned before engine resource allocation.
+    // Response 是引擎资源分配前返回的结构化错误。
+    let response = unsafe {
+        decode_response_json(luaskills_ffi_engine_new_json(borrowed_json_buffer(&input)))
+    };
+
+    assert_eq!(response["ok"], false);
+    assert!(
+        response["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("persistent_session_limit_per_engine"))
+    );
+}
+
 /// Verify the JSON FFI skill-config helpers support one full set/get/list/delete roundtrip.
 /// 验证 JSON FFI 的技能配置辅助接口支持完整的 set/get/list/delete 往返流程。
 #[test]
@@ -2529,6 +2703,9 @@ fn ffi_skill_config_json_roundtrip() {
             },
             crate::LuaRuntimeHostOptions {
                 runtime_root: None,
+                managed_runtime_distribution_root: None,
+                managed_runtime_environment_root: None,
+                managed_runtime_config: Default::default(),
                 temp_dir: Some(temp_root.join("temp")),
                 resources_dir: Some(temp_root.join("resources")),
                 lua_packages_dir: Some(temp_root.join("lua_packages")),

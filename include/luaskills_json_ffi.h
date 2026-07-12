@@ -134,6 +134,12 @@ Create one LuaSkills engine from one JSON request.
 FfiOwnedBuffer luaskills_ffi_engine_new_json(FfiBorrowedBuffer input_json);
 
 /*
+Resolve one host-visible managed Python or Node installation without creating an engine.
+在不创建引擎的情况下解析一个宿主可见受管 Python 或 Node 安装。
+*/
+FfiOwnedBuffer luaskills_ffi_managed_runtime_resolve_json(FfiBorrowedBuffer input_json);
+
+/*
 Free one previously created LuaSkills engine handle.
 释放一个先前创建的 LuaSkills 引擎句柄。
 */

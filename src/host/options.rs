@@ -226,6 +226,104 @@ pub struct LuaRuntimeRunLuaPoolConfig {
     pub idle_ttl_secs: u64,
 }
 
+/// Default maximum number of managed Python/Node workers per environment and package owner.
+/// 每个环境与包所有者默认允许的受管 Python/Node Worker 最大数量。
+pub const DEFAULT_MANAGED_RUNTIME_WORKER_POOL_MAX_SIZE_PER_ENVIRONMENT: usize = 4;
+
+/// Default idle lifetime before an unused managed Python/Node worker is retired.
+/// 未使用受管 Python/Node Worker 被回收前的默认空闲秒数。
+pub const DEFAULT_MANAGED_RUNTIME_WORKER_IDLE_TTL_SECS: u64 = 60;
+
+/// Default maximum number of persistent managed Python/Node sessions owned by one engine.
+/// 单个引擎默认允许持有的受管 Python/Node 持久会话最大数量。
+pub const DEFAULT_MANAGED_RUNTIME_PERSISTENT_SESSION_LIMIT_PER_ENGINE: usize = 256;
+
+/// Default retained byte limit for each persistent managed-session output stream.
+/// 每个受管持久会话输出流默认保留的字节上限。
+pub const DEFAULT_MANAGED_RUNTIME_PERSISTENT_SESSION_BUFFER_LIMIT_BYTES_PER_STREAM: usize =
+    1024 * 1024;
+
+/// Host-selected resource policy for managed Python and Node workers and persistent sessions.
+/// 宿主为受管 Python 与 Node Worker 及持久会话选择的资源策略。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LuaRuntimeManagedRuntimeConfig {
+    /// Maximum live workers for one exact environment and package-owner pool key.
+    /// 单个精确环境与包所有者池键允许的最大活动 Worker 数量。
+    pub worker_pool_max_size_per_environment: usize,
+    /// Idle seconds after which an unused worker may be retired.
+    /// 未使用 Worker 可被回收前的空闲秒数。
+    pub worker_idle_ttl_secs: u64,
+    /// Maximum launching or live persistent sessions retained by one engine.
+    /// 单个引擎允许保留的启动中或活动持久会话最大数量。
+    pub persistent_session_limit_per_engine: usize,
+    /// Default retained byte limit for each persistent-session stdout or stderr stream.
+    /// 每个持久会话 stdout 或 stderr 流默认保留的字节上限。
+    pub persistent_session_default_buffer_limit_bytes_per_stream: usize,
+    /// Default positive invoke timeout in milliseconds; absent means unlimited.
+    /// 默认正数 invoke 超时毫秒数；缺失表示无限制。
+    pub invoke_default_timeout_ms: Option<u64>,
+}
+
+impl Default for LuaRuntimeManagedRuntimeConfig {
+    /// Return the stable managed-runtime resource defaults used when the host omits configuration.
+    /// 返回宿主省略配置时使用的稳定受管运行时资源默认值。
+    fn default() -> Self {
+        Self {
+            worker_pool_max_size_per_environment:
+                DEFAULT_MANAGED_RUNTIME_WORKER_POOL_MAX_SIZE_PER_ENVIRONMENT,
+            worker_idle_ttl_secs: DEFAULT_MANAGED_RUNTIME_WORKER_IDLE_TTL_SECS,
+            persistent_session_limit_per_engine:
+                DEFAULT_MANAGED_RUNTIME_PERSISTENT_SESSION_LIMIT_PER_ENGINE,
+            persistent_session_default_buffer_limit_bytes_per_stream:
+                DEFAULT_MANAGED_RUNTIME_PERSISTENT_SESSION_BUFFER_LIMIT_BYTES_PER_STREAM,
+            invoke_default_timeout_ms: None,
+        }
+    }
+}
+
+impl LuaRuntimeManagedRuntimeConfig {
+    /// Validate every configured capacity, retention, and timeout boundary before engine allocation.
+    /// 在引擎分配前校验每个已配置容量、保留与超时边界。
+    ///
+    /// The receiver contains host authority only; this method performs no filesystem or process work.
+    /// 接收者仅包含宿主授权；本方法不执行文件系统或进程操作。
+    ///
+    /// Returns unit for a usable policy or a stable field-qualified error for any zero value.
+    /// 策略可用时返回空值；任一零值非法时返回带稳定字段名的错误。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.worker_pool_max_size_per_environment == 0 {
+            return Err(
+                "managed_runtime_config.worker_pool_max_size_per_environment must be greater than zero"
+                    .to_string(),
+            );
+        }
+        if self.worker_idle_ttl_secs == 0 {
+            return Err(
+                "managed_runtime_config.worker_idle_ttl_secs must be greater than zero".to_string(),
+            );
+        }
+        if self.persistent_session_limit_per_engine == 0 {
+            return Err(
+                "managed_runtime_config.persistent_session_limit_per_engine must be greater than zero"
+                    .to_string(),
+            );
+        }
+        if self.persistent_session_default_buffer_limit_bytes_per_stream == 0 {
+            return Err(
+                "managed_runtime_config.persistent_session_default_buffer_limit_bytes_per_stream must be greater than zero"
+                    .to_string(),
+            );
+        }
+        if self.invoke_default_timeout_ms == Some(0) {
+            return Err(
+                "managed_runtime_config.invoke_default_timeout_ms must be greater than zero when configured"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Host-provided filesystem and runtime paths consumed by the LuaSkills library.
 /// 宿主提供给 LuaSkills 库消费的文件系统与运行时路径集合。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -234,6 +332,18 @@ pub struct LuaRuntimeHostOptions {
     /// 用于推导固定运行时布局的可选规范 LuaSkills 运行时根目录。
     #[serde(default)]
     pub runtime_root: Option<PathBuf>,
+    /// Optional host-configured read-only root containing managed Python and Node distributions.
+    /// 可选的宿主配置只读根目录，包含受管 Python 与 Node 发行包。
+    #[serde(default)]
+    pub managed_runtime_distribution_root: Option<PathBuf>,
+    /// Optional host-configured writable root containing reusable managed environments.
+    /// 可选的宿主配置可写根目录，包含可复用受管环境。
+    #[serde(default)]
+    pub managed_runtime_environment_root: Option<PathBuf>,
+    /// Host-selected managed Python/Node worker and persistent-session resource policy.
+    /// 宿主选择的受管 Python/Node Worker 与持久会话资源策略。
+    #[serde(default)]
+    pub managed_runtime_config: LuaRuntimeManagedRuntimeConfig,
     /// Host-managed temporary directory used by luaexec spill files and similar transient artifacts.
     /// 宿主管理的临时目录，供 luaexec 请求文件等短生命周期产物使用。
     pub temp_dir: Option<PathBuf>,
@@ -383,8 +493,8 @@ impl LuaRuntimeHostOptions {
         self.skill_config_file_path = Some(layout.skill_config_file_path());
     }
 
-    /// Return a normalized copy where `runtime_root` owns every derived runtime directory.
-    /// 返回一份规范化副本，其中 `runtime_root` 统一拥有所有派生运行时目录。
+    /// Return a normalized copy where `runtime_root` owns legacy derived paths and explicit managed roots remain intact.
+    /// 返回一份规范化副本，其中 `runtime_root` 拥有旧有派生路径，显式受管根保持不变。
     pub fn normalized(mut self) -> Self {
         self.apply_runtime_root_layout();
         self
@@ -478,7 +588,13 @@ fn normalize_context_object(value: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{LuaRuntimeCapabilityOptions, LuaRuntimeHostOptions};
+    use super::{
+        DEFAULT_MANAGED_RUNTIME_PERSISTENT_SESSION_BUFFER_LIMIT_BYTES_PER_STREAM,
+        DEFAULT_MANAGED_RUNTIME_PERSISTENT_SESSION_LIMIT_PER_ENGINE,
+        DEFAULT_MANAGED_RUNTIME_WORKER_IDLE_TTL_SECS,
+        DEFAULT_MANAGED_RUNTIME_WORKER_POOL_MAX_SIZE_PER_ENVIRONMENT, LuaRuntimeCapabilityOptions,
+        LuaRuntimeHostOptions, LuaRuntimeManagedRuntimeConfig,
+    };
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -536,5 +652,126 @@ mod tests {
         assert_eq!(options.dependency_dir_name, "dependencies");
         assert_eq!(options.state_dir_name, "state");
         assert_eq!(options.database_dir_name, "databases");
+    }
+
+    /// Verify fixed-layout normalization preserves explicit managed distribution and environment roots.
+    /// 验证固定布局规范化会保留显式受管发行根与环境根。
+    #[test]
+    fn runtime_root_normalization_preserves_explicit_managed_roots() {
+        let runtime_root = PathBuf::from("D:/runtime-data");
+        let distribution_root = PathBuf::from("D:/application/dependencies/runtimes");
+        let environment_root = PathBuf::from("D:/user-data/managed-runtime-envs");
+        let mut options = LuaRuntimeHostOptions::with_runtime_root(runtime_root);
+        options.managed_runtime_distribution_root = Some(distribution_root.clone());
+        options.managed_runtime_environment_root = Some(environment_root.clone());
+
+        let normalized = options.normalized();
+
+        assert_eq!(
+            normalized.managed_runtime_distribution_root,
+            Some(distribution_root)
+        );
+        assert_eq!(
+            normalized.managed_runtime_environment_root,
+            Some(environment_root)
+        );
+    }
+
+    /// Verify omitted host policy preserves every documented B3-B7 default.
+    /// 验证省略宿主策略时会保留文档声明的全部 B3-B7 默认值。
+    #[test]
+    fn managed_runtime_config_defaults_match_documented_policy() {
+        // Config is the exact value embedded by default into every host-options object.
+        // Config 是默认嵌入每个宿主选项对象的精确值。
+        let config = LuaRuntimeManagedRuntimeConfig::default();
+
+        assert_eq!(
+            config.worker_pool_max_size_per_environment,
+            DEFAULT_MANAGED_RUNTIME_WORKER_POOL_MAX_SIZE_PER_ENVIRONMENT
+        );
+        assert_eq!(
+            config.worker_idle_ttl_secs,
+            DEFAULT_MANAGED_RUNTIME_WORKER_IDLE_TTL_SECS
+        );
+        assert_eq!(
+            config.persistent_session_limit_per_engine,
+            DEFAULT_MANAGED_RUNTIME_PERSISTENT_SESSION_LIMIT_PER_ENGINE
+        );
+        assert_eq!(
+            config.persistent_session_default_buffer_limit_bytes_per_stream,
+            DEFAULT_MANAGED_RUNTIME_PERSISTENT_SESSION_BUFFER_LIMIT_BYTES_PER_STREAM
+        );
+        assert_eq!(config.invoke_default_timeout_ms, None);
+        config.validate().expect("default policy must validate");
+    }
+
+    /// Verify every zero-valued capacity, retention, buffer, or configured timeout is rejected.
+    /// 验证每个零容量、零保留时长、零缓冲或已配置零超时都会被拒绝。
+    #[test]
+    fn managed_runtime_config_rejects_zero_boundaries() {
+        // Config isolates a zero Worker capacity while every other field retains its stable default.
+        // Config 隔离零 Worker 容量，其余字段保留稳定默认值。
+        let config = LuaRuntimeManagedRuntimeConfig {
+            worker_pool_max_size_per_environment: 0,
+            ..LuaRuntimeManagedRuntimeConfig::default()
+        };
+        assert!(
+            config
+                .validate()
+                .expect_err("zero worker capacity must fail")
+                .contains("worker_pool_max_size_per_environment")
+        );
+
+        // Config isolates a zero Worker idle lifetime.
+        // Config 隔离零 Worker 空闲时长。
+        let config = LuaRuntimeManagedRuntimeConfig {
+            worker_idle_ttl_secs: 0,
+            ..LuaRuntimeManagedRuntimeConfig::default()
+        };
+        assert!(
+            config
+                .validate()
+                .expect_err("zero worker TTL must fail")
+                .contains("worker_idle_ttl_secs")
+        );
+
+        // Config isolates a zero persistent-session capacity.
+        // Config 隔离零持久会话容量。
+        let config = LuaRuntimeManagedRuntimeConfig {
+            persistent_session_limit_per_engine: 0,
+            ..LuaRuntimeManagedRuntimeConfig::default()
+        };
+        assert!(
+            config
+                .validate()
+                .expect_err("zero session capacity must fail")
+                .contains("persistent_session_limit_per_engine")
+        );
+
+        // Config isolates a zero per-stream retained-output limit.
+        // Config 隔离零每流输出保留上限。
+        let config = LuaRuntimeManagedRuntimeConfig {
+            persistent_session_default_buffer_limit_bytes_per_stream: 0,
+            ..LuaRuntimeManagedRuntimeConfig::default()
+        };
+        assert!(
+            config
+                .validate()
+                .expect_err("zero session buffer must fail")
+                .contains("persistent_session_default_buffer_limit_bytes_per_stream")
+        );
+
+        // Config isolates a configured zero invoke timeout from the unlimited absent state.
+        // Config 将已配置零 invoke 超时与无限制缺失状态隔离。
+        let config = LuaRuntimeManagedRuntimeConfig {
+            invoke_default_timeout_ms: Some(0),
+            ..LuaRuntimeManagedRuntimeConfig::default()
+        };
+        assert!(
+            config
+                .validate()
+                .expect_err("zero default invoke timeout must fail")
+                .contains("invoke_default_timeout_ms")
+        );
     }
 }

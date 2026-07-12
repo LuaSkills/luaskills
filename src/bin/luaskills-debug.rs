@@ -1,9 +1,9 @@
 use luaskills::lua_skill::validate_luaskills_identifier;
 use luaskills::runtime::render_host_visible_path;
 use luaskills::{
-    LuaEngine, LuaEngineOptions, LuaInvocationContext, LuaRuntimeHostOptions, LuaVmPoolConfig,
-    RuntimeEntryDescriptor, RuntimeInvocationResult, RuntimeRequestContext, RuntimeSkillRoot,
-    SkillMeta,
+    LuaEngine, LuaEngineOptions, LuaInvocationContext, LuaRuntimeHostOptions,
+    LuaRuntimeManagedRuntimeConfig, LuaVmPoolConfig, RuntimeEntryDescriptor,
+    RuntimeInvocationResult, RuntimeRequestContext, RuntimeSkillRoot, SkillMeta,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -16,13 +16,24 @@ use std::path::{Path, PathBuf};
 const DEBUG_USAGE: &str = r#"luaskills-debug
 
 Usage:
-  luaskills-debug sync --runtime-root <dir> --skill-path <dir> [--output pretty|json]
-  luaskills-debug inspect --runtime-root <dir> --skill-path <dir> [--output pretty|json]
-  luaskills-debug inspect --runtime-root <dir> --skill-id <id> [--output pretty|json]
-  luaskills-debug list-tools --runtime-root <dir> --skill-path <dir> [--output pretty|json|content]
-  luaskills-debug list-tools --runtime-root <dir> --skill-id <id> [--output pretty|json|content]
-  luaskills-debug call --runtime-root <dir> --skill-path <dir> --tool <name> [--args-json <json> | --args-file <path>] [--enable-host-result] [--output pretty|json|content]
-  luaskills-debug call --runtime-root <dir> --skill-id <id> --tool <name> [--args-json <json> | --args-file <path>] [--enable-host-result] [--output pretty|json|content]
+  luaskills-debug sync --runtime-root <dir> --skill-path <dir> [managed runtime root options] [--output pretty|json]
+  luaskills-debug inspect --runtime-root <dir> --skill-path <dir> [managed runtime root options] [--output pretty|json]
+  luaskills-debug inspect --runtime-root <dir> --skill-id <id> [managed runtime root options] [--output pretty|json]
+  luaskills-debug list-tools --runtime-root <dir> --skill-path <dir> [managed runtime root options] [--output pretty|json|content]
+  luaskills-debug list-tools --runtime-root <dir> --skill-id <id> [managed runtime root options] [--output pretty|json|content]
+  luaskills-debug call --runtime-root <dir> --skill-path <dir> --tool <name> [managed runtime root options] [--args-json <json> | --args-file <path>] [--enable-host-result] [--output pretty|json|content]
+  luaskills-debug call --runtime-root <dir> --skill-id <id> --tool <name> [managed runtime root options] [--args-json <json> | --args-file <path>] [--enable-host-result] [--output pretty|json|content]
+
+Managed runtime root options:
+  --managed-runtime-distribution-root <dir>  Existing absolute Python/Node distribution root.
+  --managed-runtime-environment-root <dir>   Absolute writable managed environment root.
+
+Managed runtime resource options:
+  --managed-runtime-worker-pool-max-size <count>       Maximum Workers per environment pool.
+  --managed-runtime-worker-idle-ttl-secs <seconds>     Idle Worker retirement time.
+  --managed-runtime-session-limit <count>              Persistent sessions per engine.
+  --managed-runtime-session-buffer-limit-bytes <bytes> Default retained bytes per output stream.
+  --managed-runtime-invoke-timeout-ms <milliseconds>   Default invoke timeout; omitted is unlimited.
 
 Examples:
   luaskills-debug sync --runtime-root D:\runtime --skill-path D:\skills\vulcan-file
@@ -102,6 +113,15 @@ struct DebugCliCommand {
     /// Effective runtime root used to host the synchronized debug skill.
     /// 用于承载同步后调试 skill 的运行时根目录。
     runtime_root: PathBuf,
+    /// Optional host-selected managed Python and Node distribution root.
+    /// 可选的宿主指定受管 Python 与 Node 发行根。
+    managed_runtime_distribution_root: Option<PathBuf>,
+    /// Optional host-selected writable managed environment root.
+    /// 可选的宿主指定可写受管环境根。
+    managed_runtime_environment_root: Option<PathBuf>,
+    /// Host-selected managed Worker and persistent-session resource policy.
+    /// 宿主选择的受管 Worker 与持久会话资源策略。
+    managed_runtime_config: LuaRuntimeManagedRuntimeConfig,
     /// Source skill package directory supplied by the developer.
     /// 开发者传入的源 skill 包目录。
     skill_path: Option<PathBuf>,
@@ -324,6 +344,11 @@ fn parse_debug_cli(args: &[String]) -> Result<DebugCliCommand, String> {
     )?;
 
     let mut runtime_root: Option<PathBuf> = None;
+    let mut managed_runtime_distribution_root: Option<PathBuf> = None;
+    let mut managed_runtime_environment_root: Option<PathBuf> = None;
+    // ManagedRuntimeConfig starts from the public engine defaults and changes only for explicit CLI flags.
+    // ManagedRuntimeConfig 从公开引擎默认值开始，仅由显式命令行参数修改。
+    let mut managed_runtime_config = LuaRuntimeManagedRuntimeConfig::default();
     let mut skill_path: Option<PathBuf> = None;
     let mut skill_id: Option<String> = None;
     let mut tool_name: Option<String> = None;
@@ -338,6 +363,34 @@ fn parse_debug_cli(args: &[String]) -> Result<DebugCliCommand, String> {
         match flag {
             "--runtime-root" => {
                 runtime_root = Some(PathBuf::from(read_cli_value(args, &mut index, flag)?));
+            }
+            "--managed-runtime-distribution-root" => {
+                managed_runtime_distribution_root =
+                    Some(PathBuf::from(read_cli_value(args, &mut index, flag)?));
+            }
+            "--managed-runtime-environment-root" => {
+                managed_runtime_environment_root =
+                    Some(PathBuf::from(read_cli_value(args, &mut index, flag)?));
+            }
+            "--managed-runtime-worker-pool-max-size" => {
+                managed_runtime_config.worker_pool_max_size_per_environment =
+                    read_positive_usize_cli_value(args, &mut index, flag)?;
+            }
+            "--managed-runtime-worker-idle-ttl-secs" => {
+                managed_runtime_config.worker_idle_ttl_secs =
+                    read_positive_u64_cli_value(args, &mut index, flag)?;
+            }
+            "--managed-runtime-session-limit" => {
+                managed_runtime_config.persistent_session_limit_per_engine =
+                    read_positive_usize_cli_value(args, &mut index, flag)?;
+            }
+            "--managed-runtime-session-buffer-limit-bytes" => {
+                managed_runtime_config.persistent_session_default_buffer_limit_bytes_per_stream =
+                    read_positive_usize_cli_value(args, &mut index, flag)?;
+            }
+            "--managed-runtime-invoke-timeout-ms" => {
+                managed_runtime_config.invoke_default_timeout_ms =
+                    Some(read_positive_u64_cli_value(args, &mut index, flag)?);
             }
             "--skill-path" => {
                 skill_path = Some(PathBuf::from(read_cli_value(args, &mut index, flag)?));
@@ -387,10 +440,14 @@ fn parse_debug_cli(args: &[String]) -> Result<DebugCliCommand, String> {
     if kind == DebugCommandKind::Call && tool_name.is_none() {
         return Err("call requires --tool".to_string());
     }
+    managed_runtime_config.validate()?;
 
     Ok(DebugCliCommand {
         kind,
         runtime_root,
+        managed_runtime_distribution_root,
+        managed_runtime_environment_root,
+        managed_runtime_config,
         skill_path,
         skill_id,
         tool_name,
@@ -412,6 +469,60 @@ fn read_cli_value<'a>(
     args.get(*index)
         .map(|value| value.as_str())
         .ok_or_else(|| format!("{} requires a value", flag))
+}
+
+/// Read one positive `usize` CLI value and advance the shared parsing cursor.
+/// 读取一个正数 `usize` 命令行值，并推进共享解析游标。
+///
+/// `args`, `index`, and `flag` identify the exact option/value pair being parsed.
+/// `args`、`index` 与 `flag` 标识正在解析的精确选项和值。
+///
+/// Returns the positive value or a stable missing, integer, or zero-value error.
+/// 返回正数值，或稳定的缺失、整数格式及零值错误。
+fn read_positive_usize_cli_value(
+    args: &[String],
+    index: &mut usize,
+    flag: &str,
+) -> Result<usize, String> {
+    // RawValue is the exact text following the selected option.
+    // RawValue 是所选选项之后的精确文本。
+    let raw_value = read_cli_value(args, index, flag)?;
+    // Value is parsed without accepting signs, fractions, or platform overflow.
+    // Value 在不接受符号、小数或平台溢出的前提下完成解析。
+    let value = raw_value
+        .parse::<usize>()
+        .map_err(|error| format!("{flag} requires one positive integer: {error}"))?;
+    if value == 0 {
+        return Err(format!("{flag} must be greater than zero"));
+    }
+    Ok(value)
+}
+
+/// Read one positive `u64` CLI value and advance the shared parsing cursor.
+/// 读取一个正数 `u64` 命令行值，并推进共享解析游标。
+///
+/// `args`, `index`, and `flag` identify the exact option/value pair being parsed.
+/// `args`、`index` 与 `flag` 标识正在解析的精确选项和值。
+///
+/// Returns the positive value or a stable missing, integer, or zero-value error.
+/// 返回正数值，或稳定的缺失、整数格式及零值错误。
+fn read_positive_u64_cli_value(
+    args: &[String],
+    index: &mut usize,
+    flag: &str,
+) -> Result<u64, String> {
+    // RawValue is the exact text following the selected option.
+    // RawValue 是所选选项之后的精确文本。
+    let raw_value = read_cli_value(args, index, flag)?;
+    // Value is parsed without accepting signs, fractions, or overflow.
+    // Value 在不接受符号、小数或溢出的前提下完成解析。
+    let value = raw_value
+        .parse::<u64>()
+        .map_err(|error| format!("{flag} requires one positive integer: {error}"))?;
+    if value == 0 {
+        return Err(format!("{flag} must be greater than zero"));
+    }
+    Ok(value)
 }
 
 /// Synchronize the source skill into the debug runtime root and return its stable location.
@@ -492,7 +603,27 @@ fn prepare_debug_runtime(command: &DebugCliCommand) -> Result<PreparedDebugRunti
     let manifest = load_bound_skill_manifest(&synced_skill_path)?;
 
     let ignored_skill_ids = collect_ignored_skill_ids(&runtime_root.join("skills"), &skill_id)?;
-    let host_options = build_debug_host_options(&runtime_root, ignored_skill_ids);
+    // DistributionRoot is resolved by the host CLI before engine construction.
+    // DistributionRoot 在引擎构造前由宿主 CLI 解析。
+    let managed_runtime_distribution_root = command
+        .managed_runtime_distribution_root
+        .as_deref()
+        .map(absolutize_path)
+        .transpose()?;
+    // EnvironmentRoot is resolved by the host CLI before engine construction.
+    // EnvironmentRoot 在引擎构造前由宿主 CLI 解析。
+    let managed_runtime_environment_root = command
+        .managed_runtime_environment_root
+        .as_deref()
+        .map(absolutize_path)
+        .transpose()?;
+    let host_options = build_debug_host_options(
+        &runtime_root,
+        managed_runtime_distribution_root,
+        managed_runtime_environment_root,
+        command.managed_runtime_config,
+        ignored_skill_ids,
+    );
     let pool_config = LuaVmPoolConfig {
         min_size: 1,
         max_size: 2,
@@ -900,11 +1031,25 @@ fn debug_runtime_skills_path_is_directory(skills_dir: &Path) -> Result<bool, Str
 
 /// Build host options that map one debug runtime root into the normal LuaSkills runtime layout.
 /// 构建宿主选项，将单个调试 runtime_root 映射为正常 LuaSkills 运行时布局。
+///
+/// The root arguments are already absolute host selections, `managed_runtime_config` is validated
+/// by CLI parsing, and `ignored_skill_ids` prevents the synchronized source package from double loading.
+/// 根参数均为已解析绝对宿主选择，`managed_runtime_config` 已由 CLI 解析校验；
+/// `ignored_skill_ids` 用于防止已同步源包被重复加载。
+///
+/// Returns one complete host-options value consumed by the production engine constructor.
+/// 返回由生产引擎构造器消费的完整宿主选项值。
 fn build_debug_host_options(
     runtime_root: &Path,
+    managed_runtime_distribution_root: Option<PathBuf>,
+    managed_runtime_environment_root: Option<PathBuf>,
+    managed_runtime_config: LuaRuntimeManagedRuntimeConfig,
     ignored_skill_ids: Vec<String>,
 ) -> LuaRuntimeHostOptions {
     let mut host_options = LuaRuntimeHostOptions::with_runtime_root(runtime_root.to_path_buf());
+    host_options.managed_runtime_distribution_root = managed_runtime_distribution_root;
+    host_options.managed_runtime_environment_root = managed_runtime_environment_root;
+    host_options.managed_runtime_config = managed_runtime_config;
     host_options.allow_network_download = true;
     host_options.ignored_skill_ids = ignored_skill_ids;
     host_options
@@ -1164,7 +1309,7 @@ mod tests {
         paths_refer_to_same_directory, prepare_debug_runtime, render_debug_path,
         resolve_debug_tool_name, sync_debug_skill,
     };
-    use luaskills::{LuaInvocationContext, RuntimeEntryDescriptor};
+    use luaskills::{LuaInvocationContext, LuaRuntimeManagedRuntimeConfig, RuntimeEntryDescriptor};
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1196,6 +1341,20 @@ mod tests {
             "call".to_string(),
             "--runtime-root".to_string(),
             "D:/runtime".to_string(),
+            "--managed-runtime-distribution-root".to_string(),
+            "D:/application/dependencies/runtimes".to_string(),
+            "--managed-runtime-environment-root".to_string(),
+            "D:/data/managed-runtime-envs".to_string(),
+            "--managed-runtime-worker-pool-max-size".to_string(),
+            "8".to_string(),
+            "--managed-runtime-worker-idle-ttl-secs".to_string(),
+            "90".to_string(),
+            "--managed-runtime-session-limit".to_string(),
+            "128".to_string(),
+            "--managed-runtime-session-buffer-limit-bytes".to_string(),
+            "2097152".to_string(),
+            "--managed-runtime-invoke-timeout-ms".to_string(),
+            "15000".to_string(),
             "--skill-path".to_string(),
             "D:/skills/demo-skill".to_string(),
             "--tool".to_string(),
@@ -1210,6 +1369,37 @@ mod tests {
         assert_eq!(command.kind, DebugCommandKind::Call);
         assert_eq!(command.output_mode, DebugOutputMode::Json);
         assert_eq!(command.tool_name.as_deref(), Some("ping"));
+        assert_eq!(
+            command.managed_runtime_distribution_root.as_deref(),
+            Some(Path::new("D:/application/dependencies/runtimes"))
+        );
+        assert_eq!(
+            command.managed_runtime_environment_root.as_deref(),
+            Some(Path::new("D:/data/managed-runtime-envs"))
+        );
+        assert_eq!(
+            command
+                .managed_runtime_config
+                .worker_pool_max_size_per_environment,
+            8
+        );
+        assert_eq!(command.managed_runtime_config.worker_idle_ttl_secs, 90);
+        assert_eq!(
+            command
+                .managed_runtime_config
+                .persistent_session_limit_per_engine,
+            128
+        );
+        assert_eq!(
+            command
+                .managed_runtime_config
+                .persistent_session_default_buffer_limit_bytes_per_stream,
+            2_097_152
+        );
+        assert_eq!(
+            command.managed_runtime_config.invoke_default_timeout_ms,
+            Some(15_000)
+        );
         assert_eq!(
             command.skill_path.as_deref(),
             Some(Path::new("D:/skills/demo-skill"))
@@ -1491,6 +1681,9 @@ mod tests {
         let command = DebugCliCommand {
             kind: DebugCommandKind::Call,
             runtime_root: runtime_root.clone(),
+            managed_runtime_distribution_root: None,
+            managed_runtime_environment_root: None,
+            managed_runtime_config: LuaRuntimeManagedRuntimeConfig::default(),
             skill_path: None,
             skill_id: Some("demo-skill".to_string()),
             tool_name: Some("ping".to_string()),
@@ -1544,6 +1737,9 @@ mod tests {
         let command = DebugCliCommand {
             kind: DebugCommandKind::Sync,
             runtime_root: runtime_root.clone(),
+            managed_runtime_distribution_root: None,
+            managed_runtime_environment_root: None,
+            managed_runtime_config: LuaRuntimeManagedRuntimeConfig::default(),
             skill_path: Some(skill_path),
             skill_id: None,
             tool_name: None,
@@ -1578,12 +1774,22 @@ mod tests {
     #[test]
     fn prepare_debug_runtime_loads_and_calls_skill_from_runtime_root() {
         let runtime_root = make_temp_runtime_root();
+        // DistributionRoot is a host-selected sibling outside the LuaSkills data root.
+        // DistributionRoot 是位于 LuaSkills 数据根之外的宿主指定同级目录。
+        let distribution_root = runtime_root.with_extension("distributions");
+        // EnvironmentRoot is a separate writable sibling created by engine initialization.
+        // EnvironmentRoot 是由引擎初始化创建的独立可写同级目录。
+        let environment_root = runtime_root.with_extension("environments");
+        fs::create_dir_all(&distribution_root).expect("create explicit distribution root");
         let skill_path = PathBuf::from(
             "examples/ffi/standard_runtime/runtime_root/skills/demo-standard-ffi-skill",
         );
         let command = DebugCliCommand {
             kind: DebugCommandKind::Call,
             runtime_root: runtime_root.clone(),
+            managed_runtime_distribution_root: Some(distribution_root.clone()),
+            managed_runtime_environment_root: Some(environment_root.clone()),
+            managed_runtime_config: LuaRuntimeManagedRuntimeConfig::default(),
             skill_path: Some(skill_path),
             skill_id: None,
             tool_name: Some("ping".to_string()),
@@ -1606,8 +1812,11 @@ mod tests {
         assert_eq!(resolved_name, "demo-standard-ffi-skill-ping");
         assert_eq!(result.content, "standard-ffi-demo:from-debug-bin");
         assert!(prepared.synced_skill_path.exists());
+        assert!(environment_root.is_dir());
 
         remove_temp_directory(&runtime_root);
+        remove_temp_directory(&distribution_root);
+        remove_temp_directory(&environment_root);
     }
 
     /// Verify prepared debug runtime rejects directory-backed synchronized manifests before reading YAML.
@@ -1629,6 +1838,9 @@ mod tests {
         let command = DebugCliCommand {
             kind: DebugCommandKind::Call,
             runtime_root: runtime_root.clone(),
+            managed_runtime_distribution_root: None,
+            managed_runtime_environment_root: None,
+            managed_runtime_config: LuaRuntimeManagedRuntimeConfig::default(),
             skill_path: None,
             skill_id: Some("demo-skill".to_string()),
             tool_name: Some("ping".to_string()),
@@ -1669,6 +1881,9 @@ mod tests {
         let sync_command = DebugCliCommand {
             kind: DebugCommandKind::Sync,
             runtime_root: runtime_root.clone(),
+            managed_runtime_distribution_root: None,
+            managed_runtime_environment_root: None,
+            managed_runtime_config: LuaRuntimeManagedRuntimeConfig::default(),
             skill_path: Some(skill_path),
             skill_id: None,
             tool_name: None,
@@ -1682,6 +1897,9 @@ mod tests {
         let run_command = DebugCliCommand {
             kind: DebugCommandKind::Call,
             runtime_root: runtime_root.clone(),
+            managed_runtime_distribution_root: None,
+            managed_runtime_environment_root: None,
+            managed_runtime_config: LuaRuntimeManagedRuntimeConfig::default(),
             skill_path: None,
             skill_id: Some(sync_output.skill_id.clone()),
             tool_name: Some("ping".to_string()),

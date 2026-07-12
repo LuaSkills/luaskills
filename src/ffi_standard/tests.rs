@@ -1025,6 +1025,120 @@ fn standard_ffi_runtime_root_only_host_options_round_trip() {
     let _ = std::fs::remove_dir_all(&temp_root);
 }
 
+/// Verify standard C ABI v3 accepts independent managed roots and one resource policy.
+/// 验证标准 C ABI v3 会接受独立受管根与一份资源策略。
+#[test]
+fn standard_ffi_v3_managed_runtime_roots_and_config_round_trip() {
+    // TempRoot owns three distinct host boundaries used by the v3 engine constructor.
+    // TempRoot 拥有 v3 引擎构造器使用的三个独立宿主边界。
+    let temp_root = std::env::temp_dir().join(format!(
+        "luaskills_standard_ffi_v3_managed_roots_test_{}",
+        std::process::id()
+    ));
+    if temp_root.exists() {
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+    let runtime_root = temp_root.join("runtime data");
+    let distribution_root = temp_root.join("application assets").join("runtimes");
+    let environment_root = temp_root.join("user data").join("managed envs");
+    std::fs::create_dir_all(&runtime_root).expect("create v3 runtime root");
+    std::fs::create_dir_all(&distribution_root).expect("create v3 distribution root");
+    let runtime_root_text = ffi_test_path_cstring(&runtime_root, "runtime_root");
+    let distribution_root_text =
+        ffi_test_path_cstring(&distribution_root, "managed_runtime_distribution_root");
+    let environment_root_text =
+        ffi_test_path_cstring(&environment_root, "managed_runtime_environment_root");
+    // ManagedRuntimeConfig carries nondefault B3-B7 values through the fixed C layout.
+    // ManagedRuntimeConfig 通过固定 C 布局携带非默认 B3-B7 值。
+    let managed_runtime_config = FfiLuaRuntimeManagedRuntimeConfig {
+        worker_pool_max_size_per_environment: 5,
+        worker_idle_ttl_secs: 45,
+        persistent_session_limit_per_engine: 32,
+        persistent_session_default_buffer_limit_bytes_per_stream: 524_288,
+        has_invoke_default_timeout_ms: 1,
+        invoke_default_timeout_ms: 15_000,
+    };
+    let host_options = FfiLuaRuntimeHostOptionsV3 {
+        base: FfiLuaRuntimeHostOptionsV2 {
+            base: empty_ffi_runtime_host_options(),
+            runtime_root: runtime_root_text.as_ptr(),
+        },
+        managed_runtime_distribution_root: distribution_root_text.as_ptr(),
+        managed_runtime_environment_root: environment_root_text.as_ptr(),
+        managed_runtime_config: &managed_runtime_config,
+    };
+    let engine_options = FfiLuaEngineOptionsV3 {
+        pool: FfiLuaVmPoolConfig {
+            min_size: 1,
+            max_size: 1,
+            idle_ttl_secs: 30,
+        },
+        host: host_options,
+    };
+    // ParsedOptions proves the v3 pointer is copied into the exact Rust host policy before creation.
+    // ParsedOptions 证明 v3 指针会在创建前复制到精确 Rust 宿主策略中。
+    let parsed_options = parse_engine_options_v3(&engine_options)
+        .expect("parse v3 managed runtime roots and config");
+    assert_eq!(
+        parsed_options.host_options.managed_runtime_config,
+        LuaRuntimeManagedRuntimeConfig {
+            worker_pool_max_size_per_environment: 5,
+            worker_idle_ttl_secs: 45,
+            persistent_session_limit_per_engine: 32,
+            persistent_session_default_buffer_limit_bytes_per_stream: 524_288,
+            invoke_default_timeout_ms: Some(15_000),
+        }
+    );
+    let mut engine_id = 0_u64;
+    let mut error_out = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+
+    let engine_status =
+        unsafe { luaskills_ffi_engine_new_v3(&engine_options, &mut engine_id, &mut error_out) };
+    assert_eq!(
+        engine_status,
+        FFI_STATUS_OK,
+        "engine_new_v3 failed: {}",
+        read_owned_buffer_text(&error_out)
+    );
+    assert!(error_out.ptr.is_null());
+    assert!(engine_id > 0);
+    assert!(environment_root.is_dir());
+
+    let mut free_error = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let free_status = unsafe { luaskills_ffi_engine_free(engine_id, &mut free_error) };
+    assert_eq!(free_status, FFI_STATUS_OK);
+    assert!(free_error.ptr.is_null());
+    let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+/// Verify the v3 timeout presence byte is strict instead of accepting ambiguous nonzero values.
+/// 验证 v3 超时存在字节采用严格语义，不接受含糊的非零值。
+#[test]
+fn standard_ffi_v3_managed_runtime_config_rejects_invalid_presence_flag() {
+    // Config is otherwise valid so the presence byte is the unique rejection cause.
+    // Config 其余字段均合法，使存在字节成为唯一拒绝原因。
+    let config = FfiLuaRuntimeManagedRuntimeConfig {
+        worker_pool_max_size_per_environment: 4,
+        worker_idle_ttl_secs: 60,
+        persistent_session_limit_per_engine: 256,
+        persistent_session_default_buffer_limit_bytes_per_stream: 1_048_576,
+        has_invoke_default_timeout_ms: 2,
+        invoke_default_timeout_ms: 10_000,
+    };
+    // Error is produced before any engine or filesystem resource exists.
+    // Error 会在任何引擎或文件系统资源存在前生成。
+    let error =
+        parse_managed_runtime_config(&config).expect_err("invalid timeout presence flag must fail");
+
+    assert!(error.contains("has_invoke_default_timeout_ms"));
+}
+
 /// Verify standard call_skill accepts borrowed JSON buffers for args and invocation context.
 /// 验证标准 call_skill 会接受作为 args 与调用上下文输入的借用 JSON 缓冲。
 #[test]

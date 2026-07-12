@@ -1,4 +1,4 @@
-param(
+﻿param(
     # Asset group to synchronize into the runtime root.
     # 要同步到运行根目录的资产分组。
     [ValidateSet("all", "luaskills", "lua", "vldb")]
@@ -12,7 +12,7 @@ param(
     [string]$RuntimeRoot = "output",
     # Exact LuaSkills release tag used for the FFI SDK asset.
     # FFI SDK 资产使用的精确 LuaSkills 发布标签。
-    [string]$LuaSkillsVersion = "v0.5.0",
+    [string]$LuaSkillsVersion = "v0.5.1",
     # Compatible Lua runtime packages release series.
     # 兼容的 Lua runtime packages 发布协议线。
     [string]$LuaRuntimeSeries = "0.1",

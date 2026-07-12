@@ -9,6 +9,9 @@ Lua 仍然是调度层。Python 与 Node.js 作为受管子运行时运行，拥
 This example intentionally covers the ordinary-Skill `status` and pooled `invoke` path. It does not open a persistent `session.open(...)`, because persistent managed sessions are available only inside a strict System Plugin lease. For that end-to-end workflow, see the [System Plugin managed runtime guide](../../docs/system-plugin-managed-runtime.md).
 本示例只覆盖普通 Skill 的 `status` 与池化 `invoke` 路径。它不会打开持久 `session.open(...)`，因为持久受管会话只允许在严格 System Plugin 租约内使用。完整流程见 [System Plugin 受管运行时使用指南](../../docs/zh-CN/system-plugin-managed-runtime.md)。
 
+Hosts may set Worker capacity/idle retirement and the omitted `invoke.timeout_ms` through engine `managed_runtime_config`; the stable defaults are `4`, `60` seconds, and unlimited. An explicit positive `timeout_ms` in this package still has per-call priority.
+宿主可以通过引擎 `managed_runtime_config` 设置 Worker 容量、空闲回收与省略时的 `invoke.timeout_ms`；稳定默认值分别为 `4`、`60` 秒与无限制。本包显式传入的正数 `timeout_ms` 仍具有单次调用优先级。
+
 ## What This Example Proves
 
 This package validates the full path that a real skill author needs:
@@ -49,7 +52,7 @@ managed-child-runtime-debug/
 
 ```yaml
 python_runtime:
-  version: "3.14.4"
+version: "3.14.6"
   package_manager: uv
   package_manager_version: "0.11.28"
   lockfile: python/requirements.lock
@@ -70,25 +73,25 @@ Windows:
 Windows：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deps/fetch_managed_runtimes.ps1 -RuntimeRoot target/managed-runtime-fetch-check-uv01117-all -Target all -Force
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deps/fetch_managed_runtimes.ps1 -RuntimeRoot target/managed-runtime-fetch-check-uv01128-all -Target all -Force
 ```
 
 Linux, macOS, or WSL:
 Linux、macOS 或 WSL：
 
 ```bash
-RUNTIME_ROOT=target/managed-runtime-fetch-check-uv01117-all scripts/deps/fetch_managed_runtimes.sh all
+RUNTIME_ROOT=target/managed-runtime-fetch-check-uv01128-all scripts/deps/fetch_managed_runtimes.sh all
 ```
 
 The prepared layout can be checked directly:
 可直接检查已准备好的目录布局：
 
 ```powershell
-python scripts/debug-tools/managed_runtime_layout_check.py target/managed-runtime-fetch-check-uv01117-all
+python scripts/debug-tools/managed_runtime_layout_check.py target/managed-runtime-fetch-check-uv01128-all
 ```
 
 ```bash
-python3 scripts/debug-tools/managed_runtime_layout_check.py target/managed-runtime-fetch-check-uv01117-all
+python3 scripts/debug-tools/managed_runtime_layout_check.py target/managed-runtime-fetch-check-uv01128-all
 ```
 
 ## Debug Call
@@ -97,7 +100,7 @@ Call the example through the normal `luaskills-debug` path:
 通过正式 `luaskills-debug` 路径调用示例：
 
 ```powershell
-cargo run --bin luaskills-debug -- call --runtime-root target/managed-runtime-fetch-check-uv01117-all --skill-path examples/managed_runtime/managed-child-runtime-debug --tool smoke --args-json '{"text":"debug-call"}' --output content
+cargo run --bin luaskills-debug -- call --runtime-root target/managed-runtime-fetch-check-uv01128-all --skill-path examples/managed_runtime/managed-child-runtime-debug --tool smoke --args-json '{"text":"debug-call"}' --output content
 ```
 
 The `smoke` entry returns JSON text containing:
@@ -134,15 +137,18 @@ Linux、macOS 或 WSL：
 bash scripts/debug-tools/managed_runtime_smoke.sh
 ```
 
+The default smoke run creates separate sibling distribution and environment roots, then forwards them through `--managed-runtime-distribution-root` and `--managed-runtime-environment-root`. Use `-DistributionRoot` / `-EnvironmentRoot` on PowerShell or `--distribution-root` / `--environment-root` on Bash to select explicit locations.
+默认冒烟运行会创建独立的同级发行根与环境根，并通过 `--managed-runtime-distribution-root` 和 `--managed-runtime-environment-root` 转发给调试宿主。PowerShell 可用 `-DistributionRoot` / `-EnvironmentRoot`，Bash 可用 `--distribution-root` / `--environment-root` 选择显式位置。
+
 Use `-SkipFetch` or `--skip-fetch` only when intentionally reusing an existing runtime root during local iteration:
 仅在本地迭代时刻意复用已有运行时根目录时使用 `-SkipFetch` 或 `--skip-fetch`：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/debug-tools/managed_runtime_smoke.ps1 -RuntimeRoot target/managed-runtime-fetch-check-uv01117-all -SkipFetch -KeepRuntimeRoot
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/debug-tools/managed_runtime_smoke.ps1 -RuntimeRoot target/managed-runtime-fetch-check-uv01128-all -DistributionRoot target/managed-runtime-fetch-check-uv01128-all/dependencies/runtimes -EnvironmentRoot target/managed-runtime-fetch-check-uv01128-all/dependencies/envs -SkipFetch -KeepRuntimeRoot
 ```
 
 ```bash
-bash scripts/debug-tools/managed_runtime_smoke.sh --runtime-root target/managed-runtime-fetch-check-uv01117-all --skip-fetch --keep-runtime-root
+bash scripts/debug-tools/managed_runtime_smoke.sh --runtime-root target/managed-runtime-fetch-check-uv01128-all --distribution-root target/managed-runtime-fetch-check-uv01128-all/dependencies/runtimes --environment-root target/managed-runtime-fetch-check-uv01128-all/dependencies/envs --skip-fetch --keep-runtime-root
 ```
 
 The smoke scripts are repository validation tools. A packaged skill user normally only needs to fetch runtimes once, then call the Lua skill entry normally.

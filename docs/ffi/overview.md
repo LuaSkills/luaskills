@@ -22,6 +22,8 @@ Current stable host-facing features include:
 - Authority-bound `system_runtime_lease` endpoints for package-isolated System Plugins under `system_lua_lib`.
 - Public leases accept host-owned `cwd`, `workspace_root`, `lua_roots`, `c_roots`, and `mounts`; strict System leases accept `cwd`, `workspace_root`, `mounts`, and required `system_package { id, root, dependencies_file }`, but reject public `lua_roots` / `c_roots` fields.
 - Cross-platform persistent managed Python/Node `session.open(...)` userdata on Windows x86_64, Linux x86_64/aarch64, and macOS x86_64/aarch64 that survives across eval calls on the same lease VM and is deterministically cleaned up on eval rollback, close, replacement, expiration, VM drop, or engine drop; Windows ARM is rejected before resource allocation with `windows_arm_is_not_supported`.
+- Independent host-selected read-only distribution and writable environment roots, standard C ABI V3 engine creation, and a read-only JSON FFI runtime resolver. V1/V2 layouts remain unchanged.
+- Engine-initialized `managed_runtime_config` for Worker pool capacity/idle retirement, persistent-session capacity/default output buffering, and the omitted `invoke` timeout. Per-call `timeout_ms` and per-session `buffer_limit_bytes` retain explicit priority.
 - Engine-level managed-session event poll/wait APIs plus a standard-ABI edge-triggered wake callback; background threads publish events but never call Lua.
 - Optional `host_result` bridging so one skill may return `content, overflow_mode, template_hint, host_result`.
 - The first canonical structured host result kind: `change_set`, now carrying explicit file lifecycle records plus hunk-level `before + delete[] + insert[] + after` blocks for IDE-grade edit results.
@@ -50,6 +52,8 @@ For a new FFI host, stabilize the smallest runtime loop first:
 After that, add lifecycle operations, query helpers, installation/update flows, provider callbacks, host-tool callbacks, or `space_controller`.
 
 ## System Plugin Managed-Session Quick Path
+
+Before creating the engine, fix the managed-runtime resource policy in Rust/JSON host options or the optional standard C ABI V3 `FfiLuaRuntimeManagedRuntimeConfig` pointer. Stable defaults are `4` Workers per exact environment/package-owner pool, `60` idle seconds, `256` persistent sessions per engine, `1 MiB` per session output stream, and no default invoke timeout. All configured numbers must be positive; a null C pointer preserves the complete default policy.
 
 System lease creation is a strict package-bound operation:
 
@@ -199,6 +203,8 @@ SDK mapping:
 
 - [System Plugin managed runtime guide](../system-plugin-managed-runtime.md)
 - [System Plugin 受管运行时使用指南](../zh-CN/system-plugin-managed-runtime.md)
+- [Host-selected managed runtime roots](../managed-runtime-host-roots.md)
+- [宿主指定受管运行时根目录](../zh-CN/managed-runtime-host-roots.md)
 - [FFI beta release notes](../zh-CN/ffi/beta-release-notes.md)
 - [FFI host checklist](../zh-CN/ffi/host-checklist.md)
 - [FFI integration guide](../zh-CN/ffi/integration-guide.md)

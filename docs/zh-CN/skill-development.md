@@ -882,7 +882,7 @@ RUNTIME_ROOT=<runtime_root> scripts/deps/fetch_managed_runtimes.sh all
 
 ```yaml
 python_runtime:
-  version: "3.14.4"
+version: "3.14.6"
   package_manager: uv
   package_manager_version: "0.11.28"
   lockfile: python/requirements.lock
@@ -977,7 +977,7 @@ export async function main(args, ctx) {
 | `file` | `string` | 是 | 当前 skill 目录内的安全相对路径 |
 | `handler` | `string` | 否 | Python 默认 `main`；Node 默认 `default`，并 fallback 到 `main` |
 | `args` | JSON 兼容 Lua 值 | 否 | 传给子 handler |
-| `timeout_ms` | 正整数 | 否 | 单次调用超时；超时 worker 会被丢弃 |
+| `timeout_ms` | 正整数 | 否 | 单次调用超时；优先于引擎 `managed_runtime_config.invoke_default_timeout_ms`；两处都省略时无限制；超时 Worker 会被丢弃 |
 
 调用返回：
 
@@ -1022,7 +1022,7 @@ export async function main(args, ctx) {
 | `stdout_encoding` | `string` | 否 | stdout 解码；默认使用宿主运行时编码 |
 | `stderr_encoding` | `string` | 否 | stderr 解码；默认使用宿主运行时编码 |
 | `stdin_encoding` | `string` | 否 | stdin 编码；默认使用宿主运行时编码 |
-| `buffer_limit_bytes` | 正整数 | 否 | 每个输出流的保留字节上限；默认 1 MiB |
+| `buffer_limit_bytes` | 正整数 | 否 | 每个输出流的保留字节上限；优先于引擎 `managed_runtime_config.persistent_session_default_buffer_limit_bytes_per_stream`，后者稳定默认值为 1 MiB |
 
 未知字段会被拒绝。Python 与 Node 都从每会话唯一的不可变包快照执行；快照通过固定且不跟随链接的文件系统对象复制。Python 使用包声明对应的受管虚拟环境，并移除继承的 `PYTHONHOME`、`PYTHONPATH` 与用户 site-packages；Node 从精确受管 `node_modules` 解析裸依赖。复制的包目录树会拒绝符号链接与不支持的对象，进程创建期间还会固定已授权的 `cwd` 对象。子代码通过 `LUASKILLS_MANAGED_CONTEXT_JSON` 获取受控的包与租约元数据，而不是任意复制宿主请求状态。
 

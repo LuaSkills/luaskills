@@ -2020,10 +2020,13 @@ impl LuaEngine {
         ));
         // Canonical System Plugin context validated against the host trust root.
         // 针对宿主信任根校验后的规范 System Plugin 上下文。
-        let managed_package = ManagedRuntimePackageContext::for_system_plugin(
+        // ManagedRuntimeRoots shares the exact engine-selected distribution and environment roots.
+        // ManagedRuntimeRoots 共享引擎选定的精确发行根与环境根。
+        let managed_runtime_roots = self.managed_runtime_roots_for(runtime_root)?;
+        let managed_package = ManagedRuntimePackageContext::for_system_plugin_with_roots(
             &request.system_package.id,
             Path::new(&request.system_package.root),
-            runtime_root,
+            managed_runtime_roots,
             &system_lua_lib_dir,
             &request.system_package.dependencies_file,
             lease_binding,

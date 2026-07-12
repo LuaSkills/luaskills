@@ -50,7 +50,7 @@ Declare only the runtimes the package uses:
 
 ```yaml
 python_runtime:
-  version: "3.14.4"
+version: "3.14.6"
   package_manager: uv
   package_manager_version: "0.11.28"
   lockfile: python/requirements.lock
@@ -64,7 +64,7 @@ node_runtime:
 
 `node_runtime.version` must be one exact SemVer at or above `22.0.0`. Ranges, tags, partial versions, and older releases are rejected before environment creation. Lockfiles and package metadata are copied to private build inputs and rehashed before the package manager consumes them.
 
-Prepare the portable runtimes under the same `runtime_root` used to create the engine:
+By default, prepare portable runtimes under the same `runtime_root` used to create the engine:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deps/fetch_managed_runtimes.ps1 -RuntimeRoot <runtime_root> -Target all
@@ -74,7 +74,41 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deps/fetch_managed_r
 RUNTIME_ROOT=<runtime_root> scripts/deps/fetch_managed_runtimes.sh all
 ```
 
+LuaSkills 0.5.1 also lets the host place distributions and writable environments outside `runtime_root`:
+
+```rust
+let mut host_options = LuaRuntimeHostOptions::with_runtime_root(runtime_data_root);
+host_options.managed_runtime_distribution_root = Some(application_root.join("dependencies/runtimes"));
+host_options.managed_runtime_environment_root = Some(user_data_root.join("managed-runtime-envs"));
+```
+
+The fetch scripts accept the exact distribution root without changing the engine's data root:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deps/fetch_managed_runtimes.ps1 -RuntimeRoot <build_cache_root> -DistributionRoot <distribution_root> -Target all
+```
+
+```bash
+RUNTIME_ROOT=<build_cache_root> MANAGED_RUNTIME_DISTRIBUTION_ROOT=<distribution_root> scripts/deps/fetch_managed_runtimes.sh all
+```
+
+The explicit distribution root must already exist when the engine is created. The explicit environment root is safely created and identity-pinned. See [Host-selected managed runtime roots](managed-runtime-host-roots.md) for Rust, JSON FFI, C ABI V3, hashing, and migration details.
+
 LuaSkills does not fall back to a system Python, system Node.js, external `node_modules`, or undeclared packages.
+
+### Engine initialization policy
+
+The host fixes the following policy in `LuaRuntimeHostOptions.managed_runtime_config` before creating `LuaEngine`; System Plugin Lua code cannot modify it:
+
+| Policy | Default |
+| --- | ---: |
+| Workers per exact environment/package-owner pool | `4` |
+| Worker idle retirement | `60` seconds |
+| Persistent sessions per engine | `256` |
+| Retained session output per stdout/stderr stream | `1 MiB` |
+| `python.invoke` / `node.invoke` timeout | Unlimited |
+
+All configured numeric values must be positive. A per-call positive `invoke.timeout_ms` overrides the engine invoke default, and a per-session positive `session.open.buffer_limit_bytes` overrides the engine output-buffer default. See [Host-selected managed runtime roots](managed-runtime-host-roots.md#engine-wide-resource-policy) for Rust, JSON FFI, standard C ABI V3, and SDK examples.
 
 ## 3. Create A Strict System Lease
 
@@ -170,7 +204,7 @@ sidecar = vulcan.runtime.node.session.open({
 return sidecar:status()
 ```
 
-`session.open(...)` accepts only `file`, `args`, `cwd`, the three stream encodings, and positive `buffer_limit_bytes`. `file` is a package-relative existing source file. Arguments are a dense string array passed directly without shell expansion.
+`session.open(...)` accepts only `file`, `args`, `cwd`, the three stream encodings, and positive `buffer_limit_bytes`. Omitting `buffer_limit_bytes` uses the engine policy (1 MiB per stream by default); an explicit positive value overrides it only for that session. `file` is a package-relative existing source file. Arguments are a dense string array passed directly without shell expansion.
 
 The child runs from a per-session immutable package snapshot and receives controlled package/lease metadata in `LUASKILLS_MANAGED_CONTEXT_JSON`. Python uses the declared managed virtual environment with inherited `PYTHONHOME`, `PYTHONPATH`, and user site-packages removed. Node resolves bare imports from the exact managed `node_modules` environment.
 
@@ -330,7 +364,7 @@ An unrelated ordinary Skill-root reload does not replace the dedicated System le
 | --- | --- | --- |
 | System create rejects `system_package.root` | Root is not a strict canonical descendant of `system_lua_lib`, or contains `?`/`*`-style Lua path metacharacters | Place the package under the engine's derived `system_lua_lib` and pass its canonical absolute path |
 | `dependencies_file` is rejected | Path is absolute, escapes with `..`, is a symlink, or is not a regular file | Use a contained package-relative regular file such as `dependencies.yaml` |
-| Runtime is configured but unavailable | Portable runtime/package manager was not fetched for the declared exact version | Run the managed runtime fetch script against the engine's `runtime_root` |
+| Runtime is configured but unavailable | Portable runtime/package manager was not fetched for the declared exact version | Run the managed runtime fetch script against the selected distribution root and verify `distribution_source` |
 | Node version is rejected | Version is a range/tag/partial version or below `22.0.0` | Pin one exact supported SemVer |
 | `session.open(...)` reports `windows_arm_is_not_supported` | Host target is Windows ARM/aarch64 | Do not create a persistent session and do not fall back to a system interpreter; use a supported native target |
 | `session.open(...)` is denied in a Skill | Persistent managed sessions require a dedicated System package context | Use `invoke` in the Skill, or move the long-lived sidecar to an authorized System Plugin |
@@ -341,7 +375,7 @@ An unrelated ordinary Skill-root reload does not replace the dedicated System le
 
 ## 10. Release Checklist
 
-- The engine is created with the intended `runtime_root` and the portable runtime layout exists.
+- The engine is created with the intended data, distribution, environment roots, and B3-B7 resource policy; status reports the expected `host_configured` or `runtime_root_default` sources.
 - Every System package has a unique id, strict root, contained dependency manifest, and locked dependencies.
 - Hosts inject authority and keep `lease_id + sid + generation` as one handle.
 - Persistent sessions are exercised natively on Windows x86_64, Linux x86_64/aarch64, and macOS x86_64/aarch64; Windows ARM is rejected by structured capability.

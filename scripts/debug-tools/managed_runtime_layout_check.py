@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Validate one prepared LuaSkills managed runtime root layout.
-校验一个已准备好的 LuaSkills 受管运行时根目录布局。
+Validate one prepared LuaSkills managed runtime layout across host-selected roots.
+跨宿主指定根校验一个已准备好的 LuaSkills 受管运行时布局。
 """
 
 from __future__ import annotations
@@ -15,9 +15,17 @@ import sys
 from pathlib import Path
 
 
-PYTHON_VERSION = "3.14.4"
+# PythonVersion is the exact managed CPython layout version validated by default.
+# PythonVersion 是默认校验的精确受管 CPython 布局版本。
+PYTHON_VERSION = "3.14.6"
+# UvVersion is the exact standalone uv layout version validated by default.
+# UvVersion 是默认校验的精确独立 uv 布局版本。
 UV_VERSION = "0.11.28"
+# NodeVersion is the exact managed Node.js layout version validated by default.
+# NodeVersion 是默认校验的精确受管 Node.js 布局版本。
 NODE_VERSION = "24.18.0"
+# PnpmVersion is the exact standalone pnpm layout version validated by default.
+# PnpmVersion 是默认校验的精确独立 pnpm 布局版本。
 PNPM_VERSION = "11.11.0"
 
 
@@ -44,6 +52,8 @@ def current_platform_key() -> str:
     else:
         raise RuntimeError(f"unsupported architecture: {platform.machine()}")
 
+    if os_key == "windows" and arch_key == "arm64":
+        raise RuntimeError("windows_arm_is_not_supported")
     return f"{os_key}-{arch_key}"
 
 
@@ -69,7 +79,7 @@ def executable_exists(path: Path) -> bool:
 
 
 def validate_install(
-    runtime_root: Path,
+    distribution_root: Path,
     family: str,
     directory_name: str,
     runtime: str,
@@ -79,9 +89,29 @@ def validate_install(
     """
     Validate one managed runtime installation directory and manifest.
     校验单个受管运行时安装目录与清单。
+
+    Args:
+        distribution_root: Root that directly contains python and node families.
+        family: Distribution family directory, either python or node.
+        directory_name: Exact installation directory name.
+        runtime: Exact manifest runtime identifier.
+        version: Exact manifest version.
+        platform_key: Exact normalized manifest platform key.
+    Returns:
+        Every layout or manifest validation error.
+
+    参数：
+        distribution_root：直接包含 python 与 node 目录的根。
+        family：发行族目录，只能是 python 或 node。
+        directory_name：精确安装目录名。
+        runtime：精确清单运行时标识。
+        version：精确清单版本。
+        platform_key：精确规范化清单平台键。
+    返回：
+        全部布局或清单校验错误。
     """
     errors: list[str] = []
-    install_dir = runtime_root / "dependencies" / "runtimes" / family / directory_name
+    install_dir = distribution_root / family / directory_name
     manifest_path = install_dir / "runtime-manifest.json"
     if not manifest_path.is_file():
         return [f"missing manifest: {manifest_path}"]
@@ -120,44 +150,127 @@ def validate_install(
     return errors
 
 
-def validate_env_markers(runtime_root: Path) -> list[str]:
+def validate_env_markers(environment_root: Path) -> list[str]:
     """
     Validate managed runtime environment marker files when environments exist.
     在环境存在时校验受管运行时环境 marker 文件。
+
+    Args:
+        environment_root: Writable root that contains managed environments.
+    Returns:
+        Every schema or identity-field validation error.
+
+    参数：
+        environment_root：包含受管环境的可写根。
+    返回：
+        全部 schema 或身份字段校验错误。
     """
     errors: list[str] = []
-    env_root = runtime_root / "dependencies" / "envs"
-    if not env_root.exists():
+    if not environment_root.exists():
         return errors
 
-    for marker_path in env_root.rglob(".luaskills-env.json"):
+    for marker_path in environment_root.rglob(".luaskills-env.json"):
         try:
             marker = read_manifest(marker_path)
         except Exception as error:  # noqa: BLE001
             errors.append(f"failed to parse env marker {marker_path}: {error}")
             continue
 
-        for key in ("schema_version", "runtime", "runtime_version", "platform", "env_hash"):
+        for key in (
+            "schema_version",
+            "runtime",
+            "runtime_version",
+            "platform",
+            "package_manager",
+            "package_manager_version",
+            "lock_hash",
+            "runtime_install_manifest_hash",
+            "runtime_executable_hash",
+            "package_manager_install_manifest_hash",
+            "package_manager_executable_hash",
+            "env_hash",
+        ):
             if key not in marker:
                 errors.append(f"{marker_path}: missing marker field {key}")
-        if marker.get("schema_version") != 1:
-            errors.append(f"{marker_path}: schema_version must be 1")
+        if marker.get("schema_version") != 2:
+            errors.append(f"{marker_path}: schema_version must be 2")
         if marker.get("runtime") not in {"python", "node"}:
             errors.append(f"{marker_path}: runtime must be python or node")
+        for key in (
+            "lock_hash",
+            "runtime_install_manifest_hash",
+            "runtime_executable_hash",
+            "package_manager_install_manifest_hash",
+            "package_manager_executable_hash",
+            "env_hash",
+        ):
+            if key in marker and not is_sha256(marker[key]):
+                errors.append(f"{marker_path}: {key} must be one lowercase SHA-256 digest")
 
     return errors
 
 
-def validate_layout(runtime_root: Path) -> list[str]:
+def is_sha256(value: object) -> bool:
     """
-    Validate all first-class managed runtime layout entries under one runtime root.
-    校验单个运行时根目录下所有一等受管运行时布局项。
+    Return whether one value is a canonical lowercase SHA-256 digest.
+    返回某个值是否为规范小写 SHA-256 摘要。
+
+    Args:
+        value: Arbitrary decoded marker value.
+    Returns:
+        True only for a 64-character lowercase hexadecimal string.
+
+    参数：
+        value：任意已解码 marker 值。
+    返回：
+        仅在值为 64 字符小写十六进制字符串时返回 True。
     """
+
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def validate_layout(
+    runtime_root: Path,
+    distribution_root: Path | None = None,
+    environment_root: Path | None = None,
+) -> list[str]:
+    """
+    Validate all first-class managed runtime layout entries across host-selected roots.
+    跨宿主指定根校验全部一等受管运行时布局项。
+
+    Args:
+        runtime_root: LuaSkills data root used only for compatible defaults.
+        distribution_root: Optional explicit interpreter distribution root.
+        environment_root: Optional explicit writable environment root.
+    Returns:
+        Every installation and environment-marker validation error.
+
+    参数：
+        runtime_root：仅用于兼容默认值的 LuaSkills 数据根。
+        distribution_root：可选显式解释器发行根。
+        environment_root：可选显式可写环境根。
+    返回：
+        全部安装与环境 marker 校验错误。
+    """
+    # DistributionRoot uses the explicit host root or the compatible runtime-root default.
+    # DistributionRoot 使用显式宿主根或兼容的 runtime-root 默认值。
+    resolved_distribution_root = (
+        distribution_root or runtime_root / "dependencies" / "runtimes"
+    )
+    # EnvironmentRoot uses the explicit host root or the compatible runtime-root default.
+    # EnvironmentRoot 使用显式宿主根或兼容的 runtime-root 默认值。
+    resolved_environment_root = (
+        environment_root or runtime_root / "dependencies" / "envs"
+    )
     platform_key = current_platform_key()
     errors: list[str] = []
     errors.extend(
         validate_install(
-            runtime_root,
+            resolved_distribution_root,
             "python",
             f"uv-{UV_VERSION}-{platform_key}",
             "uv",
@@ -167,7 +280,7 @@ def validate_layout(runtime_root: Path) -> list[str]:
     )
     errors.extend(
         validate_install(
-            runtime_root,
+            resolved_distribution_root,
             "python",
             f"cpython-{PYTHON_VERSION}-{platform_key}",
             "python",
@@ -177,7 +290,7 @@ def validate_layout(runtime_root: Path) -> list[str]:
     )
     errors.extend(
         validate_install(
-            runtime_root,
+            resolved_distribution_root,
             "node",
             f"node-{NODE_VERSION}-{platform_key}",
             "node",
@@ -187,7 +300,7 @@ def validate_layout(runtime_root: Path) -> list[str]:
     )
     errors.extend(
         validate_install(
-            runtime_root,
+            resolved_distribution_root,
             "node",
             f"pnpm-{PNPM_VERSION}",
             "pnpm",
@@ -195,7 +308,7 @@ def validate_layout(runtime_root: Path) -> list[str]:
             "any",
         )
     )
-    errors.extend(validate_env_markers(runtime_root))
+    errors.extend(validate_env_markers(resolved_environment_root))
     return errors
 
 
@@ -203,19 +316,51 @@ def main() -> int:
     """
     Parse CLI arguments and validate one managed runtime layout.
     解析命令行参数并校验单个受管运行时布局。
+
+    Returns:
+        Zero when all selected roots are valid, otherwise one.
+
+    返回：
+        全部所选根有效时返回零，否则返回一。
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("runtime_root", help="Prepared LuaSkills runtime root to validate.")
+    parser.add_argument(
+        "--distribution-root",
+        help="Optional host-configured root that directly contains python and node.",
+    )
+    parser.add_argument(
+        "--environment-root",
+        help="Optional host-configured writable managed environment root.",
+    )
     args = parser.parse_args()
 
+    # RuntimeRoot is the LuaSkills data root used for compatible defaults.
+    # RuntimeRoot 是用于兼容默认值的 LuaSkills 数据根。
     runtime_root = Path(args.runtime_root).resolve()
-    errors = validate_layout(runtime_root)
+    # DistributionRoot remains independent from runtime_root when the host supplies it.
+    # DistributionRoot 在宿主提供时保持与 runtime_root 相互独立。
+    distribution_root = (
+        Path(args.distribution_root).resolve() if args.distribution_root else None
+    )
+    # EnvironmentRoot remains independent from runtime_root when the host supplies it.
+    # EnvironmentRoot 在宿主提供时保持与 runtime_root 相互独立。
+    environment_root = (
+        Path(args.environment_root).resolve() if args.environment_root else None
+    )
+    errors = validate_layout(runtime_root, distribution_root, environment_root)
     if errors:
         for error in errors:
             print(error, file=sys.stderr)
         return 1
 
-    print(f"Managed runtime layout ok: {runtime_root}")
+    print(f"Managed runtime layout ok: runtime_root={runtime_root}")
+    print(
+        f"distribution_root={distribution_root or runtime_root / 'dependencies' / 'runtimes'}"
+    )
+    print(
+        f"environment_root={environment_root or runtime_root / 'dependencies' / 'envs'}"
+    )
     return 0
 
 

@@ -21,7 +21,7 @@
 
 都能稳定演示：
 
-- `engine_new`
+- `engine_new_v3`（Python 与 TypeScript 主示例使用 V3 传入 `runtime_root`、受管发行根、受管环境根与 B3-B7 策略）
 - `load_from_roots`
 - `list_entries`
 - `call_skill`
@@ -44,6 +44,8 @@
 因此标准 ABI 示例在默认情况下应至少能读到一条 entry。
 
 标准 ABI 示例会把该夹具的 `skills` 目录作为 `ROOT` root 传给 `load_from_roots`。这是为了满足运行时必须传入 `ROOT` 的启动规则；这些示例只演示调用链，不演示普通用户层安装。
+
+Python 与 TypeScript 主示例按 `FfiLuaRuntimeHostOptionsV3 -> FfiLuaRuntimeHostOptionsV2 -> FfiLuaRuntimeHostOptions` 的真实嵌套布局声明结构体，并调用 `luaskills_ffi_engine_new_v3`。两个受管根指向夹具内独立的 `dependencies/runtimes` 与 `dependencies/envs` 目录；`managed_runtime_config` 指向逐字节匹配 `FfiLuaRuntimeManagedRuntimeConfig` 的活动内存，演示非默认 Worker 容量、空闲回收、Session 上限、默认输出缓冲与默认 invoke 超时。V1/V2 结构体尺寸不会被扩大；空策略指针会恢复全部稳定默认值。
 
 同时它的 `ping` 入口会稳定返回：
 

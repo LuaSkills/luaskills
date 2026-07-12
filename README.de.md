@@ -110,10 +110,11 @@ Der Host muss roots, installierbare Skills, Verwaltungsaktionen, database provid
 
 | Komponente | Aktuelle Version |
 | --- | --- |
-| LuaSkills Core, FFI SDK und Sprach-SDK-Linie | `0.5.0` |
+| LuaSkills Core, FFI SDK und Sprach-SDK-Linie | `0.5.1` |
 | Kompatible Serie der Lua-Runtime-Pakete | `0.1` |
-| Verwaltetes Python / uv | `3.14.4` / `0.11.28` |
+| Verwaltetes Python / uv | `3.14.6` / `0.11.28` |
 | Verwaltetes Node.js / pnpm | `24.18.0` / `11.11.0` |
+| Standardwerte der Managed-Runtime-Engine | `Worker=4 / Leerlauf=60s / Sessions=256 / Puffer=1MiB/Stream / invoke=unbegrenzt` |
 | vldb-controller | `0.2.1` |
 | vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
 

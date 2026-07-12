@@ -110,10 +110,11 @@ L'hôte doit décider des roots, des skills installables, des actions de gestion
 
 | Composant | Version actuelle |
 | --- | --- |
-| Cœur LuaSkills, SDK FFI et gamme de SDK de langage | `0.5.0` |
+| Cœur LuaSkills, SDK FFI et gamme de SDK de langage | `0.5.1` |
 | Série compatible des paquets du runtime Lua | `0.1` |
-| Python / uv gérés | `3.14.4` / `0.11.28` |
+| Python / uv gérés | `3.14.6` / `0.11.28` |
 | Node.js / pnpm gérés | `24.18.0` / `11.11.0` |
+| Valeurs par défaut du moteur géré | `workers=4 / inactivité=60s / sessions=256 / tampon=1MiB/flux / invoke=illimité` |
 | vldb-controller | `0.2.1` |
 | vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
 

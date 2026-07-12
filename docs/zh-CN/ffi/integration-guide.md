@@ -549,7 +549,7 @@ System Plugin 租约不把整个 `system_lua_lib` 当成一个共享包。每次
 
 每个存活 Worker 或持久会话快照都会持有对应受管环境的跨进程共享生命周期租约。环境最终发布或替换只尝试一次非阻塞独占租约；存在活动 Worker 或会话时立即返回稳定的 busy 错误，不会等待、强退使用方或原地替换环境。
 
-旧字段 `temp_dir`、`resources_dir`、`lua_packages_dir`、`host_provided_tool_root`、`host_provided_lua_root`、`host_provided_ffi_root`、`download_cache_root`、`dependency_dir_name`、`state_dir_name`、`database_dir_name` 与 `skill_config_file_path` 仍保留为兼容字段，但不再建议作为新宿主集成的配置入口。JSON FFI 直接在 host options 里传 `runtime_root`；标准 C ABI 为保持 `FfiLuaRuntimeHostOptions` 的 v1 布局兼容，需使用 `FfiLuaRuntimeHostOptionsV2` 与 `luaskills_ffi_engine_new_v2` 传入 `runtime_root`。若同时传入 `runtime_root`，运行时会按固定布局重写这些派生字段。
+旧字段 `temp_dir`、`resources_dir`、`lua_packages_dir`、`host_provided_tool_root`、`host_provided_lua_root`、`host_provided_ffi_root`、`download_cache_root`、`dependency_dir_name`、`state_dir_name`、`database_dir_name` 与 `skill_config_file_path` 仍保留为兼容字段，但不再建议作为新宿主集成的配置入口。JSON FFI 直接在 host options 里传 `runtime_root`；标准 C ABI 为保持 `FfiLuaRuntimeHostOptions` 的 v1 布局兼容，使用 `FfiLuaRuntimeHostOptionsV2` 与 `luaskills_ffi_engine_new_v2` 传入 `runtime_root`。如果还要独立传受管发行根、环境根或 B3-B7 资源策略，必须使用 `FfiLuaRuntimeHostOptionsV3` 与 `luaskills_ffi_engine_new_v3`。若同时传入 `runtime_root`，运行时仍会按固定布局重写旧派生字段，但不会覆盖两个显式受管根。
 
 ### 7.1.1 Space Controller 额外前置要求
 
@@ -686,12 +686,14 @@ System Plugin 租约不把整个 `system_lua_lib` 当成一个共享包。每次
 - 释放必须走 `luaskills_ffi_buffer_free`
 - 如果 `len > 0`，则 `ptr` 不得为 null
 
-### 8.3 `FfiLuaRuntimeHostOptions` / `FfiLuaRuntimeHostOptionsV2`
+### 8.3 `FfiLuaRuntimeHostOptions` / V2 / V3
 
 作用：
 
 - `FfiLuaRuntimeHostOptions` 描述旧版宿主运行时路径、依赖目录名、下载策略、基础库路径等，并保持 v1 标准 C ABI 布局兼容
 - `FfiLuaRuntimeHostOptionsV2` 在 `base` 中嵌入 `FfiLuaRuntimeHostOptions`，并新增 `runtime_root` 作为新宿主集成的规范目录入口
+- `FfiLuaRuntimeHostOptionsV3` 在 `base` 中完整嵌入 V2，并新增 `managed_runtime_distribution_root`、`managed_runtime_environment_root` 与可选 `managed_runtime_config` 指针；V1/V2 尺寸完全不变
+- `FfiLuaRuntimeManagedRuntimeConfig` 固定 Worker 池容量/空闲回收、单引擎持久会话上限、默认每流输出缓冲与默认 invoke 超时；空指针保留全部稳定默认值
 
 关键字段：
 
@@ -711,6 +713,21 @@ System Plugin 租约不把整个 `system_lua_lib` 当成一个共享包。每次
 - `default_text_encoding`
 - `disable_managed_io_compat`
 - `FfiLuaRuntimeHostOptionsV2.runtime_root`
+- `FfiLuaRuntimeHostOptionsV3.managed_runtime_distribution_root`
+- `FfiLuaRuntimeHostOptionsV3.managed_runtime_environment_root`
+- `FfiLuaRuntimeHostOptionsV3.managed_runtime_config`
+
+受管运行时根规则：
+
+- 发行根直接包含 `python/` 与 `node/`，必须是已经存在的绝对目录
+- 环境根直接创建 `python/py-<version>/<env_hash>` 与 `node/node-<version>/<env_hash>`，必须是绝对路径并由 LuaSkills 安全创建
+- 显式 V3/JSON 字段优先于 `<runtime_root>/dependencies/runtimes` 与 `<runtime_root>/dependencies/envs`
+- 不读取环境变量、系统 `PATH`、系统 Python、系统 Node 或外部 `node_modules` 作为降级候选
+- JSON FFI 可调用 `luaskills_ffi_managed_runtime_resolve_json` 只读解析同一发行包；返回规范安装根、可执行文件及两项 SHA-256，不创建 engine 或环境
+- JSON FFI 可在 `host_options.managed_runtime_config` 配置 `worker_pool_max_size_per_environment=4`、`worker_idle_ttl_secs=60`、`persistent_session_limit_per_engine=256`、`persistent_session_default_buffer_limit_bytes_per_stream=1048576` 与可空 `invoke_default_timeout_ms`；这些是稳定默认值，所有已配置数值必须大于零
+- 单次正数 `invoke.timeout_ms` 优先于引擎默认超时，单个 Session 的正数 `session.open.buffer_limit_bytes` 优先于引擎默认输出缓冲；Lua 不能修改其余引擎级策略
+- 标准 C ABI 的 `has_invoke_default_timeout_ms` 必须严格为 `0` 或 `1`；为 `0` 时数值成员被忽略
+- 完整示例见[宿主指定受管运行时根目录](../managed-runtime-host-roots.md)
 
 已取消字段：
 

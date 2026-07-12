@@ -48,6 +48,9 @@ function ensureStandardFixtureLayout(root: string): void {
     "temp",
     "resources",
     "lua_packages",
+    "system_lua_lib",
+    path.join("dependencies", "runtimes"),
+    path.join("dependencies", "envs"),
     path.join("bin", "tools"),
     "libs",
   ]) {
@@ -135,6 +138,7 @@ function main(): void {
     host_provided_tool_root: "str",
     host_provided_lua_root: "str",
     host_provided_ffi_root: "str",
+    system_lua_lib_dir: "str",
     download_cache_root: "str",
     dependency_dir_name: "str",
     state_dir_name: "str",
@@ -143,6 +147,10 @@ function main(): void {
     allow_network_download: "uint8_t",
     github_base_url: "str",
     github_api_base_url: "str",
+    official_skill_hub_base_url: "str",
+    enable_private_url_skill_install: "uint8_t",
+    private_skill_source_allowlist: "void *",
+    private_skill_source_allowlist_len: "size_t",
     sqlite_library_path: "str",
     sqlite_provider_mode: "int32_t",
     sqlite_callback_mode: "int32_t",
@@ -164,9 +172,36 @@ function main(): void {
     disable_managed_io_compat: "uint8_t",
   });
 
-  const FfiLuaEngineOptions = koffi.struct("FfiLuaEngineOptions", {
+  const FfiLuaRuntimeHostOptionsV2 = koffi.struct("FfiLuaRuntimeHostOptionsV2", {
+    base: FfiLuaRuntimeHostOptions,
+    runtime_root: "str",
+  });
+
+  // FfiLuaRuntimeManagedRuntimeConfig matches the public v3 C ABI policy byte-for-byte.
+  // FfiLuaRuntimeManagedRuntimeConfig 与公开 v3 C ABI 策略保持逐字节一致。
+  const FfiLuaRuntimeManagedRuntimeConfig = koffi.struct("FfiLuaRuntimeManagedRuntimeConfig", {
+    worker_pool_max_size_per_environment: "size_t",
+    worker_idle_ttl_secs: "uint64_t",
+    persistent_session_limit_per_engine: "size_t",
+    persistent_session_default_buffer_limit_bytes_per_stream: "size_t",
+    has_invoke_default_timeout_ms: "uint8_t",
+    invoke_default_timeout_ms: "uint64_t",
+  });
+
+  // FfiLuaRuntimeHostOptionsV3 appends two managed roots and the optional B3-B7 policy pointer.
+  // FfiLuaRuntimeHostOptionsV3 追加两个受管根与可选 B3-B7 策略指针。
+  const FfiLuaRuntimeHostOptionsV3 = koffi.struct("FfiLuaRuntimeHostOptionsV3", {
+    base: FfiLuaRuntimeHostOptionsV2,
+    managed_runtime_distribution_root: "str",
+    managed_runtime_environment_root: "str",
+    managed_runtime_config: koffi.pointer(FfiLuaRuntimeManagedRuntimeConfig),
+  });
+
+  // FfiLuaEngineOptionsV3 combines the stable VM pool prefix with the complete v3 host options.
+  // FfiLuaEngineOptionsV3 将稳定 VM 池前缀与完整 v3 宿主选项组合起来。
+  const FfiLuaEngineOptionsV3 = koffi.struct("FfiLuaEngineOptionsV3", {
     pool: FfiLuaVmPoolConfig,
-    host: FfiLuaRuntimeHostOptions,
+    host: FfiLuaRuntimeHostOptionsV3,
   });
 
   const FfiOwnedBuffer = koffi.struct("FfiOwnedBuffer", {
@@ -224,7 +259,7 @@ function main(): void {
 
   const freeBuffer = library.func("void luaskills_ffi_buffer_free(FfiOwnedBuffer value)");
   const version = library.func("int luaskills_ffi_version(_Out_ FfiOwnedBuffer *version_out, _Out_ FfiOwnedBuffer *error_out)");
-  const engineNew = library.func("int luaskills_ffi_engine_new(const FfiLuaEngineOptions *options, _Out_ uint64_t *engine_id_out, _Out_ FfiOwnedBuffer *error_out)");
+  const engineNew = library.func("int luaskills_ffi_engine_new_v3(const FfiLuaEngineOptionsV3 *options, _Out_ uint64_t *engine_id_out, _Out_ FfiOwnedBuffer *error_out)");
   const loadFromRoots = library.func("int luaskills_ffi_load_from_roots(uint64_t engine_id, const FfiRuntimeSkillRoot *skill_roots, size_t skill_roots_len, _Out_ FfiOwnedBuffer *error_out)");
   const listEntries = library.func("int luaskills_ffi_list_entries(uint64_t engine_id, int32_t authority, _Out_ void **entries_out, _Out_ FfiOwnedBuffer *error_out)");
   const callSkill = library.func("int luaskills_ffi_call_skill(uint64_t engine_id, const char *tool_name, FfiBorrowedBuffer args_json, const FfiLuaInvocationContext *invocation_context, _Out_ void **result_out, _Out_ FfiOwnedBuffer *error_out)");
@@ -239,42 +274,69 @@ function main(): void {
   console.log("Version:", readOwnedBuffer(versionOut[0]));
   freeBuffer(versionOut[0]);
 
+  // ManagedRuntimeConfigBuffer owns the exact native bytes referenced by the nested v3 host options.
+  // ManagedRuntimeConfigBuffer 拥有嵌套 v3 宿主选项所引用的精确原生字节。
+  const managedRuntimeConfigBuffer = Buffer.alloc(koffi.sizeof(FfiLuaRuntimeManagedRuntimeConfig));
+  koffi.encode(managedRuntimeConfigBuffer, FfiLuaRuntimeManagedRuntimeConfig, {
+    worker_pool_max_size_per_environment: 8,
+    worker_idle_ttl_secs: 120,
+    persistent_session_limit_per_engine: 128,
+    persistent_session_default_buffer_limit_bytes_per_stream: 2 * 1024 * 1024,
+    has_invoke_default_timeout_ms: 1,
+    invoke_default_timeout_ms: 30_000,
+  });
+
+  // Options is the complete v3 engine payload retained through the synchronous constructor call.
+  // Options 是在同步构造调用期间保持有效的完整 v3 引擎载荷。
   const options = {
     pool: { min_size: 1, max_size: 1, idle_ttl_secs: 30 },
     host: {
-      temp_dir: path.join(runtimeRoot, "temp"),
-      resources_dir: path.join(runtimeRoot, "resources"),
-      lua_packages_dir: path.join(runtimeRoot, "lua_packages"),
-      host_provided_tool_root: path.join(runtimeRoot, "bin", "tools"),
-      host_provided_lua_root: path.join(runtimeRoot, "lua_packages"),
-      host_provided_ffi_root: path.join(runtimeRoot, "libs"),
-      download_cache_root: path.join(runtimeRoot, "temp", "downloads"),
-      dependency_dir_name: "dependencies",
-      state_dir_name: "state",
-      database_dir_name: "databases",
-      skill_config_file_path: null,
-      allow_network_download: 0,
-      github_base_url: null,
-      github_api_base_url: null,
-      sqlite_library_path: null,
-      sqlite_provider_mode: 0,
-      sqlite_callback_mode: 0,
-      lancedb_library_path: null,
-      lancedb_provider_mode: 0,
-      lancedb_callback_mode: 0,
-      space_controller_endpoint: null,
-      space_controller_auto_spawn: 0,
-      space_controller_executable_path: null,
-      space_controller_process_mode: 0,
-      cache_config: null,
-      runlua_pool_config: null,
-      reserved_entry_names: null,
-      reserved_entry_names_len: 0,
-      ignored_skill_ids: null,
-      ignored_skill_ids_len: 0,
-      enable_skill_management_bridge: 0,
-      default_text_encoding: null,
-      disable_managed_io_compat: 0,
+      base: {
+        base: {
+          temp_dir: path.join(runtimeRoot, "temp"),
+          resources_dir: path.join(runtimeRoot, "resources"),
+          lua_packages_dir: path.join(runtimeRoot, "lua_packages"),
+          host_provided_tool_root: path.join(runtimeRoot, "bin", "tools"),
+          host_provided_lua_root: path.join(runtimeRoot, "lua_packages"),
+          host_provided_ffi_root: path.join(runtimeRoot, "libs"),
+          system_lua_lib_dir: path.join(runtimeRoot, "system_lua_lib"),
+          download_cache_root: path.join(runtimeRoot, "temp", "downloads"),
+          dependency_dir_name: "dependencies",
+          state_dir_name: "state",
+          database_dir_name: "databases",
+          skill_config_file_path: null,
+          allow_network_download: 0,
+          github_base_url: null,
+          github_api_base_url: null,
+          official_skill_hub_base_url: null,
+          enable_private_url_skill_install: 0,
+          private_skill_source_allowlist: null,
+          private_skill_source_allowlist_len: 0,
+          sqlite_library_path: null,
+          sqlite_provider_mode: 0,
+          sqlite_callback_mode: 0,
+          lancedb_library_path: null,
+          lancedb_provider_mode: 0,
+          lancedb_callback_mode: 0,
+          space_controller_endpoint: null,
+          space_controller_auto_spawn: 0,
+          space_controller_executable_path: null,
+          space_controller_process_mode: 0,
+          cache_config: null,
+          runlua_pool_config: null,
+          reserved_entry_names: null,
+          reserved_entry_names_len: 0,
+          ignored_skill_ids: null,
+          ignored_skill_ids_len: 0,
+          enable_skill_management_bridge: 0,
+          default_text_encoding: null,
+          disable_managed_io_compat: 0,
+        },
+        runtime_root: runtimeRoot,
+      },
+      managed_runtime_distribution_root: path.join(runtimeRoot, "dependencies", "runtimes"),
+      managed_runtime_environment_root: path.join(runtimeRoot, "dependencies", "envs"),
+      managed_runtime_config: managedRuntimeConfigBuffer,
     },
   };
 

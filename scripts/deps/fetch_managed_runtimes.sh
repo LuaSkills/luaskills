@@ -10,13 +10,17 @@ cd "$PROJECT_ROOT"
 # Target 选择需要拉取的受管运行时分组。
 TARGET="${1:-all}"
 
-# RuntimeRoot receives managed runtime executables and package managers.
-# RuntimeRoot 接收受管运行时可执行程序与包管理器。
+# RuntimeRoot selects the LuaSkills/build root used for compatible defaults and staging.
+# RuntimeRoot 选择用于兼容默认布局与暂存的 LuaSkills/构建根。
 RUNTIME_ROOT="${RUNTIME_ROOT:-output}"
+
+# DistributionRoot optionally targets the directory that directly contains python and node.
+# DistributionRoot 可选指定直接包含 python 与 node 的目录。
+DISTRIBUTION_ROOT="${MANAGED_RUNTIME_DISTRIBUTION_ROOT:-}"
 
 # PythonVersion selects the managed CPython version installed through uv.
 # PythonVersion 选择通过 uv 安装的受管 CPython 版本。
-PYTHON_VERSION="${PYTHON_VERSION:-3.14.4}"
+PYTHON_VERSION="${PYTHON_VERSION:-3.14.6}"
 
 # UvVersion selects the standalone uv binary version.
 # UvVersion 选择独立 uv 二进制版本。
@@ -152,7 +156,7 @@ install_uv_runtime() {
   # 下载并安装一个独立 uv 二进制到运行时根目录。
   local platform_key="$1"
   local uv_asset="$2"
-  local uv_target="$RUNTIME_ROOT/dependencies/runtimes/python/uv-$UV_VERSION-$platform_key"
+  local uv_target="$DISTRIBUTION_ROOT/python/uv-$UV_VERSION-$platform_key"
   local uv_exe="$uv_target/uv"
   if [ -x "$uv_exe" ] && [ "$FORCE" != "1" ]; then
     printf '%s\n' "$uv_exe"
@@ -203,7 +207,7 @@ install_python_runtime() {
   local uv_asset="$2"
   local uv_exe
   uv_exe="$(install_uv_runtime "$platform_key" "$uv_asset")"
-  local python_root="$RUNTIME_ROOT/dependencies/runtimes/python/cpython-$PYTHON_VERSION-$platform_key"
+  local python_root="$DISTRIBUTION_ROOT/python/cpython-$PYTHON_VERSION-$platform_key"
   if [ -f "$python_root/runtime-manifest.json" ] && [ "$FORCE" != "1" ]; then
     return
   fi
@@ -241,7 +245,7 @@ install_node_runtime() {
   local platform_key="$1"
   local node_asset_template="$2"
   local node_extract_template="$3"
-  local node_target="$RUNTIME_ROOT/dependencies/runtimes/node/node-$NODE_VERSION-$platform_key"
+  local node_target="$DISTRIBUTION_ROOT/node/node-$NODE_VERSION-$platform_key"
   local node_exe="$node_target/bin/node"
   if [ -x "$node_exe" ] && [ "$FORCE" != "1" ]; then
     printf '%s\n' "$node_exe"
@@ -300,7 +304,7 @@ install_pnpm_runtime() {
   local node_extract_template="$3"
   local node_exe
   node_exe="$(install_node_runtime "$platform_key" "$node_asset_template" "$node_extract_template")"
-  local pnpm_target="$RUNTIME_ROOT/dependencies/runtimes/node/pnpm-$PNPM_VERSION"
+  local pnpm_target="$DISTRIBUTION_ROOT/node/pnpm-$PNPM_VERSION"
   local pnpm_entry="$pnpm_target/bin/pnpm.cjs"
   if [ -f "$pnpm_entry" ] && [ "$FORCE" != "1" ]; then
     return
@@ -365,6 +369,20 @@ PY
 
 IFS='|' read -r PLATFORM_KEY UV_ASSET NODE_ASSET_TEMPLATE NODE_EXTRACT_TEMPLATE < <(managed_runtime_platform)
 RUNTIME_ROOT="$(python3 - "$RUNTIME_ROOT" <<'PY'
+import os
+import sys
+
+path = os.path.abspath(sys.argv[1])
+os.makedirs(path, exist_ok=True)
+print(path)
+PY
+)"
+# DistributionRoot defaults to the compatible runtime-root layout and otherwise uses the exact host path.
+# DistributionRoot 默认使用兼容的 runtime-root 布局，否则使用精确宿主路径。
+if [ -z "$DISTRIBUTION_ROOT" ]; then
+  DISTRIBUTION_ROOT="$RUNTIME_ROOT/dependencies/runtimes"
+fi
+DISTRIBUTION_ROOT="$(python3 - "$DISTRIBUTION_ROOT" <<'PY'
 import os
 import sys
 

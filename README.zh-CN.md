@@ -23,6 +23,7 @@ LuaSkills 是 LuaSkills 生态的核心运行时库，适合需要“可安装�
 - 通过 `host_result` 提供宿主结构化结果桥接，第一版标准结果种类为 `change_set`。
 - SQLite / LanceDB 可选绑定，支持状态型、记忆型、搜索型 skill。
 - 受管 Python 与 Node.js 子运行时，Lua skill 可通过 `vulcan.runtime.python.*` 与 `vulcan.runtime.node.*` 调用。
+- 宿主可独立指定只读 Python/Node 发行根与可写环境根，并通过 Rust/JSON 只读解析接口和标准 C ABI V3 复用同一资产。
 - Rust API、标准 C ABI、公共 `_json` FFI 等多种接入面。
 - TypeScript、Python、Go SDK 生态接入路径。
 
@@ -88,6 +89,8 @@ LuaSkills 不试图接管宿主产品本身。
 - [为什么是 LuaSkills](docs/zh-CN/product/why-luaskills.md)：产品化叙事、能力分类、适用场景和生态定位。
 - [Lua Skill 开发手册](docs/zh-CN/skill-development.md)：Skill 作者应优先阅读。
 - [System Plugin 受管运行时使用指南](docs/zh-CN/system-plugin-managed-runtime.md)：从严格包配置、持久 Python/Node 会话到宿主事件与关闭的完整流程。
+- [宿主指定受管运行时根目录](docs/zh-CN/managed-runtime-host-roots.md)：独立根、B3-B7 引擎策略、资产身份哈希、Rust/JSON 解析与 C ABI V3。
+- [LuaSkills 0.5.1 升级说明](docs/upgrade-0.5.1.md)：宿主根、资源策略、FFI、SDK 与验证迁移清单。
 - [FFI 对接文档](docs/zh-CN/ffi/integration-guide.md)：非 Rust 宿主集成细节。
 - [FFI 宿主接入检查清单](docs/zh-CN/ffi/host-checklist.md)：第一次联调前的最短自检路径。
 - [宿主数据库 Provider 对接说明](docs/zh-CN/providers/host-database-provider-guide.md)：SQLite / LanceDB ownership 与 provider 模式。
@@ -112,7 +115,7 @@ Rust 宿主可直接依赖 crate：
 
 ```toml
 [dependencies]
-luaskills = "0.5"
+luaskills = "0.5.1"
 ```
 
 仓库开发常用命令：
@@ -148,7 +151,7 @@ cargo run --bin luaskills-debug -- call \
 2. [FFI 宿主接入检查清单](docs/zh-CN/ffi/host-checklist.md)
 3. [FFI 对接文档](docs/zh-CN/ffi/integration-guide.md)
 
-需要接入 System Plugin 受管 Python/Node 长期会话时，在完成上述基础链路后继续阅读 [System Plugin 受管运行时使用指南](docs/zh-CN/system-plugin-managed-runtime.md)。
+需要接入 System Plugin 受管 Python/Node 长期会话时，在完成上述基础链路后继续阅读 [System Plugin 受管运行时使用指南](docs/zh-CN/system-plugin-managed-runtime.md)。宿主需要共享应用级运行时资产时，再阅读[宿主指定受管运行时根目录](docs/zh-CN/managed-runtime-host-roots.md)。
 
 ## Skill 命名规则
 
@@ -172,13 +175,13 @@ GitHub 托管 skill 的仓库派生或显式 `skill_id`、release zip 前缀、c
 
 ## 生态统一发布顺序
 
-如果要做一次 `0.5.0` 生态统一发布，推荐顺序如下：
+如果要做一次 `0.5.1` 生态统一发布，推荐顺序如下：
 
 1. 先发布 `LuaSkills/luaskills-packages`，确保新的兼容协议线下 `lua-runtime-packages-*` 与 `lua-deps-*` 已经存在。
-2. 再发布 `LuaSkills/luaskills`，完成 crate 版本以及主仓库 `luaskills-ffi-sdk-*` 和 demo 资产的 `v0.5.0` release。
-3. 再发布 TypeScript SDK `@luaskills/sdk@0.5.0`。
-4. 再发布 Python SDK `luaskills-sdk==0.5.0`。
-5. 再发布 Go SDK module tag `v0.5.0`。
+2. 再发布 `LuaSkills/luaskills`，完成 crate 版本以及主仓库 `luaskills-ffi-sdk-*` 和 demo 资产的 `v0.5.1` release。
+3. 再发布 TypeScript SDK `@luaskills/sdk@0.5.1`。
+4. 再发布 Python SDK `luaskills-sdk==0.5.1`。
+5. 再发布 Go SDK module tag `v0.5.1`。
 6. 最后分别运行各 SDK 仓库的 **Examples Release** 工作流，并确保对应包或 module tag 已经在上游可见。
 
 这样可以保证安装器、示例工作流和默认 runtime 资产都只会指向已经发布完成的 packages 资产、core 资产和 SDK 包。
@@ -187,10 +190,11 @@ GitHub 托管 skill 的仓库派生或显式 `skill_id`、release zip 前缀、c
 
 | 组件 | 当前版本 |
 | --- | --- |
-| LuaSkills core、FFI SDK 与多语言 SDK 版本线 | `0.5.0` |
+| LuaSkills core、FFI SDK 与多语言 SDK 版本线 | `0.5.1` |
 | Lua runtime packages 兼容协议线 | `0.1` |
-| 受管 Python / uv | `3.14.4` / `0.11.28` |
+| 受管 Python / uv | `3.14.6` / `0.11.28` |
 | 受管 Node.js / pnpm | `24.18.0` / `11.11.0` |
+| 受管运行时引擎默认值 | `Worker=4 / 空闲=60秒 / 会话=256 / 缓冲=1MiB/流 / invoke=无限制` |
 | vldb-controller | `0.2.1` |
 | vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
 

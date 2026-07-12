@@ -38,6 +38,7 @@ class FfiLuaRuntimeHostOptions(ctypes.Structure):
         ("host_provided_tool_root", ctypes.c_char_p),
         ("host_provided_lua_root", ctypes.c_char_p),
         ("host_provided_ffi_root", ctypes.c_char_p),
+        ("system_lua_lib_dir", ctypes.c_char_p),
         ("download_cache_root", ctypes.c_char_p),
         ("dependency_dir_name", ctypes.c_char_p),
         ("state_dir_name", ctypes.c_char_p),
@@ -46,6 +47,10 @@ class FfiLuaRuntimeHostOptions(ctypes.Structure):
         ("allow_network_download", ctypes.c_uint8),
         ("github_base_url", ctypes.c_char_p),
         ("github_api_base_url", ctypes.c_char_p),
+        ("official_skill_hub_base_url", ctypes.c_char_p),
+        ("enable_private_url_skill_install", ctypes.c_uint8),
+        ("private_skill_source_allowlist", ctypes.POINTER(ctypes.c_char_p)),
+        ("private_skill_source_allowlist_len", ctypes.c_size_t),
         ("sqlite_library_path", ctypes.c_char_p),
         ("sqlite_provider_mode", ctypes.c_int32),
         ("sqlite_callback_mode", ctypes.c_int32),
@@ -68,13 +73,61 @@ class FfiLuaRuntimeHostOptions(ctypes.Structure):
     ]
 
 
-class FfiLuaEngineOptions(ctypes.Structure):
+class FfiLuaRuntimeHostOptionsV2(ctypes.Structure):
     """
-    Plain engine options passed into the standard FFI surface.
-    传入标准 FFI 接口的原生引擎选项。
+    Version-two host options that add one canonical LuaSkills runtime root.
+    增加单个规范 LuaSkills 运行根的第二版宿主选项。
     """
 
-    _fields_ = [("pool", FfiLuaVmPoolConfig), ("host", FfiLuaRuntimeHostOptions)]
+    _fields_ = [
+        ("base", FfiLuaRuntimeHostOptions),
+        ("runtime_root", ctypes.c_char_p),
+    ]
+
+
+class FfiLuaRuntimeManagedRuntimeConfig(ctypes.Structure):
+    """
+    Managed Python/Node Worker and persistent-session policy supplied during engine creation.
+    引擎创建期间传入的受管 Python/Node Worker 与持久会话策略。
+    """
+
+    _fields_ = [
+        ("worker_pool_max_size_per_environment", ctypes.c_size_t),
+        ("worker_idle_ttl_secs", ctypes.c_uint64),
+        ("persistent_session_limit_per_engine", ctypes.c_size_t),
+        (
+            "persistent_session_default_buffer_limit_bytes_per_stream",
+            ctypes.c_size_t,
+        ),
+        ("has_invoke_default_timeout_ms", ctypes.c_uint8),
+        ("invoke_default_timeout_ms", ctypes.c_uint64),
+    ]
+
+
+class FfiLuaRuntimeHostOptionsV3(ctypes.Structure):
+    """
+    Version-three host options that add independent managed roots and an optional B3-B7 policy.
+    增加独立受管根与可选 B3-B7 策略的第三版宿主选项。
+    """
+
+    _fields_ = [
+        ("base", FfiLuaRuntimeHostOptionsV2),
+        ("managed_runtime_distribution_root", ctypes.c_char_p),
+        ("managed_runtime_environment_root", ctypes.c_char_p),
+        (
+            "managed_runtime_config",
+            ctypes.POINTER(FfiLuaRuntimeManagedRuntimeConfig),
+        ),
+    ]
+
+
+class FfiLuaEngineOptionsV3(ctypes.Structure):
+    """
+    Version-three engine options passed into the standard FFI surface.
+    传入标准 FFI 接口的第三版引擎选项。
+    """
+
+    _fields_ = [("pool", FfiLuaVmPoolConfig), ("host", FfiLuaRuntimeHostOptionsV3)]
 
 
 class FfiOwnedBuffer(ctypes.Structure):
@@ -216,11 +269,14 @@ def ensure_standard_fixture_layout(root: Path) -> None:
     for relative_path in [
         "skills",
         "dependencies",
+        "dependencies/runtimes",
+        "dependencies/envs",
         "state",
         "databases",
         "temp",
         "resources",
         "lua_packages",
+        "system_lua_lib",
         "bin/tools",
         "libs",
     ]:
@@ -292,8 +348,8 @@ def main() -> None:
         ctypes.POINTER(FfiOwnedBuffer),
         ctypes.POINTER(FfiOwnedBuffer),
     ]
-    library.luaskills_ffi_engine_new.argtypes = [
-        ctypes.POINTER(FfiLuaEngineOptions),
+    library.luaskills_ffi_engine_new_v3.argtypes = [
+        ctypes.POINTER(FfiLuaEngineOptionsV3),
         ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(FfiOwnedBuffer),
     ]
@@ -359,6 +415,7 @@ def main() -> None:
     host.host_provided_tool_root = str((root / "bin" / "tools").resolve()).replace("\\", "/").encode("utf-8")
     host.host_provided_lua_root = str((root / "lua_packages").resolve()).replace("\\", "/").encode("utf-8")
     host.host_provided_ffi_root = str((root / "libs").resolve()).replace("\\", "/").encode("utf-8")
+    host.system_lua_lib_dir = str((root / "system_lua_lib").resolve()).replace("\\", "/").encode("utf-8")
     host.download_cache_root = str((root / "temp" / "downloads").resolve()).replace("\\", "/").encode("utf-8")
     host.dependency_dir_name = b"dependencies"
     host.state_dir_name = b"state"
@@ -367,6 +424,10 @@ def main() -> None:
     host.allow_network_download = 0
     host.github_base_url = None
     host.github_api_base_url = None
+    host.official_skill_hub_base_url = None
+    host.enable_private_url_skill_install = 0
+    host.private_skill_source_allowlist = None
+    host.private_skill_source_allowlist_len = 0
     host.sqlite_library_path = None
     host.sqlite_provider_mode = 0
     host.sqlite_callback_mode = 0
@@ -387,14 +448,40 @@ def main() -> None:
     host.default_text_encoding = None
     host.disable_managed_io_compat = 0
 
-    options = FfiLuaEngineOptions(
+    # RuntimeRoot is the v2 canonical data root retained inside the nested v3 ABI.
+    # RuntimeRoot 是嵌套 v3 ABI 中保留的 v2 规范数据根。
+    runtime_root_text = str(root.resolve()).replace("\\", "/").encode("utf-8")
+    # DistributionRoot is the explicit read-only managed runtime asset root.
+    # DistributionRoot 是显式只读受管运行时资产根。
+    distribution_root_text = str((root / "dependencies" / "runtimes").resolve()).replace("\\", "/").encode("utf-8")
+    # EnvironmentRoot is the explicit writable managed environment root.
+    # EnvironmentRoot 是显式可写受管环境根。
+    environment_root_text = str((root / "dependencies" / "envs").resolve()).replace("\\", "/").encode("utf-8")
+    # ManagedRuntimeConfig customizes the engine-wide B3-B7 resource policy before any Worker or session is created.
+    # ManagedRuntimeConfig 在创建任何 Worker 或会话前定制引擎级 B3-B7 资源策略。
+    managed_runtime_config = FfiLuaRuntimeManagedRuntimeConfig(
+        worker_pool_max_size_per_environment=8,
+        worker_idle_ttl_secs=120,
+        persistent_session_limit_per_engine=128,
+        persistent_session_default_buffer_limit_bytes_per_stream=2 * 1024 * 1024,
+        has_invoke_default_timeout_ms=1,
+        invoke_default_timeout_ms=30_000,
+    )
+    host_v2 = FfiLuaRuntimeHostOptionsV2(base=host, runtime_root=runtime_root_text)
+    host_v3 = FfiLuaRuntimeHostOptionsV3(
+        base=host_v2,
+        managed_runtime_distribution_root=distribution_root_text,
+        managed_runtime_environment_root=environment_root_text,
+        managed_runtime_config=ctypes.pointer(managed_runtime_config),
+    )
+    options = FfiLuaEngineOptionsV3(
         pool=FfiLuaVmPoolConfig(min_size=1, max_size=1, idle_ttl_secs=30),
-        host=host,
+        host=host_v3,
     )
     engine_id = ctypes.c_uint64()
     error_buffer = FfiOwnedBuffer()
     must_ok(
-        library.luaskills_ffi_engine_new(
+        library.luaskills_ffi_engine_new_v3(
             ctypes.byref(options), ctypes.byref(engine_id), ctypes.byref(error_buffer)
         ),
         error_buffer,

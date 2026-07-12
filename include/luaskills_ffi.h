@@ -202,6 +202,62 @@ typedef struct FfiLuaRuntimeHostOptionsV2 {
     const char *runtime_root;
 } FfiLuaRuntimeHostOptionsV2;
 
+typedef struct FfiLuaRuntimeManagedRuntimeConfig {
+    /*
+    Maximum live workers for one exact environment and package-owner pool key.
+    单个精确环境与包所有者池键允许的最大活动 Worker 数量。
+    */
+    size_t worker_pool_max_size_per_environment;
+    /*
+    Idle seconds after which an unused worker may be retired.
+    未使用 Worker 可被回收前的空闲秒数。
+    */
+    uint64_t worker_idle_ttl_secs;
+    /*
+    Maximum launching or live persistent sessions retained by one engine.
+    单个引擎允许保留的启动中或活动持久会话最大数量。
+    */
+    size_t persistent_session_limit_per_engine;
+    /*
+    Default retained bytes for each persistent-session stdout or stderr stream.
+    每个持久会话 stdout 或 stderr 流默认保留的字节数。
+    */
+    size_t persistent_session_default_buffer_limit_bytes_per_stream;
+    /*
+    Whether invoke_default_timeout_ms contains one configured positive timeout.
+    invoke_default_timeout_ms 是否包含一个已配置的正数超时。
+    */
+    uint8_t has_invoke_default_timeout_ms;
+    /*
+    Default invoke timeout in milliseconds when the matching presence flag is one.
+    对应存在标记为一时使用的默认 invoke 超时毫秒数。
+    */
+    uint64_t invoke_default_timeout_ms;
+} FfiLuaRuntimeManagedRuntimeConfig;
+
+typedef struct FfiLuaRuntimeHostOptionsV3 {
+    /*
+    Stable v2 host options kept byte-for-byte compatible with the published v2 ABI.
+    与已发布 v2 ABI 保持逐字节兼容的稳定 v2 宿主选项。
+    */
+    FfiLuaRuntimeHostOptionsV2 base;
+    /*
+    Optional existing absolute root containing managed Python, Node, uv, and pnpm distributions.
+    包含受管 Python、Node、uv 与 pnpm 发行包的可选现有绝对根目录。
+    */
+    const char *managed_runtime_distribution_root;
+    /*
+    Optional absolute writable root containing reusable managed Python and Node environments.
+    包含可复用受管 Python 与 Node 环境的可选绝对可写根目录。
+    */
+    const char *managed_runtime_environment_root;
+    /*
+    Optional managed Worker/session policy; NULL preserves all stable defaults.
+    可选的受管 Worker/会话策略；NULL 保留全部稳定默认值。
+    */
+    const FfiLuaRuntimeManagedRuntimeConfig *managed_runtime_config;
+} FfiLuaRuntimeHostOptionsV3;
+
 typedef struct FfiLuaEngineOptions {
     FfiLuaVmPoolConfig pool;
     FfiLuaRuntimeHostOptions host;
@@ -211,6 +267,11 @@ typedef struct FfiLuaEngineOptionsV2 {
     FfiLuaVmPoolConfig pool;
     FfiLuaRuntimeHostOptionsV2 host;
 } FfiLuaEngineOptionsV2;
+
+typedef struct FfiLuaEngineOptionsV3 {
+    FfiLuaVmPoolConfig pool;
+    FfiLuaRuntimeHostOptionsV3 host;
+} FfiLuaEngineOptionsV3;
 
 typedef struct FfiRuntimeSkillRoot {
     const char *name;
@@ -587,6 +648,16 @@ Create one LuaSkills engine through the standard C ABI v2 surface.
 */
 int32_t luaskills_ffi_engine_new_v2(
     const FfiLuaEngineOptionsV2 *options,
+    uint64_t *engine_id_out,
+    FfiOwnedBuffer *error_out
+);
+
+/*
+Create one LuaSkills engine through the standard C ABI v3 surface.
+通过标准 C ABI v3 接口创建一个 LuaSkills 引擎。
+*/
+int32_t luaskills_ffi_engine_new_v3(
+    const FfiLuaEngineOptionsV3 *options,
     uint64_t *engine_id_out,
     FfiOwnedBuffer *error_out
 );

@@ -35,7 +35,7 @@ use crate::runtime_help::{
 };
 use crate::runtime_options::{
     LuaInvocationContext, LuaRuntimeCapabilityOptions, LuaRuntimeHostOptions,
-    LuaRuntimeRunLuaPoolConfig, LuaRuntimeSpaceControllerOptions,
+    LuaRuntimeManagedRuntimeConfig, LuaRuntimeRunLuaPoolConfig, LuaRuntimeSpaceControllerOptions,
     LuaRuntimeSpaceControllerProcessMode, RuntimeSkillRoot,
 };
 use crate::runtime_result::RuntimeHostResult;
@@ -403,6 +403,48 @@ fn parse_runlua_pool_config(
     }
 }
 
+/// Convert one optional C ABI managed-runtime policy pointer into a validated Rust value.
+/// 将一个可选 C ABI 受管运行时策略指针转换为已校验 Rust 值。
+///
+/// `value` is null for stable defaults or points to a complete v3 policy for the duration of the call.
+/// `value` 为空时使用稳定默认值，否则在调用期间指向完整 v3 策略。
+///
+/// Returns the effective policy or a stable presence-flag/capacity validation error.
+/// 返回生效策略，或稳定的存在标记及容量校验错误。
+fn parse_managed_runtime_config(
+    value: *const FfiLuaRuntimeManagedRuntimeConfig,
+) -> Result<LuaRuntimeManagedRuntimeConfig, String> {
+    if value.is_null() {
+        return Ok(LuaRuntimeManagedRuntimeConfig::default());
+    }
+    // Config is borrowed only for the synchronous engine-construction parse.
+    // Config 仅在同步引擎构造解析期间借用。
+    let config = unsafe { &*value };
+    // InvokeDefaultTimeout preserves absence separately from a concrete positive timeout.
+    // InvokeDefaultTimeout 将缺失状态与具体正数超时分开保留。
+    let invoke_default_timeout_ms = match config.has_invoke_default_timeout_ms {
+        0 => None,
+        1 => Some(config.invoke_default_timeout_ms),
+        other => {
+            return Err(format!(
+                "managed_runtime_config.has_invoke_default_timeout_ms must be 0 or 1, got {other}"
+            ));
+        }
+    };
+    // ParsedConfig owns primitive values and cannot retain any caller pointer.
+    // ParsedConfig 拥有全部基础值，不会保留任何调用方指针。
+    let parsed = LuaRuntimeManagedRuntimeConfig {
+        worker_pool_max_size_per_environment: config.worker_pool_max_size_per_environment,
+        worker_idle_ttl_secs: config.worker_idle_ttl_secs,
+        persistent_session_limit_per_engine: config.persistent_session_limit_per_engine,
+        persistent_session_default_buffer_limit_bytes_per_stream: config
+            .persistent_session_default_buffer_limit_bytes_per_stream,
+        invoke_default_timeout_ms,
+    };
+    parsed.validate()?;
+    Ok(parsed)
+}
+
 /// Convert one C ABI host options struct into one Rust host options value.
 /// 将单个 C ABI 宿主选项结构转换为一个 Rust 宿主选项值。
 fn parse_host_options(value: &FfiLuaRuntimeHostOptions) -> Result<LuaRuntimeHostOptions, String> {
@@ -415,9 +457,37 @@ fn parse_host_options_with_runtime_root(
     value: &FfiLuaRuntimeHostOptions,
     runtime_root: Option<PathBuf>,
 ) -> Result<LuaRuntimeHostOptions, String> {
+    parse_host_options_with_managed_roots(
+        value,
+        runtime_root,
+        None,
+        None,
+        LuaRuntimeManagedRuntimeConfig::default(),
+    )
+}
+
+/// Convert one stable v1 host-options base plus v3 root and B3-B7 policy extensions into Rust host options.
+/// 将稳定 v1 宿主选项基础结构与 v3 根及 B3-B7 策略扩展转换为 Rust 宿主选项。
+///
+/// `value` owns the published base fields while the three optional paths and managed policy are
+/// parsed only from the matching versioned ABI wrapper supplied by the caller.
+/// `value` 承载已发布基础字段，三个可选路径与受管策略仅从调用方提供的匹配版本 ABI 包装结构解析。
+///
+/// Returns one Rust host-options value or an explicit string, enum, or layout validation error.
+/// 返回 Rust 宿主选项值，或显式字符串、枚举及布局校验错误。
+fn parse_host_options_with_managed_roots(
+    value: &FfiLuaRuntimeHostOptions,
+    runtime_root: Option<PathBuf>,
+    managed_runtime_distribution_root: Option<PathBuf>,
+    managed_runtime_environment_root: Option<PathBuf>,
+    managed_runtime_config: LuaRuntimeManagedRuntimeConfig,
+) -> Result<LuaRuntimeHostOptions, String> {
     let has_runtime_root = runtime_root.is_some();
     Ok(LuaRuntimeHostOptions {
         runtime_root,
+        managed_runtime_distribution_root,
+        managed_runtime_environment_root,
+        managed_runtime_config,
         temp_dir: parse_optional_string(value.temp_dir, "temp_dir")?.map(PathBuf::from),
         resources_dir: parse_optional_string(value.resources_dir, "resources_dir")?
             .map(PathBuf::from),
@@ -635,6 +705,48 @@ fn parse_engine_options_v2(value: &FfiLuaEngineOptionsV2) -> Result<LuaEngineOpt
             idle_ttl_secs: value.pool.idle_ttl_secs,
         },
         parse_host_options_with_runtime_root(&value.host.base, runtime_root)?,
+    ))
+}
+
+/// Convert one C ABI v3 engine options struct into one Rust engine options value.
+/// 将单个 C ABI v3 引擎选项结构转换为 Rust 引擎选项值。
+///
+/// `value` preserves the complete v2 prefix and adds two managed roots plus one optional B3-B7 policy.
+/// `value` 保留完整 v2 前缀，并新增两个受管根及一份可选 B3-B7 策略。
+///
+/// Returns validated Rust options or an explicit UTF-8/path-layout parsing error.
+/// 返回已校验 Rust 选项，或显式 UTF-8 及路径布局解析错误。
+fn parse_engine_options_v3(value: &FfiLuaEngineOptionsV3) -> Result<LuaEngineOptions, String> {
+    // RuntimeRoot and managed roots are parsed from their exact versioned owning fields.
+    // RuntimeRoot 与受管根均从其精确版本所有字段解析。
+    let runtime_root =
+        parse_optional_string(value.host.base.runtime_root, "runtime_root")?.map(PathBuf::from);
+    let managed_runtime_distribution_root = parse_optional_string(
+        value.host.managed_runtime_distribution_root,
+        "managed_runtime_distribution_root",
+    )?
+    .map(PathBuf::from);
+    let managed_runtime_environment_root = parse_optional_string(
+        value.host.managed_runtime_environment_root,
+        "managed_runtime_environment_root",
+    )?
+    .map(PathBuf::from);
+    // ManagedRuntimeConfig is borrowed from the optional v3 pointer and copied before engine creation.
+    // ManagedRuntimeConfig 从可选 v3 指针借用，并在引擎创建前完成复制。
+    let managed_runtime_config = parse_managed_runtime_config(value.host.managed_runtime_config)?;
+    Ok(LuaEngineOptions::new(
+        LuaVmPoolConfig {
+            min_size: value.pool.min_size,
+            max_size: value.pool.max_size,
+            idle_ttl_secs: value.pool.idle_ttl_secs,
+        },
+        parse_host_options_with_managed_roots(
+            &value.host.base.base,
+            runtime_root,
+            managed_runtime_distribution_root,
+            managed_runtime_environment_root,
+            managed_runtime_config,
+        )?,
     ))
 }
 
@@ -2313,6 +2425,49 @@ pub unsafe extern "C" fn luaskills_ffi_engine_new_v2(
         return ffi_error_status(error_out, "engine_id_out must not be null");
     }
     let options = match parse_engine_options_v2(unsafe { &*options }) {
+        Ok(options) => options,
+        Err(error) => return ffi_error_status(error_out, error),
+    };
+    match LuaEngine::new(options) {
+        Ok(engine) => {
+            let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut registry = lock_ffi_engine_registry();
+            registry.insert(engine_id, crate::ffi::FfiEngineSlot::new(engine));
+            unsafe { *engine_id_out = engine_id };
+            ffi_ok_status(error_out)
+        }
+        Err(error) => ffi_error_status(error_out, error.to_string()),
+    }
+}
+
+/// Create one runtime engine through the standard C ABI v3 surface.
+/// 通过标准 C ABI v3 接口创建单个运行时引擎。
+/// # Safety
+/// # 安全性
+/// `options`, `engine_id_out`, and `error_out` must satisfy the LuaSkills C ABI pointer contracts;
+/// every nested string pointer must remain readable for the complete call.
+/// `options`、`engine_id_out` 与 `error_out` 必须满足 LuaSkills C ABI 指针契约；全部嵌套字符串
+/// 指针必须在完整调用期间保持可读。
+///
+/// Returns zero and writes a nonzero engine id on success, or returns nonzero with a LuaSkills-owned
+/// UTF-8 error buffer that the caller must free.
+/// 成功时返回零并写入非零引擎标识；失败时返回非零及一段调用方必须释放的 LuaSkills 所有 UTF-8
+/// 错误缓冲。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_engine_new_v3(
+    options: *const FfiLuaEngineOptionsV3,
+    engine_id_out: *mut u64,
+    error_out: *mut FfiOwnedBuffer,
+) -> i32 {
+    clear_error_out(error_out);
+    clear_out_u64(engine_id_out);
+    if options.is_null() {
+        return ffi_error_status(error_out, "options must not be null");
+    }
+    if engine_id_out.is_null() {
+        return ffi_error_status(error_out, "engine_id_out must not be null");
+    }
+    let options = match parse_engine_options_v3(unsafe { &*options }) {
         Ok(options) => options,
         Err(error) => return ffi_error_status(error_out, error),
     };

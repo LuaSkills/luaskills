@@ -1,5 +1,5 @@
 python_runtime:
-  version: "3.14.4"
+  version: "3.14.6"
   package_manager: uv
   package_manager_version: "0.11.28"
   lockfile: python/requirements.lock
