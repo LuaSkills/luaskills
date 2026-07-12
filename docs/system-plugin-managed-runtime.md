@@ -145,6 +145,7 @@ The System create body is strict:
 - `dependencies_file` is package-relative and must resolve to a contained regular file without a symlink escape.
 - `workspace_root`, when supplied, must be an existing absolute directory.
 - `cwd` must resolve under the package root or the authorized workspace. It defaults to the package root.
+- On Windows, LuaSkills 0.5.2 retains the canonical native object for identity checks and uses the equivalent non-verbatim spelling only when changing the process working directory. Child processes therefore inherit the authorized drive path without `cmd.exe` treating `\\?\` as UNC.
 - Public `lua_roots`, `c_roots`, and unknown fields are rejected.
 
 Keep the returned `lease_id`, `sid`, and `generation` together. Send all three on later eval, status, and close requests so a stale or crossed handle fails explicitly.

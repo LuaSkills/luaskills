@@ -9336,6 +9336,75 @@ fn system_runtime_lease_preserves_explicit_cwd_and_package_identity() {
     );
 }
 
+/// Verify a Windows child process inherits the authorized package cwd without verbatim syntax.
+/// 验证 Windows 子进程继承不含 verbatim 语法的已授权包 cwd。
+#[cfg(windows)]
+#[test]
+fn system_runtime_lease_process_session_inherits_non_verbatim_package_cwd() {
+    let layout = SystemRuntimeTestLayout::new("system-runtime-process-cwd");
+    let engine = make_runtime_test_engine_with_host_options(layout.host_options());
+    let created: Value = serde_json::from_str(
+        &engine
+            .create_system_runtime_lease_json(
+                &layout.create_request("system-process-cwd-test").to_string(),
+            )
+            .expect("create System process-cwd lease"),
+    )
+    .expect("decode System process-cwd lease");
+    let lease_id = created["lease_id"]
+        .as_str()
+        .expect("System process-cwd lease id")
+        .to_string();
+    let generation = created["generation"]
+        .as_u64()
+        .expect("System process-cwd lease generation");
+    // EvalRequest launches cmd without an explicit cwd so it must inherit the lease package root.
+    // EvalRequest 启动未显式指定 cwd 的 cmd，因此它必须继承租约包根。
+    let eval_request = json!({
+        "lease_id": lease_id,
+        "generation": generation,
+        "code": r#"
+local session = vulcan.process.session.open({
+  program = "cmd",
+  args = { "/D", "/S", "/C", "cd" },
+  encoding = "utf-8",
+})
+local status = session:close({ timeout_ms = 3000 })
+local output = session:read({ timeout_ms = 3000, max_bytes = 8192 })
+return {
+  stdout = output.stdout,
+  stderr = output.stderr,
+  exited = status.exited,
+  success = status.success,
+}
+"#
+    });
+    let evaluated: Value = serde_json::from_str(
+        &engine
+            .eval_system_runtime_lease_json(&eval_request.to_string())
+            .expect("eval System process-cwd lease"),
+    )
+    .expect("decode System process-cwd eval");
+    assert_eq!(evaluated["ok"], true);
+    assert_eq!(evaluated["result"]["exited"], true);
+    assert_eq!(evaluated["result"]["success"], true);
+    assert_eq!(
+        evaluated["result"]["stdout"]
+            .as_str()
+            .expect("cmd cwd stdout")
+            .trim(),
+        render_host_visible_path(&layout.package_root)
+    );
+    assert!(
+        evaluated["result"]["stderr"]
+            .as_str()
+            .expect("cmd cwd stderr")
+            .trim()
+            .is_empty(),
+        "cmd must not reject the lease cwd as a UNC path: {evaluated}"
+    );
+}
+
 /// Verify System workspace and cwd inputs are canonical authorization boundaries, not display data.
 /// 验证 System 工作区与 cwd 输入属于规范授权边界，而非仅用于显示的数据。
 #[test]

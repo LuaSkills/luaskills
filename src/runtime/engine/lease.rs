@@ -9,6 +9,7 @@ use crate::runtime::managed_package::{
     capture_managed_directory_identity, validate_lua_search_root_path,
     validate_managed_directory_identity,
 };
+use crate::runtime::path::host_process_path_argument;
 use mlua::{MetaMethod, UserData, UserDataMethods};
 
 /// Runtime session creation request accepted by the host-facing JSON API.
@@ -2185,7 +2186,10 @@ impl LuaEngine {
                 let original_dir = std::env::current_dir().map_err(|error| {
                     mlua::Error::runtime(format!("runtime lease cwd: {}", error))
                 })?;
-                std::env::set_current_dir(cwd).map_err(|error| {
+                // ExecutionCwd preserves the revalidated object while removing only Windows verbatim syntax.
+                // ExecutionCwd 保留已重新校验的对象，同时仅移除 Windows verbatim 语法。
+                let execution_cwd = host_process_path_argument(cwd);
+                std::env::set_current_dir(&execution_cwd).map_err(|error| {
                     mlua::Error::runtime(format!(
                         "runtime lease set cwd {}: {}",
                         render_host_visible_path(cwd),

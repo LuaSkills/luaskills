@@ -110,7 +110,7 @@ asset은 `{skill_id}-v{version}-skill.zip`과 `{skill_id}-v{version}-checksums.t
 
 | 구성 요소 | 현재 버전 |
 | --- | --- |
-| LuaSkills core, FFI SDK 및 언어 SDK 계열 | `0.5.1` |
+| LuaSkills core, FFI SDK 및 언어 SDK 계열 | `0.5.2` |
 | Lua runtime packages 호환 계열 | `0.1` |
 | 관리형 Python / uv | `3.14.6` / `0.11.28` |
 | 관리형 Node.js / pnpm | `24.18.0` / `11.11.0` |

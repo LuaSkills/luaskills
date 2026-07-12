@@ -17,6 +17,7 @@
 | 从 0.4.4 升级到 0.4.6 | [LuaSkills 0.4.6 升级说明](../upgrade-0.4.6.md) |
 | 从 0.4.6 升级到 0.5.0 | [LuaSkills 0.5.0 破坏性升级说明](../upgrade-0.5.0.md) |
 | 从 0.5.0 升级到 0.5.1 | [LuaSkills 0.5.1 受管运行时根升级说明](../upgrade-0.5.1.md) |
+| 从 0.5.1 升级到 0.5.2 | [LuaSkills 0.5.2 补丁升级说明](../upgrade-0.5.2.md) |
 | 第一次做 FFI 联调 | [FFI 宿主接入检查清单](ffi/host-checklist.md) |
 | 需要完整 FFI 参数、内存和生命周期规则 | [FFI 对接文档](ffi/integration-guide.md) |
 | 需要接入 System Plugin 受管 Python/Node 长期会话 | [System Plugin 受管运行时使用指南](system-plugin-managed-runtime.md) |
@@ -44,6 +45,7 @@
 - [Lua Skill 开发手册](skill-development.md)
 - [System Plugin 受管运行时使用指南](system-plugin-managed-runtime.md)
 - [宿主指定受管运行时根目录](managed-runtime-host-roots.md)
+- [LuaSkills 0.5.2 补丁升级说明](../upgrade-0.5.2.md)
 - [LuaSkills 0.5.1 升级说明](../upgrade-0.5.1.md)
 - [Skill Root 层级与管理边界](architecture/skill-root-layer-policy.md)
 - [Skill 配置系统设计稿](architecture/skill-config-system-design.md)
@@ -60,6 +62,7 @@ Skill 作者最应该记住的边界是：skill 应依赖 `vulcan.context.*` 和
 - [FFI Beta 发布说明](ffi/beta-release-notes.md)
 - [LuaSkills 0.4.6 升级说明](../upgrade-0.4.6.md)
 - [LuaSkills 0.5.0 破坏性升级说明](../upgrade-0.5.0.md)
+- [LuaSkills 0.5.2 补丁升级说明](../upgrade-0.5.2.md)
 - [LuaSkills 0.5.1 受管运行时根升级说明](../upgrade-0.5.1.md)
 - [FFI 宿主接入检查清单](ffi/host-checklist.md)
 - [FFI 对接文档](ffi/integration-guide.md)

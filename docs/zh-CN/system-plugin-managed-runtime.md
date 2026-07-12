@@ -145,6 +145,7 @@ System create 正文是严格结构：
 - `dependencies_file` 是包相对路径，必须解析为包内普通文件，不能通过符号链接逃逸。
 - 可选 `workspace_root` 必须是既有绝对目录。
 - `cwd` 必须解析到包根或已授权工作区内；省略时默认为包根。
+- 在 Windows 上，LuaSkills 0.5.2 继续使用规范原生对象完成身份校验，只在切换进程工作目录时使用等价的非 verbatim 写法。子进程会继承已授权盘符路径，不会让 `cmd.exe` 把 `\\?\` 误判为 UNC。
 - 公共 `lua_roots`、`c_roots` 与未知字段都会被拒绝。
 
 把返回的 `lease_id`、`sid` 与 `generation` 作为一个整体保存。后续 eval、status 与 close 请求都回传这三项，使陈旧句柄或串线调用显式失败。
