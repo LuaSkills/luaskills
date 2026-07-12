@@ -51,7 +51,7 @@ jobs:
       # EnvironmentRoot 在 runtime_root 外保存可写依赖环境。
       MANAGED_RUNTIME_ENVIRONMENT_ROOT: ${{ github.workspace }}/target/managed-runtime-ci-environments
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Rust 1.94
         uses: dtolnay/rust-toolchain@master
@@ -188,15 +188,15 @@ jobs:
     name: FFI examples on Python 3.14 and Node 24
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Python 3.14
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.14.6"
 
       - name: Setup Node 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "24.18.0"
 
