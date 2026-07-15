@@ -21,10 +21,13 @@ Upgrade every ecosystem component together:
 4. Host Tool arguments, Runtime Lease eval results, RunLua results, System Plugin bridge values, JSON FFI results, and standard C ABI JSON results use the same container-type rules.
 5. Windows host-visible path boundaries convert only valid verbatim drive paths and verbatim UNC paths. Mixed separators and unsupported namespaces such as Volume GUID, device, and pipe paths fail before module lookup, environment creation, or process creation.
 6. Native canonical paths remain intact for filesystem identity checks and the private Python Worker/Session long-path channel, so the stricter host boundary does not weaken package, manifest, snapshot, cwd, or runtime isolation.
+7. The minimum `tar` dependency is `0.4.46`, which includes the upstream fix for PAX header desynchronization while LuaSkills extracts downloaded release archives.
+8. Release locks use `quinn-proto 0.11.16` and `anyhow 1.0.103`, addressing the RustSec out-of-order stream memory-exhaustion advisory and `Error::downcast_mut` soundness advisory found during the release audit.
 
 ### Compatibility notes
 
 - No FFI symbol, request field, callback signature, or standard C ABI structure changed in `0.5.3`.
+- Rust hosts with an existing workspace lock should update `tar`, `quinn-proto`, and `anyhow` to the patched versions above when adopting `0.5.3`.
 - JSON decoded from an Object now encodes back as an Object even when empty. Hosts that previously worked around `{}` becoming `[]` should remove that workaround.
 - Deliberately malformed explicitly typed Lua containers now return an error instead of producing a partially encoded value.
 - Unsupported Windows verbatim namespaces are rejected with the stable error `unsupported Windows verbatim path namespace`; they are never passed to Lua module lookup or silently rewritten into relative paths.
@@ -60,10 +63,13 @@ LuaSkills `0.5.3` 是 `0.5.x` 受管运行时与宿主集成功能线的稳定�
 4. Host Tool 参数、Runtime Lease eval 结果、RunLua 结果、System Plugin 固定桥、JSON FFI 与标准 C ABI JSON 出口使用同一套容器类型规则。
 5. Windows 宿主可见路径边界只转换合法的 verbatim 盘符路径和 verbatim UNC 路径。混合分隔符以及 Volume GUID、设备、管道等不受支持的命名空间会在模块寻址、环境创建或进程创建前失败。
 6. 文件对象身份校验和 Python 私有 Worker/Session 长路径通道继续保留原生规范路径，因此更严格的宿主边界不会削弱包、清单、快照、cwd 或运行时隔离。
+7. `tar` 最低依赖提升到 `0.4.46`，包含上游针对 PAX header 不同步问题的修复，覆盖 LuaSkills 解压已下载 Release 归档的调用链。
+8. Release 锁文件使用 `quinn-proto 0.11.16` 与 `anyhow 1.0.103`，修复发布审计发现的 RustSec 乱序流内存耗尽告警和 `Error::downcast_mut` 健全性告警。
 
 ### 兼容说明
 
 - `0.5.3` 没有修改 FFI 导出符号、请求字段、回调签名或标准 C ABI 结构。
+- 已有 workspace 锁文件的 Rust 宿主升级到 `0.5.3` 时，应把 `tar`、`quinn-proto` 与 `anyhow` 同步更新到上述修复版本。
 - 从 JSON Object 解码得到的值即使为空，再编码时也保持 Object。宿主若曾为 `{}` 变成 `[]` 增加临时兼容，应删除该兼容。
 - 显式类型化 Lua 容器若结构非法，现在会返回错误，不再产生静默丢字段的部分结果。
 - 不支持的 Windows verbatim 命名空间会返回稳定错误 `unsupported Windows verbatim path namespace`，不会进入 Lua 模块寻址，也不会被错误改写成相对路径。
