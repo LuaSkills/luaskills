@@ -26,6 +26,58 @@ const DESCENDANT_PROBE_START_TIMEOUT: Duration = Duration::from_secs(60);
 /// 在单个并行测试进程内隔离后代 pid 夹具的单调后缀。
 static DESCENDANT_FIXTURE_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
 
+/// Verify persistent process sessions reject unsupported Windows verbatim program and cwd paths.
+/// 验证持久进程会话会拒绝不受支持的 Windows verbatim 程序与 cwd 路径。
+#[cfg(windows)]
+#[test]
+fn process_session_open_rejects_unsupported_windows_verbatim_namespaces() {
+    // Lua state owning both request tables passed through the production parser.
+    // 持有两个通过生产解析器请求表的 Lua 状态。
+    let lua = Lua::new();
+    // Volume namespace without an ordinary DOS/UNC equivalent.
+    // 不存在普通 DOS/UNC 等价形式的卷命名空间。
+    let volume_path = r"\\?\Volume{00000000-0000-0000-0000-000000000000}\runtime.exe";
+
+    // Program request rejected before Command construction or process creation.
+    // 在构造 Command 或创建进程前被拒绝的程序请求。
+    let program_spec = lua.create_table().expect("create program request table");
+    program_spec
+        .set("program", volume_path)
+        .expect("set unsupported program path");
+    let program_error = parse_session_open_request(
+        LuaValue::Table(program_spec),
+        default_runtime_text_encoding(),
+    )
+    .err()
+    .expect("unsupported program namespace must fail");
+    assert!(
+        program_error
+            .to_string()
+            .contains("unsupported Windows verbatim path namespace"),
+        "unexpected program error: {program_error}"
+    );
+
+    // Cwd request rejected independently while a normal program name remains accepted.
+    // 在普通程序名保持可接受时独立拒绝的 cwd 请求。
+    let cwd_spec = lua.create_table().expect("create cwd request table");
+    cwd_spec
+        .set("program", "cmd.exe")
+        .expect("set ordinary program name");
+    cwd_spec
+        .set("cwd", volume_path)
+        .expect("set unsupported cwd path");
+    let cwd_error =
+        parse_session_open_request(LuaValue::Table(cwd_spec), default_runtime_text_encoding())
+            .err()
+            .expect("unsupported cwd namespace must fail");
+    assert!(
+        cwd_error
+            .to_string()
+            .contains("unsupported Windows verbatim path namespace"),
+        "unexpected cwd error: {cwd_error}"
+    );
+}
+
 /// A direct-child reap helper must honor its absolute deadline without calling blocking wait.
 /// 直接子进程回收辅助函数必须遵守绝对截止时间，且不得调用阻塞式 wait。
 #[test]

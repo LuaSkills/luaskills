@@ -162,7 +162,7 @@ These rules apply to every projection layer, including MCP, gRPC, FFI/SDK hosts,
 
 Some skills need one caller-visible project or workspace path that follows the host's active project scope instead of the raw runtime process working directory. LuaSkills reserves `PWD` as the conventional entry-argument name for that purpose.
 
-This is a LuaSkills ecosystem compatibility convention, not one runtime-enforced magic field. The runtime treats `PWD` as ordinary entry input. Hosts and adapters that project LuaSkills entries into user-facing or model-facing tools decide whether the field stays visible, hidden, or automatically injected.
+This is a LuaSkills ecosystem compatibility convention, not an authority-bearing magic field. The runtime recognizes `PWD` only to normalize its path spelling at the Lua boundary. Hosts and adapters that project LuaSkills entries into user-facing or model-facing tools decide whether the field stays visible, hidden, or automatically injected.
 
 Skill author rules:
 
@@ -184,6 +184,8 @@ Host and adapter rules:
 
 These rules apply to every projection layer, including MCP, gRPC, FFI/SDK hosts, IDE integrations, and embedded product hosts.
 
+On Windows, a host may obtain a canonical path in `\\?\C:\...` or `\\?\UNC\server\share\...` form. LuaSkills removes that verbatim prefix from the reserved top-level `PWD` argument before it enters Lua. The same boundary rule applies to declared runtime path fields; arbitrary JSON strings are not rewritten merely because they resemble paths. Only absolute drive and UNC verbatim forms have proven ordinary equivalents. Volume GUID, device, pipe, mixed-separator, and other verbatim namespaces are rejected explicitly instead of being reinterpreted as relative paths. Prefix cleanup is a compatibility transformation, not authorization or canonicalization.
+
 ## 3. Top-Level Capability Overview
 
 | Top-level item | Purpose | Available by default | Notes |
@@ -195,7 +197,7 @@ These rules apply to every projection layer, including MCP, gRPC, FFI/SDK hosts,
 | `vulcan.path` | Path joining | Yes | Returns Lua-friendly system paths |
 | `vulcan.process` | Start child processes | Yes | Includes one-shot `exec` and interactive `session` |
 | `vulcan.os` | Host OS and architecture info | Yes | `os`, `arch` |
-| `vulcan.json` | JSON encode/decode | Yes | JSON to/from Lua table |
+| `vulcan.json` | JSON encode/decode | Yes | Type-preserving JSON/Lua conversion |
 | `vulcan.cache` | Runtime cache | Yes | Disabled inside `vulcan.runtime.lua.exec` |
 | `vulcan.models` | Standard model capabilities | Yes | Capability is active only when the host registers the matching callback |
 | `vulcan.host` | Host-registered tool bridge | Yes | Empty until the host registers a callback |
@@ -1234,6 +1236,11 @@ local ext = vulcan.path.extname(config_path)
 
 - Returns normal path text for the host system.
 - On Windows, it does not leak `\\?\` or `\\?\UNC\` verbatim prefixes directly to Lua.
+- Path-typed Lua/runtime inputs are normalized by the receiving API before lookup. This includes the reserved top-level `PWD` argument, `vulcan.fs` / `vulcan.io` paths, process `program` / `cwd` fields, Runtime Lease path fields, module search roots, and managed-runtime FFI paths.
+- Only verbatim absolute drive paths and verbatim UNC paths are converted. Other Windows verbatim namespaces fail with `unsupported Windows verbatim path namespace` before lookup or process creation.
+- `package.path` and `package.cpath` are built only from host-visible path spelling, so Windows canonical roots cannot stall Lua module lookup through a verbatim prefix.
+- Rust-internal canonical paths and native filesystem identities remain unchanged for containment, replacement, symlink, and race checks. Removing a prefix at the Lua/API boundary does not weaken those checks.
+- Arbitrary JSON string values, process arguments, and environment values are not guessed to be paths and are not rewritten.
 - `path.dirname(path)` returns `.` when a relative path has no parent segment.
 - `path.basename(path)`, `path.stem(path)`, and `path.extname(path)` return an empty string when the terminal component is absent.
 - `path.extname(path)` includes the leading dot when an extension exists, for example `.lua`.
@@ -1487,16 +1494,24 @@ Currently provides:
 
 - `vulcan.json.encode(value)`
 - `vulcan.json.decode(text)`
+- `vulcan.json.object()` / `vulcan.json.object(table)`
+- `vulcan.json.array()` / `vulcan.json.array(table)`
+- `vulcan.json.null`
 
 Example:
 
 ```lua
-local text = vulcan.json.encode({
-    hello = "world",
-    limit = 3,
+local payload = vulcan.json.object({
+    environment = vulcan.json.object(),
+    binary_path_requests = vulcan.json.array(),
+    contributions = vulcan.json.array({
+        "shell-hook",
+    }),
+    optional = vulcan.json.null,
 })
 
-local obj = vulcan.json.decode(text)
+local text = vulcan.json.encode(payload)
+local decoded = vulcan.json.decode(text)
 ```
 
 Notes:
@@ -1504,28 +1519,42 @@ Notes:
 | API | Parameters And Types | Return Value | Notes |
 | --- | --- | --- | --- |
 | `vulcan.json.encode(value)` | any JSON-serializable Lua value | `string` | encodes JSON text |
-| `vulcan.json.decode(text)` | `text: string` | Lua value | decodes JSON text |
+| `vulcan.json.decode(text)` | `text: string` | typed Lua value | recursively preserves JSON Object, Array, and Null |
+| `vulcan.json.object(table?)` | optional `table` | marked `table` | creates an Object-marked shallow copy; no argument creates an empty Object |
+| `vulcan.json.array(table?)` | optional `table` | marked `table` | creates an Array-marked shallow copy; no argument creates an empty Array |
+| `vulcan.json.null` | none | JSON Null sentinel | use inside objects or arrays when `nil` would delete a field or create a hole |
 
-Encoding rules:
+Container and Null rules:
 
-- `nil` -> `null`
+- Every Object and Array produced by `decode` is recursively marked with its original JSON container kind. Re-encoding therefore preserves nested empty `{}` and `[]` values.
+- JSON Null decodes to the same sentinel exposed as `vulcan.json.null`. It survives object fields and array elements.
+- `object(table)` and `array(table)` shallow-copy the source table and do not replace its metatable or identity. Nested values retain their existing identities.
+- Container type markers use protected shared metatables. Ordinary Lua code cannot replace or mutate the runtime marker through `getmetatable`.
+- An Object allows only UTF-8 string keys.
+- An Array allows only dense, one-based positive integer keys. String keys, mixed keys, non-positive indexes, and holes raise an explicit encoding error.
+- Constructors accept either no argument or exactly one table. Other argument shapes raise an explicit error.
+
+Scalar encoding rules:
+
+- `nil` -> JSON Null when passed as the encoded value
+- `vulcan.json.null` -> JSON Null
 - `boolean` -> JSON boolean
 - `integer` / `number` -> JSON number
 - `string` -> JSON string
-- `table` -> JSON array or object
+- marked `table` -> its declared JSON Object or Array kind
 
-Array/object detection is important:
+Compatibility rules for unmarked Lua tables:
 
-- when one Lua table has `raw_len() > 0`, the runtime serializes it as an **array**
-- when `raw_len() == 0` and the table has string keys, the runtime serializes it as an **object**
-- an empty table becomes `[]`, not `{}`
+- when one unmarked table has `raw_len() > 0`, the runtime infers an Array and applies the same strict dense-index validation
+- when `raw_len() == 0` and the table has string keys, the runtime infers an Object and requires every key to be a string
+- an unmarked empty `{}` keeps the legacy behavior and encodes as `[]`; use `vulcan.json.object()` for an explicit empty Object
 
 Unsupported input values:
 
 - `function`
 - `thread`
-- `userdata`
-- `lightuserdata`
+- `userdata`, except the runtime's documented read-only JSON context views
+- `lightuserdata` other than `vulcan.json.null`
 
 Passing those values to `vulcan.json.encode(...)` raises a runtime error.
 
@@ -1637,7 +1666,7 @@ Notes:
 - In normal skill calls, all three are usually available.
 - In some runlua, help, or non-skill-file scenarios, they may be `nil`.
 - In a System Plugin lease eval, these three **entry-specific** fields remain `nil` because the eval is not a Skill entry call. This does not mean the package context is absent: use the recursively read-only `vulcan.runtime.system_plugin` view for package identity and `vulcan.runtime.workspace_root / mounts` for host-authorized context.
-- The current implementation automatically strips Windows verbatim path prefixes so Lua receives normal system paths.
+- The current implementation converts Windows verbatim drive/UNC paths to their ordinary equivalents so Lua receives normal system paths; unsupported verbatim namespaces are rejected.
 
 ### 12.8 `vulcan.context.host_result`
 

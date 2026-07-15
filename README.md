@@ -104,6 +104,7 @@ Start here:
 - [FFI and SDK overview](docs/ffi/overview.md): English overview for host integrators.
 - [System Plugin managed runtime guide](docs/system-plugin-managed-runtime.md): end-to-end package, persistent Python/Node session, event, and cleanup workflow.
 - [Host-selected managed runtime roots](docs/managed-runtime-host-roots.md): independent roots, B3-B7 engine policy, asset identity hashes, Rust/JSON resolvers, and C ABI V3.
+- [LuaSkills 0.5.3 patch guide](docs/upgrade-0.5.3.md): JSON Object/Array/Null fidelity, explicit Lua JSON constructors, and strict Windows verbatim-path boundaries.
 - [LuaSkills 0.5.2 patch guide](docs/upgrade-0.5.2.md): Windows System-lease cwd, SHA-256 release assets, and Go runtime-lease example corrections.
 - [LuaSkills 0.5.1 upgrade guide](docs/upgrade-0.5.1.md): host-root, resource-policy, FFI, SDK, and validation migration checklist.
 - [Database provider overview](docs/providers/database-providers.md): English overview for SQLite and LanceDB ownership.
@@ -144,7 +145,7 @@ Rust hosts can depend on the crate directly:
 
 ```toml
 [dependencies]
-luaskills = "0.5.2"
+luaskills = "0.5.3"
 ```
 
 Repository development uses the normal Rust workflow:
@@ -247,13 +248,13 @@ examples/
 
 ## Ecosystem Release Order
 
-For one unified ecosystem release such as `0.5.2`, publish in this order:
+For one unified ecosystem release such as `0.5.3`, publish in this order:
 
 1. Release `LuaSkills/luaskills-packages` first so `lua-runtime-packages-*` and `lua-deps-*` already exist for the new compatible series.
-2. Release `LuaSkills/luaskills` next, including the crate version plus the main-repo `luaskills-ffi-sdk-*` and demo assets under tag `v0.5.2`.
-3. Publish the TypeScript SDK `@luaskills/sdk@0.5.2`.
-4. Publish the Python SDK `luaskills-sdk==0.5.2`.
-5. Publish the Go SDK module tag `v0.5.2`.
+2. Release `LuaSkills/luaskills` next, including the crate version plus the main-repo `luaskills-ffi-sdk-*` and demo assets under tag `v0.5.3`.
+3. Publish the TypeScript SDK `@luaskills/sdk@0.5.3`.
+4. Publish the Python SDK `luaskills-sdk==0.5.3`.
+5. Publish the Go SDK module tag `v0.5.3`.
 6. Run the **Examples Release** workflow for each SDK only after its package or module tag is already visible upstream.
 
 This order keeps every installer and examples workflow pointed at already-published packages assets, core assets, and SDK packages.
@@ -262,7 +263,7 @@ This order keeps every installer and examples workflow pointed at already-publis
 
 | Component | Current version |
 | --- | --- |
-| LuaSkills core, FFI SDK, and language SDK line | `0.5.2` |
+| LuaSkills core, FFI SDK, and language SDK line | `0.5.3` |
 | Lua runtime packages compatible series | `0.1` |
 | Managed Python / uv | `3.14.6` / `0.11.28` |
 | Managed Node.js / pnpm | `24.18.0` / `11.11.0` |

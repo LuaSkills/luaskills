@@ -145,7 +145,7 @@ System create 正文是严格结构：
 - `dependencies_file` 是包相对路径，必须解析为包内普通文件，不能通过符号链接逃逸。
 - 可选 `workspace_root` 必须是既有绝对目录。
 - `cwd` 必须解析到包根或已授权工作区内；省略时默认为包根。
-- 在 Windows 上，LuaSkills 0.5.2 继续使用规范原生对象完成身份校验，只在切换进程工作目录时使用等价的非 verbatim 写法。子进程会继承已授权盘符路径，不会让 `cmd.exe` 把 `\\?\` 误判为 UNC。
+- 在 Windows 上，LuaSkills 0.5.3 继续使用规范原生对象完成身份校验，并在 Lua、宿主 API、模块搜索和子进程边界转换受支持的 verbatim 盘符路径与 UNC 路径。其他 verbatim 命名空间和混合分隔符会在寻址或创建进程前明确失败。
 - 公共 `lua_roots`、`c_roots` 与未知字段都会被拒绝。
 
 把返回的 `lease_id`、`sid` 与 `generation` 作为一个整体保存。后续 eval、status 与 close 请求都回传这三项，使陈旧句柄或串线调用显式失败。
@@ -355,6 +355,7 @@ callback 在每个 engine 的单个串行后台调度器上运行，可以发信
 - `vulcan.runtime.system_plugin` 与 `vulcan.runtime.mounts` 是递归只读 userdata 视图；`vulcan.runtime.workspace_root` 是规范授权路径或 `nil`。
 - 专用 System VM 会移除全局 `rawset` 与 Lua `debug` 库，阻止绕过元表边界。
 - 包源码、依赖清单、lockfile、入口文件与授权 cwd 对象都按固定文件系统身份校验；路径穿越、符号链接逃逸与不支持的包对象会被拒绝。
+- Windows 下，Lua 可见包根、`package.path` / `package.cpath`、Node Worker 载荷、Lua/宿主可见子进程路径字段、租约状态与 FFI 路径结果会把 verbatim 盘符/UNC 路径转换为普通等价形式；卷 GUID、设备、管道、混合分隔符及其他 verbatim 命名空间会在寻址前被拒绝，不会被改写。原生规范路径与文件系统对象身份仍在内部固定并用于全部安全校验。Python 私有 Worker 与持久会话源码传输会保留原生规范路径，因为 Windows 超长路径导入必须使用 verbatim 形式；这些值绝不会暴露给 Lua 或宿主 API。
 - 存活 Worker 或会话快照持有跨进程环境共享租约。环境发布/替换只尝试非阻塞独占租约，并返回稳定 busy 错误，而不会与存活消费者竞态。
 - 后台输出、退出与失败观察器只发布有界引擎事件，绝不执行 Lua。
 - 不要转发调用方提供的 authority、任意包根或任意 workspace 根；它们属于宿主策略输入。

@@ -1,7 +1,8 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use mlua::{
-    AnyUserData, Function, HookTriggers, Lua, MultiValue, Table, Value as LuaValue, VmState,
+    AnyUserData, Function, HookTriggers, LightUserData, Lua, LuaSerdeExt, MultiValue, Table,
+    Value as LuaValue, VmState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -68,7 +69,7 @@ use crate::runtime::managed_runtime_session::{
 use crate::runtime::managed_session_events::{
     ManagedSessionEventCenter, RuntimeManagedSessionEventBatch, RuntimeManagedSessionWakeCallback,
 };
-use crate::runtime::path::render_host_visible_path;
+use crate::runtime::path::{normalize_host_input_path_text, render_host_visible_path};
 use crate::runtime::process_session::{
     DetachedChildReaperPermit, ManagedChildProcessTree, create_managed_process_session_userdata,
     create_process_session_table,
@@ -133,8 +134,8 @@ struct LoadedSkill {
     resolved_entry_names: HashMap<String, String>,
 }
 
-/// Render one filesystem path for user-facing runtime logs without Windows verbatim prefixes.
-/// 为面向用户的运行时日志渲染文件系统路径，并去掉 Windows verbatim 前缀。
+/// Render one filesystem path for user-facing logs with safe Windows drive/UNC prefix cleanup.
+/// 为面向用户的日志渲染文件系统路径，并安全清理 Windows 盘符/UNC 前缀。
 fn render_log_friendly_path(path: &Path) -> String {
     render_host_visible_path(path)
 }
@@ -712,6 +713,11 @@ fn configured_package_search_directory_exists(
     path: &Path,
     option_name: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    // Host option paths must have an ordinary spelling before any metadata or Lua lookup occurs.
+    // 在任何元数据或 Lua 寻址发生前，宿主选项路径必须具备普通写法。
+    if let Err(error) = normalize_host_input_path_text(&path.to_string_lossy()) {
+        return Err(format!("configured {option_name}: {error}").into());
+    }
     match fs::metadata(path) {
         Ok(metadata) if metadata.is_dir() => Ok(true),
         Ok(_) => Err(format!(
@@ -1628,13 +1634,17 @@ fn find_vulcan_process_candidate(base: &Path) -> Result<Option<PathBuf>, String>
 /// Returns an error when the current directory or executable lookup environment cannot be read.
 /// 当当前目录或可执行查找环境无法读取时返回错误。
 fn resolve_vulcan_process_which(program: &str) -> Result<Option<PathBuf>, String> {
+    // Program spelling normalized before explicit path detection or PATH candidate construction.
+    // 在显式路径检测或 PATH 候选构造前归一化程序路径写法。
+    let program = normalize_host_input_path_text(program)
+        .map_err(|error| format!("process.which: program: {error}"))?;
     // Current working directory used to resolve relative explicit paths and relative PATH entries.
     // 用于解析相对显式路径与相对 PATH 条目的当前工作目录。
     let cwd = std::env::current_dir().map_err(|error| format!("process.which: {}", error))?;
-    if is_vulcan_process_explicit_path(program) {
+    if is_vulcan_process_explicit_path(&program) {
         // Explicit program path resolved against the current working directory when needed.
         // 必要时基于当前工作目录解析得到的显式程序路径。
-        let explicit_path = resolve_vulcan_process_search_path(Path::new(program), &cwd);
+        let explicit_path = resolve_vulcan_process_search_path(Path::new(&program), &cwd);
         return find_vulcan_process_candidate(&explicit_path);
     }
     // Host PATH environment used for command-name lookup.
@@ -1650,7 +1660,7 @@ fn resolve_vulcan_process_which(program: &str) -> Result<Option<PathBuf>, String
         let resolved_dir = resolve_vulcan_process_search_path(&search_dir, &cwd);
         // Candidate base path before platform-specific executable suffix expansion.
         // 执行平台相关可执行后缀扩展之前的候选基础路径。
-        let base = resolved_dir.join(program);
+        let base = resolved_dir.join(&program);
         if let Some(found) = find_vulcan_process_candidate(&base)? {
             return Ok(Some(found));
         }
@@ -5595,6 +5605,10 @@ fn invoke_managed_python(lua: &Lua, spec: LuaValue) -> Result<LuaValue, mlua::Er
     // Controlled worker payload containing package metadata but no host secrets.
     // 包含包元数据但不包含宿主密钥的受控 Worker 载荷。
     let payload = json!({
+        // Python receives native canonical paths because Windows long-path imports require the
+        // verbatim prefix; this private worker transport is not exposed to Lua or host APIs.
+        // Python 接收原生规范路径，因为 Windows 超长路径导入需要 verbatim 前缀；该私有 Worker
+        // 传输不会暴露给 Lua 或宿主 API。
         "file": import_file,
         "snapshot_root": snapshot_root,
         "handler": request.handler,
@@ -5690,8 +5704,8 @@ fn invoke_managed_node(lua: &Lua, spec: LuaValue) -> Result<LuaValue, mlua::Erro
         // validated absolute share-locked source independently from its neutral short cwd.
         // Unix 会在对象固定的 `fchdir` 后使用已校验相对名称；Windows 则独立于中立短 cwd 使用
         // 已校验且受共享锁保护的绝对源码。
-        "file": import_file,
-        "env_dir": plan.env_dir,
+        "file": render_host_visible_path(&import_file),
+        "env_dir": render_host_visible_path(&plan.env_dir),
         "handler": request.handler,
         "args": request.args,
         "ctx": package.worker_context_json(),
@@ -9758,8 +9772,14 @@ impl LuaEngine {
                 .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
             _ => Value::Object(serde_json::Map::new()),
         };
-        let client_info_lua = json_value_to_lua(lua, &client_info_value)
-            .map_err(|error| format!("Failed to convert client_info to Lua: {}", error))?;
+        // Optional client metadata retains its documented nil-on-absence compatibility contract.
+        // 可选客户端元数据在缺失时继续保持文档约定的 nil 兼容契约。
+        let client_info_lua = if client_info_value.is_null() {
+            LuaValue::Nil
+        } else {
+            json_value_to_lua(lua, &client_info_value)
+                .map_err(|error| format!("Failed to convert client_info to Lua: {}", error))?
+        };
         let client_capabilities_lua = json_value_to_lua(lua, &client_capabilities_value)
             .map_err(|error| format!("Failed to convert client_capabilities to Lua: {}", error))?;
         let client_budget_value = invocation_context
@@ -10592,11 +10612,8 @@ impl LuaEngine {
     /// This keeps runtime resolution aligned with the deployed layout under
     /// `lua_packages/share/lua/` and `lua_packages/lib/lua/`, instead of relying on
     /// versioned `5.1` subdirectories that may not exist in the shipped bundle.
-    /// This keeps runtime resolution aligned with the deployed layout under
     /// 这会让运行时与已部署的目录布局保持一致，
-    /// `lua_packages/share/lua/` and `lua_packages/lib/lua/`, instead of relying on
     /// 即仅依赖 `lua_packages/share/lua/` 与 `lua_packages/lib/lua/`，
-    /// versioned `5.1` subdirectories that may not exist in the shipped bundle.
     /// 而不再依赖发布包中可能并不存在的带版本 `5.1` 子目录。
     fn setup_package_paths(
         lua: &Lua,
@@ -10609,10 +10626,21 @@ impl LuaEngine {
             return Ok(());
         }
 
-        let host_provided_ffi_root = match host_options.host_provided_ffi_root.as_ref() {
+        // Lua-compatible package root spelling without Windows verbatim transport syntax.
+        // 不含 Windows verbatim 传输语法的 Lua 兼容包根写法。
+        let lua_packages_text = normalize_host_input_path_text(&lua_packages.to_string_lossy())
+            .map_err(|error| format!("configured lua_packages_dir: {error}"))?;
+
+        // Optional native-module root rendered once after the same host-option validation.
+        // 经过相同宿主选项校验后仅渲染一次的可选原生模块根。
+        let host_provided_ffi_root_text = match host_options.host_provided_ffi_root.as_ref() {
             Some(root) => {
                 if configured_package_search_directory_exists(root, "host_provided_ffi_root")? {
-                    Some(root.as_path())
+                    Some(
+                        normalize_host_input_path_text(&root.to_string_lossy()).map_err(
+                            |error| format!("configured host_provided_ffi_root: {error}"),
+                        )?,
+                    )
                 } else {
                     None
                 }
@@ -10626,17 +10654,10 @@ impl LuaEngine {
         let cpath_pattern = {
             let mut pattern = format!(
                 "{}\\lib\\lua\\?.dll;{}\\lib\\lua\\?\\init.dll;{}\\lib\\lua\\loadall.dll;{}\\?\\?.dll;",
-                lua_packages.display(),
-                lua_packages.display(),
-                lua_packages.display(),
-                lua_packages.display()
+                lua_packages_text, lua_packages_text, lua_packages_text, lua_packages_text
             );
-            if let Some(root) = host_provided_ffi_root {
-                pattern.push_str(&format!(
-                    "{}\\?.dll;{}\\?\\init.dll;",
-                    root.display(),
-                    root.display()
-                ));
+            if let Some(root) = host_provided_ffi_root_text.as_deref() {
+                pattern.push_str(&format!("{}\\?.dll;{}\\?\\init.dll;", root, root));
             }
             pattern
         };
@@ -10647,17 +10668,10 @@ impl LuaEngine {
         let cpath_pattern = {
             let mut pattern = format!(
                 "{}/lib/lua/?.so;{}/lib/lua/?/init.so;{}/lib/lua/loadall.so;{}/?.so;",
-                lua_packages.display(),
-                lua_packages.display(),
-                lua_packages.display(),
-                lua_packages.display()
+                lua_packages_text, lua_packages_text, lua_packages_text, lua_packages_text
             );
-            if let Some(root) = host_provided_ffi_root {
-                pattern.push_str(&format!(
-                    "{}/?.so;{}/?/init.so;",
-                    root.display(),
-                    root.display()
-                ));
+            if let Some(root) = host_provided_ffi_root_text.as_deref() {
+                pattern.push_str(&format!("{}/?.so;{}/?/init.so;", root, root));
             }
             pattern
         };
@@ -10668,17 +10682,10 @@ impl LuaEngine {
         let cpath_pattern = {
             let mut pattern = format!(
                 "{}/lib/lua/?.dylib;{}/lib/lua/?/init.dylib;{}/lib/lua/loadall.dylib;{}/?.dylib;",
-                lua_packages.display(),
-                lua_packages.display(),
-                lua_packages.display(),
-                lua_packages.display()
+                lua_packages_text, lua_packages_text, lua_packages_text, lua_packages_text
             );
-            if let Some(root) = host_provided_ffi_root {
-                pattern.push_str(&format!(
-                    "{}/?.dylib;{}/?/init.dylib;",
-                    root.display(),
-                    root.display()
-                ));
+            if let Some(root) = host_provided_ffi_root_text.as_deref() {
+                pattern.push_str(&format!("{}/?.dylib;{}/?/init.dylib;", root, root));
             }
             pattern
         };
@@ -10688,9 +10695,7 @@ impl LuaEngine {
         #[cfg(windows)]
         let path_pattern = format!(
             "{}\\share\\lua\\?.lua;{}\\share\\lua\\?\\init.lua;{}\\?.lua;",
-            lua_packages.display(),
-            lua_packages.display(),
-            lua_packages.display()
+            lua_packages_text, lua_packages_text, lua_packages_text
         );
 
         // Build package.path entries for Lua modules on Unix-like systems
@@ -10698,9 +10703,7 @@ impl LuaEngine {
         #[cfg(unix)]
         let path_pattern = format!(
             "{}/share/lua/?.lua;{}/share/lua/?/init.lua;{}/?.lua;",
-            lua_packages.display(),
-            lua_packages.display(),
-            lua_packages.display()
+            lua_packages_text, lua_packages_text, lua_packages_text
         );
 
         // Prepend to existing paths
@@ -11161,6 +11164,24 @@ impl LuaEngine {
         })?;
         json.set("decode", json_decode_fn)?;
 
+        // Explicit JSON object constructor that returns a protected, shallow copy.
+        // 显式 JSON 对象构造器，返回受保护的浅拷贝。
+        let json_object_fn = lua.create_function(|lua, arguments: MultiValue| {
+            create_json_container(lua, arguments, JsonContainerKind::Object)
+        })?;
+        json.set("object", json_object_fn)?;
+
+        // Explicit JSON array constructor that returns a protected, shallow copy.
+        // 显式 JSON 数组构造器，返回受保护的浅拷贝。
+        let json_array_fn = lua.create_function(|lua, arguments: MultiValue| {
+            create_json_container(lua, arguments, JsonContainerKind::Array)
+        })?;
+        json.set("array", json_array_fn)?;
+
+        // Stable JSON null sentinel that remains present inside objects and arrays.
+        // 稳定的 JSON null 哨兵，在对象与数组内部不会消失。
+        json.set("null", LuaValue::NULL)?;
+
         let cache_put_fn = lua.create_function(|lua, (value, ttl_sec): (LuaValue, LuaValue)| {
             let internal = get_vulcan_runtime_internal_table(lua).map_err(mlua::Error::runtime)?;
             let tool_name: Option<String> =
@@ -11416,8 +11437,37 @@ impl LuaEngine {
 // JSON ↔ Lua Value conversion
 // ============================================================
 
+/// Convert one top-level JSON argument object into a typed Lua table.
+/// 将一个顶层 JSON 参数对象转换为带类型的 Lua table。
+///
+/// The `lua` parameter owns the resulting table and shared JSON container markers.
+/// `lua` 参数拥有返回 table 及共享 JSON 容器标记。
+///
+/// The `json` parameter is the host-injected top-level argument object. Its reserved `PWD`
+/// project-path field is normalized at this boundary without changing arbitrary JSON strings.
+/// `json` 参数是宿主注入的顶层参数对象；其保留的 `PWD` 项目路径字段会在此边界归一化，
+/// 其他任意 JSON 字符串不会被修改。
+///
+/// Return the converted Lua table or one conversion/assignment error.
+/// 返回转换后的 Lua table，或转换/赋值错误。
 fn json_to_lua_table(lua: &Lua, json: &Value) -> Result<Table, String> {
-    json_to_lua_table_inner(lua, json).map_err(|e| e.to_string())
+    // Typed argument table produced by the shared recursive JSON conversion path.
+    // 由共享递归 JSON 转换路径生成的带类型参数 table。
+    let table = json_to_lua_table_inner(lua, json).map_err(|error| error.to_string())?;
+    if let Some(project_path) = json
+        .as_object()
+        .and_then(|object| object.get("PWD"))
+        .and_then(Value::as_str)
+    {
+        // Reserved project path normalized only when it has an ordinary Windows drive/UNC identity.
+        // 仅当保留项目路径具有普通 Windows 盘符/UNC 身份时才进行归一化。
+        let project_path = normalize_host_input_path_text(project_path)
+            .map_err(|error| format!("PWD: {error}"))?;
+        table
+            .raw_set("PWD", project_path)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(table)
 }
 
 /// Convert one provider Lua `input` table argument into the JSON value passed to provider bindings.
@@ -11686,23 +11736,197 @@ fn install_disabled_provider_context(
     Ok(())
 }
 
-fn json_to_lua_table_inner(lua: &Lua, json: &Value) -> mlua::Result<Table> {
-    let table = lua.create_table()?;
-    if let Value::Object(obj) = json {
-        for (k, v) in obj {
-            table.set(k.as_str(), json_value_to_lua(lua, v)?)?;
-        }
-    } else if let Value::Array(arr) = json {
-        for (i, v) in arr.iter().enumerate() {
-            table.set(i + 1, json_value_to_lua(lua, v)?)?;
+/// Registry key for the shared JSON object metatable stored inside each Lua VM.
+/// 每个 Lua 虚拟机中保存共享 JSON 对象元表的 Registry 键。
+const JSON_OBJECT_METATABLE_REGISTRY_KEY: &str = "__vulcan_json_object_metatable_v1";
+
+/// Private light-userdata key used to read the JSON container identity from a metatable.
+/// 用于从元表读取 JSON 容器身份的私有 light userdata 键。
+static JSON_CONTAINER_MARKER_KEY: AtomicU8 = AtomicU8::new(0);
+
+/// Private light-userdata identity assigned to the JSON object metatable.
+/// 分配给 JSON 对象元表的私有 light userdata 身份。
+static JSON_OBJECT_MARKER: AtomicU8 = AtomicU8::new(1);
+
+/// Private light-userdata identity assigned to the JSON array metatable.
+/// 分配给 JSON 数组元表的私有 light userdata 身份。
+static JSON_ARRAY_MARKER: AtomicU8 = AtomicU8::new(2);
+
+/// Distinguish the two JSON container kinds represented by protected Lua tables.
+/// 区分由受保护 Lua 表表示的两种 JSON 容器类型。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsonContainerKind {
+    /// JSON object whose keys must all be UTF-8 strings.
+    /// 所有键都必须是 UTF-8 字符串的 JSON 对象。
+    Object,
+    /// JSON array whose keys must be a dense one-based integer sequence.
+    /// 键必须是从一开始连续整数序列的 JSON 数组。
+    Array,
+}
+
+impl JsonContainerKind {
+    /// Return the private light-userdata identity for this container kind.
+    /// 返回当前容器类型对应的私有 light userdata 身份。
+    ///
+    /// The return value is compared by pointer identity and cannot be synthesized by ordinary Lua.
+    /// 返回值通过指针身份比较，普通 Lua 无法自行构造。
+    fn marker(self) -> LightUserData {
+        // Stable process address selected for the requested container kind.
+        // 为目标容器类型选择的稳定进程地址。
+        let marker = match self {
+            Self::Object => &JSON_OBJECT_MARKER,
+            Self::Array => &JSON_ARRAY_MARKER,
+        };
+        LightUserData(std::ptr::from_ref(marker).cast_mut().cast())
+    }
+
+    /// Return the public constructor name used in diagnostics.
+    /// 返回诊断信息中使用的公开构造器名称。
+    fn constructor_name(self) -> &'static str {
+        match self {
+            Self::Object => "vulcan.json.object",
+            Self::Array => "vulcan.json.array",
         }
     }
+}
+
+/// Return the private light-userdata key used by both JSON container metatables.
+/// 返回两个 JSON 容器元表共用的私有 light userdata 键。
+fn json_container_marker_key() -> LightUserData {
+    LightUserData(
+        std::ptr::from_ref(&JSON_CONTAINER_MARKER_KEY)
+            .cast_mut()
+            .cast(),
+    )
+}
+
+/// Resolve the shared protected metatable for one JSON container kind in the current Lua VM.
+/// 解析当前 Lua 虚拟机中某种 JSON 容器类型对应的共享受保护元表。
+///
+/// The lua parameter owns the Registry where the shared metatable is stored.
+/// lua 参数拥有保存共享元表的 Registry。
+/// The kind parameter selects the object or array identity.
+/// kind 参数选择对象或数组身份。
+/// Returns the shared metatable, or an mlua error when Registry access fails.
+/// 返回共享元表；Registry 访问失败时返回 mlua 错误。
+fn json_container_metatable(lua: &Lua, kind: JsonContainerKind) -> mlua::Result<Table> {
+    // Shared metatable resolved from mlua for arrays or LuaSkills Registry state for objects.
+    // 数组从 mlua、对象从 LuaSkills Registry 状态解析得到的共享元表。
+    let metatable = match kind {
+        JsonContainerKind::Array => lua.array_metatable(),
+        JsonContainerKind::Object => {
+            // Existing object metatable, if this VM has already converted or constructed an object.
+            // 当前虚拟机此前已转换或构造对象时存在的对象元表。
+            let existing: Option<Table> =
+                lua.named_registry_value(JSON_OBJECT_METATABLE_REGISTRY_KEY)?;
+            match existing {
+                Some(metatable) => metatable,
+                None => {
+                    // New object metatable retained by the current VM Registry.
+                    // 由当前虚拟机 Registry 持有的新对象元表。
+                    let metatable = lua.create_table()?;
+                    lua.set_named_registry_value(
+                        JSON_OBJECT_METATABLE_REGISTRY_KEY,
+                        metatable.clone(),
+                    )?;
+                    metatable
+                }
+            }
+        }
+    };
+
+    // Private identity read only by the Rust conversion boundary.
+    // 仅由 Rust 转换边界读取的私有身份。
+    metatable.raw_set(json_container_marker_key(), kind.marker())?;
+    // Public metatable protection prevents ordinary Lua from replacing the type identity.
+    // 公开元表保护可防止普通 Lua 替换类型身份。
+    metatable.raw_set("__metatable", false)?;
+    Ok(metatable)
+}
+
+/// Read the JSON container kind carried by a protected Lua table metatable.
+/// 读取受保护 Lua 表元表携带的 JSON 容器类型。
+///
+/// The table parameter is inspected without invoking Lua metamethods.
+/// table 参数在不触发 Lua 元方法的情况下接受检查。
+/// Returns Some for LuaSkills JSON containers and None for ordinary Lua tables.
+/// LuaSkills JSON 容器返回 Some，普通 Lua 表返回 None。
+fn json_container_kind(table: &Table) -> Result<Option<JsonContainerKind>, String> {
+    // Actual metatable obtained through mlua, which intentionally ignores __metatable masking.
+    // 通过 mlua 获得的真实元表；该接口会有意忽略 __metatable 遮蔽。
+    let Some(metatable) = table.metatable() else {
+        return Ok(None);
+    };
+    // Raw marker value avoids invoking user-provided __index behavior.
+    // 原始标记值可避免触发用户提供的 __index 行为。
+    let marker: LuaValue = metatable
+        .raw_get(json_container_marker_key())
+        .map_err(|error| format!("Cannot inspect JSON container metatable: {error}"))?;
+
+    match marker {
+        LuaValue::LightUserData(marker) if marker == JsonContainerKind::Object.marker() => {
+            Ok(Some(JsonContainerKind::Object))
+        }
+        LuaValue::LightUserData(marker) if marker == JsonContainerKind::Array.marker() => {
+            Ok(Some(JsonContainerKind::Array))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Convert one JSON object or array into a recursively marked Lua table.
+/// 将一个 JSON 对象或数组转换为递归标记的 Lua 表。
+///
+/// The lua parameter creates the table and resolves its shared metatable.
+/// lua 参数负责创建表并解析其共享元表。
+/// The json parameter must contain an object or array value.
+/// json 参数必须包含对象或数组值。
+/// Returns the marked table, or an explicit error for a non-container input.
+/// 返回已标记表；输入不是容器时返回显式错误。
+fn json_to_lua_table_inner(lua: &Lua, json: &Value) -> mlua::Result<Table> {
+    // Empty target table populated recursively before its protected metatable is attached.
+    // 在附加受保护元表前递归填充的空目标表。
+    let table = lua.create_table()?;
+    // Container kind derived exclusively from the serde_json value variant.
+    // 仅根据 serde_json 值变体确定的容器类型。
+    let kind = match json {
+        Value::Object(object) => {
+            for (key, value) in object {
+                table.raw_set(key.as_str(), json_value_to_lua(lua, value)?)?;
+            }
+            JsonContainerKind::Object
+        }
+        Value::Array(array) => {
+            for (index, value) in array.iter().enumerate() {
+                table.raw_set(index + 1, json_value_to_lua(lua, value)?)?;
+            }
+            JsonContainerKind::Array
+        }
+        _ => {
+            return Err(mlua::Error::runtime(
+                "JSON container conversion requires an object or array",
+            ));
+        }
+    };
+    // Shared protected type marker attached after raw population.
+    // 原始填充完成后附加的共享受保护类型标记。
+    let metatable = json_container_metatable(lua, kind)?;
+    table.set_metatable(Some(metatable))?;
     Ok(table)
 }
 
+/// Convert one serde_json value into its Lua representation while preserving container types.
+/// 将一个 serde_json 值转换为 Lua 表示，同时保留容器类型。
+///
+/// The lua parameter creates strings, tables, and shared metatables.
+/// lua 参数用于创建字符串、表及共享元表。
+/// The json parameter is recursively converted without dropping JSON null values.
+/// json 参数会递归转换，且不会丢弃 JSON null 值。
+/// Returns the corresponding Lua value or an mlua allocation/conversion error.
+/// 返回对应 Lua 值或 mlua 分配/转换错误。
 fn json_value_to_lua(lua: &Lua, json: &Value) -> mlua::Result<LuaValue> {
     match json {
-        Value::Null => Ok(LuaValue::Nil),
+        Value::Null => Ok(LuaValue::NULL),
         Value::Bool(b) => Ok(LuaValue::Boolean(*b)),
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
@@ -11727,6 +11951,12 @@ fn json_value_to_lua(lua: &Lua, json: &Value) -> mlua::Result<LuaValue> {
 /// Return the JSON representation, or an explicit error when a Lua value cannot be represented.
 /// 返回 JSON 表示；当 Lua 值无法表示时返回显式错误。
 fn lua_value_to_json(val: &LuaValue) -> Result<Value, String> {
+    // mlua represents JSON null as a null light-userdata value rather than Lua nil.
+    // mlua 使用空指针 light userdata 表示 JSON null，而不是 Lua nil。
+    if val.is_null() {
+        return Ok(Value::Null);
+    }
+
     match val {
         LuaValue::Nil => Ok(Value::Null),
         LuaValue::Boolean(b) => Ok(Value::Bool(*b)),
@@ -11743,12 +11973,20 @@ fn lua_value_to_json(val: &LuaValue) -> Result<Value, String> {
             .map(|text| Value::String(text.to_string()))
             .map_err(|error| format!("Cannot convert Lua string to JSON: invalid UTF-8: {error}")),
         LuaValue::Table(t) => {
-            // Heuristic: if raw_len() > 0, treat as array. Otherwise as object.
-            if t.raw_len() > 0 {
-                let arr = lua_table_to_array(t)?;
-                Ok(Value::Array(arr))
-            } else {
-                lua_table_to_object(t)
+            match json_container_kind(t)? {
+                Some(JsonContainerKind::Object) => Ok(Value::Object(lua_table_to_object(t)?)),
+                Some(JsonContainerKind::Array) => Ok(Value::Array(lua_table_to_array(t)?)),
+                None if t.raw_len() > 0 => Ok(Value::Array(lua_table_to_array(t)?)),
+                None => {
+                    // Legacy empty-table behavior remains an empty array for unmarked Lua tables.
+                    // 无标记 Lua 表继续保留空表编码为空数组的旧行为。
+                    let object = lua_table_to_object(t)?;
+                    if object.is_empty() {
+                        Ok(Value::Array(Vec::new()))
+                    } else {
+                        Ok(Value::Object(object))
+                    }
+                }
             }
         }
         LuaValue::Function(_) => Err("Cannot convert Lua function to JSON".to_string()),
@@ -11764,32 +12002,210 @@ fn lua_value_to_json(val: &LuaValue) -> Result<Value, String> {
     }
 }
 
-fn lua_table_to_array(t: &Table) -> Result<Vec<Value>, String> {
-    let len = t.raw_len();
-    if len == 0 {
-        // Could be empty object or empty array, default to array
-        return Ok(Vec::new());
+/// Normalize one Lua numeric key into a positive one-based JSON array index.
+/// 将一个 Lua 数字键规范化为从一开始的正整数 JSON 数组索引。
+///
+/// The key parameter must be an integer-valued Lua number greater than zero.
+/// key 参数必须是大于零且具有整数值的 Lua 数字。
+/// Returns the platform-sized array index or an explicit structural error.
+/// 返回平台字长的数组索引或显式结构错误。
+fn json_array_index(key: &LuaValue) -> Result<usize, String> {
+    match key {
+        LuaValue::Integer(index) => usize::try_from(*index).map_err(|_| {
+            "JSON array table keys must be positive integers starting at 1".to_string()
+        }),
+        LuaValue::Number(index)
+            if index.is_finite()
+                && *index >= 1.0
+                && index.fract() == 0.0
+                && *index <= usize::MAX as f64 =>
+        {
+            // Exact integer index accepted from Lua implementations without a distinct integer tag.
+            // 从没有独立整数标签的 Lua 实现中接受的精确整数索引。
+            let normalized = *index as usize;
+            if normalized as f64 == *index {
+                Ok(normalized)
+            } else {
+                Err(
+                    "JSON array table keys must be exactly representable positive integers"
+                        .to_string(),
+                )
+            }
+        }
+        LuaValue::String(_) => Err("JSON array table cannot contain string keys".to_string()),
+        LuaValue::Number(_) => {
+            Err("JSON array table keys must be positive integers starting at 1".to_string())
+        }
+        _ => Err("JSON array table keys must be positive integers".to_string()),
     }
-    let mut arr = Vec::with_capacity(len);
-    for i in 1..=len {
-        let val: LuaValue = t.get(i).map_err(|e| format!("Array index {}: {}", i, e))?;
-        arr.push(lua_value_to_json(&val)?);
-    }
-    Ok(arr)
 }
 
-fn lua_table_to_object(t: &Table) -> Result<Value, String> {
-    let mut obj = serde_json::Map::new();
-    for pair in t.pairs::<String, LuaValue>() {
-        let (k, v) = pair.map_err(|e| format!("Table key: {}", e))?;
-        obj.insert(k, lua_value_to_json(&v)?);
+/// Collect and validate the dense one-based entries of a JSON array table.
+/// 收集并校验 JSON 数组表中从一开始的连续条目。
+///
+/// The table parameter is traversed with raw pair iteration and no metamethod invocation.
+/// table 参数通过原始 pair 迭代遍历，不触发元方法。
+/// Returns values in JSON array order or an explicit error for mixed keys and holes.
+/// 按 JSON 数组顺序返回值；遇到混合键或空洞时返回显式错误。
+fn collect_json_array_values(table: &Table) -> Result<Vec<LuaValue>, String> {
+    // Sparse-safe ordered storage used to verify every index before value conversion.
+    // 用于在值转换前校验每个索引的稀疏安全有序存储。
+    let mut indexed_values = BTreeMap::<usize, LuaValue>::new();
+    for pair in table.pairs::<LuaValue, LuaValue>() {
+        // Raw key and value yielded by Lua's next operation.
+        // Lua next 操作产生的原始键和值。
+        let (key, value) = pair.map_err(|error| format!("JSON array table entry: {error}"))?;
+        // Positive integer index derived from the exact Lua key type.
+        // 从精确 Lua 键类型得到的正整数索引。
+        let index = json_array_index(&key)?;
+        indexed_values.insert(index, value);
     }
-    // Empty Lua table has no distinction between array and object.
-    // If there are no string keys, treat as empty array.
-    if obj.is_empty() && t.raw_len() == 0 {
-        return Ok(Value::Array(Vec::new()));
+
+    // Dense output with implicit one-based positions.
+    // 具有隐式从一开始位置的连续输出。
+    let mut values = Vec::with_capacity(indexed_values.len());
+    for (offset, (index, value)) in indexed_values.into_iter().enumerate() {
+        // Expected one-based index for the current dense output position.
+        // 当前连续输出位置对应的预期一基索引。
+        let expected = offset + 1;
+        if index != expected {
+            return Err(format!(
+                "JSON array table must be contiguous from index 1; missing index {expected}"
+            ));
+        }
+        values.push(value);
     }
-    Ok(Value::Object(obj))
+    Ok(values)
+}
+
+/// Collect and validate the UTF-8 string-keyed entries of a JSON object table.
+/// 收集并校验 JSON 对象表中以 UTF-8 字符串为键的条目。
+///
+/// The table parameter is traversed with raw pair iteration and no metamethod invocation.
+/// table 参数通过原始 pair 迭代遍历，不触发元方法。
+/// Returns owned key/value pairs or an explicit error for every non-string key.
+/// 返回自有键值对；遇到任何非字符串键时返回显式错误。
+fn collect_json_object_entries(table: &Table) -> Result<Vec<(String, LuaValue)>, String> {
+    // Raw object entries retained until structural validation has completed.
+    // 在结构校验完成前保留的原始对象条目。
+    let mut entries = Vec::new();
+    for pair in table.pairs::<LuaValue, LuaValue>() {
+        // Raw key and value yielded by Lua's next operation.
+        // Lua next 操作产生的原始键和值。
+        let (key, value) = pair.map_err(|error| format!("JSON object table entry: {error}"))?;
+        // UTF-8 object key accepted only from an actual Lua string.
+        // 仅从真实 Lua 字符串接受的 UTF-8 对象键。
+        let key = match key {
+            LuaValue::String(key) => key
+                .to_str()
+                .map(|key| key.to_string())
+                .map_err(|error| format!("JSON object table key is not valid UTF-8: {error}"))?,
+            LuaValue::Integer(_) | LuaValue::Number(_) => {
+                return Err("JSON object table cannot contain numeric keys".to_string());
+            }
+            _ => return Err("JSON object table can contain only string keys".to_string()),
+        };
+        entries.push((key, value));
+    }
+    Ok(entries)
+}
+
+/// Create a protected JSON container, optionally shallow-copying one validated source table.
+/// 创建受保护的 JSON 容器，并可选择浅拷贝一个已校验的源表。
+///
+/// The lua parameter creates the new table and resolves the shared metatable.
+/// lua 参数创建新表并解析共享元表。
+/// The arguments parameter must contain zero values or one Lua table whose keys match the kind.
+/// arguments 参数必须不包含值，或只包含一个键结构符合目标类型的 Lua 表。
+/// The kind parameter selects object or array validation and identity.
+/// kind 参数选择对象或数组校验及身份。
+/// Returns a new protected table; the source table and its metatable are never modified.
+/// 返回新的受保护表；源表及其元表永远不会被修改。
+fn create_json_container(
+    lua: &Lua,
+    mut arguments: MultiValue,
+    kind: JsonContainerKind,
+) -> mlua::Result<Table> {
+    if arguments.len() > 1 {
+        return Err(mlua::Error::runtime(format!(
+            "{} expects no argument or exactly one table",
+            kind.constructor_name()
+        )));
+    }
+    // Optional source table distinguished from one explicitly supplied nil argument.
+    // 与显式传入 nil 参数严格区分的可选源表。
+    let source = match arguments.pop_front() {
+        None => None,
+        Some(LuaValue::Table(source)) => Some(source),
+        Some(_) => {
+            return Err(mlua::Error::runtime(format!(
+                "{} expects no argument or exactly one table",
+                kind.constructor_name()
+            )));
+        }
+    };
+    // New destination table guarantees constructor calls never mutate caller-owned tables.
+    // 新目标表可保证构造器调用永远不会修改调用方持有的表。
+    let destination = lua.create_table()?;
+    if let Some(source) = source {
+        match kind {
+            JsonContainerKind::Object => {
+                for (key, value) in collect_json_object_entries(&source).map_err(|error| {
+                    mlua::Error::runtime(format!("{}: {error}", kind.constructor_name()))
+                })? {
+                    destination.raw_set(key, value)?;
+                }
+            }
+            JsonContainerKind::Array => {
+                for (offset, value) in collect_json_array_values(&source)
+                    .map_err(|error| {
+                        mlua::Error::runtime(format!("{}: {error}", kind.constructor_name()))
+                    })?
+                    .into_iter()
+                    .enumerate()
+                {
+                    destination.raw_set(offset + 1, value)?;
+                }
+            }
+        }
+    }
+
+    // Protected shared metatable attached only after the destination is fully populated.
+    // 仅在目标表完全填充后附加的受保护共享元表。
+    let metatable = json_container_metatable(lua, kind)?;
+    destination.set_metatable(Some(metatable))?;
+    Ok(destination)
+}
+
+/// Convert one structurally valid Lua array table into ordered JSON values.
+/// 将一个结构合法的 Lua 数组表转换为有序 JSON 值。
+///
+/// The table parameter must contain only a dense one-based integer sequence.
+/// table 参数必须只包含从一开始的连续整数序列。
+/// Returns the recursively converted array or an explicit structural/value error.
+/// 返回递归转换后的数组或显式结构/值错误。
+fn lua_table_to_array(table: &Table) -> Result<Vec<Value>, String> {
+    collect_json_array_values(table)?
+        .into_iter()
+        .map(|value| lua_value_to_json(&value))
+        .collect()
+}
+
+/// Convert one structurally valid Lua object table into a JSON object map.
+/// 将一个结构合法的 Lua 对象表转换为 JSON 对象 Map。
+///
+/// The table parameter must contain only UTF-8 string keys.
+/// table 参数必须只包含 UTF-8 字符串键。
+/// Returns the recursively converted object map or an explicit structural/value error.
+/// 返回递归转换后的对象 Map 或显式结构/值错误。
+fn lua_table_to_object(table: &Table) -> Result<serde_json::Map<String, Value>, String> {
+    // JSON object map populated only after every Lua key passes strict validation.
+    // 仅在所有 Lua 键都通过严格校验后填充的 JSON 对象 Map。
+    let mut object = serde_json::Map::new();
+    for (key, value) in collect_json_object_entries(table)? {
+        object.insert(key, lua_value_to_json(&value)?);
+    }
+    Ok(object)
 }
 
 #[cfg(test)]

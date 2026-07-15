@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mlua::{Function, Lua, MultiValue, Table, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::runtime::encoding::{RuntimeTextEncoding, decode_runtime_text, encode_runtime_text};
+use crate::runtime::path::normalize_host_input_path_text;
 
 /// Process-local monotonic suffix used to reserve managed temporary file names.
 /// 用于预留托管临时文件名的进程内单调后缀。
@@ -1348,6 +1349,10 @@ fn require_path_arg(value: LuaValue, fn_name: &str, param_name: &str) -> mlua::R
             "{fn_name}: {param_name} looks like a coerced Lua object string `{path}`"
         )));
     }
+    // Host-visible drive/UNC spelling normalized and unsupported namespaces rejected before lookup.
+    // 在寻址前归一化宿主可见盘符/UNC 写法，并拒绝不受支持的命名空间。
+    let path = normalize_host_input_path_text(&path)
+        .map_err(|error| mlua::Error::runtime(format!("{fn_name}: {param_name}: {error}")))?;
     #[cfg(windows)]
     if has_invalid_windows_path_syntax(&path) {
         return Err(mlua::Error::runtime(format!(
@@ -1370,9 +1375,6 @@ fn looks_like_lua_debug_value(text: &str) -> bool {
 #[cfg(windows)]
 fn has_invalid_windows_path_syntax(text: &str) -> bool {
     let trimmed = text.trim();
-    if trimmed.starts_with(r"\\?\") {
-        return false;
-    }
     let first_char = trimmed.chars().next();
     for (index, ch) in trimmed.char_indices() {
         if ch.is_control() {

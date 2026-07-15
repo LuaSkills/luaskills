@@ -723,7 +723,7 @@ System Plugin 租约不把整个 `system_lua_lib` 当成一个共享包。每次
 - 环境根直接创建 `python/py-<version>/<env_hash>` 与 `node/node-<version>/<env_hash>`，必须是绝对路径并由 LuaSkills 安全创建
 - 显式 V3/JSON 字段优先于 `<runtime_root>/dependencies/runtimes` 与 `<runtime_root>/dependencies/envs`
 - 不读取环境变量、系统 `PATH`、系统 Python、系统 Node 或外部 `node_modules` 作为降级候选
-- JSON FFI 可调用 `luaskills_ffi_managed_runtime_resolve_json` 只读解析同一发行包；返回规范安装根、可执行文件及两项 SHA-256，不创建 engine 或环境
+- JSON FFI 可调用 `luaskills_ffi_managed_runtime_resolve_json` 只读解析同一发行包；返回已解析安装根、可执行文件及两项 SHA-256，不创建 engine 或环境。Windows 绝对盘符/UNC 输入可带 `\\?\` / `\\?\UNC\`，但两个返回路径始终使用去除该前缀后的宿主可见形式；其他 verbatim 命名空间会在寻址前被拒绝，Rust 原生描述符仍保留规范 `PathBuf` 身份
 - JSON FFI 可在 `host_options.managed_runtime_config` 配置 `worker_pool_max_size_per_environment=4`、`worker_idle_ttl_secs=60`、`persistent_session_limit_per_engine=256`、`persistent_session_default_buffer_limit_bytes_per_stream=1048576` 与可空 `invoke_default_timeout_ms`；这些是稳定默认值，所有已配置数值必须大于零
 - 单次正数 `invoke.timeout_ms` 优先于引擎默认超时，单个 Session 的正数 `session.open.buffer_limit_bytes` 优先于引擎默认输出缓冲；Lua 不能修改其余引擎级策略
 - 标准 C ABI 的 `has_invoke_default_timeout_ms` 必须严格为 `0` 或 `1`；为 `0` 时数值成员被忽略

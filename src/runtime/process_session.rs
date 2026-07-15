@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use mlua::{AnyUserData, Lua, MultiValue, Table, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::runtime::encoding::{RuntimeTextEncoding, decode_runtime_text, encode_runtime_text};
+use crate::runtime::path::normalize_host_input_path_text;
 
 #[cfg(unix)]
 use libc::{ESRCH, SIGKILL};
@@ -1853,9 +1854,24 @@ fn parse_session_open_request(
             )));
         }
     };
-    let program = require_string_field(&table, "program", "process.session.open")?;
+    // Program spelling exposed by Lua must not retain a Windows verbatim prefix.
+    // Lua 暴露的程序写法不得保留 Windows verbatim 前缀。
+    let program = normalize_host_input_path_text(&require_string_field(
+        &table,
+        "program",
+        "process.session.open",
+    )?)
+    .map_err(|error| mlua::Error::runtime(format!("process.session.open: program: {error}")))?;
     let args = parse_string_array_field(&table, "args", "process.session.open")?;
-    let cwd = parse_optional_string_field(&table, "cwd", "process.session.open")?;
+    // Optional cwd normalized at the Lua-to-process boundary.
+    // 在 Lua 到进程边界规范化可选 cwd。
+    let cwd = parse_optional_string_field(&table, "cwd", "process.session.open")?
+        .map(|path| {
+            normalize_host_input_path_text(&path).map_err(|error| {
+                mlua::Error::runtime(format!("process.session.open: cwd: {error}"))
+            })
+        })
+        .transpose()?;
     let encoding = parse_optional_encoding_field(&table, "encoding", "process.session.open")?
         .unwrap_or(default_encoding);
     let stdout_encoding =

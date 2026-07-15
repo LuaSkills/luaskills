@@ -73,7 +73,7 @@ struct ManagedDependencyManifestContext {
 }
 
 use crate::runtime::managed_runtime::ManagedRuntimeRoots;
-use crate::runtime::path::render_host_visible_path;
+use crate::runtime::path::{normalize_host_input_path_text, render_host_visible_path};
 use crate::skill::dependencies::PackageDependencyManifest;
 use crate::skill::manifest::validate_luaskills_identifier;
 
@@ -700,6 +700,10 @@ fn allocate_managed_runtime_owner_token() -> Result<u64, String> {
 /// Returns unit only when the path can be embedded into `package.path` without grammar injection.
 /// 仅当路径可安全嵌入 `package.path` 且不会注入语法时返回空值。
 pub(crate) fn validate_lua_search_root_path(path: &Path, field_name: &str) -> Result<(), String> {
+    // Safe host-visible spelling proves a canonical Windows namespace has a DOS or UNC equivalent.
+    // 安全宿主可见写法用于证明规范 Windows 命名空间具备 DOS 或 UNC 等价形式。
+    normalize_host_input_path_text(&path.to_string_lossy())
+        .map_err(|error| format!("{field_name}: {error}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -1273,6 +1277,24 @@ mod tests {
             .expect("test clock should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("luaskills-managed-package-{label}-{suffix}"))
+    }
+
+    /// Verify Lua search-root validation rejects unsupported Windows verbatim namespaces.
+    /// 验证 Lua 搜索根校验会拒绝不受支持的 Windows verbatim 命名空间。
+    #[cfg(windows)]
+    #[test]
+    fn lua_search_root_rejects_unsupported_windows_verbatim_namespace() {
+        // Volume GUID namespace has no ordinary path spelling that Lua package search can consume.
+        // 卷 GUID 命名空间不存在 Lua 包搜索可消费的普通路径写法。
+        let root = Path::new(r"\\?\Volume{00000000-0000-0000-0000-000000000000}\system_lua_lib");
+        // Explicit validation failure returned before the root can enter package.path or cpath.
+        // 在根目录进入 package.path 或 cpath 前返回的显式校验失败。
+        let error = validate_lua_search_root_path(root, "system_package.root")
+            .expect_err("unsupported Lua search namespace must fail");
+        assert!(
+            error.contains("unsupported Windows verbatim path namespace"),
+            "unexpected Lua search-root error: {error}"
+        );
     }
 
     /// Verify System Plugin construction canonicalizes and binds one trusted manifest.

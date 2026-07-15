@@ -18,10 +18,10 @@ use super::{
     ManagedRuntimeWorkerService, NativeLibrarySearchGuard, ResolvedEntryTarget,
     RunLuaVmBuildContext, SkillApplyLifecycleAction, SkillConfigStore,
     VulcanInternalExecutionContext, build_lua_call_dispatch_entries,
-    copy_managed_node_package_import_root, default_runlua_vm_pool_config,
-    find_vulcan_process_candidate, format_lifecycle_recovery_error, get_vulcan_context_table,
-    get_vulcan_deps_table, get_vulcan_runtime_internal_table, get_vulcan_table,
-    invoke_managed_runtime_worker, json_to_lua_table, lua_value_to_json,
+    configured_package_search_directory_exists, copy_managed_node_package_import_root,
+    default_runlua_vm_pool_config, find_vulcan_process_candidate, format_lifecycle_recovery_error,
+    get_vulcan_context_table, get_vulcan_deps_table, get_vulcan_runtime_internal_table,
+    get_vulcan_table, invoke_managed_runtime_worker, json_to_lua_table, lua_value_to_json,
     managed_runtime_status_from_plan, managed_runtime_worker_result_to_json,
     parse_runtime_request_context_json, populate_vulcan_dependency_context,
     populate_vulcan_file_context, populate_vulcan_internal_execution_context,
@@ -39,6 +39,8 @@ use crate::runtime::encoding::{
 use crate::runtime::managed_package::{
     ManagedRuntimePackageContext, replace_lua_managed_package_context,
 };
+#[cfg(windows)]
+use crate::runtime::managed_runtime::managed_env_dir;
 use crate::runtime::managed_runtime::{
     MANAGED_RUNTIME_ENV_MARKER_SCHEMA_VERSION, ManagedRuntimeEnvMarker, ManagedRuntimeEnvPlan,
     ManagedRuntimeKind, ManagedRuntimeRootSource, ManagedRuntimeRoots,
@@ -281,6 +283,42 @@ fn lua_value_to_json_rejects_invalid_utf8_string() {
         .expect_err("invalid UTF-8 Lua string should fail JSON conversion");
 
     assert!(error.contains("Cannot convert Lua string to JSON: invalid UTF-8"));
+}
+
+/// Verify JSON objects, arrays, nested empty containers, and null values survive a direct round trip.
+/// 验证 JSON 对象、数组、嵌套空容器与 null 值可在直接往返中保持不变。
+#[test]
+fn json_value_round_trip_preserves_container_kinds_and_null() {
+    // Lua state that owns the shared protected JSON container metatables.
+    // 持有共享受保护 JSON 容器元表的 Lua 状态。
+    let lua = Lua::new();
+    // Independent payloads covering both top-level container kinds and recursively nested values.
+    // 覆盖两种顶层容器类型及递归嵌套值的独立载荷。
+    let payloads = [
+        json!({}),
+        json!([]),
+        json!({
+            "object": {},
+            "array": [],
+            "nested": {
+                "object": {},
+                "array": []
+            },
+            "nullable": null,
+            "nullableArray": [null]
+        }),
+    ];
+
+    for expected in payloads {
+        // Recursively marked Lua table produced by the production JSON decoder boundary.
+        // 由生产 JSON 解码边界产生的递归标记 Lua 表。
+        let table = json_to_lua_table(&lua, &expected).expect("convert JSON container to Lua");
+        // JSON value reconstructed by the production Lua result encoder boundary.
+        // 由生产 Lua 结果编码边界重建的 JSON 值。
+        let actual = lua_value_to_json(&LuaValue::Table(table))
+            .expect("convert marked Lua container back to JSON");
+        assert_eq!(actual, expected);
+    }
 }
 
 /// Verify print argument rendering surfaces invalid UTF-8 strings in log text.
@@ -1004,6 +1042,167 @@ fn setup_package_paths_rejects_non_directory_lua_packages_dir() {
     );
 
     let _ = fs::remove_dir_all(&runtime_root);
+}
+
+/// Verify configured Lua search roots reject Windows namespaces without ordinary equivalents.
+/// 验证已配置 Lua 搜索根会拒绝不存在普通等价形式的 Windows 命名空间。
+#[cfg(windows)]
+#[test]
+fn configured_package_search_root_rejects_unsupported_windows_verbatim_namespace() {
+    // Volume GUID path checked before metadata lookup, so no platform-specific fixture is required.
+    // 在元数据查询前检查的卷 GUID 路径，因此无需平台专属夹具。
+    let path = Path::new(r"\\?\Volume{00000000-0000-0000-0000-000000000000}\lua_packages");
+    // Stable configuration error proving the namespace never reaches package.path or package.cpath.
+    // 稳定配置错误用于证明该命名空间绝不会进入 package.path 或 package.cpath。
+    let error = configured_package_search_directory_exists(path, "lua_packages_dir")
+        .expect_err("unsupported package search namespace must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported Windows verbatim path namespace"),
+        "unexpected package search error: {error}"
+    );
+}
+
+/// Verify ordinary VM package search paths and Lua path arguments strip Windows verbatim prefixes.
+/// 验证普通虚拟机包搜索路径与 Lua 路径参数会去除 Windows verbatim 前缀。
+#[cfg(windows)]
+#[test]
+fn ordinary_lua_path_boundaries_strip_windows_verbatim_prefixes() {
+    // Temporary runtime root canonicalized to the Windows verbatim spelling used by Rust.
+    // 规范化为 Rust 所用 Windows verbatim 写法的临时运行时根。
+    let runtime_root = make_temp_runtime_root("ordinary-lua-verbatim-filter");
+    let _ = fs::remove_dir_all(&runtime_root);
+    // Lua package and native-module roots required by the production setup helper.
+    // 生产初始化辅助函数所需的 Lua 包根与原生模块根。
+    let lua_packages_dir = runtime_root.join("lua_packages");
+    let ffi_root = runtime_root.join("ffi");
+    fs::create_dir_all(&lua_packages_dir).expect("create Lua package root");
+    fs::create_dir_all(&ffi_root).expect("create FFI root");
+    // Canonical roots deliberately retain the verbatim prefix internally on Windows.
+    // 在 Windows 内部有意保留 verbatim 前缀的规范根。
+    let canonical_lua_packages =
+        fs::canonicalize(&lua_packages_dir).expect("canonicalize Lua package root");
+    let canonical_ffi_root = fs::canonicalize(&ffi_root).expect("canonicalize FFI root");
+    assert!(
+        canonical_lua_packages
+            .to_string_lossy()
+            .starts_with(r"\\?\"),
+        "expected a verbatim canonical path: {}",
+        canonical_lua_packages.to_string_lossy()
+    );
+    // Lua state receiving the same package path setup as production pooled VMs.
+    // 接收与生产池化虚拟机相同包路径初始化的 Lua 状态。
+    let lua = Lua::new();
+    // Host options injecting canonical roots across the Rust-to-Lua boundary.
+    // 跨 Rust 到 Lua 边界注入规范根的宿主选项。
+    let host_options = LuaRuntimeHostOptions {
+        lua_packages_dir: Some(canonical_lua_packages.clone()),
+        host_provided_ffi_root: Some(canonical_ffi_root),
+        ..Default::default()
+    };
+    LuaEngine::setup_package_paths(&lua, &host_options)
+        .expect("configure ordinary Lua package paths");
+    // Actual Lua package search strings after production initialization.
+    // 生产初始化后的真实 Lua 包搜索字符串。
+    let package: Table = lua.globals().get("package").expect("get package table");
+    let package_path: String = package.get("path").expect("get package.path");
+    let package_cpath: String = package.get("cpath").expect("get package.cpath");
+    assert!(!package_path.contains(r"\\?\"), "{package_path}");
+    assert!(!package_cpath.contains(r"\\?\"), "{package_cpath}");
+    assert!(package_path.contains(&render_host_visible_path(&canonical_lua_packages)));
+
+    // Full runtime API check proving a host-injected verbatim path is normalized before Lua use.
+    // 完整运行时 API 检查，证明宿主注入的 verbatim 路径会在 Lua 使用前被规范化。
+    let engine = make_runtime_test_engine();
+    let normalized = engine
+        .run_lua(
+            "return vulcan.path.normalize(args.path)",
+            &json!({"path": canonical_lua_packages}),
+            None,
+        )
+        .expect("normalize verbatim Lua path argument");
+    assert_eq!(
+        normalized,
+        json!(render_host_visible_path(&lua_packages_dir))
+    );
+    // Reserved PWD field must be normalized as soon as host JSON enters Lua arguments.
+    // 保留的 PWD 字段必须在宿主 JSON 进入 Lua 参数时立即完成归一化。
+    // Verbatim text retained as a control value for non-path and nested JSON fields.
+    // 作为非路径字段与嵌套 JSON 字段对照值保留的 verbatim 文本。
+    let verbatim_text = canonical_lua_packages.to_string_lossy().into_owned();
+    // Injected argument result proving only the declared top-level PWD field is rewritten.
+    // 注入参数结果，用于证明仅声明的顶层 PWD 字段会被改写。
+    let injected_paths = engine
+        .run_lua(
+            "return { PWD = args.PWD, raw = args.raw, nested = args.nested.PWD }",
+            &json!({
+                "PWD": canonical_lua_packages,
+                "raw": verbatim_text,
+                "nested": {"PWD": verbatim_text}
+            }),
+            None,
+        )
+        .expect("read normalized host-injected PWD");
+    assert_eq!(
+        injected_paths["PWD"],
+        json!(render_host_visible_path(&lua_packages_dir))
+    );
+    assert_eq!(injected_paths["raw"], json!(verbatim_text));
+    assert_eq!(injected_paths["nested"], json!(verbatim_text));
+
+    let _ = fs::remove_dir_all(&runtime_root);
+}
+
+/// Verify Lua and host argument paths reject Windows verbatim namespaces without safe equivalents.
+/// 验证 Lua 与宿主参数路径会拒绝不存在安全等价形式的 Windows verbatim 命名空间。
+#[cfg(windows)]
+#[test]
+fn ordinary_lua_path_boundaries_reject_unsupported_windows_verbatim_namespaces() {
+    // Runtime engine exercising both Lua path APIs and the reserved host-injected PWD field.
+    // 同时覆盖 Lua 路径 API 与宿主注入保留 PWD 字段的运行时引擎。
+    let engine = make_runtime_test_engine();
+    // Volume GUID namespace deliberately lacking an ordinary DOS or UNC spelling.
+    // 有意使用不存在普通 DOS 或 UNC 写法的卷 GUID 命名空间。
+    let volume_path = r"\\?\Volume{00000000-0000-0000-0000-000000000000}\module.lua";
+
+    // Lua path parser failure returned before any filesystem lookup occurs.
+    // 在任何文件系统寻址发生前返回的 Lua 路径解析失败。
+    let path_error = engine
+        .run_lua(
+            "return vulcan.path.normalize(args.path)",
+            &json!({"path": volume_path}),
+            None,
+        )
+        .expect_err("unsupported path namespace must fail Lua path parsing");
+    assert!(
+        path_error.contains("unsupported Windows verbatim path namespace"),
+        "unexpected path error: {path_error}"
+    );
+
+    // Reserved PWD rejection proving host injection cannot reinterpret the namespace as relative.
+    // 保留 PWD 拒绝结果，用于证明宿主注入不会把该命名空间重新解释为相对路径。
+    let pwd_error = engine
+        .run_lua("return args.PWD", &json!({"PWD": volume_path}), None)
+        .expect_err("unsupported PWD namespace must fail host argument conversion");
+    assert!(
+        pwd_error.contains("unsupported Windows verbatim path namespace"),
+        "unexpected PWD error: {pwd_error}"
+    );
+
+    // Process lookup failure proving executable search never receives a rewritten relative name.
+    // 进程查找失败结果，用于证明可执行文件搜索不会收到被改写的相对名称。
+    let which_error = engine
+        .run_lua(
+            "return vulcan.process.which(args.path)",
+            &json!({"path": volume_path}),
+            None,
+        )
+        .expect_err("unsupported process path namespace must fail lookup parsing");
+    assert!(
+        which_error.contains("unsupported Windows verbatim path namespace"),
+        "unexpected process.which error: {which_error}"
+    );
 }
 
 /// Build one minimal managed Node environment plan for import-root tests.
@@ -5040,6 +5239,82 @@ return {
     assert_eq!(result["tool"], "model.echo");
 }
 
+/// Verify host-tool arguments and callback results preserve empty objects, arrays, and null values.
+/// 验证宿主工具参数与回调结果会保留空对象、数组及 null 值。
+#[test]
+fn vulcan_host_bridge_preserves_json_container_types_and_null() {
+    // Process-wide callback guard serializing this host-tool callback test.
+    // 串行化当前宿主工具回调测试的进程级保护器。
+    let _guard = host_tool_callback_test_guard();
+    set_host_tool_callback(Some(Arc::new(|request| match request.action {
+        RuntimeHostToolAction::List => Ok(json!([])),
+        RuntimeHostToolAction::Has => Ok(json!(true)),
+        RuntimeHostToolAction::Call => {
+            // Explicit object markers must bypass the historical empty host-args compatibility rule.
+            // 显式对象标记必须绕过历史空宿主参数兼容规则。
+            if request.tool_name.as_deref() == Some("json.empty-object") {
+                assert_eq!(request.args, json!({}));
+                return Ok(json!({"ok": true}));
+            }
+            // Explicit array markers must also retain their container identity at the callback boundary.
+            // 显式数组标记在回调边界也必须保留其容器身份。
+            if request.tool_name.as_deref() == Some("json.empty-array") {
+                assert_eq!(request.args, json!([]));
+                return Ok(json!({"ok": true}));
+            }
+            // Canonical protocol shape expected at the Rust callback boundary.
+            // Rust 回调边界预期的规范协议结构。
+            let expected = json!({
+                "environment": {},
+                "binary_path_requests": [],
+                "contributions": [],
+                "optional": null,
+                "nullable_items": [null]
+            });
+            assert_eq!(request.args, expected);
+            Ok(json!({
+                "ok": true,
+                "value": expected
+            }))
+        }
+    })));
+
+    // Runtime engine exercising both Lua-to-host arguments and host-to-Lua callback results.
+    // 同时覆盖 Lua 到宿主参数与宿主到 Lua 回调结果的运行时引擎。
+    let engine = make_runtime_test_engine();
+    // Result returned through the shared RunLua JSON boundary.
+    // 通过共享 RunLua JSON 边界返回的结果。
+    let result = engine
+        .run_lua(
+            r#"
+local called = vulcan.host.call("json.protocol", {
+  environment = vulcan.json.object(),
+  binary_path_requests = vulcan.json.array(),
+  contributions = vulcan.json.array(),
+  optional = vulcan.json.null,
+  nullable_items = vulcan.json.array({ vulcan.json.null }),
+})
+vulcan.host.call("json.empty-object", vulcan.json.object())
+vulcan.host.call("json.empty-array", vulcan.json.array())
+return called.value
+"#,
+            &json!({}),
+            None,
+        )
+        .expect("run host JSON fidelity bridge");
+
+    assert_eq!(
+        result,
+        json!({
+            "environment": {},
+            "binary_path_requests": [],
+            "contributions": [],
+            "optional": null,
+            "nullable_items": [null]
+        })
+    );
+}
+
 /// Verify `vulcan.host.call` converts callback failures into table error envelopes.
 /// 验证 `vulcan.host.call` 会把回调失败转换为 table 错误包络。
 #[test]
@@ -6027,6 +6302,151 @@ fn run_lua_json_encode_rejects_function_value() {
         .expect_err("json.encode of a function should fail");
 
     assert!(error.contains("json.encode: Cannot convert Lua function to JSON"));
+}
+
+/// Verify `vulcan.json` decode, encode, constructors, null, protection, and copy semantics together.
+/// 验证 `vulcan.json` 解码、编码、构造器、null、保护及拷贝语义可协同工作。
+#[test]
+fn run_lua_json_api_preserves_types_and_uses_protected_shallow_copies() {
+    // Runtime engine exposing the production vulcan.json module.
+    // 暴露生产 vulcan.json 模块的运行时引擎。
+    let engine = make_runtime_test_engine();
+    // JSON result combining decoded data and explicitly constructed containers.
+    // 组合解码数据与显式构造容器的 JSON 结果。
+    let result = engine
+        .run_lua(
+            r#"
+local decoded = vulcan.json.decode([[{
+  "object": {},
+  "array": [],
+  "nested": {"object": {}, "array": []},
+  "nullable": null,
+  "nullableArray": [null]
+}]])
+local object_source = { name = "before" }
+local array_source = { "one", "two" }
+local copied_object = vulcan.json.object(object_source)
+local copied_array = vulcan.json.array(array_source)
+object_source.name = "after"
+array_source[1] = "changed"
+return {
+  decoded = vulcan.json.decode(vulcan.json.encode(decoded)),
+  empty_object = vulcan.json.object(),
+  empty_array = vulcan.json.array(),
+  copied_object = copied_object,
+  copied_array = copied_array,
+  object_source = object_source,
+  array_source = array_source,
+  explicit_null = vulcan.json.null,
+  protected_object = getmetatable(copied_object) == false,
+  protected_array = getmetatable(copied_array) == false,
+}
+"#,
+            &json!({}),
+            None,
+        )
+        .expect("run JSON fidelity API Lua");
+
+    assert_eq!(
+        result["decoded"],
+        json!({
+            "object": {},
+            "array": [],
+            "nested": {"object": {}, "array": []},
+            "nullable": null,
+            "nullableArray": [null]
+        })
+    );
+    assert_eq!(result["empty_object"], json!({}));
+    assert_eq!(result["empty_array"], json!([]));
+    assert_eq!(result["copied_object"], json!({"name": "before"}));
+    assert_eq!(result["copied_array"], json!(["one", "two"]));
+    assert_eq!(result["object_source"], json!({"name": "after"}));
+    assert_eq!(result["array_source"], json!(["changed", "two"]));
+    assert!(result["explicit_null"].is_null());
+    assert_eq!(result["protected_object"], true);
+    assert_eq!(result["protected_array"], true);
+}
+
+/// Verify an ordinary unmarked empty Lua table keeps the historical empty-array encoding.
+/// 验证普通无标记 Lua 空表继续保持历史空数组编码行为。
+#[test]
+fn run_lua_unmarked_empty_table_keeps_legacy_array_semantics() {
+    // Runtime engine exercising the compatibility branch of the shared converter.
+    // 覆盖共享转换器兼容分支的运行时引擎。
+    let engine = make_runtime_test_engine();
+    // Unmarked empty table result produced by ordinary Lua syntax.
+    // 由普通 Lua 语法产生的无标记空表结果。
+    let result = engine
+        .run_lua("return {}", &json!({}), None)
+        .expect("convert ordinary empty Lua table");
+
+    assert_eq!(result, json!([]));
+}
+
+/// Verify marked and inferred JSON containers reject mixed keys, holes, and invalid constructors.
+/// 验证已标记及推断 JSON 容器会拒绝混合键、空洞与非法构造器参数。
+#[test]
+fn run_lua_json_containers_reject_invalid_structures() {
+    // Runtime engine reused across independent invalid-container cases.
+    // 在多个独立非法容器用例间复用的运行时引擎。
+    let engine = make_runtime_test_engine();
+    // Lua snippets paired with the stable diagnostic fragment each one must produce.
+    // Lua 片段及每个片段必须产生的稳定诊断片段。
+    let cases = [
+        (
+            "return vulcan.json.array({ [1] = 'one', name = 'invalid' })",
+            "JSON array table cannot contain string keys",
+        ),
+        (
+            "return vulcan.json.object({ [1] = 'invalid' })",
+            "JSON object table cannot contain numeric keys",
+        ),
+        (
+            "return vulcan.json.array({ [1] = 'one', [3] = 'three' })",
+            "JSON array table must be contiguous from index 1; missing index 2",
+        ),
+        (
+            "return vulcan.json.object('invalid')",
+            "vulcan.json.object expects no argument or exactly one table",
+        ),
+        (
+            "return vulcan.json.array(42)",
+            "vulcan.json.array expects no argument or exactly one table",
+        ),
+        (
+            "return vulcan.json.object(nil)",
+            "vulcan.json.object expects no argument or exactly one table",
+        ),
+        (
+            "return vulcan.json.array({}, {})",
+            "vulcan.json.array expects no argument or exactly one table",
+        ),
+        (
+            "local value = vulcan.json.array(); value.name = 'invalid'; return value",
+            "JSON array table cannot contain string keys",
+        ),
+        (
+            "local value = vulcan.json.object(); value[1] = 'invalid'; return value",
+            "JSON object table cannot contain numeric keys",
+        ),
+        (
+            "return { [1] = 'one', name = 'invalid' }",
+            "JSON array table cannot contain string keys",
+        ),
+    ];
+
+    for (code, expected_error) in cases {
+        // Explicit conversion failure returned by the production RunLua boundary.
+        // 由生产 RunLua 边界返回的显式转换失败。
+        let error = engine
+            .run_lua(code, &json!({}), None)
+            .expect_err("invalid JSON container must fail");
+        assert!(
+            error.contains(expected_error),
+            "expected `{expected_error}` in `{error}`"
+        );
+    }
 }
 
 /// Verify the Lua VM pool recovers state access and condition-variable wakeups after lock poisoning.
@@ -7219,10 +7639,17 @@ fn execute_runlua_request_inline_supports_vulcan_process_which_for_explicit_path
     fs::write(&program_path, "echo explicit-process-which")
         .expect("write process which explicit program");
     mark_test_program_executable(&program_path);
+    // ProgramArgument carries the native canonical spelling on Windows to exercise prefix filtering.
+    // ProgramArgument 在 Windows 上携带原生规范写法，用于覆盖前缀过滤。
+    #[cfg(windows)]
+    let program_argument =
+        fs::canonicalize(&program_path).expect("canonical explicit process.which program");
+    #[cfg(not(windows))]
+    let program_argument = program_path.clone();
     let request = json!({
         "code": "return vulcan.json.encode({ found = vulcan.process.which(args.program) })",
         "args": {
-            "program": render_host_visible_path(&program_path)
+            "program": program_argument
         }
     });
 
@@ -8070,7 +8497,9 @@ fn prepare_ready_managed_session_environment(
                 .expect("run managed test Python executable");
             assert!(
                 probe.status.success(),
-                "managed test Python executable failed: {}",
+                "managed test Python executable failed: status={} stdout={} stderr={}",
+                probe.status,
+                String::from_utf8_lossy(&probe.stdout),
                 String::from_utf8_lossy(&probe.stderr)
             );
             assert_eq!(
@@ -9336,6 +9765,111 @@ fn system_runtime_lease_preserves_explicit_cwd_and_package_identity() {
     );
 }
 
+/// Verify System Lease eval preserves protocol container types and exposes Lua-compatible search paths.
+/// 验证 System Lease eval 会保留协议容器类型并暴露 Lua 兼容搜索路径。
+#[test]
+fn system_runtime_lease_preserves_json_protocol_types_and_search_path_spelling() {
+    // Strict System package layout whose canonical Windows paths may carry verbatim prefixes internally.
+    // 严格 System 包布局；其 Windows 规范路径在内部可能带有 verbatim 前缀。
+    let layout = SystemRuntimeTestLayout::new("system-json-path-fidelity");
+    // Engine configured with the real System trust root and package identity.
+    // 配置了真实 System 信任根与包身份的引擎。
+    let engine = make_runtime_test_engine_with_host_options(layout.host_options());
+    // Created lease response from the production JSON create surface.
+    // 由生产 JSON 创建表面返回的租约响应。
+    let created: Value = serde_json::from_str(
+        &engine
+            .create_system_runtime_lease_json(
+                &layout
+                    .create_request("system-json-path-fidelity")
+                    .to_string(),
+            )
+            .expect("create System JSON fidelity lease"),
+    )
+    .expect("decode System JSON fidelity create response");
+    assert_eq!(created["ok"], true);
+
+    // Eval request exercising decode, encode, lease result conversion, package.path, and package.cpath.
+    // 覆盖解码、编码、租约结果转换、package.path 与 package.cpath 的执行请求。
+    let eval_request = json!({
+        "lease_id": created["lease_id"],
+        "generation": created["generation"],
+        "code": r#"
+local protocol = vulcan.json.decode([[{
+  "environment": {},
+  "binary_path_requests": [],
+  "contributions": [],
+  "optional": null,
+  "nullable_items": [null]
+}]])
+return {
+  protocol = protocol,
+  encoded = vulcan.json.encode(protocol),
+  package_path = package.path,
+  package_cpath = package.cpath,
+}
+"#
+    });
+    // Eval response decoded from the stable production lease JSON envelope.
+    // 从稳定生产租约 JSON 包络解码的执行响应。
+    let evaluated: Value = serde_json::from_str(
+        &engine
+            .eval_system_runtime_lease_json(&eval_request.to_string())
+            .expect("eval System JSON fidelity lease"),
+    )
+    .expect("decode System JSON fidelity eval response");
+    assert_eq!(evaluated["ok"], true, "unexpected eval: {evaluated}");
+    // Canonical protocol shape required by System Plugin Shell Hook consumers.
+    // System Plugin Shell Hook 消费方要求的规范协议结构。
+    let expected_protocol = json!({
+        "environment": {},
+        "binary_path_requests": [],
+        "contributions": [],
+        "optional": null,
+        "nullable_items": [null]
+    });
+    assert_eq!(evaluated["result"]["protocol"], expected_protocol);
+    // Encoded JSON text parsed independently to avoid depending on object key order.
+    // 独立解析编码 JSON 文本，避免依赖对象键顺序。
+    let encoded_protocol: Value = serde_json::from_str(
+        evaluated["result"]["encoded"]
+            .as_str()
+            .expect("encoded protocol text"),
+    )
+    .expect("parse encoded protocol text");
+    assert_eq!(encoded_protocol, expected_protocol);
+
+    #[cfg(windows)]
+    {
+        // Lua module search strings must never retain the Windows verbatim prefix.
+        // Lua 模块搜索字符串绝不能保留 Windows verbatim 前缀。
+        let package_path = evaluated["result"]["package_path"]
+            .as_str()
+            .expect("System package.path text");
+        let package_cpath = evaluated["result"]["package_cpath"]
+            .as_str()
+            .expect("System package.cpath text");
+        assert!(!package_path.contains(r"\\?\"), "{package_path}");
+        assert!(!package_cpath.contains(r"\\?\"), "{package_cpath}");
+    }
+
+    // Close request proving the dedicated VM can be retired after the regression check.
+    // 证明回归检查后可退役专用虚拟机的关闭请求。
+    let closed: Value = serde_json::from_str(
+        &engine
+            .close_system_runtime_lease_json(
+                &json!({
+                    "lease_id": created["lease_id"],
+                    "generation": created["generation"]
+                })
+                .to_string(),
+            )
+            .expect("close System JSON fidelity lease"),
+    )
+    .expect("decode System JSON fidelity close response");
+    assert_eq!(closed["ok"], true);
+}
+
 /// Verify a Windows child process inherits the authorized package cwd without verbatim syntax.
 /// 验证 Windows 子进程继承不含 verbatim 语法的已授权包 cwd。
 #[cfg(windows)]
@@ -9872,14 +10406,7 @@ fn run_managed_runtime_status_invoke_integration(
         );
         // RuntimeVersion lengthens only the managed environment group; the System package cwd stays short.
         // RuntimeVersion 仅加长受管环境分组；System 包 cwd 保持较短。
-        let runtime_version = match runtime {
-            ManagedSessionTestRuntime::Python => {
-                format!("{}-{}", host.version, "p".repeat(160))
-            }
-            ManagedSessionTestRuntime::Node => {
-                format!("{}+{}", host.version, "n".repeat(160))
-            }
-        };
+        let runtime_version = managed_session_long_path_runtime_version(runtime, &host.version);
         ManagedSessionSystemLayout::new_with_runtime_version(
             layout_label,
             Some(&runtime_version),
@@ -10074,6 +10601,83 @@ fn run_managed_runtime_status_invoke_integration(
     close_managed_session_test_lease(&engine, &lease);
 }
 
+/// Return a valid declared runtime version padded enough to force Windows snapshot paths past MAX_PATH.
+/// 返回一个有效的已声明运行时版本，并填充到足以使 Windows 快照路径超过 MAX_PATH。
+///
+/// `runtime` selects the version grammar and `host_version` is the exact discovered interpreter version.
+/// `runtime` 选择版本语法，`host_version` 是探测得到的精确解释器版本。
+///
+/// Returns a runtime-specific valid version used only by long-path integration fixtures.
+/// 返回一个仅供长路径集成夹具使用、且符合对应运行时语法的版本。
+fn managed_session_long_path_runtime_version(
+    runtime: ManagedSessionTestRuntime,
+    host_version: &str,
+) -> String {
+    match runtime {
+        ManagedSessionTestRuntime::Python => format!("{}-{}", host_version, "p".repeat(160)),
+        ManagedSessionTestRuntime::Node => format!("{}+{}", host_version, "n".repeat(160)),
+    }
+}
+
+/// Return a Windows runtime version that keeps Python itself short while forcing its snapshot source long.
+/// 返回一个 Windows 运行时版本，使 Python 自身路径保持较短、同时强制快照源码成为长路径。
+///
+/// `layout_label` and `host_version` reproduce the exact Python fixture path grammar before creation.
+/// `layout_label` 与 `host_version` 会在创建前复现精确的 Python 夹具路径语法。
+///
+/// Returns a padded valid version whose virtual-environment interpreter is exactly 245 UTF-16 units.
+/// 返回一个经过填充的有效版本，使虚拟环境解释器路径恰为 245 个 UTF-16 代码单元。
+#[cfg(windows)]
+fn managed_python_session_persistence_long_path_runtime_version(
+    layout_label: &str,
+    host_version: &str,
+) -> String {
+    use std::os::windows::ffi::OsStrExt;
+
+    // TargetInterpreterLength leaves explicit room below MAX_PATH while the longer snapshot suffix crosses it.
+    // TargetInterpreterLength 在 MAX_PATH 以下留下明确余量，同时让更长的快照后缀越过该边界。
+    const TARGET_INTERPRETER_LENGTH: usize = 245;
+    // PlaceholderHash has the exact fixed width of every SHA-256 environment identity.
+    // PlaceholderHash 与每个 SHA-256 环境身份具有完全相同的固定宽度。
+    let placeholder_hash = "0".repeat(64);
+    // UnpaddedVersion includes the Python prerelease separator that remains before added padding.
+    // UnpaddedVersion 包含添加填充前仍会保留的 Python 预发布分隔符。
+    let unpadded_version = format!("{host_version}-");
+    // EnvironmentRoot mirrors SystemRuntimeTestLayout and ManagedSessionSystemLayout exactly.
+    // EnvironmentRoot 精确镜像 SystemRuntimeTestLayout 与 ManagedSessionSystemLayout。
+    let environment_root = make_temp_runtime_root(layout_label)
+        .join("dependencies")
+        .join("envs");
+    // UnpaddedEnvDir uses production layout logic with an equal-width identity placeholder.
+    // UnpaddedEnvDir 使用生产布局逻辑及等宽身份占位符。
+    let unpadded_env_dir = managed_env_dir(
+        &environment_root,
+        ManagedRuntimeKind::Python,
+        &unpadded_version,
+        &placeholder_hash,
+    );
+    // UnpaddedInterpreter matches the executable suffix used by persistent Python sessions.
+    // UnpaddedInterpreter 与持久 Python 会话使用的可执行文件后缀一致。
+    let unpadded_interpreter = unpadded_env_dir
+        .join(".venv")
+        .join("Scripts")
+        .join("python.exe");
+    // UnpaddedLength is measured exactly as Windows CreateProcess consumes the visible spelling.
+    // UnpaddedLength 按 Windows CreateProcess 消费可见路径的方式精确计量。
+    let unpadded_length = unpadded_interpreter.as_os_str().encode_wide().count();
+    // PaddingLength is exact; failure means this runner's temporary root leaves no valid test window.
+    // PaddingLength 是精确值；失败表示当前 runner 的临时根没有留下有效测试窗口。
+    let padding_length = TARGET_INTERPRETER_LENGTH
+        .checked_sub(unpadded_length)
+        .filter(|length| *length > 0)
+        .unwrap_or_else(|| {
+            panic!(
+                "persistent-session test root leaves no long-source window: unpadded interpreter length={unpadded_length}"
+            )
+        });
+    format!("{}-{}", host_version, "p".repeat(padding_length))
+}
+
 /// Exercise two System Plugin packages with same-named modules and dependencies in one engine.
 /// 在一个引擎内验证两个具有同名模块与依赖的 System Plugin 包。
 ///
@@ -10225,7 +10829,16 @@ fn run_managed_system_plugin_dependency_module_isolation_integration(
 
 /// Exercise persistent state, events, security boundaries, and bounded output for one runtime.
 /// 针对一个运行时验证持久状态、事件、安全边界与有界输出。
-fn run_managed_session_persistence_integration(runtime: ManagedSessionTestRuntime) {
+///
+/// `runtime` selects the real interpreter and `expect_long_source` requests a Windows path beyond MAX_PATH.
+/// `runtime` 选择真实解释器，`expect_long_source` 请求一条超过 MAX_PATH 的 Windows 路径。
+///
+/// Returns unit after the complete persistent-session and cleanup contract succeeds.
+/// 完整持久会话与清理契约成功后返回空值。
+fn run_managed_session_persistence_integration(
+    runtime: ManagedSessionTestRuntime,
+    expect_long_source: bool,
+) {
     // Host is optional only when the requested real interpreter is unavailable.
     // Host 仅在请求的真实解释器不可用时才为空。
     let Some(host) = discover_host_managed_runtime(runtime) else {
@@ -10245,10 +10858,84 @@ fn run_managed_session_persistence_integration(runtime: ManagedSessionTestRuntim
     }
     // Layout contains one strict System package and one prevalidated ready environment.
     // Layout 包含一个严格 System 包与一个已预验证的就绪环境。
-    let layout = ManagedSessionSystemLayout::new(
-        &format!("managed-session-persistence-{}", runtime.label()),
-        runtime,
-        &host,
+    let layout_label = if expect_long_source {
+        format!("managed-session-long-persistence-{}", runtime.label())
+    } else {
+        format!("managed-session-persistence-{}", runtime.label())
+    };
+    // Layout uses a grammar-valid padded version only when the test must prove native long-path launch.
+    // 仅当测试必须证明原生长路径启动时，Layout 才使用符合语法的填充版本。
+    let layout = if expect_long_source {
+        #[cfg(windows)]
+        {
+            // Long-source layout is intentionally Python-specific because its path window is
+            // calculated from the virtual-environment interpreter suffix.
+            // 长源码布局有意仅用于 Python，因为其路径窗口按虚拟环境解释器后缀计算。
+            assert_eq!(runtime, ManagedSessionTestRuntime::Python);
+            let runtime_version = managed_python_session_persistence_long_path_runtime_version(
+                &layout_label,
+                &host.version,
+            );
+            ManagedSessionSystemLayout::new_with_runtime_version(
+                &layout_label,
+                Some(&runtime_version),
+                runtime,
+                &host,
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            panic!("long persistent-session source fixture is Windows-only")
+        }
+    } else {
+        ManagedSessionSystemLayout::new(&layout_label, runtime, &host)
+    };
+    #[cfg(windows)]
+    if expect_long_source {
+        use std::os::windows::ffi::OsStrExt;
+
+        // MinimumSource uses the shortest possible formatted snapshot identity, so crossing
+        // MAX_PATH here proves every real source remains long after prefix filtering.
+        // MinimumSource 使用格式允许的最短快照身份，因此这里在过滤前缀后仍超过 MAX_PATH，
+        // 足以证明每条真实源码路径也都保持为长路径。
+        let minimum_source = render_host_visible_path(
+            &layout
+                .env_dir
+                .join(".ls-s")
+                .join("0-0-0-00000000")
+                .join(layout.sidecar_file()),
+        );
+        // InterpreterPath stays below MAX_PATH so this test isolates source-argument handling from
+        // CPython's independent `sys.executable` descendant-launch behavior.
+        // InterpreterPath 保持低于 MAX_PATH，使本测试只验证源码参数处理，而不混入 CPython
+        // 通过 `sys.executable` 启动后代进程的独立行为。
+        let interpreter_path = render_host_visible_path(
+            &layout
+                .env_dir
+                .join(".venv")
+                .join("Scripts")
+                .join("python.exe"),
+        );
+        // MinimumSourceLength and InterpreterLength are measured in Windows UTF-16 code units.
+        // MinimumSourceLength 与 InterpreterLength 均以 Windows UTF-16 代码单元计量。
+        let minimum_source_length = Path::new(&minimum_source).as_os_str().encode_wide().count();
+        let interpreter_length = Path::new(&interpreter_path)
+            .as_os_str()
+            .encode_wide()
+            .count();
+        assert!(
+            minimum_source_length >= 260,
+            "expected persistent-session snapshot source past MAX_PATH, length={minimum_source_length}, path={minimum_source}"
+        );
+        assert!(
+            interpreter_length < 260,
+            "expected persistent-session interpreter below MAX_PATH, length={interpreter_length}, path={interpreter_path}"
+        );
+    }
+    #[cfg(not(windows))]
+    assert!(
+        !expect_long_source,
+        "long persistent-session source assertion is Windows-only"
     );
     // Engine is the production JSON surface under test.
     // Engine 是被测的生产 JSON 接口。
@@ -11000,14 +11687,22 @@ fn system_runtime_node_plugins_isolate_dependencies_and_modules() {
 /// 验证真实受管 Python 会话会跨 eval 持续存在并发出有界事件。
 #[test]
 fn system_runtime_python_session_persists_across_evals_and_emits_events() {
-    run_managed_session_persistence_integration(ManagedSessionTestRuntime::Python);
+    run_managed_session_persistence_integration(ManagedSessionTestRuntime::Python, false);
 }
 
 /// Verify a real managed Node session persists across evals and emits bounded events.
 /// 验证真实受管 Node 会话会跨 eval 持续存在并发出有界事件。
 #[test]
 fn system_runtime_node_session_persists_across_evals_and_emits_events() {
-    run_managed_session_persistence_integration(ManagedSessionTestRuntime::Node);
+    run_managed_session_persistence_integration(ManagedSessionTestRuntime::Node, false);
+}
+
+/// Verify a real Python persistent session launches from a snapshot path beyond Windows MAX_PATH.
+/// 验证真实 Python 持久会话可从超过 Windows MAX_PATH 的快照路径启动。
+#[cfg(windows)]
+#[test]
+fn system_runtime_python_session_supports_long_snapshot_source_path() {
+    run_managed_session_persistence_integration(ManagedSessionTestRuntime::Python, true);
 }
 
 /// Verify two real managed Python sessions remain process- and state-isolated.

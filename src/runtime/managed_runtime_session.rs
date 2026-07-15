@@ -47,6 +47,8 @@ use crate::runtime::managed_runtime::{
     current_managed_runtime_persistent_session_capability, ensure_managed_env,
     resolve_node_env_plan, resolve_python_env_plan,
 };
+#[cfg(windows)]
+use crate::runtime::path::normalize_windows_verbatim_path;
 use crate::runtime::path::{host_process_path_argument, render_host_visible_path};
 use crate::runtime::process_session::{
     ManagedProcessSessionCleanup, ManagedProcessSessionCore, ManagedProcessSessionLaunchOptions,
@@ -317,7 +319,12 @@ impl ManagedPackageSnapshot {
         let source_path = self.execution_source_path(relative_path)?;
         #[cfg(windows)]
         {
-            windows_non_verbatim_path(&source_path)
+            normalize_windows_verbatim_path(&source_path).map_err(|error| {
+                format!(
+                    "{error} for managed Node source: {}",
+                    render_host_visible_path(&source_path)
+                )
+            })
         }
         #[cfg(not(windows))]
         {
@@ -383,7 +390,12 @@ impl ManagedPackageSnapshot {
         let source_path = self.worker_source_path(relative_path)?;
         #[cfg(windows)]
         {
-            windows_non_verbatim_path(&source_path)
+            normalize_windows_verbatim_path(&source_path).map_err(|error| {
+                format!(
+                    "{error} for managed Node source: {}",
+                    render_host_visible_path(&source_path)
+                )
+            })
         }
         #[cfg(not(windows))]
         {
@@ -1109,9 +1121,11 @@ pub(crate) fn launch_managed_python_session(
     )?;
     ensure_regular_file(&snapshot_source, "managed Python snapshot source")?;
     let execution_cwd = cwd.canonical.clone();
-    command
-        .arg(host_process_path_argument(&snapshot_source))
-        .args(&request.args);
+    // Native canonical source argument retained because Windows Python needs verbatim syntax for
+    // long snapshot paths; this private argument never crosses the Lua or host API boundary.
+    // 保留原生规范源码参数，因为 Windows Python 访问超长快照路径需要 verbatim 语法；
+    // 该私有参数不会跨越 Lua 或宿主 API 边界。
+    command.arg(&snapshot_source).args(&request.args);
     configure_managed_command_cwd(&mut command, &cwd)?;
     // Canonical Python virtual-environment directory.
     // 规范 Python 虚拟环境目录。
@@ -1190,7 +1204,9 @@ pub(crate) fn launch_managed_node_session(
     )?;
     ensure_regular_file(&snapshot_source, "managed Node snapshot source")?;
     let execution_cwd = cwd.canonical.clone();
-    command.arg(&snapshot_source).args(&request.args);
+    command
+        .arg(host_process_path_argument(&snapshot_source))
+        .args(&request.args);
     configure_managed_command_cwd(&mut command, &cwd)?;
     configure_managed_node_command_environment(&mut command, &plan)?;
     install_controlled_context_environment(&mut command, package)?;
@@ -2100,7 +2116,7 @@ fn configure_managed_command_cwd(
     #[cfg(windows)]
     {
         let ManagedSessionCwdPin::Windows(_directory) = &cwd.pin;
-        command.current_dir(&cwd.canonical);
+        command.current_dir(host_process_path_argument(&cwd.canonical));
         Ok(())
     }
     #[cfg(not(any(unix, windows)))]
@@ -2296,49 +2312,6 @@ fn windows_worker_neutral_cwd(snapshot_root: &Path) -> Result<PathBuf, String> {
     Ok(neutral_root)
 }
 
-/// Remove one Windows verbatim prefix without lossy string conversion or filesystem lookup.
-/// 在不进行有损字符串转换或文件系统查询的情况下移除 Windows verbatim 前缀。
-///
-/// `path` is already anchored by a retained filesystem handle. Returns the equivalent DOS or UNC
-/// spelling accepted by Node's CLI main-module resolver.
-/// `path` 已由保留的文件系统句柄锚定；返回 Node CLI 主模块解析器可接受的等价 DOS 或 UNC 写法。
-#[cfg(windows)]
-fn windows_non_verbatim_path(path: &Path) -> Result<PathBuf, String> {
-    // UTF-16 units preserve every Windows path code unit exactly.
-    // UTF-16 单元会精确保留 Windows 路径的每个代码单元。
-    let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
-    // Canonical verbatim UNC prefix `\\?\UNC\` converted to the ordinary leading `\\`.
-    // 规范 verbatim UNC 前缀 `\\?\UNC\` 会被转换为普通前导 `\\`。
-    const VERBATIM_UNC_PREFIX: [u16; 8] = [92, 92, 63, 92, 85, 78, 67, 92];
-    // Canonical verbatim local prefix `\\?\` removed before a drive-qualified path.
-    // 规范 verbatim 本地前缀 `\\?\` 会在驱动器限定路径前被移除。
-    const VERBATIM_PREFIX: [u16; 4] = [92, 92, 63, 92];
-    if encoded.starts_with(&VERBATIM_UNC_PREFIX) {
-        let mut normalized = Vec::with_capacity(encoded.len().saturating_sub(6));
-        normalized.extend_from_slice(&[92, 92]);
-        normalized.extend_from_slice(&encoded[VERBATIM_UNC_PREFIX.len()..]);
-        return Ok(PathBuf::from(OsString::from_wide(&normalized)));
-    }
-    if encoded.starts_with(&VERBATIM_PREFIX) {
-        // Only a drive-qualified verbatim path has an equivalent ordinary DOS spelling.
-        // 只有驱动器限定的 verbatim 路径才具备等价普通 DOS 写法。
-        let remainder = &encoded[VERBATIM_PREFIX.len()..];
-        let drive_qualified = remainder.len() >= 3
-            && (remainder[0] >= u16::from(b'A') && remainder[0] <= u16::from(b'Z')
-                || remainder[0] >= u16::from(b'a') && remainder[0] <= u16::from(b'z'))
-            && remainder[1] == u16::from(b':')
-            && remainder[2] == u16::from(b'\\');
-        if drive_qualified {
-            return Ok(PathBuf::from(OsString::from_wide(remainder)));
-        }
-        return Err(format!(
-            "unsupported Windows verbatim namespace for managed Node source: {}",
-            render_host_visible_path(path)
-        ));
-    }
-    Ok(path.to_path_buf())
-}
-
 /// Return the environment-specific Python executable path.
 /// 返回环境专属 Python 可执行文件路径。
 fn managed_python_session_executable(plan: &ManagedRuntimeEnvPlan) -> PathBuf {
@@ -2392,7 +2365,7 @@ pub(crate) fn configure_managed_python_command_environment(
             executable_parent(&plan.runtime_executable)?.to_path_buf(),
         ],
     )?;
-    command.env("VIRTUAL_ENV", virtual_env);
+    command.env("VIRTUAL_ENV", host_process_path_argument(&virtual_env));
     command.env("PYTHONNOUSERSITE", "1");
     command.env("PYTHONUTF8", "1");
     Ok(())
@@ -2421,7 +2394,10 @@ pub(crate) fn configure_managed_node_command_environment(
             plan.env_dir.join("node_modules").join(".bin"),
         ],
     )?;
-    command.env("NODE_PATH", plan.env_dir.join("node_modules"));
+    command.env(
+        "NODE_PATH",
+        host_process_path_argument(&plan.env_dir.join("node_modules")),
+    );
     Ok(())
 }
 
@@ -3415,9 +3391,9 @@ mod tests {
         // Volume GUID namespace is absolute only while its verbatim prefix remains present.
         // 卷 GUID 命名空间仅在保留 verbatim 前缀时才是绝对路径。
         let volume_path = Path::new(r"\\?\Volume{00000000-0000-0000-0000-000000000000}\entry.mjs");
-        let error = windows_non_verbatim_path(volume_path)
+        let error = normalize_windows_verbatim_path(volume_path)
             .expect_err("volume GUID path must not become a relative Node source");
-        assert!(error.contains("unsupported Windows verbatim namespace"));
+        assert!(error.contains("unsupported Windows verbatim path namespace"));
     }
 
     /// Windows worker cwd derivation must normalize every supported drive and UNC spelling.

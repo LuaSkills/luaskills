@@ -1,5 +1,6 @@
 use super::lease::default_runlua_exec_args;
 use super::*;
+use crate::runtime::path::normalize_host_input_path_text;
 use std::sync::OnceLock;
 
 /// RunLua execution request accepted by `vulcan.runtime.lua.exec`.
@@ -164,10 +165,6 @@ fn looks_like_lua_debug_value(text: &str) -> bool {
 #[cfg(windows)]
 pub(super) fn has_invalid_windows_path_syntax(text: &str) -> bool {
     let trimmed = text.trim();
-    if trimmed.starts_with(r"\\?\") {
-        return false;
-    }
-
     let first_char = trimmed.chars().next();
     for (index, ch) in trimmed.char_indices() {
         if ch.is_control() {
@@ -244,6 +241,24 @@ fn validate_path_text(text: &str, fn_name: &str, param_name: &str) -> mlua::Resu
     Ok(())
 }
 
+/// Normalize and validate one already-decoded path field before filesystem or process use.
+/// 在文件系统或进程使用前归一化并校验一个已经解码的路径字段。
+///
+/// `text` is the exact UTF-8 field value, while `fn_name` and `param_name` identify its public API
+/// location in diagnostics.
+/// `text` 是精确 UTF-8 字段值，`fn_name` 与 `param_name` 用于在诊断中标识其公开 API 位置。
+///
+/// Return a Lua-compatible path spelling or an explicit namespace/syntax error.
+/// 返回 Lua 兼容路径写法，或显式的命名空间/语法错误。
+fn normalize_path_text_arg(text: String, fn_name: &str, param_name: &str) -> mlua::Result<String> {
+    // Safe host-input conversion accepts only verbatim drive and UNC paths with ordinary equivalents.
+    // 安全宿主输入转换仅接受具备普通等价形式的 verbatim 盘符路径与 UNC 路径。
+    let normalized = normalize_host_input_path_text(&text)
+        .map_err(|error| mlua::Error::runtime(format!("{fn_name}: {param_name}: {error}")))?;
+    validate_path_text(&normalized, fn_name, param_name)?;
+    Ok(normalized)
+}
+
 /// Require a validated path string from Lua input.
 /// 从 Lua 输入中提取并校验路径字符串参数。
 pub(super) fn require_path_arg(
@@ -252,8 +267,7 @@ pub(super) fn require_path_arg(
     param_name: &str,
 ) -> mlua::Result<String> {
     let text = require_string_arg(value, fn_name, param_name, false)?;
-    validate_path_text(&text, fn_name, param_name)?;
-    Ok(text)
+    normalize_path_text_arg(text, fn_name, param_name)
 }
 
 /// Read an optional non-negative integer argument from Lua.
@@ -810,9 +824,17 @@ pub(super) fn parse_exec_request(
         }),
         LuaValue::Table(spec) => {
             let command = table_get_optional_string_field(&spec, fn_name, "command", false)?;
-            let program = table_get_optional_string_field(&spec, fn_name, "program", false)?;
+            // Optional direct-program path normalized before process-mode validation and launch.
+            // 在进程模式校验与启动前归一化的可选直接程序路径。
+            let program = table_get_optional_string_field(&spec, fn_name, "program", false)?
+                .map(|path| normalize_path_text_arg(path, fn_name, "program"))
+                .transpose()?;
             let args = table_get_string_list_field(&spec, fn_name, "args")?;
-            let cwd = table_get_optional_string_field(&spec, fn_name, "cwd", false)?;
+            // Optional child working directory normalized before syntax validation and launch.
+            // 在语法校验与启动前归一化的可选子进程工作目录。
+            let cwd = table_get_optional_string_field(&spec, fn_name, "cwd", false)?
+                .map(|path| normalize_path_text_arg(path, fn_name, "cwd"))
+                .transpose()?;
             let env = table_get_string_map_field(&spec, fn_name, "env")?;
             let stdin = table_get_optional_string_field(&spec, fn_name, "stdin", true)?;
             let timeout_ms = table_get_optional_timeout_field(&spec, fn_name, "timeout_ms")?;
@@ -828,10 +850,6 @@ pub(super) fn parse_exec_request(
             let stdin_encoding =
                 table_get_optional_encoding_field(&spec, fn_name, "stdin_encoding")?
                     .unwrap_or(encoding);
-
-            if let Some(current_dir) = cwd.as_deref() {
-                validate_path_text(current_dir, fn_name, "cwd")?;
-            }
 
             let mode = match (command, program) {
                 (Some(command_text), None) => {
@@ -1480,7 +1498,9 @@ impl LuaEngine {
             (None, None) => Err("luaexec requires code or file".to_string()),
             (Some(code), None) => Ok((code, None)),
             (None, Some(file_text)) => {
-                validate_path_text(&file_text, "luaexec", "file")
+                // Luaexec file spelling normalized before filesystem lookup and VM cwd injection.
+                // 在文件系统寻址与虚拟机 cwd 注入前规范化 Luaexec 文件写法。
+                let file_text = normalize_path_text_arg(file_text, "luaexec", "file")
                     .map_err(|error| error.to_string())?;
                 let raw_file_path = PathBuf::from(&file_text);
                 let file_path = if raw_file_path.is_absolute() {

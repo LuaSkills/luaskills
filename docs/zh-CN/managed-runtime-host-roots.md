@@ -105,6 +105,8 @@ let descriptor = resolve_managed_runtime_install(
 
 `ManagedRuntimeInstallDescriptor` 返回规范安装根、规范可执行文件、精确版本/平台、清单哈希与可执行文件哈希。
 
+Rust 描述符会有意保留原生规范 `PathBuf`，供依赖文件对象身份的宿主逻辑使用；Windows 下这些内部值可能采用 `\\?\` 形式。
+
 对应 JSON FFI 是 `luaskills_ffi_managed_runtime_resolve_json`：
 
 ```json
@@ -116,7 +118,7 @@ let descriptor = resolve_managed_runtime_install(
 }
 ```
 
-它返回标准 `{ "ok": true, "result": ... }` 包络，不创建引擎，也不修改环境状态。
+它返回标准 `{ "ok": true, "result": ... }` 包络，不创建引擎，也不修改环境状态。JSON 输入可接受带 `\\?\` / `\\?\UNC\` 前缀的 Windows 规范绝对盘符路径与 UNC 路径，但 `result.install_root` 与 `result.executable` 始终返回去除该前缀后的等价宿主可见形式；其他 verbatim 命名空间会在文件系统寻址前被拒绝。
 
 ## C ABI 版本
 
@@ -232,7 +234,7 @@ vulcan.runtime.node.invoke(...)
 vulcan.runtime.node.session.open(...)
 ```
 
-运行时状态新增 `distribution_root`、`distribution_source`、`environment_root` 与 `environment_source`。来源值稳定为 `host_configured` 或 `runtime_root_default`。
+运行时状态新增 `distribution_root`、`distribution_source`、`environment_root` 与 `environment_source`。来源值稳定为 `host_configured` 或 `runtime_root_default`。Windows 状态路径采用宿主可见形式，绝不包含 `\\?\` / `\\?\UNC\`。
 
 ## 平台与失败处理
 

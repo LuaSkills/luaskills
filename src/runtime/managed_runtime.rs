@@ -15,7 +15,9 @@ use crate::runtime::managed_package::{
     ManagedFilesystemObjectIdentity, ManagedRuntimePackageContext,
     capture_managed_directory_identity, validate_managed_directory_identity,
 };
-use crate::runtime::path::{host_process_path_argument, render_host_visible_path};
+use crate::runtime::path::{
+    host_process_path_argument, normalize_host_input_path_text, render_host_visible_path,
+};
 use crate::skill::dependencies::{
     NodeRuntimeDependencySpec, NodeRuntimePackageManager, PythonRuntimeDependencySpec,
     PythonRuntimePackageManager,
@@ -425,6 +427,10 @@ fn canonicalize_managed_runtime_directory(
             render_host_visible_path(path)
         )
     })?;
+    // Every managed root must have a stable spelling consumable by Lua and managed child runtimes.
+    // 每个受管根都必须具备可由 Lua 与受管子运行时消费的稳定写法。
+    normalize_host_input_path_text(&canonical.to_string_lossy())
+        .map_err(|error| format!("{label}: {error}"))?;
     ensure_managed_runtime_directory(&canonical, label)?;
     Ok(canonical)
 }
@@ -2243,9 +2249,9 @@ fn create_python_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
         create_command
             .arg("venv")
             .arg("--python")
-            .arg(&plan.runtime_executable)
-            .arg(&venv_dir)
-            .current_dir(&build_dir);
+            .arg(host_process_path_argument(&plan.runtime_executable))
+            .arg(host_process_path_argument(&venv_dir))
+            .current_dir(host_process_path_argument(&build_dir));
         configure_managed_command_base_environment(
             &mut create_command,
             &build_dir,
@@ -2270,12 +2276,14 @@ fn create_python_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
         sync_command
             .arg("pip")
             .arg("sync")
-            .arg(&build_lockfile)
+            .arg(host_process_path_argument(&build_lockfile))
             .arg("--python")
-            .arg(&python_executable)
+            .arg(host_process_path_argument(&python_executable))
             .arg("--cache-dir")
-            .arg(package_store_dir_for_plan(plan))
-            .current_dir(&build_dir);
+            .arg(host_process_path_argument(&package_store_dir_for_plan(
+                plan,
+            )))
+            .current_dir(host_process_path_argument(&build_dir));
         configure_managed_command_base_environment(
             &mut sync_command,
             &build_dir,
@@ -2368,7 +2376,7 @@ fn create_node_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
                 .arg(host_process_path_argument(&package_store_dir_for_plan(
                     plan,
                 )))
-                .current_dir(&build_dir);
+                .current_dir(host_process_path_argument(&build_dir));
             configure_managed_command_base_environment(
                 &mut install_command,
                 &build_dir,
@@ -2830,14 +2838,28 @@ fn install_required_windows_command_environment(
             render_managed_runtime_path(&canonical_com_spec)
         ));
     }
-    command.env("SystemRoot", &system_root);
-    command.env("WINDIR", &system_root);
-    command.env("ComSpec", &com_spec);
+    // Child bootstrap paths retain the validated identities without Windows verbatim syntax.
+    // 子进程启动路径保留已校验身份，同时移除 Windows verbatim 语法。
+    let child_system_root = PathBuf::from(
+        normalize_host_input_path_text(&system_root.to_string_lossy())
+            .map_err(|error| format!("SystemRoot: {error}"))?,
+    );
+    let child_com_spec = PathBuf::from(
+        normalize_host_input_path_text(&com_spec.to_string_lossy())
+            .map_err(|error| format!("ComSpec: {error}"))?,
+    );
+    command.env("SystemRoot", &child_system_root);
+    command.env("WINDIR", &child_system_root);
+    command.env("ComSpec", &child_com_spec);
     command.env("PATHEXT", ".COM;.EXE;.BAT;.CMD");
     // Optional non-secret drive bootstrap value used by Windows command scripts.
     // Windows 命令脚本使用的可选非密钥驱动器启动值。
     if let Some(system_drive) = env::var_os("SystemDrive") {
-        command.env("SystemDrive", system_drive);
+        // Lua/Node-compatible drive value rejected if it names another verbatim namespace.
+        // 与 Lua/Node 兼容的驱动器值；若它指向其他 verbatim 命名空间则拒绝。
+        let child_system_drive = normalize_host_input_path_text(&system_drive.to_string_lossy())
+            .map_err(|error| format!("SystemDrive: {error}"))?;
+        command.env("SystemDrive", child_system_drive);
     }
     command.env("USERPROFILE", controlled_home);
     command.env("APPDATA", controlled_home);

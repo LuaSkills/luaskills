@@ -105,6 +105,8 @@ let descriptor = resolve_managed_runtime_install(
 
 `ManagedRuntimeInstallDescriptor` returns the canonical install root, canonical executable, exact version/platform, manifest hash, and executable hash.
 
+The Rust descriptor intentionally retains native canonical `PathBuf` values for identity-sensitive host logic. On Windows those internal values may use the `\\?\` form.
+
 The equivalent JSON FFI entrypoint is `luaskills_ffi_managed_runtime_resolve_json`:
 
 ```json
@@ -116,7 +118,7 @@ The equivalent JSON FFI entrypoint is `luaskills_ffi_managed_runtime_resolve_jso
 }
 ```
 
-It returns the normal `{ "ok": true, "result": ... }` envelope and does not create an engine or mutate environment state.
+It returns the normal `{ "ok": true, "result": ... }` envelope and does not create an engine or mutate environment state. JSON input accepts Windows canonical absolute-drive and UNC paths with a `\\?\` / `\\?\UNC\` prefix, but `result.install_root` and `result.executable` always use the equivalent host-visible spelling without that prefix. Other verbatim namespaces are rejected before filesystem lookup.
 
 ## C ABI versions
 
@@ -232,7 +234,7 @@ vulcan.runtime.node.invoke(...)
 vulcan.runtime.node.session.open(...)
 ```
 
-Runtime status includes `distribution_root`, `distribution_source`, `environment_root`, and `environment_source`. Source values are stable: `host_configured` or `runtime_root_default`.
+Runtime status includes `distribution_root`, `distribution_source`, `environment_root`, and `environment_source`. Source values are stable: `host_configured` or `runtime_root_default`. Windows status paths are host-visible and never include `\\?\` / `\\?\UNC\`.
 
 ## Platforms and failures
 

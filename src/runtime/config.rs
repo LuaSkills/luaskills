@@ -1,4 +1,6 @@
 use crate::lua_skill::validate_luaskills_identifier;
+#[cfg(windows)]
+use crate::runtime::path::normalize_host_visible_path_text;
 use crate::runtime::path::render_host_visible_path;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -448,8 +450,8 @@ fn normalize_skill_config_lock_identity_path(path: &Path) -> Result<PathBuf, Str
     }
 }
 
-/// Normalize one Windows lock path so case aliases and verbatim prefixes collapse to one shared identity.
-/// 规范化单个 Windows 锁路径，使大小写别名与 verbatim 前缀收敛到同一共享标识。
+/// Normalize one Windows lock path so case aliases and drive/UNC verbatim forms share one identity.
+/// 规范化单个 Windows 锁路径，使大小写别名与盘符/UNC verbatim 形式共享同一标识。
 ///
 /// The path parameter is the lexically normalized Windows skill-config file path.
 /// path 参数是已经完成词法规整的 Windows 技能配置文件路径。
@@ -458,16 +460,14 @@ fn normalize_skill_config_lock_identity_path(path: &Path) -> Result<PathBuf, Str
 /// 返回 Windows 归一化后的锁身份；如果路径文本不是有效 UTF-8，则返回显式错误。
 #[cfg(windows)]
 fn normalize_windows_skill_config_lock_identity_path(path: &Path) -> Result<PathBuf, String> {
+    // UTF-8 Windows spelling required by the case-insensitive process-local lock identity.
+    // 进程内大小写不敏感锁身份所需的 UTF-8 Windows 路径形式。
     let rendered = path
         .to_str()
         .ok_or_else(|| "skill config lock path must be valid UTF-8 on Windows".to_string())?;
-    let without_verbatim = if let Some(stripped) = rendered.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{}", stripped)
-    } else if let Some(stripped) = rendered.strip_prefix(r"\\?\") {
-        stripped.to_string()
-    } else {
-        rendered.to_string()
-    };
+    // Shared host-visible spelling covering drive, UNC, case, and separator variants uniformly.
+    // 统一覆盖盘符、UNC、大小写与分隔符变体的共享宿主可见形式。
+    let without_verbatim = normalize_host_visible_path_text(rendered);
     Ok(PathBuf::from(without_verbatim.to_lowercase()))
 }
 
@@ -560,6 +560,8 @@ fn replace_file_atomically(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::normalize_windows_skill_config_lock_identity_path;
     use super::{
         SkillConfigEntry, SkillConfigStore, shared_skill_config_path_lock,
         skill_config_lock_registry,
@@ -568,6 +570,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::panic::{self, AssertUnwindSafe};
+    #[cfg(windows)]
+    use std::path::Path;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1009,5 +1013,20 @@ mod tests {
         let second_lock = shared_skill_config_path_lock(std::path::Path::new(&verbatim_alias))
             .expect("resolve windows alias shared lock");
         assert!(Arc::ptr_eq(&first_lock, &second_lock));
+
+        // Lowercase verbatim UNC spelling normalized by the same lock-identity boundary.
+        // 由同一锁身份边界归一化的小写 verbatim UNC 写法。
+        let lowercase_unc = normalize_windows_skill_config_lock_identity_path(Path::new(
+            r"\\?\unc\SERVER\Share\Config.JSON",
+        ))
+        .expect("normalize lowercase verbatim UNC lock path");
+        assert_eq!(lowercase_unc, PathBuf::from(r"\\server\share\config.json"));
+        // Forward-slash verbatim UNC spelling accepted from JSON-oriented hosts.
+        // 从面向 JSON 的宿主接受的正斜杠 verbatim UNC 写法。
+        let forward_unc = normalize_windows_skill_config_lock_identity_path(Path::new(
+            "//?/UNC/SERVER/Share/Config.JSON",
+        ))
+        .expect("normalize forward verbatim UNC lock path");
+        assert_eq!(forward_unc, PathBuf::from(r"\\server\share\config.json"));
     }
 }

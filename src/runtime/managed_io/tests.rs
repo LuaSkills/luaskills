@@ -4,6 +4,55 @@ use std::path::Path;
 
 use crate::runtime::render_host_visible_path;
 
+/// Verify managed IO removes a Windows verbatim prefix before filesystem lookup.
+/// 验证托管 IO 会在文件系统寻址前移除 Windows 逐字路径前缀。
+#[cfg(windows)]
+#[test]
+fn managed_io_path_argument_strips_windows_verbatim_prefix() {
+    // Lua state used to create the exact string value accepted by the managed IO boundary.
+    // 用于创建托管 IO 边界所接收精确字符串值的 Lua 状态。
+    let lua = Lua::new();
+    // Normalized path returned by the production argument parser.
+    // 生产参数解析器返回的归一化路径。
+    let normalized = require_path_arg(
+        LuaValue::String(
+            lua.create_string(r"\\?\C:\runtime\data.txt")
+                .expect("create verbatim path string"),
+        ),
+        "vulcan.io.read_text",
+        "path",
+    )
+    .expect("normalize managed IO path");
+    assert_eq!(normalized, r"C:\runtime\data.txt");
+}
+
+/// Verify managed IO rejects Windows verbatim namespaces without ordinary path equivalents.
+/// 验证托管 IO 会拒绝不存在普通路径等价形式的 Windows verbatim 命名空间。
+#[cfg(windows)]
+#[test]
+fn managed_io_path_argument_rejects_unsupported_verbatim_namespace() {
+    // Lua state used to create the exact unsupported volume-namespace string.
+    // 用于创建精确不受支持卷命名空间字符串的 Lua 状态。
+    let lua = Lua::new();
+    // Parser failure returned before managed IO performs any filesystem operation.
+    // 在托管 IO 执行任何文件系统操作前返回的解析失败。
+    let error = require_path_arg(
+        LuaValue::String(
+            lua.create_string(r"\\?\Volume{00000000-0000-0000-0000-000000000000}\data.txt")
+                .expect("create unsupported verbatim path string"),
+        ),
+        "vulcan.io.read_text",
+        "path",
+    )
+    .expect_err("unsupported managed IO namespace must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported Windows verbatim path namespace"),
+        "unexpected managed IO error: {error}"
+    );
+}
+
 /// Verify managed read_text decodes GB18030 content.
 /// 验证托管 read_text 可以解码 GB18030 内容。
 #[test]

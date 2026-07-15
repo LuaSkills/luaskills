@@ -20,9 +20,9 @@ use super::{
 use crate::ffi_standard::{
     FfiBorrowedBuffer, FfiOwnedBuffer, luaskills_ffi_buffer_clone, luaskills_ffi_buffer_free,
     luaskills_ffi_engine_free, luaskills_ffi_managed_session_events_poll,
-    luaskills_ffi_managed_session_events_wait, luaskills_ffi_set_managed_session_wake_callback,
-    luaskills_ffi_system_runtime_lease_close, luaskills_ffi_system_runtime_lease_create,
-    luaskills_ffi_system_runtime_lease_eval,
+    luaskills_ffi_managed_session_events_wait, luaskills_ffi_run_lua,
+    luaskills_ffi_set_managed_session_wake_callback, luaskills_ffi_system_runtime_lease_close,
+    luaskills_ffi_system_runtime_lease_create, luaskills_ffi_system_runtime_lease_eval,
 };
 use crate::runtime::managed_session_events::{
     ManagedSessionEventCenter, ManagedSessionEventToken, RuntimeManagedSessionEventKind,
@@ -436,6 +436,94 @@ fn register_test_engine() -> TestFfiEngineHandle {
     let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
     lock_ffi_engine_registry().insert(engine_id, FfiEngineSlot::new(engine));
     TestFfiEngineHandle { engine_id }
+}
+
+/// Verify both JSON and standard C ABI RunLua entrypoints preserve JSON container kinds and null values.
+/// 验证 JSON 与标准 C ABI 两种 RunLua 出口均保留 JSON 容器类型及 null 值。
+#[test]
+fn ffi_run_lua_entrypoints_preserve_json_container_types_and_null() {
+    // Global FFI registry guard preventing concurrent engine mutation during this test.
+    // 防止测试期间并发修改全局 FFI 引擎注册表的保护器。
+    let _guard = ffi_test_guard();
+    // Registered production engine shared by the two FFI entrypoint variants.
+    // 由两种 FFI 入口变体共享的已注册生产引擎。
+    let engine = register_test_engine();
+    // Lua source returning the protocol shape that originally regressed in System Plugin hooks.
+    // 返回曾在 System Plugin Hook 中回归的协议结构的 Lua 源码。
+    let code = r#"
+return vulcan.json.decode([[{
+  "environment": {},
+  "binary_path_requests": [],
+  "contributions": [],
+  "optional": null,
+  "nullable_items": [null]
+}]])
+"#;
+    // Expected result shared by the high-level JSON wrapper and standard ABI.
+    // 高层 JSON 包装与标准 ABI 共享的期望结果。
+    let expected = serde_json::json!({
+        "environment": {},
+        "binary_path_requests": [],
+        "contributions": [],
+        "optional": null,
+        "nullable_items": [null]
+    });
+
+    // High-level JSON FFI request encoded into one borrowed input buffer.
+    // 编码到单个借用输入缓冲区的高层 JSON FFI 请求。
+    let json_request = CString::new(
+        serde_json::json!({
+            "engine_id": engine.engine_id,
+            "code": code,
+            "args": {}
+        })
+        .to_string(),
+    )
+    .expect("encode JSON RunLua FFI request");
+    // Decoded high-level JSON response envelope.
+    // 已解码的高层 JSON 响应包络。
+    let json_response = unsafe {
+        decode_response_json(luaskills_ffi_run_lua_json(borrowed_json_buffer(
+            &json_request,
+        )))
+    };
+    assert_eq!(json_response["ok"], true);
+    assert_eq!(json_response["result"], expected);
+
+    // Standard ABI code and empty argument buffers retained for the complete call duration.
+    // 在完整调用期间保持存活的标准 ABI 代码与空参数缓冲区。
+    let standard_code = CString::new(code).expect("encode standard ABI RunLua code");
+    let standard_args = CString::new("{}").expect("encode standard ABI RunLua args");
+    // LuaSkills-owned result and error slots initialized to the required empty state.
+    // 初始化为所需空状态的 LuaSkills 所有结果与错误槽。
+    let mut result_out = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let mut error_out = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    // Standard C ABI status produced by the same engine conversion boundary.
+    // 由同一引擎转换边界产生的标准 C ABI 状态。
+    let status = unsafe {
+        luaskills_ffi_run_lua(
+            engine.engine_id,
+            standard_code.as_ptr(),
+            borrowed_json_buffer(&standard_args),
+            ptr::null(),
+            &mut result_out,
+            &mut error_out,
+        )
+    };
+    assert_eq!(status, 0);
+    assert!(error_out.ptr.is_null());
+    // Standard ABI JSON result decoded before releasing its LuaSkills-owned allocation.
+    // 在释放 LuaSkills 所有分配前解码的标准 ABI JSON 结果。
+    let standard_result: serde_json::Value =
+        serde_json::from_str(&unsafe { take_owned_buffer_text(result_out) })
+            .expect("decode standard ABI RunLua result");
+    assert_eq!(standard_result, expected);
 }
 
 /// One registered FFI engine backed by a real strict System Plugin package layout.
@@ -1033,9 +1121,13 @@ fn ffi_managed_runtime_resolve_json_returns_descriptor() {
         serde_json::to_vec_pretty(&manifest).expect("encode JSON resolver manifest"),
     )
     .expect("write JSON resolver manifest");
+    // CanonicalDistributionRoot exercises the exact Windows verbatim spelling accepted by FFI.
+    // CanonicalDistributionRoot 用于覆盖 FFI 接受的 Windows 逐字规范路径形式。
+    let canonical_distribution_root =
+        std::fs::canonicalize(&distribution_root).expect("canonical JSON resolver root");
     let request = CString::new(
         serde_json::json!({
-            "distribution_root": distribution_root,
+            "distribution_root": canonical_distribution_root,
             "runtime": "node",
             "version": "24.18.0",
             "platform": "linux-x64"
@@ -1053,13 +1145,35 @@ fn ffi_managed_runtime_resolve_json_returns_descriptor() {
     assert_eq!(response["result"]["runtime"], "node");
     assert_eq!(response["result"]["version"], "24.18.0");
     assert_eq!(response["result"]["platform"], "linux-x64");
+    // CanonicalInstallRoot is retained internally while the JSON API returns host-visible spelling.
+    // CanonicalInstallRoot 在内部保留，而 JSON API 返回宿主可见形式。
+    let canonical_install_root =
+        std::fs::canonicalize(&install_root).expect("canonical JSON resolver install root");
     assert_eq!(
-        PathBuf::from(
-            response["result"]["install_root"]
-                .as_str()
-                .expect("descriptor install_root string")
-        ),
-        std::fs::canonicalize(&install_root).expect("canonical JSON resolver install root")
+        response["result"]["install_root"]
+            .as_str()
+            .expect("descriptor install_root string"),
+        render_host_visible_path(&canonical_install_root)
+    );
+    #[cfg(windows)]
+    assert!(
+        canonical_distribution_root
+            .to_string_lossy()
+            .starts_with(r"\\?\")
+    );
+    #[cfg(windows)]
+    assert!(
+        !response["result"]["install_root"]
+            .as_str()
+            .expect("descriptor install_root string")
+            .starts_with(r"\\?\")
+    );
+    #[cfg(windows)]
+    assert!(
+        !response["result"]["executable"]
+            .as_str()
+            .expect("descriptor executable string")
+            .starts_with(r"\\?\")
     );
     assert_eq!(
         response["result"]["manifest_hash"].as_str().map(str::len),
@@ -1070,6 +1184,40 @@ fn ffi_managed_runtime_resolve_json_returns_descriptor() {
         Some(64)
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// Verify the managed-runtime resolver FFI rejects unsupported Windows verbatim namespaces.
+/// 验证受管运行时解析器 FFI 会拒绝不受支持的 Windows verbatim 命名空间。
+#[cfg(windows)]
+#[test]
+fn ffi_managed_runtime_resolve_json_rejects_unsupported_verbatim_namespace() {
+    // Request containing a volume GUID namespace that cannot be exposed safely to Lua or JSON hosts.
+    // 包含无法安全暴露给 Lua 或 JSON 宿主的卷 GUID 命名空间请求。
+    let request = CString::new(
+        serde_json::json!({
+            "distribution_root": r"\\?\Volume{00000000-0000-0000-0000-000000000000}\runtimes",
+            "runtime": "node",
+            "version": "24.18.0",
+            "platform": "windows-x64"
+        })
+        .to_string(),
+    )
+    .expect("encode unsupported managed runtime resolver request");
+    // Stable FFI error envelope returned before any filesystem access.
+    // 在任何文件系统访问前返回的稳定 FFI 错误包络。
+    let response = unsafe {
+        decode_response_json(luaskills_ffi_managed_runtime_resolve_json(
+            borrowed_json_buffer(&request),
+        ))
+    };
+    assert_eq!(response["ok"], false);
+    assert!(
+        response["error"]
+            .as_str()
+            .expect("resolver error string")
+            .contains("unsupported Windows verbatim path namespace"),
+        "unexpected resolver error: {response}"
+    );
 }
 
 /// Verify JSON engine creation accepts independent managed distribution and environment roots.

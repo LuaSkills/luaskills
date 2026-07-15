@@ -160,7 +160,7 @@ Skill 作者规则：
 
 有些 skill 需要一个面向调用方可见的项目路径或工作区路径，而且这个路径应跟随宿主当前激活的项目作用域，而不是简单等于运行时进程的原始工作目录。LuaSkills 把 `PWD` 保留为这一用途的约定入口参数名。
 
-这是 LuaSkills 生态层的兼容性公约，不是运行时强制识别的魔法字段。运行时会把 `PWD` 当作普通入口输入处理。把 LuaSkills entry 投影成用户可见或模型可见工具的宿主和 adapter，负责决定该字段是可见、隐藏，还是自动注入。
+这是 LuaSkills 生态层的兼容性公约，不是携带授权能力的魔法字段。运行时只识别 `PWD`，以便在 Lua 边界归一化其路径写法。把 LuaSkills entry 投影成用户可见或模型可见工具的宿主和 adapter，负责决定该字段是可见、隐藏，还是自动注入。
 
 Skill 作者规则：
 
@@ -182,6 +182,8 @@ Skill 作者规则：
 
 这些规则适用于所有投影层，包括 MCP、gRPC、FFI/SDK 宿主、IDE 集成和嵌入式产品宿主。
 
+Windows 宿主取得的规范路径可能采用 `\\?\C:\...` 或 `\\?\UNC\server\share\...` 形式。LuaSkills 会在保留的顶层 `PWD` 参数进入 Lua 前移除该逐字路径前缀；其他已声明的运行时路径字段也遵循同一边界规则。任意 JSON 字符串不会仅因“看起来像路径”而被改写。只有绝对盘符与 UNC verbatim 形式具备经过证明的普通等价路径；卷 GUID、设备、管道、混合分隔符及其他 verbatim 命名空间会被显式拒绝，不会重新解释为相对路径。前缀清理只属于兼容转换，不代表授权或规范化。
+
 ## 3. 顶级能力总览
 
 | 顶级项 | 作用 | 默认可用 | 备注 |
@@ -193,7 +195,7 @@ Skill 作者规则：
 | `vulcan.path` | 路径拼接 | 是 | 返回对 Lua 友好的系统路径 |
 | `vulcan.process` | 启动子进程 | 是 | 包含一次性 `exec` 与交互式 `session` |
 | `vulcan.os` | 宿主 OS/架构信息 | 是 | `os`、`arch` |
-| `vulcan.json` | JSON 编解码 | 是 | JSON ↔ Lua table |
+| `vulcan.json` | JSON 编解码 | 是 | JSON/Lua 类型保真转换 |
 | `vulcan.cache` | 运行时缓存 | 是 | 在 `vulcan.runtime.lua.exec` 中会被禁用 |
 | `vulcan.models` | 标准模型能力 | 是 | 只有宿主注册对应 callback 后能力才会开启 |
 | `vulcan.host` | 宿主注册工具桥接 | 是 | 宿主未注册 callback 时为空能力面 |
@@ -1234,6 +1236,11 @@ local ext = vulcan.path.extname(config_path)
 
 - 会按宿主系统返回正常路径文本。
 - Windows 下不会把 `\\?\` 或 `\\?\UNC\` verbatim 前缀直接泄漏给 Lua。
+- Lua/运行时的路径型输入会在接收 API 寻址前归一化，包括保留的顶层 `PWD` 参数、`vulcan.fs` / `vulcan.io` 路径、进程 `program` / `cwd` 字段、Runtime Lease 路径字段、模块搜索根与受管运行时 FFI 路径。
+- 只有 verbatim 绝对盘符路径与 verbatim UNC 路径会被转换；其他 Windows verbatim 命名空间会在寻址或创建进程前以 `unsupported Windows verbatim path namespace` 明确失败。
+- `package.path` 与 `package.cpath` 只使用宿主可见路径形式构造，Windows 规范根不会因逐字路径前缀导致 Lua 模块寻址卡顿。
+- Rust 内部用于包含关系、目录替换、符号链接与竞态校验的规范路径及原生文件对象身份保持不变；Lua/API 边界去前缀不会降低这些校验强度。
+- 任意 JSON 字符串、进程普通参数和环境变量不会被猜测为路径，也不会被改写。
 - `path.dirname(path)` 在相对路径没有父级片段时返回 `.`。
 - `path.basename(path)`、`path.stem(path)`、`path.extname(path)` 在末尾组件缺失时返回空字符串。
 - `path.extname(path)` 在存在扩展名时会包含前导点，例如 `.lua`。
@@ -1487,16 +1494,24 @@ local info = vulcan.os.info()
 
 - `vulcan.json.encode(value)`
 - `vulcan.json.decode(text)`
+- `vulcan.json.object()` / `vulcan.json.object(table)`
+- `vulcan.json.array()` / `vulcan.json.array(table)`
+- `vulcan.json.null`
 
 示例：
 
 ```lua
-local text = vulcan.json.encode({
-    hello = "world",
-    limit = 3,
+local payload = vulcan.json.object({
+    environment = vulcan.json.object(),
+    binary_path_requests = vulcan.json.array(),
+    contributions = vulcan.json.array({
+        "shell-hook",
+    }),
+    optional = vulcan.json.null,
 })
 
-local obj = vulcan.json.decode(text)
+local text = vulcan.json.encode(payload)
+local decoded = vulcan.json.decode(text)
 ```
 
 说明：
@@ -1504,28 +1519,42 @@ local obj = vulcan.json.decode(text)
 | API | 参数与类型 | 返回值 | 说明 |
 | --- | --- | --- | --- |
 | `vulcan.json.encode(value)` | 任意可 JSON 化 Lua 值 | `string` | 编码为 JSON 文本 |
-| `vulcan.json.decode(text)` | `text: string` | Lua 值 | 解析 JSON 文本 |
+| `vulcan.json.decode(text)` | `text: string` | 带类型的 Lua 值 | 递归保留 JSON Object、Array 与 Null |
+| `vulcan.json.object(table?)` | 可选 `table` | 带标记的 `table` | 创建带 Object 标记的浅复制；无参数时创建空 Object |
+| `vulcan.json.array(table?)` | 可选 `table` | 带标记的 `table` | 创建带 Array 标记的浅复制；无参数时创建空 Array |
+| `vulcan.json.null` | 无 | JSON Null 哨兵 | 对象字段或数组元素需要 Null 时使用，避免 `nil` 删除字段或产生空洞 |
 
-JSON 编码规则：
+容器与 Null 规则：
 
-- `nil` -> `null`
+- `decode` 产生的每个 Object 与 Array 都会递归携带原始 JSON 容器类型标记，因此再次编码时嵌套空 `{}` 与 `[]` 仍保持原类型。
+- JSON Null 会解码为与 `vulcan.json.null` 相同的哨兵，可安全保留在对象字段与数组元素中。
+- `object(table)` 与 `array(table)` 会浅复制源 table，不替换源 table 的元表或对象身份；嵌套值继续保留原身份。
+- 容器类型标记使用受保护的共享元表；普通 Lua 代码无法通过 `getmetatable` 替换或修改运行时标记。
+- Object 只允许 UTF-8 字符串键。
+- Array 只允许从 1 开始、连续且为正数的整数键；字符串键、混合键、非正数索引与空洞都会返回明确编码错误。
+- 构造器只接受零个参数，或恰好一个 table 参数；其他参数形式会明确报错。
+
+标量编码规则：
+
+- 单独作为编码值传入的 `nil` -> JSON Null
+- `vulcan.json.null` -> JSON Null
 - `boolean` -> JSON boolean
 - `integer` / `number` -> JSON number
 - `string` -> JSON string
-- `table` -> JSON 数组或对象
+- 带标记 `table` -> 其声明的 JSON Object 或 Array 类型
 
-数组/对象判定规则非常重要：
+无标记 Lua table 的兼容规则：
 
-- 若 Lua table 的 `raw_len() > 0`，运行时会按**数组**序列化
-- 若 `raw_len() == 0` 且存在字符串 key，会按**对象**序列化
-- 空 table 最终会被序列化成 `[]`，不是 `{}`
+- 若无标记 table 的 `raw_len() > 0`，运行时推断为 Array，并执行相同的连续索引严格校验
+- 若 `raw_len() == 0` 且存在字符串 key，运行时推断为 Object，并要求全部键都是字符串
+- 无标记空 `{}` 保留旧行为，仍编码为 `[]`；需要显式空 Object 时使用 `vulcan.json.object()`
 
 不支持直接编码的 Lua 值：
 
 - `function`
 - `thread`
-- `userdata`
-- `lightuserdata`
+- `userdata`，但运行时已文档化的只读 JSON 上下文视图除外
+- `vulcan.json.null` 以外的 `lightuserdata`
 
 这些值传给 `vulcan.json.encode(...)` 会直接报运行时错误。
 
@@ -1637,7 +1666,7 @@ local deleted = vulcan.cache.delete(cache_id)
 - 在普通 skill 调用中，这三个值通常都可用。
 - 在某些 runlua / help / 非 skill 文件场景里，可能为 `nil`。
 - 在 System Plugin 租约 eval 中，这三个**入口专属**字段仍为 `nil`，因为该 eval 不是 Skill 入口调用。这不表示包上下文缺失：包身份应读取递归只读的 `vulcan.runtime.system_plugin` 视图，宿主授权上下文应读取 `vulcan.runtime.workspace_root / mounts`。
-- 当前实现会自动把 Windows verbatim 路径前缀去掉，保证 Lua 侧拿到的是正常系统路径。
+- 当前实现会把 Windows verbatim 盘符/UNC 路径转换为普通等价形式，保证 Lua 侧拿到正常系统路径；不受支持的 verbatim 命名空间会被拒绝。
 
 ### 12.8 `vulcan.context.host_result`
 

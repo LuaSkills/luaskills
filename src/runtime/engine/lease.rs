@@ -9,7 +9,7 @@ use crate::runtime::managed_package::{
     capture_managed_directory_identity, validate_lua_search_root_path,
     validate_managed_directory_identity,
 };
-use crate::runtime::path::host_process_path_argument;
+use crate::runtime::path::{host_process_path_argument, normalize_host_input_path_text};
 use mlua::{MetaMethod, UserData, UserDataMethods};
 
 /// Runtime session creation request accepted by the host-facing JSON API.
@@ -1785,13 +1785,17 @@ fn normalize_optional_runtime_lease_path(
     if trimmed.contains('\0') {
         return Err(format!("{field_name} must not contain NUL bytes"));
     }
+    // Host/API-visible path spelling normalized before validation and native identity capture.
+    // 在校验和捕获原生身份前归一化宿主/API 可见的路径形式。
+    let normalized = normalize_host_input_path_text(trimmed)
+        .map_err(|error| format!("{field_name}: {error}"))?;
     #[cfg(windows)]
-    if has_invalid_windows_path_syntax(trimmed) {
+    if has_invalid_windows_path_syntax(&normalized) {
         return Err(format!(
             "{field_name} contains unsupported Windows path syntax"
         ));
     }
-    Ok(Some(PathBuf::from(trimmed)))
+    Ok(Some(PathBuf::from(normalized)))
 }
 
 /// Canonicalize one host-authorized System directory and require an absolute real directory.
@@ -2098,49 +2102,35 @@ impl LuaEngine {
         let mut cpath_prefix = String::new();
         for root in &path_context.c_roots {
             validate_lua_search_root_path(root, "c_roots")?;
+            // Lua-compatible native-module root spelling without Windows verbatim syntax.
+            // 不含 Windows verbatim 语法的 Lua 兼容原生模块根写法。
+            let root = render_host_visible_path(root);
             #[cfg(windows)]
             {
-                cpath_prefix.push_str(&format!(
-                    "{}\\?.dll;{}\\?\\init.dll;",
-                    root.display(),
-                    root.display()
-                ));
+                cpath_prefix.push_str(&format!("{}\\?.dll;{}\\?\\init.dll;", root, root));
             }
             #[cfg(target_os = "linux")]
             {
-                cpath_prefix.push_str(&format!(
-                    "{}/?.so;{}/?/init.so;",
-                    root.display(),
-                    root.display()
-                ));
+                cpath_prefix.push_str(&format!("{}/?.so;{}/?/init.so;", root, root));
             }
             #[cfg(target_os = "macos")]
             {
-                cpath_prefix.push_str(&format!(
-                    "{}/?.dylib;{}/?/init.dylib;",
-                    root.display(),
-                    root.display()
-                ));
+                cpath_prefix.push_str(&format!("{}/?.dylib;{}/?/init.dylib;", root, root));
             }
         }
         let mut path_prefix = String::new();
         for root in &path_context.lua_roots {
             validate_lua_search_root_path(root, "lua_roots")?;
+            // Lua-compatible source-module root spelling without Windows verbatim syntax.
+            // 不含 Windows verbatim 语法的 Lua 兼容源码模块根写法。
+            let root = render_host_visible_path(root);
             #[cfg(windows)]
             {
-                path_prefix.push_str(&format!(
-                    "{}\\?.lua;{}\\?\\init.lua;",
-                    root.display(),
-                    root.display()
-                ));
+                path_prefix.push_str(&format!("{}\\?.lua;{}\\?\\init.lua;", root, root));
             }
             #[cfg(unix)]
             {
-                path_prefix.push_str(&format!(
-                    "{}/?.lua;{}/?/init.lua;",
-                    root.display(),
-                    root.display()
-                ));
+                path_prefix.push_str(&format!("{}/?.lua;{}/?/init.lua;", root, root));
             }
         }
         if !cpath_prefix.is_empty() {
@@ -2640,6 +2630,8 @@ impl LuaEngine {
 #[cfg(test)]
 mod tests {
     use super::super::LuaVm;
+    #[cfg(windows)]
+    use super::normalize_optional_runtime_lease_path;
     use super::{
         RuntimeLeasePathContext, RuntimeLeaseProfile, RuntimeSessionManager,
         RuntimeSessionTerminalState, next_runtime_session_generation,
@@ -2655,6 +2647,40 @@ mod tests {
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    /// Verify host-injected lease paths drop Windows verbatim prefixes before retention.
+    /// 验证宿主注入的租约路径会在留存前移除 Windows 逐字路径前缀。
+    #[cfg(windows)]
+    #[test]
+    fn runtime_lease_path_normalization_strips_windows_verbatim_prefix() {
+        // Normalized lease path retained by the ordinary and System lease context builders.
+        // 普通租约与 System 租约上下文构造器留存的归一化路径。
+        let normalized = normalize_optional_runtime_lease_path(
+            Some(r"\\?\C:\workspace\plugin"),
+            "workspace_root",
+        )
+        .expect("normalize runtime lease path")
+        .expect("non-empty runtime lease path");
+        assert_eq!(normalized, std::path::Path::new(r"C:\workspace\plugin"));
+    }
+
+    /// Verify host-injected leases reject Windows verbatim namespaces without safe equivalents.
+    /// 验证宿主注入租约会拒绝不存在安全等价形式的 Windows verbatim 命名空间。
+    #[cfg(windows)]
+    #[test]
+    fn runtime_lease_path_normalization_rejects_unsupported_verbatim_namespace() {
+        // Stable validation error returned before canonicalization or identity capture.
+        // 在规范化或捕获身份前返回的稳定校验错误。
+        let error = normalize_optional_runtime_lease_path(
+            Some(r"\\?\Volume{00000000-0000-0000-0000-000000000000}\workspace"),
+            "workspace_root",
+        )
+        .expect_err("unsupported lease namespace must fail");
+        assert!(
+            error.contains("unsupported Windows verbatim path namespace"),
+            "unexpected lease path error: {error}"
+        );
+    }
 
     /// Userdata probe that records whether manager state is unlocked during Lua VM destruction.
     /// 在 Lua VM 析构期间记录管理器状态是否已解锁的 userdata 探针。

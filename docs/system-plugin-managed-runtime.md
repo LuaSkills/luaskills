@@ -145,7 +145,7 @@ The System create body is strict:
 - `dependencies_file` is package-relative and must resolve to a contained regular file without a symlink escape.
 - `workspace_root`, when supplied, must be an existing absolute directory.
 - `cwd` must resolve under the package root or the authorized workspace. It defaults to the package root.
-- On Windows, LuaSkills 0.5.2 retains the canonical native object for identity checks and uses the equivalent non-verbatim spelling only when changing the process working directory. Child processes therefore inherit the authorized drive path without `cmd.exe` treating `\\?\` as UNC.
+- On Windows, LuaSkills 0.5.3 retains canonical native objects for identity checks while converting supported verbatim drive and UNC spellings at Lua, host-API, module-search, and child-process boundaries. Other verbatim namespaces and mixed separators fail explicitly before lookup or process creation.
 - Public `lua_roots`, `c_roots`, and unknown fields are rejected.
 
 Keep the returned `lease_id`, `sid`, and `generation` together. Send all three on later eval, status, and close requests so a stale or crossed handle fails explicitly.
@@ -355,6 +355,7 @@ An unrelated ordinary Skill-root reload does not replace the dedicated System le
 - `vulcan.runtime.system_plugin` and `vulcan.runtime.mounts` are recursively read-only userdata views; `vulcan.runtime.workspace_root` is the canonical authorized path or `nil`.
 - Dedicated System VMs remove global `rawset` and the Lua `debug` library to prevent metatable bypass.
 - Package source, dependency manifests, lockfiles, entry files, and authorized cwd objects are validated against fixed filesystem identities. Path traversal, symlink escape, and unsupported package objects are rejected.
+- On Windows, Lua-visible package roots, `package.path` / `package.cpath`, Node worker payloads, Lua/host-visible child-process path fields, lease status, and FFI path results convert verbatim drive/UNC paths to ordinary equivalents. Volume GUID, device, pipe, mixed-separator, and other verbatim namespaces are rejected before lookup instead of being rewritten. Native canonical paths and filesystem-object identities remain fixed internally for every security check. Private Python worker and persistent-session source transports retain native canonical paths because Windows long-path imports require the verbatim form; those values are never exposed to Lua or host APIs.
 - A live worker or session snapshot holds a shared cross-process environment lease. Environment publication/replacement takes a nonblocking exclusive lease and returns a stable busy error instead of racing a live consumer.
 - Background output, exit, and failure observers publish bounded engine events and never execute Lua.
 - Do not forward caller-provided authority, arbitrary package roots, or arbitrary workspace roots. Those are host policy inputs.

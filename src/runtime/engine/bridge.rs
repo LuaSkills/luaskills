@@ -83,7 +83,13 @@ fn parse_host_tool_has_response(value: &Value) -> Result<bool, String> {
 /// Convert a Lua host-tool args table into JSON while preserving empty args as an object.
 /// 将 Lua 宿主工具参数表转换为 JSON，并把空参数保持为空对象。
 fn host_tool_args_table_to_json(args_table: Table) -> Result<Value, String> {
-    if args_table.raw_len() == 0 && args_table.pairs::<String, LuaValue>().next().is_none() {
+    // Explicit JSON container identity takes precedence over the historical empty-args shortcut.
+    // 显式 JSON 容器身份优先于历史空参数特例。
+    let container_kind = json_container_kind(&args_table)?;
+    if container_kind.is_none()
+        && args_table.raw_len() == 0
+        && args_table.pairs::<String, LuaValue>().next().is_none()
+    {
         return Ok(Value::Object(serde_json::Map::new()));
     }
     lua_value_to_json(&LuaValue::Table(args_table))

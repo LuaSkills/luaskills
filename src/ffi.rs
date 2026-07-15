@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::ffi_standard::{FfiBorrowedBuffer, FfiOwnedBuffer};
 use crate::runtime::managed_runtime::resolve_managed_runtime_install;
 use crate::runtime::managed_session_events::ManagedSessionEventCenter;
+use crate::runtime::path::{normalize_host_input_path_text, render_host_visible_path};
 use crate::runtime_help::{RuntimeHelpDetail, RuntimeSkillHelpDescriptor};
 
 use crate::{
@@ -569,13 +570,27 @@ pub unsafe extern "C" fn luaskills_ffi_managed_runtime_resolve_json(
         Ok(request) => request,
         Err(error) => return ffi_error(error),
     };
+    // Host-visible distribution path normalized before the FFI request enters native resolution.
+    // FFI 请求进入原生解析前归一化宿主可见的发行根路径。
+    let distribution_root = match normalize_host_input_path_text(
+        &request.distribution_root.as_os_str().to_string_lossy(),
+    ) {
+        Ok(path) => path,
+        Err(error) => return ffi_error(format!("distribution_root: {error}")),
+    };
     match resolve_managed_runtime_install(
-        &request.distribution_root,
+        std::path::Path::new(&distribution_root),
         request.runtime,
         &request.version,
         &request.platform,
     ) {
-        Ok(descriptor) => ffi_ok(descriptor),
+        Ok(mut descriptor) => {
+            // Host-visible copies retain the descriptor's derived serialization contract as fields evolve.
+            // 宿主可见副本继续复用描述符派生的序列化契约，避免字段演进时出现遗漏。
+            descriptor.install_root = render_host_visible_path(&descriptor.install_root).into();
+            descriptor.executable = render_host_visible_path(&descriptor.executable).into();
+            ffi_ok(descriptor)
+        }
         Err(error) => ffi_error(error),
     }
 }
