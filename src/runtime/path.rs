@@ -240,9 +240,12 @@ pub(crate) fn host_process_path_argument(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_process_path_argument, normalize_host_input_path_text};
+    use super::host_process_path_argument;
     #[cfg(windows)]
-    use super::{normalize_host_visible_path_text, normalize_windows_verbatim_path};
+    use super::{
+        normalize_host_input_path_text, normalize_host_visible_path_text,
+        normalize_windows_verbatim_path,
+    };
     use std::path::Path;
 
     /// Verify all supported Windows verbatim spellings become ordinary host-visible paths.

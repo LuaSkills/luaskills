@@ -1,4 +1,6 @@
 #[cfg(windows)]
+use super::configured_package_search_directory_exists;
+#[cfg(windows)]
 use super::format_vulcan_fs_list_non_utf8_file_name_error;
 use super::host_result::{
     host_result_capability_to_json_value, normalize_change_set_payload,
@@ -18,10 +20,10 @@ use super::{
     ManagedRuntimeWorkerService, NativeLibrarySearchGuard, ResolvedEntryTarget,
     RunLuaVmBuildContext, SkillApplyLifecycleAction, SkillConfigStore,
     VulcanInternalExecutionContext, build_lua_call_dispatch_entries,
-    configured_package_search_directory_exists, copy_managed_node_package_import_root,
-    default_runlua_vm_pool_config, find_vulcan_process_candidate, format_lifecycle_recovery_error,
-    get_vulcan_context_table, get_vulcan_deps_table, get_vulcan_runtime_internal_table,
-    get_vulcan_table, invoke_managed_runtime_worker, json_to_lua_table, lua_value_to_json,
+    copy_managed_node_package_import_root, default_runlua_vm_pool_config,
+    find_vulcan_process_candidate, format_lifecycle_recovery_error, get_vulcan_context_table,
+    get_vulcan_deps_table, get_vulcan_runtime_internal_table, get_vulcan_table,
+    invoke_managed_runtime_worker, json_to_lua_table, lua_value_to_json,
     managed_runtime_status_from_plan, managed_runtime_worker_result_to_json,
     parse_runtime_request_context_json, populate_vulcan_dependency_context,
     populate_vulcan_file_context, populate_vulcan_internal_execution_context,
