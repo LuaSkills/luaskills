@@ -1126,7 +1126,7 @@ fn ordinary_lua_path_boundaries_strip_windows_verbatim_prefixes() {
         .expect("normalize verbatim Lua path argument");
     assert_eq!(
         normalized,
-        json!(render_host_visible_path(&lua_packages_dir))
+        json!(render_host_visible_path(&canonical_lua_packages))
     );
     // Reserved PWD field must be normalized as soon as host JSON enters Lua arguments.
     // 保留的 PWD 字段必须在宿主 JSON 进入 Lua 参数时立即完成归一化。
@@ -1148,7 +1148,7 @@ fn ordinary_lua_path_boundaries_strip_windows_verbatim_prefixes() {
         .expect("read normalized host-injected PWD");
     assert_eq!(
         injected_paths["PWD"],
-        json!(render_host_visible_path(&lua_packages_dir))
+        json!(render_host_visible_path(&canonical_lua_packages))
     );
     assert_eq!(injected_paths["raw"], json!(verbatim_text));
     assert_eq!(injected_paths["nested"], json!(verbatim_text));
@@ -7659,7 +7659,7 @@ fn execute_runlua_request_inline_supports_vulcan_process_which_for_explicit_path
         .execute_runlua_request_json_inline(&request.to_string())
         .expect("inline runlua should resolve explicit process.which path");
 
-    let expected_found = serde_json::to_string(&render_host_visible_path(&program_path))
+    let expected_found = serde_json::to_string(&render_host_visible_path(&program_argument))
         .expect("json explicit found");
     assert!(result.contains("SUCCESS"));
     assert!(result.contains(&format!("\"found\":{}", expected_found)));
@@ -10645,11 +10645,21 @@ fn managed_python_session_persistence_long_path_runtime_version(
     // UnpaddedVersion includes the Python prerelease separator that remains before added padding.
     // UnpaddedVersion 包含添加填充前仍会保留的 Python 预发布分隔符。
     let unpadded_version = format!("{host_version}-");
+    // RuntimeRoot is materialized once so Windows expands any 8.3 temporary-directory alias exactly
+    // as SystemRuntimeTestLayout will when it canonicalizes the real fixture root.
+    // RuntimeRoot 会先实际落盘一次，使 Windows 按 SystemRuntimeTestLayout 规范化真实夹具根时的
+    // 相同方式精确展开临时目录中的任何 8.3 别名。
+    let runtime_root = make_temp_runtime_root(layout_label);
+    let _ = fs::remove_dir_all(&runtime_root);
+    fs::create_dir_all(&runtime_root).expect("create long-source sizing runtime root");
+    // CanonicalRuntimeRoot is the exact visible identity used later by managed plan resolution.
+    // CanonicalRuntimeRoot 是后续受管计划解析实际使用的精确可见身份。
+    let canonical_runtime_root =
+        fs::canonicalize(&runtime_root).expect("canonicalize long-source sizing runtime root");
+    fs::remove_dir_all(&canonical_runtime_root).expect("remove long-source sizing runtime root");
     // EnvironmentRoot mirrors SystemRuntimeTestLayout and ManagedSessionSystemLayout exactly.
     // EnvironmentRoot 精确镜像 SystemRuntimeTestLayout 与 ManagedSessionSystemLayout。
-    let environment_root = make_temp_runtime_root(layout_label)
-        .join("dependencies")
-        .join("envs");
+    let environment_root = canonical_runtime_root.join("dependencies").join("envs");
     // UnpaddedEnvDir uses production layout logic with an equal-width identity placeholder.
     // UnpaddedEnvDir 使用生产布局逻辑及等宽身份占位符。
     let unpadded_env_dir = managed_env_dir(
@@ -10660,13 +10670,18 @@ fn managed_python_session_persistence_long_path_runtime_version(
     );
     // UnpaddedInterpreter matches the executable suffix used by persistent Python sessions.
     // UnpaddedInterpreter 与持久 Python 会话使用的可执行文件后缀一致。
-    let unpadded_interpreter = unpadded_env_dir
-        .join(".venv")
-        .join("Scripts")
-        .join("python.exe");
-    // UnpaddedLength is measured exactly as Windows CreateProcess consumes the visible spelling.
-    // UnpaddedLength 按 Windows CreateProcess 消费可见路径的方式精确计量。
-    let unpadded_length = unpadded_interpreter.as_os_str().encode_wide().count();
+    let unpadded_interpreter = render_host_visible_path(
+        &unpadded_env_dir
+            .join(".venv")
+            .join("Scripts")
+            .join("python.exe"),
+    );
+    // UnpaddedLength is measured from the same canonical, non-verbatim spelling asserted by the test.
+    // UnpaddedLength 使用测试断言采用的同一规范非 verbatim 写法精确计量。
+    let unpadded_length = Path::new(&unpadded_interpreter)
+        .as_os_str()
+        .encode_wide()
+        .count();
     // PaddingLength is exact; failure means this runner's temporary root leaves no valid test window.
     // PaddingLength 是精确值；失败表示当前 runner 的临时根没有留下有效测试窗口。
     let padding_length = TARGET_INTERPRETER_LENGTH
