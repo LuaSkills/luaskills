@@ -115,8 +115,8 @@ L'hôte doit décider des roots, des skills installables, des actions de gestion
 | Python / uv gérés | `3.14.6` / `0.11.28` |
 | Node.js / pnpm gérés | `24.18.0` / `11.11.0` |
 | Valeurs par défaut du moteur géré | `workers=4 / inactivité=60s / sessions=256 / tampon=1MiB/flux / invoke=illimité` |
-| vldb-controller | `0.2.1` |
-| vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
+| vldb-controller | `0.2.3` |
+| vldb-sqlite / vldb-lancedb | `0.1.6` / `0.1.5` |
 
 Les valeurs exécutables par défaut sont définies dans `scripts/deps/fetch_managed_runtimes.*`, `scripts/deps/fetch_deps.*` et `scripts/deps/sync_runtime_assets.*`. `dependencies.yaml` doit déclarer ces versions exactes du runtime et du gestionnaire de paquets, sauf si l’hôte installe et déclare volontairement une autre version exacte prise en charge.
 

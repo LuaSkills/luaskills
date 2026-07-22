@@ -115,8 +115,8 @@ El host debe decidir roots, skills instalables, acciones de gestión, modo de da
 | Python / uv gestionados | `3.14.6` / `0.11.28` |
 | Node.js / pnpm gestionados | `24.18.0` / `11.11.0` |
 | Valores predeterminados del motor administrado | `workers=4 / inactividad=60s / sesiones=256 / búfer=1MiB/flujo / invoke=ilimitado` |
-| vldb-controller | `0.2.1` |
-| vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
+| vldb-controller | `0.2.3` |
+| vldb-sqlite / vldb-lancedb | `0.1.6` / `0.1.5` |
 
 Los valores ejecutables predeterminados se definen en `scripts/deps/fetch_managed_runtimes.*`, `scripts/deps/fetch_deps.*` y `scripts/deps/sync_runtime_assets.*`. `dependencies.yaml` debe declarar estas versiones exactas del runtime y del gestor de paquetes, salvo que el host instale y declare deliberadamente otra versión exacta compatible.
 

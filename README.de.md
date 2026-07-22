@@ -115,8 +115,8 @@ Der Host muss roots, installierbare Skills, Verwaltungsaktionen, database provid
 | Verwaltetes Python / uv | `3.14.6` / `0.11.28` |
 | Verwaltetes Node.js / pnpm | `24.18.0` / `11.11.0` |
 | Standardwerte der Managed-Runtime-Engine | `Worker=4 / Leerlauf=60s / Sessions=256 / Puffer=1MiB/Stream / invoke=unbegrenzt` |
-| vldb-controller | `0.2.1` |
-| vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
+| vldb-controller | `0.2.3` |
+| vldb-sqlite / vldb-lancedb | `0.1.6` / `0.1.5` |
 
 Die ausführbaren Standardwerte werden in `scripts/deps/fetch_managed_runtimes.*`, `scripts/deps/fetch_deps.*` und `scripts/deps/sync_runtime_assets.*` definiert. `dependencies.yaml` muss diese exakten Runtime- und Paketmanager-Versionen deklarieren, sofern der Host nicht bewusst eine andere exakt unterstützte Version installiert und deklariert.
 

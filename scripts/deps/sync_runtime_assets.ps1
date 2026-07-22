@@ -21,10 +21,10 @@
     [string]$LuaRuntimeVersion = "",
     # Exact vldb-controller release tag.
     # 精确的 vldb-controller 发布标签。
-    [string]$VldbControllerVersion = "v0.2.1",
+    [string]$VldbControllerVersion = "v0.2.3",
     # Exact vldb-sqlite release tag.
     # 精确的 vldb-sqlite 发布标签。
-    [string]$VldbSQLiteVersion = "v0.1.5",
+    [string]$VldbSQLiteVersion = "v0.1.6",
     # Exact vldb-lancedb release tag.
     # 精确的 vldb-lancedb 发布标签。
     [string]$VldbLanceDBVersion = "v0.1.5"

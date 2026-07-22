@@ -268,8 +268,8 @@ This order keeps every installer and examples workflow pointed at already-publis
 | Managed Python / uv | `3.14.6` / `0.11.28` |
 | Managed Node.js / pnpm | `24.18.0` / `11.11.0` |
 | Managed-runtime engine defaults | `workers=4 / idle=60s / sessions=256 / buffer=1MiB/stream / invoke=unlimited` |
-| vldb-controller | `0.2.1` |
-| vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
+| vldb-controller | `0.2.3` |
+| vldb-sqlite / vldb-lancedb | `0.1.6` / `0.1.5` |
 
 The executable defaults are defined by `scripts/deps/fetch_managed_runtimes.*`, `scripts/deps/fetch_deps.*`, and `scripts/deps/sync_runtime_assets.*`. `dependencies.yaml` must declare the exact managed runtime and package-manager versions shown above unless the host deliberately installs and declares another exact supported version.
 

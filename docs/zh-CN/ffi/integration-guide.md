@@ -570,7 +570,7 @@ System Plugin 租约不把整个 `system_lua_lib` 当成一个共享包。每次
 
 这里要特别注意：
 
-- `luaskills` 代码层通过 crates.io 版本 `vldb-controller-client = 0.2.1` 固定依赖 controller Rust SDK
+- `luaskills` 代码层通过 crates.io 版本 `vldb-controller-client = 0.2.3` 固定依赖 controller Rust SDK
 - 当前上游 Rust SDK 在注册阶段使用 `client_name`，具体 `client_session_id` 由 SDK 内部自动管理并自动回放附着与 backend 期望状态
 - `v0.2.1` 额外修复了共享本地 endpoint 在 `auto_spawn` 场景下的重复拉起协调风险
 - 真正被拉起的 controller 服务程序，不是通过 Cargo 把二进制嵌进宿主，而是由宿主自行复制并管理

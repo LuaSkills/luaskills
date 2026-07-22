@@ -35,7 +35,7 @@ VLDB_CONTROLLER_REPO="${VLDB_CONTROLLER_REPO:-OpenVulcan/vldb-controller}"
 
 # VldbControllerVersion stores the GitHub Release tag for vldb-controller assets.
 # VldbControllerVersion 保存 vldb-controller 资产的 GitHub Release 标签。
-VLDB_CONTROLLER_VERSION="${VLDB_CONTROLLER_VERSION:-v0.2.1}"
+VLDB_CONTROLLER_VERSION="${VLDB_CONTROLLER_VERSION:-v0.2.3}"
 
 # VldbSQLiteRepo stores the GitHub repository for vldb-sqlite assets.
 # VldbSQLiteRepo 保存 vldb-sqlite 资产所在的 GitHub 仓库。
@@ -43,7 +43,7 @@ VLDB_SQLITE_REPO="${VLDB_SQLITE_REPO:-OpenVulcan/vldb-sqlite}"
 
 # VldbSQLiteVersion stores the GitHub Release tag for vldb-sqlite assets.
 # VldbSQLiteVersion 保存 vldb-sqlite 资产的 GitHub Release 标签。
-VLDB_SQLITE_VERSION="${VLDB_SQLITE_VERSION:-v0.1.5}"
+VLDB_SQLITE_VERSION="${VLDB_SQLITE_VERSION:-v0.1.6}"
 
 # VldbLanceDBRepo stores the GitHub repository for vldb-lancedb assets.
 # VldbLanceDBRepo 保存 vldb-lancedb 资产所在的 GitHub 仓库。

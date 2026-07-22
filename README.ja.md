@@ -115,8 +115,8 @@ asset は `{skill_id}-v{version}-skill.zip` と `{skill_id}-v{version}-checksums
 | 管理対象 Python / uv | `3.14.6` / `0.11.28` |
 | 管理対象 Node.js / pnpm | `24.18.0` / `11.11.0` |
 | 管理ランタイムエンジンの既定値 | `Worker=4 / アイドル=60秒 / セッション=256 / バッファ=1MiB/ストリーム / invoke=無制限` |
-| vldb-controller | `0.2.1` |
-| vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
+| vldb-controller | `0.2.3` |
+| vldb-sqlite / vldb-lancedb | `0.1.6` / `0.1.5` |
 
 実際の既定値は `scripts/deps/fetch_managed_runtimes.*`、`scripts/deps/fetch_deps.*`、`scripts/deps/sync_runtime_assets.*` で定義されます。ホストが別の正確な対応バージョンを意図的に導入して宣言しない限り、`dependencies.yaml` では上記の管理対象 runtime とパッケージマネージャーの正確なバージョンを宣言する必要があります。
 

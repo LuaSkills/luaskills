@@ -83,7 +83,7 @@
 
 推荐理解方式：
 
-- Rust SDK：走 crates.io 固定版本 `vldb-controller-client = 0.2.1`
+- Rust SDK：走 crates.io 固定版本 `vldb-controller-client = 0.2.3`
 - SDK 注册时宿主名使用 `client_name`，会话主键 `client_session_id` 由 controller 分配并由 SDK 内部自动管理
 - `binding_tag` 仍保留为稳定数据库标签与诊断标签，但在 `space_controller` 模式下不会直接等同于 controller `binding_id`
 - lib 会基于稳定 `binding_tag` 与当前 controller client 会话域生成客户端隔离的 controller `binding_id`

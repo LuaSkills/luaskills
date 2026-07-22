@@ -115,8 +115,8 @@ asset은 `{skill_id}-v{version}-skill.zip`과 `{skill_id}-v{version}-checksums.t
 | 관리형 Python / uv | `3.14.6` / `0.11.28` |
 | 관리형 Node.js / pnpm | `24.18.0` / `11.11.0` |
 | 관리형 런타임 엔진 기본값 | `Worker=4 / 유휴=60초 / 세션=256 / 버퍼=1MiB/스트림 / invoke=무제한` |
-| vldb-controller | `0.2.1` |
-| vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
+| vldb-controller | `0.2.3` |
+| vldb-sqlite / vldb-lancedb | `0.1.6` / `0.1.5` |
 
 실제 기본값은 `scripts/deps/fetch_managed_runtimes.*`, `scripts/deps/fetch_deps.*`, `scripts/deps/sync_runtime_assets.*`에 정의됩니다. 호스트가 다른 정확한 지원 버전을 의도적으로 설치하고 선언하지 않는 한 `dependencies.yaml`에는 위 관리형 runtime 및 패키지 관리자 버전을 정확히 선언해야 합니다.
 

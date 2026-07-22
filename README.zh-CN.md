@@ -197,8 +197,8 @@ GitHub 托管 skill 的仓库派生或显式 `skill_id`、release zip 前缀、c
 | 受管 Python / uv | `3.14.6` / `0.11.28` |
 | 受管 Node.js / pnpm | `24.18.0` / `11.11.0` |
 | 受管运行时引擎默认值 | `Worker=4 / 空闲=60秒 / 会话=256 / 缓冲=1MiB/流 / invoke=无限制` |
-| vldb-controller | `0.2.1` |
-| vldb-sqlite / vldb-lancedb | `0.1.5` / `0.1.5` |
+| vldb-controller | `0.2.3` |
+| vldb-sqlite / vldb-lancedb | `0.1.6` / `0.1.5` |
 
 实际可执行默认值由 `scripts/deps/fetch_managed_runtimes.*`、`scripts/deps/fetch_deps.*` 与 `scripts/deps/sync_runtime_assets.*` 定义。除非宿主有意安装并声明其他受支持的精确版本，否则 `dependencies.yaml` 必须使用上表中的受管运行时和包管理器精确版本。
 
