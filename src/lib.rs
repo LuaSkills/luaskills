@@ -40,12 +40,26 @@ pub use runtime::cache::{
     DEFAULT_TOOL_CACHE_DEFAULT_TTL_SECS, DEFAULT_TOOL_CACHE_MAX_ENTRIES,
     DEFAULT_TOOL_CACHE_MAX_TTL_SECS, ToolCacheConfig,
 };
-pub use runtime::config::SkillConfigEntry;
+pub use runtime::config::{
+    SKILL_CONFIG_DEFAULT_LOCK_TIMEOUT_MS, SKILL_CONFIG_FORMAT_VERSION, SKILL_CONFIG_MAX_BATCH_KEYS,
+    SKILL_CONFIG_MAX_DOCUMENT_BYTES, SKILL_CONFIG_MAX_LOCK_TIMEOUT_MS,
+    SKILL_CONFIG_MAX_PACKAGES_PER_DOCUMENT, SKILL_CONFIG_MAX_TOOL_RESPONSE_BYTES,
+    SkillConfigDeleteResult, SkillConfigEntry, SkillConfigRefreshResult, SkillConfigWriteResult,
+};
 pub use runtime::config_service::{
-    RuntimeSkillPackageConfigDescriptor, RuntimeSkillPackageConfigEnumOption,
-    RuntimeSkillPackageConfigIssue, RuntimeSkillPackageConfigItemDescriptor,
-    RuntimeSkillPackageConfigStatus, RuntimeSkillPackageConfigValidationError,
-    SkillPackageConfigValueSource,
+    RuntimeInstalledSkillPackageConfigDescriptor, RuntimeSkillConfigEvent,
+    RuntimeSkillConfigEventBatch, RuntimeSkillConfigEventError, RuntimeSkillConfigStoreRefresh,
+    RuntimeSkillPackageConfigBusinessIssue, RuntimeSkillPackageConfigDescriptor,
+    RuntimeSkillPackageConfigEnumOption, RuntimeSkillPackageConfigIssue,
+    RuntimeSkillPackageConfigItemDescriptor, RuntimeSkillPackageConfigStatus,
+    RuntimeSkillPackageConfigValidationError, SKILL_CONFIG_DEFAULT_WATCH_DEBOUNCE_MS,
+    SKILL_CONFIG_EVENT_QUEUE_CAPACITY, SKILL_CONFIG_MAX_EVENT_POLL_LIMIT,
+    SKILL_CONFIG_MAX_WATCH_DEBOUNCE_MS, SkillPackageConfigDescribeMode,
+    SkillPackageConfigInputValue, SkillPackageConfigItemState,
+};
+pub use runtime::config_tool::{
+    RuntimeSkillConfigToolAction, RuntimeSkillConfigToolError, RuntimeSkillConfigToolRequest,
+    RuntimeSkillConfigToolResponse,
 };
 pub use runtime::context::{RuntimeClientInfo, RuntimeRequestContext};
 pub use runtime::engine::{LuaEngine, LuaEngineOptions, LuaVmPoolConfig};
@@ -73,7 +87,12 @@ pub use runtime::result::{
     NON_STRING_TOOL_RESULT_ERROR, RuntimeInvocationResult, ToolOverflowMode,
 };
 pub use skill::config::{
-    SkillPackageConfigConstraints, SkillPackageConfigDeclaration, SkillPackageConfigEnumOption,
+    SKILL_CONFIG_MAX_DIAGNOSTIC_VALUE_PREVIEW_BYTES, SKILL_CONFIG_MAX_ENUM_OPTIONS,
+    SKILL_CONFIG_MAX_GROUP_BYTES, SKILL_CONFIG_MAX_HINT_BYTES, SKILL_CONFIG_MAX_ITEMS_PER_PACKAGE,
+    SKILL_CONFIG_MAX_LONG_TEXT_BYTES, SKILL_CONFIG_MAX_SAFE_INTEGER,
+    SKILL_CONFIG_MAX_SHORT_TEXT_BYTES, SKILL_CONFIG_MAX_STRING_CHARS, SKILL_CONFIG_MAX_VALUE_BYTES,
+    SKILL_CONFIG_MIN_SAFE_INTEGER, SKILL_CONFIG_RESERVED_KEY_PREFIX, SkillPackageConfigConstraints,
+    SkillPackageConfigDeclaration, SkillPackageConfigEnumOption, SkillPackageConfigFormat,
     SkillPackageConfigType,
 };
 pub use skill::dependencies::{

@@ -9,11 +9,11 @@ This Release now publishes only the main-repo artifacts that still belong to `lu
 - `luaskills-demo-rust-{platform}.tar.gz`: Runnable non-FFI Rust demo package that shows a Rust host using the `luaskills` crate. It includes platform-matching runner scripts and dependency fetch scripts.
 - `luaskills-debug-tool-{platform}.tar.gz`: Standalone skill-debug workspace. It includes the release-mode `luaskills-debug` binary, a package-local `runtime/`, a `skills/` drop-in directory, and scripts that fetch Lua runtime packages on demand.
 
-Every archive above has a same-name `.sha256` sidecar. LuaSkills `0.5.4` preserves the `0.5.3` API and behavior while aligning the Rust controller client and managed VLDB runtime with `vldb-controller 0.2.3` and the optimized `vldb-sqlite 0.1.6`.
+Every archive above has a same-name `.sha256` sidecar. LuaSkills `0.5.5` introduces the strict package-level configuration contract, versioned user-level stores, cross-process transactions, cached file-watch reloads, business validators, host events, and matching TypeScript, Python, and Go SDK APIs. This unreleased configuration surface intentionally does not retain its earlier draft format or symbols.
 
 ### Runtime dependencies
 
-LuaSkills 0.5.1 introduced separate LuaSkills data, read-only managed Python/Node distribution, and writable managed-environment roots. LuaSkills 0.5.4 preserves that API and its B3-B7 defaults of `4` Workers per exact environment/package-owner pool, `60` idle seconds, `256` persistent sessions, `1 MiB` per session output stream, and unlimited invoke time. Standard C ABI hosts use `FfiLuaRuntimeHostOptionsV3` plus the optional `FfiLuaRuntimeManagedRuntimeConfig` pointer; JSON FFI and language SDKs use `host_options.managed_runtime_config`.
+LuaSkills 0.5.1 introduced separate LuaSkills data, read-only managed Python/Node distribution, and writable managed-environment roots. LuaSkills 0.5.5 retains its B3-B7 defaults of `4` Workers per exact environment/package-owner pool, `60` idle seconds, `256` persistent sessions, `1 MiB` per session output stream, and unlimited invoke time. Standard C ABI hosts use `FfiLuaRuntimeHostOptionsV3` plus the optional `FfiLuaRuntimeManagedRuntimeConfig` pointer; JSON FFI and language SDKs use `host_options.managed_runtime_config`.
 
 Demo and debug-tool packages no longer bundle `lua-runtime-{platform}.tar.gz` or `lua-deps-{platform}.tar.gz` from this repository. Instead, their bundled `scripts/deps/fetch_deps.ps1` and `scripts/deps/fetch_deps.sh` scripts download the runtime packages below from `LuaSkills/luaskills-packages`. FFI-mode demo packages additionally bundle `scripts/ffi/fetch_ffi.ps1` or `scripts/ffi/fetch_ffi.sh` for the LuaSkills FFI SDK:
 
@@ -24,7 +24,7 @@ Demo and debug-tool packages no longer bundle `lua-runtime-{platform}.tar.gz` or
 
 Demo packages provide standalone dependency upgrade scripts with four targets. The `run` script only runs the demo and does not download dependencies automatically. Windows packages include `upgrade_deps.bat`, `scripts/deps/fetch_deps.ps1`, and `run.ps1`; FFI packages also include `scripts/ffi/fetch_ffi.ps1`. Linux/macOS packages include the matching `.sh` scripts.
 
-SDK repositories additionally publish `scripts/deps/sync_runtime_assets.ps1` and `scripts/deps/sync_runtime_assets.sh` as one direct entrypoint for LuaSkills FFI, Lua runtime packages, and VLDB. Use target `all`, `luaskills`, `lua`, or `vldb`; select `none`, `vldb-controller`, `vldb-direct`, or `host-callback` as the database preset. The default LuaSkills tag is `v0.5.4`, and release tags can be overridden explicitly for controlled validation.
+SDK repositories additionally publish `scripts/deps/sync_runtime_assets.ps1` and `scripts/deps/sync_runtime_assets.sh` as one direct entrypoint for LuaSkills FFI, Lua runtime packages, and VLDB. Use target `all`, `luaskills`, `lua`, or `vldb`; select `none`, `vldb-controller`, `vldb-direct`, or `host-callback` as the database preset. The default LuaSkills tag is `v0.5.5`, and release tags can be overridden explicitly for controlled validation.
 
 - `all`: Fetch `lua-runtime-packages-{platform}.tar.gz`, optional vldb-controller, and the FFI SDK when the package contains `scripts/ffi`.
 - `lua`: Fetch `lua-runtime-packages-{platform}.tar.gz` and install it into the demo `runtime/` directory.
@@ -52,11 +52,11 @@ The debug binary accepts explicit managed distribution/environment roots and fiv
 - `luaskills-demo-rust-{platform}.tar.gz`：面向非 FFI / Rust 直连模式的可运行 demo 包，演示 Rust 宿主通过 `luaskills` crate 使用运行时，并携带平台匹配的运行脚本与依赖拉取脚本。
 - `luaskills-debug-tool-{platform}.tar.gz`：独立 skill 调试工作台，包含 release 模式的 `luaskills-debug` 二进制、包内 `runtime/`、可直接放 skill 的 `skills/` 目录，以及按需拉取 Lua runtime packages 的脚本。
 
-以上每个归档都有同名 `.sha256` sidecar。LuaSkills `0.5.4` 保持 `0.5.3` 的 API 与行为不变，同时将 Rust controller client 和受管 VLDB 运行时对齐到 `vldb-controller 0.2.3` 与优化后的 `vldb-sqlite 0.1.6`。
+以上每个归档都有同名 `.sha256` sidecar。LuaSkills `0.5.5` 引入严格的技能包级配置契约、版本化用户级存储、跨进程事务、缓存与文件监听重载、业务校验器、宿主事件，以及匹配的 TypeScript、Python、Go SDK API。此前未发布的配置草案格式与符号有意不保留。
 
 ### Runtime 依赖来源
 
-LuaSkills 0.5.1 引入了独立的 LuaSkills 数据根、只读受管 Python/Node 发行根与可写受管环境根。LuaSkills 0.5.4 保持该 API 不变，并保留 B3-B7 稳定默认值：每个精确环境/包所有者池 `4` 个 Worker、空闲 `60` 秒、每引擎 `256` 个持久会话、每个 Session 输出流 `1 MiB`，且 invoke 无默认超时。标准 C ABI 宿主使用 `FfiLuaRuntimeHostOptionsV3` 与可选 `FfiLuaRuntimeManagedRuntimeConfig` 指针；JSON FFI 和语言 SDK 使用 `host_options.managed_runtime_config`。
+LuaSkills 0.5.1 引入了独立的 LuaSkills 数据根、只读受管 Python/Node 发行根与可写受管环境根。LuaSkills 0.5.5 保留 B3-B7 稳定默认值：每个精确环境/包所有者池 `4` 个 Worker、空闲 `60` 秒、每引擎 `256` 个持久会话、每个 Session 输出流 `1 MiB`，且 invoke 无默认超时。标准 C ABI 宿主使用 `FfiLuaRuntimeHostOptionsV3` 与可选 `FfiLuaRuntimeManagedRuntimeConfig` 指针；JSON FFI 和语言 SDK 使用 `host_options.managed_runtime_config`。
 
 demo 包与 debug-tool 包不再从本仓库发布 `lua-runtime-{platform}.tar.gz` 或 `lua-deps-{platform}.tar.gz`。取而代之，包内自带的 `scripts/deps/fetch_deps.ps1` 与 `scripts/deps/fetch_deps.sh` 会从 `LuaSkills/luaskills-packages` 下载以下资产。FFI 模式 demo 包会额外携带 `scripts/ffi/fetch_ffi.ps1` 或 `scripts/ffi/fetch_ffi.sh` 拉取 LuaSkills FFI SDK：
 
@@ -67,7 +67,7 @@ demo 包与 debug-tool 包不再从本仓库发布 `lua-runtime-{platform}.tar.g
 
 demo 包内的独立依赖升级脚本支持四个目标。`run` 脚本只负责运行 demo，不会自动下载依赖。Windows 包携带 `upgrade_deps.bat`、`scripts/deps/fetch_deps.ps1` 和 `run.ps1`；FFI 包额外携带 `scripts/ffi/fetch_ffi.ps1`。Linux/macOS 包携带对应的 `.sh` 脚本。
 
-三个 SDK 仓库还会发布 `scripts/deps/sync_runtime_assets.ps1` 与 `scripts/deps/sync_runtime_assets.sh`，作为 LuaSkills FFI、Lua runtime packages 与 VLDB 的统一直接同步入口。目标支持 `all`、`luaskills`、`lua`、`vldb`；数据库预设支持 `none`、`vldb-controller`、`vldb-direct`、`host-callback`。默认 LuaSkills 标签固定为 `v0.5.4`，受控验证时可显式覆盖发布标签。
+三个 SDK 仓库还会发布 `scripts/deps/sync_runtime_assets.ps1` 与 `scripts/deps/sync_runtime_assets.sh`，作为 LuaSkills FFI、Lua runtime packages 与 VLDB 的统一直接同步入口。目标支持 `all`、`luaskills`、`lua`、`vldb`；数据库预设支持 `none`、`vldb-controller`、`vldb-direct`、`host-callback`。默认 LuaSkills 标签固定为 `v0.5.5`，受控验证时可显式覆盖发布标签。
 
 - `all`：拉取 `lua-runtime-packages-{platform}.tar.gz`、可选 vldb-controller，并在包内存在 `scripts/ffi` 时额外拉取 FFI SDK。
 - `lua`：只拉取并安装 `lua-runtime-packages-{platform}.tar.gz` 到 demo 的 `runtime/` 目录。

@@ -1,12 +1,15 @@
 use super::{default_ffi_runtime_session_timeout_ms, default_json_object};
+use crate::runtime::config_tool::deserialize_unique_config_values;
 use crate::runtime::managed_runtime::ManagedRuntimeKind;
 use crate::runtime_context::RuntimeRequestContext;
 use crate::runtime_options::{LuaInvocationContext, RuntimeSkillRoot};
 use crate::{
-    LuaEngineOptions, SkillInstallRequest, SkillManagementAuthority, SkillUninstallOptions,
+    LuaEngineOptions, SkillInstallRequest, SkillManagementAuthority,
+    SkillPackageConfigDescribeMode, SkillPackageConfigInputValue, SkillUninstallOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// One JSON request used to create one runtime engine instance.
@@ -196,6 +199,14 @@ pub(super) struct SkillPackageConfigDescribeJsonRequest {
     /// 是否必须无掩码包含原始有效值。
     #[serde(default)]
     pub(super) include_values: bool,
+    /// Declaration discovery mode.
+    /// 声明发现模式。
+    #[serde(default)]
+    pub(super) mode: SkillPackageConfigDescribeMode,
+    /// Optional physical root filter accepted only by installed mode.
+    /// 仅已安装模式接受的可选物理根过滤器。
+    #[serde(default)]
+    pub(super) root_name: Option<String>,
 }
 
 /// One JSON request used to validate an effective package configuration.
@@ -214,6 +225,7 @@ pub(super) struct SkillPackageConfigValidateJsonRequest {
 /// One JSON request used to resolve one `(skill_id, key)` config pair.
 /// 用于解析单个 `(skill_id, key)` 配置对的 JSON 请求。
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct SkillConfigGetJsonRequest {
     /// Stable numeric FFI handle id of the target engine.
     /// 目标引擎的稳定数值 FFI 句柄标识。
@@ -226,9 +238,10 @@ pub(super) struct SkillConfigGetJsonRequest {
     pub(super) key: String,
 }
 
-/// One JSON request used to insert or replace one `(skill_id, key)` config pair.
-/// 用于插入或替换单个 `(skill_id, key)` 配置对的 JSON 请求。
+/// One JSON request used to atomically insert or replace one package configuration batch.
+/// 用于原子插入或替换单个技能包配置批次的 JSON 请求。
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct SkillConfigSetJsonRequest {
     /// Stable numeric FFI handle id of the target engine.
     /// 目标引擎的稳定数值 FFI 句柄标识。
@@ -236,12 +249,72 @@ pub(super) struct SkillConfigSetJsonRequest {
     /// Stable skill identifier that owns the current key.
     /// 拥有当前键的稳定技能标识符。
     pub(super) skill_id: String,
-    /// Stable config key inside the current skill namespace.
-    /// 当前技能命名空间内的稳定配置键。
+    /// Typed values written as one all-or-nothing package transaction.
+    /// 作为单次全有或全无技能包事务写入的类型化值。
+    #[serde(deserialize_with = "deserialize_unique_config_values")]
+    pub(super) values: BTreeMap<String, SkillPackageConfigInputValue>,
+    /// Optional compare-and-swap revision.
+    /// 可选的比较并交换修订号。
+    #[serde(default)]
+    pub(super) expected_revision: Option<String>,
+}
+
+/// One JSON request used to atomically delete one package configuration value.
+/// 用于原子删除单个技能包配置值的 JSON 请求。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SkillConfigDeleteJsonRequest {
+    /// Stable numeric FFI handle id of the target engine.
+    /// 目标引擎的稳定数值 FFI 句柄标识。
+    pub(super) engine_id: u64,
+    /// Stable skill identifier that owns the target key.
+    /// 拥有目标键的稳定技能标识符。
+    pub(super) skill_id: String,
+    /// Exact declared or orphaned key to delete.
+    /// 需要删除的精确已声明或遗留键。
     pub(super) key: String,
-    /// String config value written into the unified skill config store.
-    /// 写入统一技能配置存储的字符串配置值。
-    pub(super) value: String,
+    /// Optional compare-and-swap revision.
+    /// 可选的比较并交换修订号。
+    #[serde(default)]
+    pub(super) expected_revision: Option<String>,
+}
+
+/// One JSON request used to explicitly refresh configured skill stores.
+/// 用于显式刷新已配置技能存储的 JSON 请求。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SkillConfigRefreshJsonRequest {
+    /// Stable numeric FFI handle id of the target engine.
+    /// 目标引擎的稳定数值 FFI 句柄标识。
+    pub(super) engine_id: u64,
+    /// Optional store scope, either `skills` or `system-skills`.
+    /// 可选存储作用域，只能是 `skills` 或 `system-skills`。
+    #[serde(default)]
+    pub(super) store_scope: Option<String>,
+}
+
+/// One JSON request used to poll ordered skill configuration events.
+/// 用于轮询有序技能配置事件的 JSON 请求。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SkillConfigEventsPollJsonRequest {
+    /// Stable numeric FFI handle id of the target engine.
+    /// 目标引擎的稳定数值 FFI 句柄标识。
+    pub(super) engine_id: u64,
+    /// Optional engine-local decimal event cursor.
+    /// 可选的引擎内十进制事件游标。
+    #[serde(default)]
+    pub(super) after_sequence: Option<String>,
+    /// Positive bounded event count.
+    /// 正数有界事件数量。
+    #[serde(default = "default_skill_config_event_limit")]
+    pub(super) limit: usize,
+}
+
+/// Return the default skill configuration event poll limit.
+/// 返回技能配置事件轮询默认限制。
+fn default_skill_config_event_limit() -> usize {
+    100
 }
 
 /// One JSON result describing the lookup state of one skill config value.
@@ -273,13 +346,26 @@ pub(super) struct SkillConfigMutationJsonResult {
     /// Stable skill identifier that owns the current key.
     /// 拥有当前键的稳定技能标识符。
     pub(super) skill_id: String,
-    /// Stable config key touched by the mutation.
-    /// 当前变更触及的稳定配置键。
-    pub(super) key: String,
-    /// Optional value returned for `set`.
-    /// 为 `set` 动作返回的可选值。
+    /// Revision visible after this mutation.
+    /// 当前变更完成后可见的修订号。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) value: Option<String>,
+    pub(super) revision: Option<String>,
+    /// Whether this mutation changed persisted data.
+    /// 当前变更是否改变了持久化数据。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) changed: Option<bool>,
+    /// Canonical values returned for a batch set.
+    /// 批量设置返回的规范值。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) values: Option<BTreeMap<String, String>>,
+    /// Stable keys whose values changed.
+    /// 值发生变化的稳定键。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) changed_keys: Option<Vec<String>>,
+    /// Optional key touched by one delete mutation.
+    /// 单次删除变更触及的可选键。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) key: Option<String>,
     /// Optional deletion flag returned for `delete`.
     /// 为 `delete` 动作返回的可选删除标记。
     #[serde(skip_serializing_if = "Option::is_none")]

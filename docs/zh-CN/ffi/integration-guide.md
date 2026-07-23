@@ -549,7 +549,7 @@ System Plugin 租约不把整个 `system_lua_lib` 当成一个共享包。每次
 
 每个存活 Worker 或持久会话快照都会持有对应受管环境的跨进程共享生命周期租约。环境最终发布或替换只尝试一次非阻塞独占租约；存在活动 Worker 或会话时立即返回稳定的 busy 错误，不会等待、强退使用方或原地替换环境。
 
-旧字段 `temp_dir`、`resources_dir`、`lua_packages_dir`、`host_provided_tool_root`、`host_provided_lua_root`、`host_provided_ffi_root`、`download_cache_root`、`dependency_dir_name`、`state_dir_name`、`database_dir_name` 与 `skill_config_file_path` 仍保留为兼容字段，但不再建议作为新宿主集成的配置入口。JSON FFI 直接在 host options 里传 `runtime_root`；标准 C ABI 为保持 `FfiLuaRuntimeHostOptions` 的 v1 布局兼容，使用 `FfiLuaRuntimeHostOptionsV2` 与 `luaskills_ffi_engine_new_v2` 传入 `runtime_root`。如果还要独立传受管发行根、环境根或 B3-B7 资源策略，必须使用 `FfiLuaRuntimeHostOptionsV3` 与 `luaskills_ffi_engine_new_v3`。若同时传入 `runtime_root`，运行时仍会按固定布局重写旧派生字段，但不会覆盖两个显式受管根。
+旧字段 `temp_dir`、`resources_dir`、`lua_packages_dir`、`host_provided_tool_root`、`host_provided_lua_root`、`host_provided_ffi_root`、`download_cache_root`、`dependency_dir_name`、`state_dir_name` 与 `database_dir_name` 仍属于既有运行时布局接口。技能配置不沿用这套推导：宿主必须单独提供绝对用户级 `skill_config_root`，没有旧单文件配置字段或路径猜测。JSON FFI 直接在 host options 里传 `runtime_root`；标准 C ABI 使用对应版本结构传入运行时与受管根。
 
 ### 7.1.1 Space Controller 额外前置要求
 
@@ -708,7 +708,9 @@ System Plugin 租约不把整个 `system_lua_lib` 当成一个共享包。每次
 - `runlua_pool_config`
 - `reserved_entry_names`
 - `ignored_skill_ids`
-- `skill_config_file_path`
+- `skill_config_root`
+- `skill_config_lock_timeout_ms`
+- `skill_config_watch_debounce_ms`
 - `enable_skill_management_bridge`
 - `default_text_encoding`
 - `disable_managed_io_compat`
@@ -779,20 +781,15 @@ System Plugin 租约不把整个 `system_lua_lib` 当成一个共享包。每次
 - 该字段适合宿主已经用原生、gRPC、VMM 或其他实现替代某个默认 skill 包时使用
 - 这不是 skill 自声明的 capability 判定，也不会自动推断宿主已有能力
 
-统一 skill 配置路径规则：
+技能配置路径规则：
 
-- `skill_config_file_path`
-  - 显式指定统一主配置文件路径
-- 一旦显式指定：
-  - 将完全跳过默认 `runtime_root` 推导
-  - 会在引擎创建时固定成绝对路径，不会随进程 `cwd` 漂移
-- 未配置时默认使用：
-  - `<runtime_root>/config/skill_config.json`
-- 即使 `skills/` 目录尚未创建，也会优先解析这条默认配置路径
-- 如果同时传入多个 skill root，且它们映射到不同的 `runtime_root`，则必须显式传入 `skill_config_file_path`
-- 当前整个运行时只维护一个主配置文件
-- 文件内部按 `skill_id` 分组存储字符串配置值
-- 这不是按 skill root 分片的配置模型
+- `skill_config_root` 必须是绝对用户级目录；未配置时配置 API 明确返回 `CONFIG_PATH_UNAVAILABLE`。
+- 普通有效包写入 `<skill_config_root>/skills/config.json`。
+- `ROOT` 系统包写入 `<skill_config_root>/system-skills/config.json`。
+- `skill_config_lock_timeout_ms` 可选范围为 1–60000，默认 5000。
+- `skill_config_watch_debounce_ms` 可选范围为 1–5000，默认 200。
+- 路径不从 `runtime_root`、skill roots 或当前目录推导。
+- 配置按包级 `skill_id` 分组，不属于独立 entry。
 
 隔离 `runlua` 专用池规则：
 
@@ -812,7 +809,7 @@ System Plugin 租约不把整个 `system_lua_lib` 当成一个共享包。每次
 - 推荐工具签名：
 
 ```text
-runtime-config(action, skill_id?, key?, value?, include_values?)
+runtime-config(action, skill_id?, key?, value?, values?, expected_revision?, mode?, root_name?, include_values?, store_scope?)
 ```
 
 推荐动作：
@@ -823,6 +820,7 @@ runtime-config(action, skill_id?, key?, value?, include_values?)
 - `get`
 - `set`
 - `delete`
+- `refresh`
 
 也就是说：
 
@@ -1254,8 +1252,10 @@ system 版本的 `_json` 生命周期接口，以及可见性查询、prompt com
 - `luaskills_ffi_skill_config_describe`
 - `luaskills_ffi_skill_config_validate`
 - `luaskills_ffi_skill_config_get`
-- `luaskills_ffi_skill_config_set`
+- `luaskills_ffi_skill_config_set_values`
 - `luaskills_ffi_skill_config_delete`
+- `luaskills_ffi_skill_config_refresh`
+- `luaskills_ffi_skill_config_events_poll`
 
 公共 `_json` FFI 接口：
 
@@ -1265,15 +1265,19 @@ system 版本的 `_json` 生命周期接口，以及可见性查询、prompt com
 - `luaskills_ffi_skill_config_get_json`
 - `luaskills_ffi_skill_config_set_json`
 - `luaskills_ffi_skill_config_delete_json`
+- `luaskills_ffi_skill_config_refresh_json`
+- `luaskills_ffi_skill_config_events_poll_json`
 
 说明：
 
-- skill config 按技能包 `skill_id` 管理，不属于某个独立 entry，也不按 `ROOT` / `PROJECT` / `USER` 可见性过滤。
+- skill config 按技能包 `skill_id` 管理，不属于某个独立 entry；有效包所属根决定写入普通或系统用户级存储。
 - 当前有效技能包必须在 `skill.yaml` 顶层声明配置项；宿主 `set` 不能写入未声明 key，也不能绕过类型和约束校验。
-- `describe` 返回参数名、类型、约束、枚举说明、技能包作者提供的文本和状态。`skill_id` 可为空。
+- `describe` 返回参数名、类型、约束、枚举说明、UI 元数据、技能包作者提供的文本和状态。JSON FFI 支持 `effective` 与不执行 Lua 的 `installed` 模式。
 - 标准 C ABI 的 `include_values` 只接受 `0` 或 `1`；JSON FFI 中为布尔值且默认 `false`。
 - `include_values=false` 时响应完全省略每项的 `value`；为 `true` 时返回未遮罩原始有效值。
-- `validate` 是只读操作，返回 `complete`、`missing`、`invalid`、`orphaned_count`。
+- `validate` 是只读操作，返回 revision、store scope、`complete`、`missing`、`invalid`、业务问题和 orphaned 键。
+- `set` 只接受一个非空批次并支持可选 revision CAS；标准 C ABI 名称为 `set_values`。`delete` 同样支持 CAS。
+- `refresh` 显式刷新一个或两个缓存快照；events poll 返回本地写入、外部重载和结构化失败事件。
 - 原始 `list/get/delete` 可以管理技能包升级后留下的未声明值；`set` 始终要求当前声明。
 - LuaSkills 不对配置值执行用户授权，也不因 `sensitive=true` 自动遮罩。上级封装必须决定是否允许 `get/list`、是否允许 `include_values=true`、是否直接修改或先请求用户授权。
 - 完整请求响应与权限建议见 [Skill 包级配置声明、运行时控制与宿主对接](../architecture/skill-config-system-design.md)。
@@ -1526,29 +1530,26 @@ SDK 对接入口：
 作用：
 
 - 发现和校验每个有效技能包在 `skill.yaml` 顶层声明的配置结构
-- 统一管理按 `skill_id + key + value` 持久化的规范字符串值
+- 统一管理按 `skill_id + values` 批量持久化的规范字符串值
 
 调用逻辑：
 
-1. 解析宿主显式配置的 `skill_config_file_path`
-   - 若已配置，则直接使用该路径并跳过默认 `runtime_root` 推导
-2. 若未配置，则使用默认主配置文件：
-   - `<runtime_root>/config/skill_config.json`
-   - 即使 `skills/` 目录尚未存在，也仍然先解析这条默认路径
-   - 若多个 skill root 指向不同的 `runtime_root`，则拒绝隐式猜测路径并要求宿主显式配置
-3. 在单一主配置文件中按包级 `skill_id` 读写当前配置
-4. `describe/validate` 提供声明、类型、说明、约束和状态
-5. `set` 只允许当前有效包已声明的 key，并执行类型校验与规范化
-6. `delete` 返回是否真实删除了某个键，并允许清理 orphaned
+1. 验证宿主显式绝对 `skill_config_root` 与锁/监听时间参数。
+2. 建立普通 `skills/config.json` 与系统 `system-skills/config.json` 双存储路由。
+3. 从最后合法不可变快照读取；文件监听或显式 `refresh` 接受 revision 单调增加的外部替换。
+4. `describe/validate` 提供声明、UI 元数据、类型、说明、约束、revision、状态和业务问题。
+5. `set_values` 在跨进程锁内重新读取最新磁盘版本，对整批执行声明、类型和隔离业务校验，然后一次增加 revision。
+6. `delete` 支持 revision CAS 并允许清理 orphaned；events poll 提供有界有序通知。
 
 宿主包装建议：
 
 - 推荐把这组底层 API 封装成单工具：
-  - `runtime-config(action, skill_id?, key?, value?, include_values?)`
-- 推荐动作是 `describe/validate/list/get/set/delete`
+  - `runtime-config(action, skill_id?, key?, value?, values?, expected_revision?, mode?, root_name?, include_values?, store_scope?)`
+- 推荐动作是 `describe/validate/list/get/set/delete/refresh`
 - 不建议把这些动作暴露成多个独立终端工具，避免占用过多上下文
 - 这组接口不是 ROOT 可见性查询接口；宿主必须按产品权限决定哪些 `skill_id` 可以读写
 - LuaSkills 不执行用户授权或敏感值遮罩；宿主必须决定是否允许原始值查询、是否传 `include_values=true`、是否直接修改或先请求用户授权
+- 面向模型的默认包装必须固定 `describe(mode=effective, include_values=false)`，不得让模型任意选择 `mode=installed` 或 `root_name`；installed 结果包含宿主诊断用物理路径，获授权后也应按产品需要裁剪 `absolute_path`
 
 ### 10.7 `list_entries`
 

@@ -200,12 +200,15 @@ List flattened skill config records as JSON.
 FfiOwnedBuffer luaskills_ffi_skill_config_list_json(FfiBorrowedBuffer input_json);
 
 /*
-Describe effective package configuration declarations as JSON.
-以 JSON 形式描述有效技能包配置声明。
+Describe effective or physically installed package configuration declarations as JSON.
+以 JSON 形式描述有效或物理已安装技能包配置声明。
 
-The request may contain skill_id and include_values. The host must
-authorize value disclosure before setting include_values=true; values are not masked.
-请求可包含 skill_id 与 include_values。宿主在设置 include_values=true
+The request may contain skill_id, mode, root_name, and include_values.
+root_name is accepted only in installed mode, which never returns values.
+The host must authorize value disclosure before setting include_values=true
+in effective mode; values are not masked.
+请求可包含 skill_id、mode、root_name 与 include_values。root_name 只允许用于
+永不返回值的 installed 模式。宿主在 effective 模式设置 include_values=true
 之前必须完成值披露授权；返回值不会被遮罩。
 */
 FfiOwnedBuffer luaskills_ffi_skill_config_describe_json(FfiBorrowedBuffer input_json);
@@ -223,8 +226,8 @@ Read one optional skill config value as JSON.
 FfiOwnedBuffer luaskills_ffi_skill_config_get_json(FfiBorrowedBuffer input_json);
 
 /*
-Insert or replace one skill config value as JSON.
-以 JSON 形式插入或替换单个技能配置值。
+Atomically insert or replace one skill package configuration batch as JSON.
+以 JSON 形式原子插入或替换单个技能包配置批次。
 */
 FfiOwnedBuffer luaskills_ffi_skill_config_set_json(FfiBorrowedBuffer input_json);
 
@@ -233,6 +236,18 @@ Delete one skill config key as JSON.
 以 JSON 形式删除单个技能配置键。
 */
 FfiOwnedBuffer luaskills_ffi_skill_config_delete_json(FfiBorrowedBuffer input_json);
+
+/*
+Explicitly refresh one or both skill configuration stores as JSON.
+以 JSON 形式显式刷新一个或两个技能配置存储。
+*/
+FfiOwnedBuffer luaskills_ffi_skill_config_refresh_json(FfiBorrowedBuffer input_json);
+
+/*
+Poll ordered skill configuration events as JSON.
+以 JSON 形式轮询有序技能配置事件。
+*/
+FfiOwnedBuffer luaskills_ffi_skill_config_events_poll_json(FfiBorrowedBuffer input_json);
 
 /*
 Call one active loaded skill entry using one JSON request.

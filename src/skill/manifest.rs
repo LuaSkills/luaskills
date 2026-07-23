@@ -238,6 +238,10 @@ pub struct SkillMeta {
     /// 当前技能包全部入口共享的包级配置声明。
     #[serde(default)]
     pub config: Vec<SkillPackageConfigDeclaration>,
+    /// Optional package-level Lua validator executed only by configuration transactions.
+    /// 仅由配置事务执行的可选包级 Lua 校验器。
+    #[serde(default)]
+    pub config_validator: Option<String>,
     /// Structured LanceDB configuration used by the host-managed binding.
     /// 宿主管理的 LanceDB 绑定所使用的结构化配置对象。
     #[serde(default)]
@@ -714,6 +718,25 @@ impl SkillMeta {
     pub fn resolve_entry_input_schemas(&mut self, skill_dir: &Path) -> Result<(), String> {
         let skill_id = self.effective_skill_id().to_string();
         validate_skill_package_config_declarations(&skill_id, &mut self.config)?;
+        if let Some(config_validator) = self.config_validator.as_deref() {
+            validate_skill_relative_path(config_validator, "runtime", "config_validator")?;
+            let validator_path = skill_dir.join(config_validator);
+            let metadata = fs::symlink_metadata(&validator_path).map_err(|error| {
+                format!(
+                    "skill package '{}' config_validator {} cannot be inspected: {}",
+                    skill_id,
+                    render_host_visible_path(&validator_path),
+                    error
+                )
+            })?;
+            if !metadata.file_type().is_file() {
+                return Err(format!(
+                    "skill package '{}' config_validator {} must be a regular file",
+                    skill_id,
+                    render_host_visible_path(&validator_path)
+                ));
+            }
+        }
         for tool in &mut self.entries {
             tool.resolve_input_schema(skill_dir)?;
         }

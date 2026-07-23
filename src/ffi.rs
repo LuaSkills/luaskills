@@ -399,8 +399,10 @@ pub(crate) fn exported_ffi_function_names() -> Vec<String> {
         "luaskills_ffi_skill_config_describe",
         "luaskills_ffi_skill_config_validate",
         "luaskills_ffi_skill_config_get",
-        "luaskills_ffi_skill_config_set",
+        "luaskills_ffi_skill_config_set_values",
         "luaskills_ffi_skill_config_delete",
+        "luaskills_ffi_skill_config_refresh",
+        "luaskills_ffi_skill_config_events_poll",
         "luaskills_ffi_call_skill",
         "luaskills_ffi_run_lua",
         "luaskills_ffi_disable_skill",
@@ -444,6 +446,8 @@ pub(crate) fn exported_ffi_function_names() -> Vec<String> {
         "luaskills_ffi_skill_config_get_json",
         "luaskills_ffi_skill_config_set_json",
         "luaskills_ffi_skill_config_delete_json",
+        "luaskills_ffi_skill_config_refresh_json",
+        "luaskills_ffi_skill_config_events_poll_json",
         "luaskills_ffi_call_skill_json",
         "luaskills_ffi_run_lua_json",
         "luaskills_ffi_runtime_lease_create_json",
@@ -942,11 +946,39 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_describe_json(
         Ok(request) => request,
         Err(error) => return ffi_error(error),
     };
-    match with_engine(request.engine_id, |engine| {
-        engine.describe_skill_package_config(request.skill_id.as_deref(), request.include_values)
-    }) {
-        Ok(descriptors) => ffi_ok(descriptors),
-        Err(error) => ffi_error(error),
+    match request.mode {
+        crate::SkillPackageConfigDescribeMode::Effective => {
+            if request.root_name.is_some() {
+                return ffi_error(
+                    "CONFIG_BATCH_ARGUMENT_CONFLICT: root_name is accepted only in installed describe mode",
+                );
+            }
+            match with_engine(request.engine_id, |engine| {
+                engine.describe_skill_package_config(
+                    request.skill_id.as_deref(),
+                    request.include_values,
+                )
+            }) {
+                Ok(descriptors) => ffi_ok(descriptors),
+                Err(error) => ffi_error(error),
+            }
+        }
+        crate::SkillPackageConfigDescribeMode::Installed => {
+            if request.include_values {
+                return ffi_error(
+                    "CONFIG_BATCH_ARGUMENT_CONFLICT: installed describe mode never returns persisted values",
+                );
+            }
+            match with_engine(request.engine_id, |engine| {
+                Ok(engine.describe_installed_skill_package_config(
+                    request.skill_id.as_deref(),
+                    request.root_name.as_deref(),
+                ))
+            }) {
+                Ok(descriptors) => ffi_ok(descriptors),
+                Err(error) => ffi_error(error),
+            }
+        }
     }
 }
 
@@ -1014,8 +1046,8 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_get_json(
     }
 }
 
-/// Insert or replace one skill config value through the JSON FFI surface.
-/// 通过 JSON FFI 入口插入或替换单个技能配置值。
+/// Atomically insert or replace one package configuration batch through JSON FFI.
+/// 通过 JSON FFI 入口原子插入或替换单个技能包配置批次。
 /// Hosts that do not want user-level config mutation should not expose this endpoint.
 /// 不希望用户级修改配置的宿主不应暴露该入口。
 /// # Safety
@@ -1035,14 +1067,22 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_set_json(
         Ok(request) => request,
         Err(error) => return ffi_error(error),
     };
+    let response_skill_id = request.skill_id.clone();
     match with_engine_mut(request.engine_id, |engine| {
-        engine.set_skill_config_value(&request.skill_id, &request.key, &request.value)
+        engine.set_skill_config_values(
+            &request.skill_id,
+            request.values,
+            request.expected_revision.as_deref(),
+        )
     }) {
-        Ok(normalized_value) => ffi_ok(SkillConfigMutationJsonResult {
+        Ok(result) => ffi_ok(SkillConfigMutationJsonResult {
             action: "set".to_string(),
-            skill_id: request.skill_id,
-            key: request.key,
-            value: Some(normalized_value),
+            skill_id: response_skill_id,
+            revision: Some(result.revision),
+            changed: Some(result.changed),
+            values: Some(result.values),
+            changed_keys: Some(result.changed_keys),
+            key: None,
             deleted: None,
         }),
         Err(error) => ffi_error(error),
@@ -1063,7 +1103,7 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_set_json(
 pub unsafe extern "C" fn luaskills_ffi_skill_config_delete_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<SkillConfigGetJsonRequest>(
+    let request = match decode_json_request::<SkillConfigDeleteJsonRequest>(
         input_json,
         "luaskills_ffi_skill_config_delete_json",
     ) {
@@ -1071,15 +1111,72 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_delete_json(
         Err(error) => return ffi_error(error),
     };
     match with_engine_mut(request.engine_id, |engine| {
-        engine.delete_skill_config_value(&request.skill_id, &request.key)
+        engine.delete_skill_config_value(
+            &request.skill_id,
+            &request.key,
+            request.expected_revision.as_deref(),
+        )
     }) {
-        Ok(deleted) => ffi_ok(SkillConfigMutationJsonResult {
+        Ok(result) => ffi_ok(SkillConfigMutationJsonResult {
             action: "delete".to_string(),
             skill_id: request.skill_id,
-            key: request.key,
-            value: None,
-            deleted: Some(deleted),
+            revision: Some(result.revision),
+            changed: Some(result.deleted),
+            values: None,
+            changed_keys: None,
+            key: Some(result.key),
+            deleted: Some(result.deleted),
         }),
+        Err(error) => ffi_error(error),
+    }
+}
+
+/// Explicitly refresh one or both skill configuration stores through JSON FFI.
+/// 通过 JSON FFI 显式刷新一个或两个技能配置存储。
+/// # Safety
+/// # 安全性
+/// The caller must provide one valid borrowed JSON buffer.
+/// 调用方必须提供一个有效的借用 JSON 缓冲。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_skill_config_refresh_json(
+    input_json: FfiBorrowedBuffer,
+) -> FfiOwnedBuffer {
+    let request = match decode_json_request::<SkillConfigRefreshJsonRequest>(
+        input_json,
+        "luaskills_ffi_skill_config_refresh_json",
+    ) {
+        Ok(request) => request,
+        Err(error) => return ffi_error(error),
+    };
+    match with_engine(request.engine_id, |engine| {
+        engine.refresh_skill_config(request.store_scope.as_deref())
+    }) {
+        Ok(result) => ffi_ok(result),
+        Err(error) => ffi_error(error),
+    }
+}
+
+/// Poll ordered skill configuration events through JSON FFI.
+/// 通过 JSON FFI 轮询有序技能配置事件。
+/// # Safety
+/// # 安全性
+/// The caller must provide one valid borrowed JSON buffer.
+/// 调用方必须提供一个有效的借用 JSON 缓冲。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_skill_config_events_poll_json(
+    input_json: FfiBorrowedBuffer,
+) -> FfiOwnedBuffer {
+    let request = match decode_json_request::<SkillConfigEventsPollJsonRequest>(
+        input_json,
+        "luaskills_ffi_skill_config_events_poll_json",
+    ) {
+        Ok(request) => request,
+        Err(error) => return ffi_error(error),
+    };
+    match with_engine(request.engine_id, |engine| {
+        engine.poll_skill_config_events(request.after_sequence.as_deref(), request.limit)
+    }) {
+        Ok(result) => ffi_ok(result),
         Err(error) => ffi_error(error),
     }
 }

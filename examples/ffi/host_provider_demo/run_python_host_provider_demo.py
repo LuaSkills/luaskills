@@ -46,7 +46,9 @@ class FfiLuaRuntimeHostOptions(ctypes.Structure):
         ("dependency_dir_name", ctypes.c_char_p),
         ("state_dir_name", ctypes.c_char_p),
         ("database_dir_name", ctypes.c_char_p),
-        ("skill_config_file_path", ctypes.c_char_p),
+        ("skill_config_root", ctypes.c_char_p),
+        ("skill_config_lock_timeout_ms", ctypes.c_uint64),
+        ("skill_config_watch_debounce_ms", ctypes.c_uint64),
         ("allow_network_download", ctypes.c_uint8),
         ("github_base_url", ctypes.c_char_p),
         ("github_api_base_url", ctypes.c_char_p),
@@ -458,7 +460,9 @@ def main() -> None:
     host.dependency_dir_name = b"dependencies"
     host.state_dir_name = b"state"
     host.database_dir_name = b"databases"
-    host.skill_config_file_path = None
+    host.skill_config_root = None
+    host.skill_config_lock_timeout_ms = 0
+    host.skill_config_watch_debounce_ms = 0
     host.allow_network_download = 0
     host.github_base_url = None
     host.github_api_base_url = None
@@ -500,7 +504,9 @@ def main() -> None:
                 "dependency_dir_name": "dependencies",
                 "state_dir_name": "state",
                 "database_dir_name": "databases",
-                "skill_config_file_path": None,
+                "skill_config_root": None,
+                "skill_config_lock_timeout_ms": None,
+                "skill_config_watch_debounce_ms": None,
                 "allow_network_download": False,
                 "github_base_url": None,
                 "github_api_base_url": None,

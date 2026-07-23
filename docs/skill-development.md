@@ -1090,11 +1090,12 @@ Currently available:
 | --- | --- | --- | --- |
 | `vulcan.config.get(key)` | `key: string` | `string \| nil` | returns the stored value or declared default; key must be declared |
 | `vulcan.config.has(key)` | `key: string` | `boolean` | checks for a stored value or declared default |
-| `vulcan.config.set(key, value)` | `key: string`; `value: string` | `true` | validates, normalizes, and persists one declared value |
+| `vulcan.config.set(key, value)` | `key: string`; `value: scalar` | `true` | routes one value through the atomic batch transaction |
+| `vulcan.config.set(values)` | `values: table<string, scalar>` | `true` | validates and persists one nonempty all-or-nothing batch |
 | `vulcan.config.delete(key)` | `key: string` | `boolean` | deletes the stored value and may reveal the declared default |
 | `vulcan.config.list()` | none | `table<string, string>` | lists effective values for declared keys only |
 | `vulcan.config.describe()` | none | `table` | returns names, types, constraints, package-authored enum metadata and descriptions, and state without values |
-| `vulcan.config.status()` | none | `table` | returns completeness, missing values, invalid values, and the orphaned count |
+| `vulcan.config.status()` | none | `table` | returns revision, store scope, completeness, static/business issues, and orphaned keys |
 
 Minimal example:
 
@@ -1117,7 +1118,8 @@ Notes:
 - Configuration is isolated by package. A nested call switches to the target package and restores the caller afterward.
 - These APIs **require one active skill context**. They raise an error in system runtimes that do not currently represent one skill identity.
 - Missing or invalid configuration does not prevent package loading. Check it only where an entry needs it.
-- The unified main config file defaults to `<runtime_root>/config/skill_config.json`; hosts can explicitly override the path.
+- Hosts must provide one absolute user-level `skill_config_root`; normal and system packages route to `skills/config.json` and `system-skills/config.json` under that root.
+- Optional `config_validator` runs cross-field checks in an isolated, capability-free Lua state during the same atomic transaction.
 - Human-readable declaration fields use the single language chosen by the package author. English is recommended for broadly distributed packages but is not enforced.
 - The complete declaration schema, storage formats, host authorization boundary, and FFI contract are documented in [Skill package configuration](zh-CN/architecture/skill-config-system-design.md).
 

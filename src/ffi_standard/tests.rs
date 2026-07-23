@@ -186,7 +186,9 @@ fn empty_ffi_runtime_host_options() -> FfiLuaRuntimeHostOptions {
         dependency_dir_name: ptr::null(),
         state_dir_name: ptr::null(),
         database_dir_name: ptr::null(),
-        skill_config_file_path: ptr::null(),
+        skill_config_root: ptr::null(),
+        skill_config_lock_timeout_ms: 0,
+        skill_config_watch_debounce_ms: 0,
         allow_network_download: 0,
         github_base_url: ptr::null(),
         github_api_base_url: ptr::null(),
@@ -243,9 +245,9 @@ struct FfiStandardHostOptionsFixture {
     /// CString backing the database_dir_name pointer.
     /// 支撑 database_dir_name 指针的 CString。
     database_dir_name: CString,
-    /// Optional CString backing the skill_config_file_path pointer.
-    /// 支撑 skill_config_file_path 指针的可选 CString。
-    skill_config_file_path: Option<CString>,
+    /// Optional CString backing the skill_config_root pointer.
+    /// 支撑 skill_config_root 指针的可选 CString。
+    skill_config_root: Option<CString>,
 }
 
 impl FfiStandardHostOptionsFixture {
@@ -258,24 +260,21 @@ impl FfiStandardHostOptionsFixture {
     /// Return a fixture whose CString fields must outlive the generated options.
     /// 返回 CString 字段必须比生成的 options 存活更久的夹具。
     fn new(temp_root: &Path) -> Self {
-        Self::with_skill_config_file_path(temp_root, None)
+        Self::with_skill_config_root(temp_root, None)
     }
 
-    /// Create one fixture and optionally include a skill-config file path.
-    /// 创建夹具，并可选包含 skill-config 文件路径。
+    /// Create one fixture and optionally include a skill-config root.
+    /// 创建夹具，并可选包含 skill-config 根目录。
     ///
     /// The temp_root parameter is the root directory prepared by the current test.
     /// temp_root 参数是当前测试准备的根目录。
     ///
-    /// The skill_config_file_path parameter is the optional config file path exposed to the FFI host options.
-    /// skill_config_file_path 参数是暴露给 FFI host options 的可选配置文件路径。
+    /// The skill_config_root parameter is the optional config root exposed to the FFI host options.
+    /// skill_config_root 参数是暴露给 FFI host options 的可选配置根目录。
     ///
     /// Return a fixture that owns every CString referenced by host_options.
     /// 返回持有 host_options 所引用全部 CString 的夹具。
-    fn with_skill_config_file_path(
-        temp_root: &Path,
-        skill_config_file_path: Option<&Path>,
-    ) -> Self {
+    fn with_skill_config_root(temp_root: &Path, skill_config_root: Option<&Path>) -> Self {
         Self {
             temp_dir_text: ffi_test_path_cstring(&temp_root.join("temp"), "temp_dir"),
             resources_dir_text: ffi_test_path_cstring(
@@ -294,8 +293,8 @@ impl FfiStandardHostOptionsFixture {
             dependency_dir_name: CString::new("dependencies").expect("dependencies cstring"),
             state_dir_name: CString::new("state").expect("state cstring"),
             database_dir_name: CString::new("databases").expect("databases cstring"),
-            skill_config_file_path: skill_config_file_path
-                .map(|path| ffi_test_path_cstring(path, "skill_config_file_path")),
+            skill_config_root: skill_config_root
+                .map(|path| ffi_test_path_cstring(path, "skill_config_root")),
         }
     }
 
@@ -315,8 +314,8 @@ impl FfiStandardHostOptionsFixture {
         host_options.dependency_dir_name = self.dependency_dir_name.as_ptr();
         host_options.state_dir_name = self.state_dir_name.as_ptr();
         host_options.database_dir_name = self.database_dir_name.as_ptr();
-        host_options.skill_config_file_path = self
-            .skill_config_file_path
+        host_options.skill_config_root = self
+            .skill_config_root
             .as_ref()
             .map_or(ptr::null(), |path| path.as_ptr());
         host_options
@@ -1390,14 +1389,11 @@ fn standard_ffi_skill_config_round_trip() {
     )
     .expect("write config skill runtime");
 
-    let skill_config_file_path = temp_root.join("config").join("skill_config.json");
-    let host_fixture = FfiStandardHostOptionsFixture::with_skill_config_file_path(
-        &temp_root,
-        Some(&skill_config_file_path),
-    );
+    let skill_config_root = temp_root.join("config");
+    let host_fixture =
+        FfiStandardHostOptionsFixture::with_skill_config_root(&temp_root, Some(&skill_config_root));
     let skill_id = CString::new("demo-skill").expect("skill_id cstring");
     let key = CString::new("api_token").expect("key cstring");
-    let value = CString::new("sk-standard-ffi").expect("value cstring");
 
     let host_options = host_fixture.host_options();
     let engine_options = FfiLuaEngineOptions {
@@ -1449,17 +1445,30 @@ fn standard_ffi_skill_config_round_trip() {
         ptr: ptr::null_mut(),
         len: 0,
     };
+    let values_json =
+        CString::new(r#"{"api_token":"sk-standard-ffi"}"#).expect("values json cstring");
+    let mut set_result = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
     let set_status = unsafe {
-        luaskills_ffi_skill_config_set(
+        luaskills_ffi_skill_config_set_values(
             engine_id,
             skill_id.as_ptr(),
-            key.as_ptr(),
-            value.as_ptr(),
+            values_json.as_ptr(),
+            ptr::null(),
+            &mut set_result,
             &mut set_error,
         )
     };
     assert_eq!(set_status, FFI_STATUS_OK);
     assert!(set_error.ptr.is_null());
+    let set_result_json: serde_json::Value =
+        serde_json::from_str(&read_owned_buffer_text(&set_result))
+            .expect("set result should be json");
+    assert_eq!(set_result_json["revision"], "1");
+    assert_eq!(set_result_json["values"]["api_token"], "sk-standard-ffi");
+    unsafe { luaskills_ffi_buffer_free(set_result) };
 
     let mut hidden_descriptor_out = FfiOwnedBuffer {
         ptr: ptr::null_mut(),
@@ -1588,22 +1597,30 @@ fn standard_ffi_skill_config_round_trip() {
     assert_eq!(read_owned_buffer_text(&value_out), "sk-standard-ffi");
     unsafe { luaskills_ffi_buffer_free(value_out) };
 
-    let empty_value = CString::new("").expect("empty value cstring");
+    let empty_values_json = CString::new(r#"{"api_token":""}"#).expect("empty values json cstring");
     let mut empty_set_error = FfiOwnedBuffer {
         ptr: ptr::null_mut(),
         len: 0,
     };
+    let mut empty_set_result = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
     let empty_set_status = unsafe {
-        luaskills_ffi_skill_config_set(
+        luaskills_ffi_skill_config_set_values(
             engine_id,
             skill_id.as_ptr(),
-            key.as_ptr(),
-            empty_value.as_ptr(),
+            empty_values_json.as_ptr(),
+            ptr::null(),
+            &mut empty_set_result,
             &mut empty_set_error,
         )
     };
     assert_eq!(empty_set_status, FFI_STATUS_ERROR);
-    assert!(read_owned_buffer_text(&empty_set_error).contains("below minimum"));
+    assert!(empty_set_result.ptr.is_null());
+    let empty_set_error_text = read_owned_buffer_text(&empty_set_error);
+    assert!(empty_set_error_text.contains("CONFIG_VALUE_OUT_OF_RANGE"));
+    assert!(empty_set_error_text.contains("invalid sensitive configuration value"));
     unsafe { luaskills_ffi_buffer_free(empty_set_error) };
 
     let mut empty_value_out = FfiOwnedBuffer {
@@ -1652,12 +1669,68 @@ fn standard_ffi_skill_config_round_trip() {
     let list_json: serde_json::Value = serde_json::from_str(&read_owned_buffer_text(&list_out))
         .expect("skill config list json should parse");
     assert_eq!(list_json.as_array().map(Vec::len), Some(1));
+    assert_eq!(list_json[0]["store_scope"], "system-skills");
     assert_eq!(list_json[0]["skill_id"], "demo-skill");
     assert_eq!(list_json[0]["key"], "api_token");
     assert_eq!(list_json[0]["value"], "sk-standard-ffi");
     unsafe { luaskills_ffi_buffer_free(list_out) };
 
-    let mut deleted_out = 0_u8;
+    let mut events_out = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let mut events_error = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let events_status = unsafe {
+        luaskills_ffi_skill_config_events_poll(
+            engine_id,
+            ptr::null(),
+            100,
+            &mut events_out,
+            &mut events_error,
+        )
+    };
+    assert_eq!(events_status, FFI_STATUS_OK);
+    assert!(events_error.ptr.is_null());
+    let events_json: serde_json::Value = serde_json::from_str(&read_owned_buffer_text(&events_out))
+        .expect("skill config events should parse");
+    assert_eq!(events_json["events"].as_array().map(Vec::len), Some(1));
+    assert_eq!(events_json["events"][0]["source"], "local_write");
+    assert_eq!(events_json["next_sequence"], "1");
+    unsafe { luaskills_ffi_buffer_free(events_out) };
+
+    let mut refresh_out = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let mut refresh_error = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let refresh_status = unsafe {
+        luaskills_ffi_skill_config_refresh(
+            engine_id,
+            ptr::null(),
+            &mut refresh_out,
+            &mut refresh_error,
+        )
+    };
+    assert_eq!(refresh_status, FFI_STATUS_OK);
+    assert!(refresh_error.ptr.is_null());
+    let refresh_json: serde_json::Value =
+        serde_json::from_str(&read_owned_buffer_text(&refresh_out))
+            .expect("skill config refresh should parse");
+    assert_eq!(refresh_json.as_array().map(Vec::len), Some(2));
+    assert_eq!(refresh_json[0]["changed"], false);
+    assert_eq!(refresh_json[1]["changed"], false);
+    unsafe { luaskills_ffi_buffer_free(refresh_out) };
+
+    let mut delete_result_out = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
     let mut delete_error = FfiOwnedBuffer {
         ptr: ptr::null_mut(),
         len: 0,
@@ -1667,13 +1740,19 @@ fn standard_ffi_skill_config_round_trip() {
             engine_id,
             skill_id.as_ptr(),
             key.as_ptr(),
-            &mut deleted_out,
+            ptr::null(),
+            &mut delete_result_out,
             &mut delete_error,
         )
     };
     assert_eq!(delete_status, FFI_STATUS_OK);
     assert!(delete_error.ptr.is_null());
-    assert_eq!(deleted_out, 1);
+    let delete_result: serde_json::Value =
+        serde_json::from_str(&read_owned_buffer_text(&delete_result_out))
+            .expect("skill config delete result should parse");
+    assert_eq!(delete_result["deleted"], true);
+    assert_eq!(delete_result["revision"], "2");
+    unsafe { luaskills_ffi_buffer_free(delete_result_out) };
 
     let mut free_error = FfiOwnedBuffer {
         ptr: ptr::null_mut(),

@@ -1090,11 +1090,12 @@ bash scripts/debug-tools/managed_runtime_smoke.sh
 | --- | --- | --- | --- |
 | `vulcan.config.get(key)` | `key: string` | `string \| nil` | 读取显式值或声明默认值；key 必须已声明 |
 | `vulcan.config.has(key)` | `key: string` | `boolean` | 判断是否存在显式值或声明默认值；key 必须已声明 |
-| `vulcan.config.set(key, value)` | `key: string`；`value: string` | `true` | 按声明类型和约束校验、规范化并持久化 |
+| `vulcan.config.set(key, value)` | `key: string`；`value: scalar` | `true` | 通过原子批量事务写入单个值 |
+| `vulcan.config.set(values)` | `values: table<string, scalar>` | `true` | 校验并持久化一个非空全有或全无批次 |
 | `vulcan.config.delete(key)` | `key: string` | `boolean` | 删除显式值；之后可以回退到声明默认值 |
 | `vulcan.config.list()` | 无 | `table<string, string>` | 列出当前包全部声明项的有效值 |
 | `vulcan.config.describe()` | 无 | `table` | 获取当前包参数名、类型、作者提供的说明、约束、枚举和状态，不包含值 |
-| `vulcan.config.status()` | 无 | `table` | 获取完整性、缺失项、非法项和 orphaned 数量 |
+| `vulcan.config.status()` | 无 | `table` | 获取 revision、存储作用域、完整性、静态/业务问题和 orphaned 键 |
 
 最小示例：
 
@@ -1117,7 +1118,8 @@ return use_service(api_token)
 - 配置严格按技能包隔离。嵌套调用目标包时切换到目标包，返回后恢复调用方。
 - 这组 API **要求当前存在活动 skill 上下文**；如果在没有当前 skill 身份的系统运行时里调用，会直接报错。
 - 缺失或非法配置不会阻止技能包加载，具体 entry 应在需要时检查并提示。
-- 统一主配置文件默认位于 `<runtime_root>/config/skill_config.json`；宿主也可以显式覆盖路径。
+- 宿主必须提供绝对用户级 `skill_config_root`；普通包与系统包分别路由到其下的 `skills/config.json` 与 `system-skills/config.json`。
+- 可选 `config_validator` 在同一个原子事务内通过隔离且无能力的 Lua 状态执行跨字段校验。
 - 声明中的人类可读字段使用技能包作者选择的单一语言；面向广泛分发的技能包建议使用英文，但不强制。
 - 完整声明格式、类型存储规则、宿主权限边界和 FFI 对接见 [Skill 包级配置声明、运行时控制与宿主对接](architecture/skill-config-system-design.md)。
 

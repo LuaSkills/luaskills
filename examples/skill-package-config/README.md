@@ -9,9 +9,11 @@ The package covers:
 - `integer`, `string`, `float`, `enum`, and `boolean`;
 - numeric ranges and Unicode string-length limits;
 - package-author-provided descriptions and enum metadata;
+- host-facing titles, groups, ordering, formats, restart hints, and advanced flags;
 - defaults and one required sensitive value;
+- an isolated cross-field `config_validator`;
 - `vulcan.config.describe/status`;
-- one valid normalized write and one intentionally invalid write.
+- atomic table writes, one valid normalized write, and one intentionally invalid write.
 
 Expected flow:
 
@@ -20,7 +22,7 @@ Expected flow:
 3. Use the host `runtime-config` wrapper with `action=describe`.
 4. After host or user authorization, set `api_token`.
 5. Call `example-config-skill-query`.
-6. Pass `action=set_valid_demo` to persist `retry_count=5`.
+6. Pass `action=set_valid_demo` to atomically persist `retry_count=5` and `telemetry_enabled=true`.
 7. Pass `action=set_invalid_demo` to observe range validation rejecting `99`.
 
 Configuration belongs to the package. Both `query` and `status` use the same values.

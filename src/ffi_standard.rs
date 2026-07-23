@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::Ordering;
 
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::ffi::{
@@ -25,6 +27,7 @@ use crate::host::database::{
     set_lancedb_provider_json_callback, set_sqlite_provider_callback,
     set_sqlite_provider_json_callback,
 };
+use crate::runtime::config_tool::deserialize_unique_config_values;
 use crate::runtime::logging;
 use crate::runtime::managed_session_events::{
     FallibleRuntimeManagedSessionWakeCallback, RuntimeManagedSessionEventBatch,
@@ -45,13 +48,22 @@ use crate::tool_cache::ToolCacheConfig;
 use crate::{
     LuaEngine, LuaEngineOptions, LuaVmPoolConfig, RuntimeEntryDescriptor,
     RuntimeEntryParameterDescriptor, RuntimeInvocationResult, SkillApplyResult,
-    SkillUninstallResult,
+    SkillPackageConfigInputValue, SkillUninstallResult,
 };
 
 const FFI_STATUS_OK: i32 = 0;
 const FFI_STATUS_ERROR: i32 = 1;
 const FFI_SOURCE_TYPE_ABSENT: i32 = -1;
 const FFI_SOURCE_TYPE_GITHUB: i32 = 0;
+
+/// Strict standard-ABI batch wrapper that rejects duplicate JSON object keys.
+/// 拒绝重复 JSON 对象键的严格标准 ABI 批次封装。
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct StrictSkillConfigInputValues(
+    #[serde(deserialize_with = "deserialize_unique_config_values")]
+    BTreeMap<String, SkillPackageConfigInputValue>,
+);
 const FFI_SOURCE_TYPE_URL: i32 = 1;
 const FFI_SOURCE_TYPE_OFFICIAL_HUB: i32 = 2;
 const FFI_SOURCE_TYPE_PRIVATE_URL_MANIFEST: i32 = 3;
@@ -220,19 +232,6 @@ fn parse_required_string(value: *const c_char, field_name: &str) -> Result<Strin
 
 /// Parse one required UTF-8 string pointer while allowing one empty string payload.
 /// 解析单个必填 UTF-8 字符串指针，并允许空字符串载荷。
-fn parse_required_string_allow_empty(
-    value: *const c_char,
-    field_name: &str,
-) -> Result<String, String> {
-    if value.is_null() {
-        return Err(format!("{} must not be null", field_name));
-    }
-    unsafe { CStr::from_ptr(value) }
-        .to_str()
-        .map(|text| text.to_string())
-        .map_err(|error| format!("{} contains invalid UTF-8: {}", field_name, error))
-}
-
 /// Parse one optional UTF-8 string pointer.
 /// 解析单个可选 UTF-8 字符串指针。
 fn parse_optional_string(value: *const c_char, field_name: &str) -> Result<Option<String>, String> {
@@ -533,11 +532,12 @@ fn parse_host_options_with_managed_roots(
             "databases",
             has_runtime_root,
         )?,
-        skill_config_file_path: parse_optional_string(
-            value.skill_config_file_path,
-            "skill_config_file_path",
-        )?
-        .map(PathBuf::from),
+        skill_config_root: parse_optional_string(value.skill_config_root, "skill_config_root")?
+            .map(PathBuf::from),
+        skill_config_lock_timeout_ms: (value.skill_config_lock_timeout_ms != 0)
+            .then_some(value.skill_config_lock_timeout_ms),
+        skill_config_watch_debounce_ms: (value.skill_config_watch_debounce_ms != 0)
+            .then_some(value.skill_config_watch_debounce_ms),
         allow_network_download: value.allow_network_download != 0,
         github_base_url: parse_optional_string(value.github_base_url, "github_base_url")?,
         github_api_base_url: parse_optional_string(
@@ -2867,7 +2867,10 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_list(
             }
             Err(error) => ffi_error_status(
                 error_out,
-                format!("failed to serialize skill config entries: {}", error),
+                format!(
+                    "CONFIG_DECLARATION_INVALID: failed to serialize skill config entries: {}",
+                    error
+                ),
             ),
         },
         Err(error) => ffi_error_status(error_out, error),
@@ -2919,7 +2922,7 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_describe(
             Err(error) => ffi_error_status(
                 error_out,
                 format!(
-                    "failed to serialize skill package configuration descriptors: {}",
+                    "CONFIG_DECLARATION_INVALID: failed to serialize skill package configuration descriptors: {}",
                     error
                 ),
             ),
@@ -2966,7 +2969,7 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_validate(
             Err(error) => ffi_error_status(
                 error_out,
                 format!(
-                    "failed to serialize skill package configuration status: {}",
+                    "CONFIG_DECLARATION_INVALID: failed to serialize skill package configuration status: {}",
                     error
                 ),
             ),
@@ -3023,8 +3026,8 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_get(
     }
 }
 
-/// Insert or replace one skill config value through the standard C ABI surface.
-/// 通过标准 C ABI 接口插入或替换单个技能配置值。
+/// Atomically insert or replace one package configuration batch through the standard C ABI.
+/// 通过标准 C ABI 原子插入或替换单个技能包配置批次。
 /// # Safety
 /// # 安全性
 /// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
@@ -3032,30 +3035,56 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_get(
 /// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
 /// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn luaskills_ffi_skill_config_set(
+pub unsafe extern "C" fn luaskills_ffi_skill_config_set_values(
     engine_id: u64,
     skill_id: *const c_char,
-    key: *const c_char,
-    value: *const c_char,
+    values_json: *const c_char,
+    expected_revision: *const c_char,
+    result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
     clear_error_out(error_out);
+    clear_out_buffer(result_json_out);
+    if result_json_out.is_null() {
+        return ffi_error_status(error_out, "result_json_out must not be null");
+    }
     let skill_id = match parse_required_string(skill_id, "skill_id") {
         Ok(skill_id) => skill_id,
         Err(error) => return ffi_error_status(error_out, error),
     };
-    let key = match parse_required_string(key, "key") {
-        Ok(key) => key,
+    let values_json = match parse_required_string(values_json, "values_json") {
+        Ok(values_json) => values_json,
         Err(error) => return ffi_error_status(error_out, error),
     };
-    let value = match parse_required_string_allow_empty(value, "value") {
-        Ok(value) => value,
+    let values = match serde_json::from_str::<StrictSkillConfigInputValues>(&values_json) {
+        Ok(values) => values.0,
+        Err(error) => {
+            return ffi_error_status(
+                error_out,
+                format!("values_json must be one typed JSON object: {}", error),
+            );
+        }
+    };
+    let expected_revision = match parse_optional_string(expected_revision, "expected_revision") {
+        Ok(expected_revision) => expected_revision,
         Err(error) => return ffi_error_status(error_out, error),
     };
     match with_engine_mut(engine_id, |engine| {
-        engine.set_skill_config_value(&skill_id, &key, &value)
+        engine.set_skill_config_values(&skill_id, values, expected_revision.as_deref())
     }) {
-        Ok(_) => ffi_ok_status(error_out),
+        Ok(result) => match serde_json::to_string(&result) {
+            Ok(result_json) => {
+                unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(
+                error_out,
+                format!(
+                    "CONFIG_DECLARATION_INVALID: failed to serialize skill config write result: {}",
+                    error
+                ),
+            ),
+        },
         Err(error) => ffi_error_status(error_out, error),
     }
 }
@@ -3073,13 +3102,14 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_delete(
     engine_id: u64,
     skill_id: *const c_char,
     key: *const c_char,
-    deleted_out: *mut u8,
+    expected_revision: *const c_char,
+    result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
     clear_error_out(error_out);
-    clear_out_u8(deleted_out);
-    if deleted_out.is_null() {
-        return ffi_error_status(error_out, "deleted_out must not be null");
+    clear_out_buffer(result_json_out);
+    if result_json_out.is_null() {
+        return ffi_error_status(error_out, "result_json_out must not be null");
     }
     let skill_id = match parse_required_string(skill_id, "skill_id") {
         Ok(skill_id) => skill_id,
@@ -3089,13 +3119,118 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_delete(
         Ok(key) => key,
         Err(error) => return ffi_error_status(error_out, error),
     };
+    let expected_revision = match parse_optional_string(expected_revision, "expected_revision") {
+        Ok(expected_revision) => expected_revision,
+        Err(error) => return ffi_error_status(error_out, error),
+    };
     match with_engine_mut(engine_id, |engine| {
-        engine.delete_skill_config_value(&skill_id, &key)
+        engine.delete_skill_config_value(&skill_id, &key, expected_revision.as_deref())
     }) {
-        Ok(deleted) => {
-            unsafe { *deleted_out = u8::from(deleted) };
-            ffi_ok_status(error_out)
+        Ok(result) => match serde_json::to_string(&result) {
+            Ok(result_json) => {
+                unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(
+                error_out,
+                format!(
+                    "CONFIG_DECLARATION_INVALID: failed to serialize skill config delete result: {}",
+                    error
+                ),
+            ),
+        },
+        Err(error) => ffi_error_status(error_out, error),
+    }
+}
+
+/// Explicitly refresh one selected skill configuration store or both stores.
+/// 显式刷新一个选定技能配置存储或两个存储。
+/// # Safety
+/// # 安全性
+/// Optional strings must be null or valid UTF-8 C strings, and output pointers must be writable.
+/// 可选字符串必须为空指针或合法 UTF-8 C 字符串，输出指针必须可写。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_skill_config_refresh(
+    engine_id: u64,
+    store_scope: *const c_char,
+    result_json_out: *mut FfiOwnedBuffer,
+    error_out: *mut FfiOwnedBuffer,
+) -> i32 {
+    clear_error_out(error_out);
+    clear_out_buffer(result_json_out);
+    if result_json_out.is_null() {
+        return ffi_error_status(error_out, "result_json_out must not be null");
+    }
+    let store_scope = match parse_optional_string(store_scope, "store_scope") {
+        Ok(store_scope) => store_scope,
+        Err(error) => return ffi_error_status(error_out, error),
+    };
+    match with_engine(engine_id, |engine| {
+        engine.refresh_skill_config(store_scope.as_deref())
+    }) {
+        Ok(result) => match serde_json::to_string(&result) {
+            Ok(result_json) => {
+                unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(
+                error_out,
+                format!(
+                    "CONFIG_DECLARATION_INVALID: failed to serialize skill config refresh result: {error}"
+                ),
+            ),
+        },
+        Err(error) => ffi_error_status(error_out, error),
+    }
+}
+
+/// Poll ordered skill configuration events through the standard C ABI.
+/// 通过标准 C ABI 轮询有序技能配置事件。
+/// # Safety
+/// # 安全性
+/// Optional strings must be null or valid UTF-8 C strings, and output pointers must be writable.
+/// 可选字符串必须为空指针或合法 UTF-8 C 字符串，输出指针必须可写。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_skill_config_events_poll(
+    engine_id: u64,
+    after_sequence: *const c_char,
+    limit: u64,
+    result_json_out: *mut FfiOwnedBuffer,
+    error_out: *mut FfiOwnedBuffer,
+) -> i32 {
+    clear_error_out(error_out);
+    clear_out_buffer(result_json_out);
+    if result_json_out.is_null() {
+        return ffi_error_status(error_out, "result_json_out must not be null");
+    }
+    let after_sequence = match parse_optional_string(after_sequence, "after_sequence") {
+        Ok(after_sequence) => after_sequence,
+        Err(error) => return ffi_error_status(error_out, error),
+    };
+    let limit = match usize::try_from(limit) {
+        Ok(limit) => limit,
+        Err(_) => {
+            return ffi_error_status(
+                error_out,
+                "event poll limit is outside the platform usize range",
+            );
         }
+    };
+    match with_engine(engine_id, |engine| {
+        engine.poll_skill_config_events(after_sequence.as_deref(), limit)
+    }) {
+        Ok(result) => match serde_json::to_string(&result) {
+            Ok(result_json) => {
+                unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(
+                error_out,
+                format!(
+                    "CONFIG_DECLARATION_INVALID: failed to serialize skill config event batch: {error}"
+                ),
+            ),
+        },
         Err(error) => ffi_error_status(error_out, error),
     }
 }

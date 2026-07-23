@@ -1,6 +1,6 @@
 [package]
 name = "luaskills"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -18,6 +18,7 @@ include = [
     "/README.md",
     "/deny.toml",
     "/include/**",
+    "/contracts/**",
     "/src/**",
     "/skills/**",
 ]
@@ -32,6 +33,7 @@ flate2 = "1"
 libc = "0.2"
 libloading = "0.8"
 mlua = { version = "0.12.0-rc.1", features = ["luajit52", "vendored", "serialize", "send"] }
+notify = "8.2.0"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }

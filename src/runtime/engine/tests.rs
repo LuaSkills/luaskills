@@ -7,9 +7,7 @@ use super::host_result::{
     resolve_host_result_capability, validate_change_set_payload,
 };
 use super::lease::RuntimeSessionManager;
-use super::runlua::{
-    ExecShellLauncher, lock_runlua_cwd_guard, lock_runlua_print_capture, runlua_cwd_guard,
-};
+use super::runlua::{ExecShellLauncher, lock_runlua_print_capture, runlua_cwd_guard};
 #[cfg(windows)]
 use super::vulcan_process_candidate_paths;
 #[cfg(windows)]
@@ -680,9 +678,14 @@ fn normalize_host_visible_path_text_preserves_posix_path() {
 /// 构造仅用于入口注册表测试的最小引擎实例。
 fn make_test_engine(skills: HashMap<String, LoadedSkill>) -> LuaEngine {
     let skill_config_service = Arc::new(
-        SkillPackageConfigService::new(None).expect("create runtime test skill config service"),
+        SkillPackageConfigService::new(None, Duration::from_secs(5), Duration::from_millis(200))
+            .expect("create runtime test skill config service"),
     );
-    skill_config_service.replace_registry(skills.values().map(|skill| &skill.meta));
+    skill_config_service.replace_registry(
+        skills
+            .values()
+            .map(|skill| (&skill.meta, skill.root_name.as_str(), skill.dir.as_path())),
+    );
     LuaEngine {
         skills,
         entry_registry: Default::default(),
@@ -4313,10 +4316,11 @@ fn skill_config_engine_api_persists_values_into_explicit_file() {
     }
     create_runtime_test_layout(&runtime_root);
     write_skill_config_test_skill(&runtime_root, "demo-skill");
-    let config_file = runtime_root.join("custom").join("skill_config.json");
+    let config_root = runtime_root.join("custom");
+    let config_file = config_root.join("system-skills").join("config.json");
 
     let mut engine = try_make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions {
-        skill_config_file_path: Some(config_file.clone()),
+        skill_config_root: Some(config_root),
         ..Default::default()
     })
     .expect("create skill config test engine");
@@ -4346,94 +4350,15 @@ fn skill_config_engine_api_persists_values_into_explicit_file() {
     assert!(config_file.exists());
 
     let deleted = engine
-        .delete_skill_config_value("demo-skill", "api_token")
+        .delete_skill_config_value("demo-skill", "api_token", None)
         .expect("delete explicit skill config");
-    assert!(deleted);
+    assert!(deleted.deleted);
     assert_eq!(
         engine
             .get_skill_config_value("demo-skill", "api_token")
             .expect("read deleted explicit skill config"),
         None
     );
-
-    let _ = fs::remove_dir_all(&runtime_root);
-}
-
-/// Verify the unified skill config store falls back to `<runtime_root>/config/skill_config.json` after roots load.
-/// 验证统一技能配置存储会在加载根目录后回退到 `<runtime_root>/config/skill_config.json`。
-#[test]
-fn skill_config_service_uses_default_runtime_config_file_after_load() {
-    let runtime_root = make_temp_runtime_root("skill_config_default_path");
-    if runtime_root.exists() {
-        let _ = fs::remove_dir_all(&runtime_root);
-    }
-    create_runtime_test_layout(&runtime_root);
-    write_skill_config_test_skill(&runtime_root, "demo-skill");
-
-    let mut engine =
-        try_make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions::default())
-            .expect("create default skill config test engine");
-
-    engine
-        .load_from_roots(&[crate::host::options::RuntimeSkillRoot {
-            name: "ROOT".to_string(),
-            skills_dir: runtime_root.join("skills"),
-        }])
-        .expect("load declared skill for default skill config path");
-
-    let expected_path = runtime_root.join("config").join("skill_config.json");
-    assert_eq!(
-        engine
-            .skill_config_service
-            .file_path()
-            .expect("resolve default skill config file path"),
-        expected_path
-    );
-
-    engine
-        .set_skill_config_value("demo-skill", "api_token", "sk-default-path")
-        .expect("write default skill config");
-    assert!(expected_path.exists());
-
-    let _ = fs::remove_dir_all(&runtime_root);
-}
-
-/// Verify the unified skill config store resolves the default config path even before the skills directory exists.
-/// 验证统一技能配置存储会在技能目录尚未创建前解析默认配置路径。
-#[test]
-fn skill_config_service_initializes_default_path_before_skills_dir_exists() {
-    let runtime_root = make_temp_runtime_root("skill_config_without_skills_dir");
-    if runtime_root.exists() {
-        let _ = fs::remove_dir_all(&runtime_root);
-    }
-    fs::create_dir_all(&runtime_root).expect("create runtime root without skills dir");
-
-    let missing_skills_dir = runtime_root.join("skills");
-    let mut engine =
-        try_make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions::default())
-            .expect("create config path initialization test engine");
-
-    engine
-        .load_from_roots(&[crate::host::options::RuntimeSkillRoot {
-            name: "ROOT".to_string(),
-            skills_dir: missing_skills_dir,
-        }])
-        .expect("load roots without an existing skills directory");
-
-    let expected_path = runtime_root.join("config").join("skill_config.json");
-    assert_eq!(
-        engine
-            .skill_config_service
-            .file_path()
-            .expect("resolve config path without skills directory"),
-        expected_path
-    );
-
-    let error = engine
-        .set_skill_config_value("demo-skill", "api_token", "sk-before-install")
-        .expect_err("reject config write before its package declaration is loaded");
-    assert!(error.contains("not loaded or effective"));
-    assert!(!expected_path.exists());
 
     let _ = fs::remove_dir_all(&runtime_root);
 }
@@ -4484,323 +4409,6 @@ fn reload_from_roots_rejects_invalid_chain_before_resetting_runtime_state() {
     let _ = fs::remove_dir_all(&runtime_root);
 }
 
-/// Verify reload failures after formal validation still preserve the active runtime view.
-/// 验证 formal 校验之后发生的重载失败仍会保留当前活动运行时视图。
-#[test]
-fn reload_from_roots_preserves_state_after_ambiguous_config_root_error() {
-    let runtime_root = make_temp_runtime_root("reload-ambiguous-preserves-state");
-    let first_ambiguous_root = make_temp_runtime_root("reload-ambiguous-first");
-    let second_ambiguous_root = make_temp_runtime_root("reload-ambiguous-second");
-    for path in [&runtime_root, &first_ambiguous_root, &second_ambiguous_root] {
-        if path.exists() {
-            let _ = fs::remove_dir_all(path);
-        }
-    }
-    let root_root = RuntimeSkillRoot {
-        name: "ROOT".to_string(),
-        skills_dir: runtime_root.join("root_skills"),
-    };
-    let user_root = RuntimeSkillRoot {
-        name: "USER".to_string(),
-        skills_dir: runtime_root.join("user_skills"),
-    };
-    fs::create_dir_all(&root_root.skills_dir).expect("create root skills root");
-    write_minimal_skill_to_root_with_response(&user_root.skills_dir, "vulcan-codekit", "user");
-    let mut engine = make_runtime_test_engine();
-    engine
-        .load_from_roots(&[root_root, user_root])
-        .expect("initial root and user runtime should load");
-    let previous_config_path = engine
-        .skill_config_service
-        .file_path()
-        .expect("resolve previous skill config path");
-
-    let ambiguous_reload_error = engine
-        .reload_from_roots(&[
-            RuntimeSkillRoot {
-                name: "ROOT".to_string(),
-                skills_dir: first_ambiguous_root.join("skills"),
-            },
-            RuntimeSkillRoot {
-                name: "PROJECT".to_string(),
-                skills_dir: second_ambiguous_root.join("skills"),
-            },
-        ])
-        .expect_err("ambiguous config root reload should fail");
-    assert!(
-        ambiguous_reload_error
-            .to_string()
-            .contains("multiple runtime roots map to different parents")
-    );
-
-    let result = engine
-        .call_skill("vulcan-codekit-ping", &json!({}), None)
-        .expect("old entry should remain callable after ambiguous reload failure");
-    assert_eq!(result.content, "user");
-    assert_eq!(
-        engine
-            .skill_config_service
-            .file_path()
-            .expect("resolve config path after failed reload"),
-        previous_config_path
-    );
-
-    let layers = engine
-        .run_lua("return vulcan.runtime.skills.layers()", &json!({}), None)
-        .expect("layers should still use the previous root chain");
-    assert_eq!(layers["labels"], json!(["USER"]));
-    assert_eq!(layers["default"], json!("USER"));
-
-    let _ = fs::remove_dir_all(&runtime_root);
-    let _ = fs::remove_dir_all(&first_ambiguous_root);
-    let _ = fs::remove_dir_all(&second_ambiguous_root);
-}
-
-/// Verify reloading a different runtime root updates the default unified skill-config path.
-/// 验证重新加载另一套运行时根目录时会同步更新默认统一技能配置路径。
-#[test]
-fn reload_from_roots_updates_default_skill_config_path() {
-    let first_runtime_root = make_temp_runtime_root("skill_config_reload_first");
-    let second_runtime_root = make_temp_runtime_root("skill_config_reload_second");
-    if first_runtime_root.exists() {
-        let _ = fs::remove_dir_all(&first_runtime_root);
-    }
-    if second_runtime_root.exists() {
-        let _ = fs::remove_dir_all(&second_runtime_root);
-    }
-    create_runtime_test_layout(&first_runtime_root);
-    create_runtime_test_layout(&second_runtime_root);
-
-    let mut engine =
-        try_make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions::default())
-            .expect("create reload skill config test engine");
-
-    engine
-        .load_from_roots(&[crate::host::options::RuntimeSkillRoot {
-            name: "ROOT".to_string(),
-            skills_dir: first_runtime_root.join("skills"),
-        }])
-        .expect("load first runtime root");
-    assert_eq!(
-        engine
-            .skill_config_service
-            .file_path()
-            .expect("resolve first config path"),
-        first_runtime_root.join("config").join("skill_config.json")
-    );
-
-    engine
-        .reload_from_roots(&[crate::host::options::RuntimeSkillRoot {
-            name: "ROOT".to_string(),
-            skills_dir: second_runtime_root.join("skills"),
-        }])
-        .expect("reload second runtime root");
-    assert_eq!(
-        engine
-            .skill_config_service
-            .file_path()
-            .expect("resolve second config path"),
-        second_runtime_root.join("config").join("skill_config.json")
-    );
-
-    let _ = fs::remove_dir_all(&first_runtime_root);
-    let _ = fs::remove_dir_all(&second_runtime_root);
-}
-
-/// Verify reload keeps the initially resolved explicit relative skill-config path.
-/// 验证重载会保持初始解析后的显式相对技能配置路径。
-#[test]
-fn reload_from_roots_keeps_frozen_relative_explicit_skill_config_path() {
-    let _cwd_guard = lock_runlua_cwd_guard();
-    let original_cwd = std::env::current_dir().expect("resolve original cwd");
-    /// Restore the process current directory when the test exits.
-    /// 在测试退出时恢复进程当前工作目录。
-    struct CwdRestoreGuard(PathBuf);
-    impl Drop for CwdRestoreGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
-        }
-    }
-    let _cwd_restore = CwdRestoreGuard(original_cwd);
-    let first_cwd = make_temp_runtime_root("skill_config_reload_relative_cwd_first");
-    let second_cwd = make_temp_runtime_root("skill_config_reload_relative_cwd_second");
-    let runtime_root = make_temp_runtime_root("skill_config_reload_relative_runtime");
-    for path in [&first_cwd, &second_cwd, &runtime_root] {
-        if path.exists() {
-            let _ = fs::remove_dir_all(path);
-        }
-        fs::create_dir_all(path).expect("create explicit config reload test directory");
-    }
-    let relative_config_path = PathBuf::from("config").join("skill_config.json");
-    std::env::set_current_dir(&first_cwd).expect("switch to first cwd");
-    #[cfg(target_os = "macos")]
-    let expected_config_path = fs::canonicalize(&first_cwd)
-        .expect("canonicalize first cwd")
-        .join(&relative_config_path);
-    #[cfg(not(target_os = "macos"))]
-    let expected_config_path = first_cwd.join(&relative_config_path);
-
-    let mut engine = try_make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions {
-        skill_config_file_path: Some(relative_config_path),
-        ..Default::default()
-    })
-    .expect("create explicit relative config reload test engine");
-    engine
-        .load_from_roots(&[RuntimeSkillRoot {
-            name: "ROOT".to_string(),
-            skills_dir: runtime_root.join("root_skills"),
-        }])
-        .expect("load initial root for explicit relative config reload test");
-    assert_eq!(
-        engine
-            .skill_config_service
-            .file_path()
-            .expect("resolve explicit config path before reload"),
-        expected_config_path
-    );
-
-    std::env::set_current_dir(&second_cwd).expect("switch to second cwd before reload");
-    engine
-        .reload_from_roots(&[RuntimeSkillRoot {
-            name: "ROOT".to_string(),
-            skills_dir: runtime_root.join("other_root_skills"),
-        }])
-        .expect("reload should preserve frozen explicit config path");
-    assert_eq!(
-        engine
-            .skill_config_service
-            .file_path()
-            .expect("resolve explicit config path after reload"),
-        expected_config_path
-    );
-
-    let _ = fs::remove_dir_all(&first_cwd);
-    let _ = fs::remove_dir_all(&second_cwd);
-    let _ = fs::remove_dir_all(&runtime_root);
-}
-
-/// Verify explicit unified config file paths bypass ambiguous runtime-root inference.
-/// 验证显式统一配置文件路径会绕过歧义运行时根目录推导。
-#[test]
-fn load_from_roots_accepts_explicit_skill_config_path_for_ambiguous_runtime_roots() {
-    let first_runtime_root = make_temp_runtime_root("skill_config_explicit_ambiguous_first");
-    let second_runtime_root = make_temp_runtime_root("skill_config_explicit_ambiguous_second");
-    if first_runtime_root.exists() {
-        let _ = fs::remove_dir_all(&first_runtime_root);
-    }
-    if second_runtime_root.exists() {
-        let _ = fs::remove_dir_all(&second_runtime_root);
-    }
-    fs::create_dir_all(&first_runtime_root).expect("create first explicit ambiguous runtime root");
-    fs::create_dir_all(&second_runtime_root)
-        .expect("create second explicit ambiguous runtime root");
-    let explicit_config_file = first_runtime_root.join("custom").join("skill_config.json");
-
-    let mut engine = try_make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions {
-        skill_config_file_path: Some(explicit_config_file.clone()),
-        ..Default::default()
-    })
-    .expect("create explicit ambiguous root test engine");
-
-    engine
-        .load_from_roots(&[
-            crate::host::options::RuntimeSkillRoot {
-                name: "ROOT".to_string(),
-                skills_dir: first_runtime_root.join("skills"),
-            },
-            crate::host::options::RuntimeSkillRoot {
-                name: "PROJECT".to_string(),
-                skills_dir: second_runtime_root.join("skills"),
-            },
-        ])
-        .expect("explicit config path should bypass ambiguous runtime roots");
-
-    assert_eq!(
-        engine
-            .skill_config_service
-            .file_path()
-            .expect("resolve explicit config path"),
-        explicit_config_file
-    );
-
-    let _ = fs::remove_dir_all(&first_runtime_root);
-    let _ = fs::remove_dir_all(&second_runtime_root);
-}
-
-/// Verify divergent runtime roots require one explicit unified skill config file path.
-/// 验证运行时根目录分叉时必须显式提供统一技能配置文件路径。
-#[test]
-fn load_from_roots_rejects_ambiguous_default_skill_config_runtime_root() {
-    let first_runtime_root = make_temp_runtime_root("skill_config_ambiguous_first");
-    let second_runtime_root = make_temp_runtime_root("skill_config_ambiguous_second");
-    if first_runtime_root.exists() {
-        let _ = fs::remove_dir_all(&first_runtime_root);
-    }
-    if second_runtime_root.exists() {
-        let _ = fs::remove_dir_all(&second_runtime_root);
-    }
-    fs::create_dir_all(&first_runtime_root).expect("create first ambiguous runtime root");
-    fs::create_dir_all(&second_runtime_root).expect("create second ambiguous runtime root");
-
-    let mut engine =
-        try_make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions::default())
-            .expect("create ambiguous root test engine");
-
-    let error = engine
-        .load_from_roots(&[
-            crate::host::options::RuntimeSkillRoot {
-                name: "ROOT".to_string(),
-                skills_dir: first_runtime_root.join("skills"),
-            },
-            crate::host::options::RuntimeSkillRoot {
-                name: "PROJECT".to_string(),
-                skills_dir: second_runtime_root.join("skills"),
-            },
-        ])
-        .expect_err("ambiguous runtime roots should require an explicit config file path");
-    assert!(
-        error
-            .to_string()
-            .contains("set host_options.skill_config_file_path explicitly"),
-        "unexpected ambiguous root error: {error}"
-    );
-
-    let _ = fs::remove_dir_all(&first_runtime_root);
-    let _ = fs::remove_dir_all(&second_runtime_root);
-}
-
-/// Verify lexically equivalent runtime roots do not get misclassified as ambiguous.
-/// 验证词法等价的运行时根目录不会被误判为歧义根目录。
-#[test]
-fn canonical_skill_config_runtime_root_normalizes_equivalent_runtime_roots() {
-    let runtime_root = make_temp_runtime_root("skill_config_equivalent_runtime_root");
-    if runtime_root.exists() {
-        let _ = fs::remove_dir_all(&runtime_root);
-    }
-    create_runtime_test_layout(&runtime_root);
-
-    let engine = try_make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions::default())
-        .expect("create equivalent runtime root test engine");
-
-    let equivalent_root = runtime_root.join("nested").join("..").join("skills");
-    let resolved_runtime_root = engine
-        .canonical_skill_config_runtime_root(&[
-            crate::host::options::RuntimeSkillRoot {
-                name: "ROOT".to_string(),
-                skills_dir: runtime_root.join("skills"),
-            },
-            crate::host::options::RuntimeSkillRoot {
-                name: "PROJECT".to_string(),
-                skills_dir: equivalent_root,
-            },
-        ])
-        .expect("equivalent runtime roots should resolve to one canonical root");
-
-    assert_eq!(resolved_runtime_root, runtime_root);
-
-    let _ = fs::remove_dir_all(&runtime_root);
-}
-
 /// Verify one loaded skill can read its own namespaced config through `vulcan.config.get`.
 /// 验证单个已加载技能可以通过 `vulcan.config.get` 读取自己的命名空间配置。
 #[test]
@@ -4812,9 +4420,11 @@ fn call_skill_reads_own_skill_config_namespace() {
     create_runtime_test_layout(&runtime_root);
     write_skill_config_test_skill(&runtime_root, "demo-skill");
 
-    let mut engine =
-        try_make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions::default())
-            .expect("create call_skill config test engine");
+    let mut engine = try_make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions {
+        skill_config_root: Some(runtime_root.join("user-config")),
+        ..Default::default()
+    })
+    .expect("create call_skill config test engine");
     engine
         .load_from_roots(&[crate::host::options::RuntimeSkillRoot {
             name: "ROOT".to_string(),
@@ -4844,7 +4454,10 @@ fn lua_package_config_describe_status_and_declaration_guards() {
     create_runtime_test_layout(&runtime_root);
     write_skill_config_test_skill(&runtime_root, "demo-skill");
 
-    let mut engine = make_runtime_test_engine();
+    let mut engine = make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions {
+        skill_config_root: Some(runtime_root.join("user-config")),
+        ..Default::default()
+    });
     engine
         .load_from_roots(&[crate::host::options::RuntimeSkillRoot {
             name: "ROOT".to_string(),
@@ -4894,7 +4507,10 @@ fn lua_visible_skill_marker_cannot_bypass_package_config_isolation() {
     write_skill_config_test_skill(&runtime_root, "package-a");
     write_skill_config_test_skill(&runtime_root, "package-b");
 
-    let mut engine = make_runtime_test_engine();
+    let mut engine = make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions {
+        skill_config_root: Some(runtime_root.join("user-config")),
+        ..Default::default()
+    });
     engine
         .load_from_roots(&[crate::host::options::RuntimeSkillRoot {
             name: "ROOT".to_string(),
@@ -4950,7 +4566,10 @@ fn nested_skill_call_isolates_and_restores_package_config_context() {
     write_skill_config_test_skill(&runtime_root, "package-b");
     write_skill_config_caller_test_skill(&runtime_root, "package-a", "package-b-ping");
 
-    let mut engine = make_runtime_test_engine();
+    let mut engine = make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions {
+        skill_config_root: Some(runtime_root.join("user-config")),
+        ..Default::default()
+    });
     engine
         .load_from_roots(&[crate::host::options::RuntimeSkillRoot {
             name: "ROOT".to_string(),
@@ -4981,13 +4600,13 @@ fn package_config_example_skill_smoke_test() {
         let _ = fs::remove_dir_all(&runtime_root);
     }
     fs::create_dir_all(&runtime_root).expect("create example smoke runtime root");
-    let config_file = runtime_root.join("config").join("skill_config.json");
+    let config_root = runtime_root.join("config");
     let example_skills_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
         .join("skill-package-config");
 
     let mut engine = try_make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions {
-        skill_config_file_path: Some(config_file),
+        skill_config_root: Some(config_root),
         ..Default::default()
     })
     .expect("create example package config engine");

@@ -2,6 +2,7 @@ name: example-config-skill
 version: 1.0.0
 enable: true
 debug: false
+config_validator: runtime/config-validator.lua
 
 config:
   - key: api_token
@@ -9,6 +10,12 @@ config:
     required: true
     sensitive: true
     description: Service access token
+    title: API token
+    group: Connection
+    order: 10
+    placeholder: sk-...
+    format: password
+    restart_required: true
     constraints:
       min_length: 1
       max_length: 4096
@@ -17,6 +24,9 @@ config:
     type: integer
     default: 3
     description: Request retry count
+    title: Retry count
+    group: Requests
+    order: 20
     constraints:
       minimum: 0
       maximum: 10
@@ -25,6 +35,10 @@ config:
     type: float
     default: 0.7
     description: Model sampling temperature
+    title: Temperature
+    group: Requests
+    order: 30
+    advanced: true
     constraints:
       minimum: 0.0
       maximum: 2.0
@@ -33,6 +47,9 @@ config:
     type: enum
     default: openai
     description: Service provider
+    title: Provider
+    group: Connection
+    order: 5
     options:
       - value: openai
         label: OpenAI
@@ -45,6 +62,9 @@ config:
     type: boolean
     default: false
     description: Whether telemetry is enabled
+    title: Telemetry
+    group: Diagnostics
+    order: 40
 
 entries:
   - name: query

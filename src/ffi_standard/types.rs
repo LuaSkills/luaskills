@@ -91,9 +91,15 @@ pub struct FfiLuaRuntimeHostOptions {
     /// Required database sibling directory name.
     /// 必填的数据库兄弟目录名称。
     pub database_dir_name: *const c_char,
-    /// Optional unified skill config file path owned by the host.
-    /// 由宿主拥有的可选统一技能配置文件路径。
-    pub skill_config_file_path: *const c_char,
+    /// Optional explicit user-level skill configuration root.
+    /// 可选的显式用户级技能配置根目录。
+    pub skill_config_root: *const c_char,
+    /// Optional configuration lock timeout in milliseconds, where zero selects the default.
+    /// 可选的配置锁超时毫秒数，其中零表示选择默认值。
+    pub skill_config_lock_timeout_ms: u64,
+    /// Optional configuration watcher debounce in milliseconds, where zero selects the default.
+    /// 可选的配置监听防抖毫秒数，其中零表示选择默认值。
+    pub skill_config_watch_debounce_ms: u64,
     /// Whether the runtime may perform network downloads.
     /// 运行时是否允许执行网络下载。
     pub allow_network_download: u8,

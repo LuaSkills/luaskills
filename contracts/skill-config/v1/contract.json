@@ -1,0 +1,122 @@
+{
+  "contract_version": 1,
+  "declaration": {
+    "describe_modes": [
+      "effective",
+      "installed"
+    ],
+    "formats": [
+      "text",
+      "password",
+      "uri",
+      "path",
+      "file",
+      "directory",
+      "multiline"
+    ],
+    "states": [
+      "unset",
+      "missing",
+      "default",
+      "configured",
+      "invalid"
+    ],
+    "store_scopes": [
+      "skills",
+      "system-skills"
+    ],
+    "types": [
+      "integer",
+      "string",
+      "float",
+      "enum",
+      "boolean"
+    ]
+  },
+  "errors": [
+    "CONFIG_ATOMIC_REPLACE_FAILED",
+    "CONFIG_BATCH_ARGUMENT_CONFLICT",
+    "CONFIG_BATCH_EMPTY",
+    "CONFIG_BATCH_TOO_LARGE",
+    "CONFIG_DECLARATION_INVALID",
+    "CONFIG_ENUM_VALUE_INVALID",
+    "CONFIG_EVENT_CURSOR_EXPIRED",
+    "CONFIG_EVENT_CURSOR_INVALID",
+    "CONFIG_FILE_TOO_LARGE",
+    "CONFIG_FORMAT_INVALID",
+    "CONFIG_FORMAT_VERSION_UNSUPPORTED",
+    "CONFIG_KEY_INVALID",
+    "CONFIG_KEY_UNDECLARED",
+    "CONFIG_LOCK_FAILED",
+    "CONFIG_LOCK_TIMEOUT",
+    "CONFIG_PACKAGE_NOT_FOUND",
+    "CONFIG_PATH_INVALID",
+    "CONFIG_PATH_UNAVAILABLE",
+    "CONFIG_RELOAD_FAILED",
+    "CONFIG_RESPONSE_TOO_LARGE",
+    "CONFIG_REVISION_CONFLICT",
+    "CONFIG_REVISION_EXHAUSTED",
+    "CONFIG_REVISION_INVALID",
+    "CONFIG_REVISION_REGRESSION",
+    "CONFIG_SNAPSHOT_UNAVAILABLE",
+    "CONFIG_VALIDATOR_FAILED",
+    "CONFIG_VALIDATOR_LIMIT_EXCEEDED",
+    "CONFIG_VALIDATOR_TIMEOUT",
+    "CONFIG_VALIDATOR_UNAVAILABLE",
+    "CONFIG_VALUE_OUT_OF_RANGE",
+    "CONFIG_VALUE_TOO_LONG",
+    "CONFIG_VALUE_TYPE_INVALID",
+    "CONFIG_WATCHER_FAILED"
+  ],
+  "limits": {
+    "default_lock_timeout_ms": 5000,
+    "default_watch_debounce_ms": 200,
+    "event_queue_capacity": 4096,
+    "maximum_batch_keys": 1024,
+    "maximum_diagnostic_value_preview_bytes": 4096,
+    "maximum_document_bytes": 67108864,
+    "maximum_enum_options": 1024,
+    "maximum_event_poll_limit": 1024,
+    "maximum_group_bytes": 256,
+    "maximum_hint_bytes": 8192,
+    "maximum_items_per_package": 1024,
+    "maximum_lock_timeout_ms": 60000,
+    "maximum_long_text_bytes": 16384,
+    "maximum_packages_per_document": 10000,
+    "maximum_safe_integer": 9007199254740991,
+    "maximum_short_text_bytes": 1024,
+    "maximum_string_characters": 1048576,
+    "maximum_tool_response_bytes": 67108864,
+    "maximum_value_bytes": 1048576,
+    "maximum_watch_debounce_ms": 5000,
+    "minimum_safe_integer": -9007199254740991,
+    "reserved_key_prefix": "luaskills."
+  },
+  "storage": {
+    "companion_lock_suffix": ".lock",
+    "format_version": 1,
+    "normal_relative_path": "skills/config.json",
+    "revision": "canonical unsigned decimal string",
+    "system_relative_path": "system-skills/config.json"
+  },
+  "tool": {
+    "actions": [
+      "describe",
+      "validate",
+      "list",
+      "get",
+      "set",
+      "delete",
+      "refresh"
+    ],
+    "event_sources": [
+      "local_write",
+      "external_reload"
+    ],
+    "name": "runtime-config",
+    "set_forms": [
+      "values",
+      "key/value"
+    ]
+  }
+}

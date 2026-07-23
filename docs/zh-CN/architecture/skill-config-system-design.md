@@ -1,25 +1,19 @@
-# Skill 包级配置声明、运行时控制与宿主对接
+# Skill 包级配置契约与宿主接入
 
-## 1. 适用范围
+LuaSkills 的配置归属单位始终是技能包目录，不是 entry。一个包内所有 entry 共享同一份声明、持久化值、revision 和业务校验器；Lua 只能访问当前正在执行的包，不能指定其他 `skill_id`。
 
-LuaSkills 的配置对象是**技能包**，不是包内的独立 entry。
+配置声明采用技能包作者选择的单一语言文本。生态发布建议使用英文，但运行时不强制，也不支持 `locale`、`*_i18n` 或语言回退。
 
-- 声明写在技能包根目录 `skill.yaml` 的顶层 `config` 字段。
-- 同一技能包的全部 entries 共享同一份声明和值。
-- 配置命名空间使用物理目录绑定后的稳定 `skill_id`。
-- entry 名称变化不会改变配置命名空间。
-- `config` 写在某个 entry 内会被视为未知字段并拒绝加载。
-- 不同技能包可以声明完全不同的配置项。
+## 唯一声明格式
 
-配置缺失或旧值非法不会阻止技能包加载。技能包应在真正需要配置的操作前调用 `vulcan.config.status()`，并给出可执行提示。
-
-## 2. 完整声明示例
+声明只能位于 `skill.yaml` 顶层：
 
 ```yaml
-name: example-skill
+name: example-config-skill
 version: 1.0.0
 enable: true
 debug: false
+config_validator: runtime/config-validator.lua
 
 config:
   - key: api_token
@@ -27,6 +21,12 @@ config:
     required: true
     sensitive: true
     description: Service access token
+    title: API token
+    group: Connection
+    order: 10
+    placeholder: sk-...
+    format: password
+    restart_required: true
     constraints:
       min_length: 1
       max_length: 4096
@@ -43,20 +43,21 @@ config:
     type: float
     default: 0.7
     description: Model sampling temperature
+    advanced: true
     constraints:
       minimum: 0.0
       maximum: 2.0
 
   - key: provider
     type: enum
-    required: true
+    default: openai
     description: Service provider
     options:
       - value: openai
         label: OpenAI
         description: OpenAI service
       - value: local
-        label: Local service
+        label: Local
         description: User-managed local service
 
   - key: telemetry_enabled
@@ -64,252 +65,172 @@ config:
     default: false
     description: Whether telemetry is enabled
 
-entries:
-  - name: query
-    description: Execute a query
-    lua_entry: runtime/query.lua
-    lua_module: example-skill.query
-  - name: status
-    description: Inspect configuration status
-    lua_entry: runtime/status.lua
-    lua_module: example-skill.status
+entries: []
 ```
 
-`query` 与 `status` 共享上述五个配置项。
+公共字段为：
 
-## 3. 公共字段
+- `key`：包内唯一稳定键，只允许小写 ASCII 字母开头，后续可使用小写字母、数字、`_`、`-`、`.`。
+- `type`：`integer`、`string`、`float`、`enum` 或 `boolean`。
+- `description`：必填单语言说明。
+- `required`、`sensitive`：默认 `false`。
+- `default`、`example`：必须与声明类型一致；默认值即使敏感也属于公开声明元数据。
+- `title`、`group`、`order`、`advanced`、`placeholder`：可选 UI 提示。
+- `format`：可选 `text`、`password`、`uri`、`path`、`file`、`directory`、`multiline`。
+- `restart_required`：提示宿主修改后可能需要执行重启流程。
+- `deprecated`、`deprecation_message`：弃用状态与迁移说明。
+- `constraints`：整数/浮点使用包含式 `minimum`、`maximum`；字符串使用 Unicode 标量数量 `min_length`、`max_length`。
+- `options`：仅 `enum` 使用，每项必须有 `value`、`label`、`description`。
 
-| 字段 | 必填 | 说明 |
-|---|---:|---|
-| `key` | 是 | 包内稳定参数名；不得为空或包含首尾空白；同一包内不得重复 |
-| `type` | 是 | `integer`、`string`、`float`、`enum`、`boolean` |
-| `required` | 否 | 默认 `false`；没有显式值和默认值时是否计为缺失 |
-| `default` | 否 | 类型化 YAML 值；加载时按与写入相同的规则校验；不会自动写入配置文件 |
-| `sensitive` | 否 | 默认 `false`；只提供给宿主作为权限和展示提示 |
-| `description` | 是 | 技能包作者提供的人类可读说明，不得为空 |
-| `constraints` | 否 | 类型专属约束 |
-| `options` | enum 必填 | 枚举选项，机器值不得重复 |
+未知字段、重复 key、错误类型、非有限浮点、超限文本和超过 JavaScript 安全整数范围的整数都会被拒绝。entry 内声明 `config` 或 `config_validator` 也会作为未知字段失败。
 
-清单结构采用严格未知字段检查。拼错字段名，或写入未支持的国际化字段，都不会被静默忽略。
+## 数值与存储公约
 
-## 4. 文本语言规则
-
-LuaSkills 不为配置声明单独实现国际化，也不解析语言标记。`description`、枚举 `label` 和枚举 `description` 均为技能包作者直接提供的单一文本。
-
-- 技能包作者可以选择适合目标用户的任意语言。
-- 面向广泛分发、跨地区宿主或公共生态的技能包建议统一使用英文。
-- LuaSkills 不强制英文，也不执行翻译、语言匹配或回退。
-- 宿主收到的文本与技能包声明一致，不包含语言标记或解析后的语言字段。
-- 如果开发者需要多语言体验，应由技能包自身或上层产品作为完整能力设计，不应在配置声明中加入私有 `*_i18n` 字段。
-
-## 5. 类型、约束与持久化格式
-
-配置文件只保存字符串。类型声明负责把宿主或 Lua 写入的字符串校验并规范化。
-
-| 类型 | YAML 默认值 | 可用约束 | 写入输入 | 持久化字符串 |
-|---|---|---|---|---|
-| `integer` | YAML 整数 | `minimum`、`maximum`，包含边界，必须为 i64 | 可含首尾空白的十进制整数 | i64 十进制规范形式，如 `003` 保存为 `3` |
-| `string` | YAML 字符串 | `min_length`、`max_length`，按 Unicode 标量数量计算 | 任意 UTF-8 字符串 | 原样保存，不自动 trim |
-| `float` | YAML 数字 | `minimum`、`maximum`，包含边界 | 可解析为 f64 的字符串 | 有限 f64 的规范十进制形式，如 `0.500` 保存为 `0.5` |
-| `enum` | 选项中的字符串 `value` | 不允许 `constraints` | 必须精确匹配某个 `value` | 对应稳定机器值 |
-| `boolean` | YAML 布尔值 | 不允许 `constraints` | 严格为小写 `true` 或 `false`，可有首尾空白 | `true` 或 `false` |
-
-额外规则：
-
-- `integer` 不允许长度约束。
-- `float` 不允许长度约束，也不允许 `NaN`、`inf`、`-inf`。
-- `string` 不允许数值范围。
-- `enum` 至少有一个选项；每项必须包含非空 `value`、`label`、`description`。
-- `boolean` 和 `enum` 不允许任何 `constraints`。
-- 下界不得大于上界，最小长度不得大于最大长度。
-- 默认值必须使用声明类型，并满足全部约束。
-
-## 6. 有效值、完整性与升级
-
-有效值解析顺序：
-
-1. 已持久化的显式值；
-2. 清单中的默认值；
-3. 未设置。
-
-`required=true` 只影响完整性判定，不阻止包加载。一个包在以下条件同时满足时 `complete=true`：
-
-- 每个必填项都有显式值或合法默认值；
-- 每个已持久化且仍然声明的值都满足当前声明。
-
-升级后可能出现两类状态：
-
-- **invalid**：key 仍被声明，但旧值不满足新类型、范围、长度或枚举。
-- **orphaned**：配置文件中存在，但当前包不再声明该 key。
-
-orphaned 不影响 `complete`，但会通过 `orphaned_count` 报告。技能包内部看不到 orphaned 的 key 和 value；宿主仍可通过原始 `list/get/delete` 管理它们。宿主 `set` 永远不能绕过声明。
-
-## 7. Lua API 与包隔离
-
-所有 Lua API 隐式使用当前正在执行的技能包，不接受 `skill_id` 参数。授权身份由 Rust 侧执行上下文持有；修改 Lua 可见的 `vulcan.runtime.internal.skill_name` 不会改变配置归属，也不能用于跨包读写。
-
-| API | 语义 |
-|---|---|
-| `vulcan.config.get(key)` | key 必须声明；返回显式值、默认值或 `nil` |
-| `vulcan.config.has(key)` | key 必须声明；显式值或默认值存在时返回 `true` |
-| `vulcan.config.set(key, value)` | key 必须声明；校验、规范化、持久化后返回 `true` |
-| `vulcan.config.delete(key)` | key 必须声明；只删除显式值，之后可回退默认值 |
-| `vulcan.config.list()` | 只列当前包声明项的有效值，不包含 orphaned |
-| `vulcan.config.describe()` | 返回当前包结构；不返回 `value` |
-| `vulcan.config.status()` | 返回 `complete`、`missing`、`invalid`、`orphaned_count` |
-
-嵌套调用时，包 A 调用包 B 的 entry，包 B 内只能访问包 B 配置；包 B 返回后恢复包 A 配置上下文。包内 API 禁止跨包读写。
-
-```lua
-local status = vulcan.config.status()
-if not status.complete then
-    return [[This skill package configuration is incomplete.
-
-Ask the AI to call the host runtime-config tool:
-1. Use action=describe to inspect names, types, constraints, and descriptions.
-2. After host or user authorization, use action=set for required values.
-
-If configuration mutation is unavailable, ask the user to provide the missing values.]]
-end
-
-local token = vulcan.config.get("api_token")
-```
-
-推荐技能在缺配置时返回清晰帮助，而不是抛出难以理解的内部错误。
-
-## 8. Rust 宿主 API
-
-结构与状态类型从 crate 根导出，包括声明类型、运行时描述符、状态、问题和校验错误。
-
-主要方法：
-
-```rust
-engine.describe_skill_package_config(skill_id, include_values)
-engine.validate_skill_package_config(skill_id)
-engine.list_skill_config_entries(skill_id)
-engine.get_skill_config_value(skill_id, key)
-engine.set_skill_config_value(skill_id, key, value)
-engine.delete_skill_config_value(skill_id, key)
-```
-
-管理面语义：
-
-- `describe` 返回声明、约束、作者提供的说明、值来源和有效性。
-- `skill_id=None` 时按技能包标识排序返回全部有效包。
-- `include_values=false` 时 JSON 中完全省略 `value`。
-- `include_values=true` 时返回未遮罩的有效值；非法旧值也会原样返回并附带结构化 `validation_error`。
-- `validate` 只读，不修改持久化状态。
-- 原始 `get` 只读取已保存值，不回退默认值。
-- 原始 `list/get/delete` 可处理 orphaned。
-- `set` 要求目标包当前有效、key 已声明，并返回规范化后的最终字符串。
-
-## 9. 标准 C ABI
-
-结构与状态接口：
-
-```c
-int32_t luaskills_ffi_skill_config_describe(
-    uint64_t engine_id,
-    const char *skill_id,       /* 可为 NULL */
-    uint8_t include_values,     /* 只能是 0 或 1 */
-    FfiOwnedBuffer *result_json_out,
-    FfiOwnedBuffer *error_out
-);
-
-int32_t luaskills_ffi_skill_config_validate(
-    uint64_t engine_id,
-    const char *skill_id,
-    FfiOwnedBuffer *result_json_out,
-    FfiOwnedBuffer *error_out
-);
-```
-
-原有 `list/get/set/delete` 继续作为宿主管理面。`set` 严格受当前有效包声明和类型约束限制；`delete` 仍允许清理 orphaned。`include_values` 传入除 `0`、`1` 以外的值会失败。
-
-## 10. JSON FFI
-
-结构查询：
-
-```json
-{
-  "engine_id": 42,
-  "skill_id": "example-skill",
-  "include_values": false
-}
-```
-
-调用 `luaskills_ffi_skill_config_describe_json`。状态查询：
-
-```json
-{
-  "engine_id": 42,
-  "skill_id": "example-skill"
-}
-```
-
-调用 `luaskills_ffi_skill_config_validate_json`。请求采用严格未知字段检查，`include_values` 省略时为 `false`。
-
-## 11. 宿主权限与安全边界
-
-LuaSkills 不负责判断“当前用户是否有权读取或修改配置值”，也不根据 `sensitive` 自动遮罩。
-
-宿主或上层封装必须自行决定：
-
-1. 是否向当前调用方暴露原始 `list/get`。
-2. 是否允许结构查询设置 `include_values=true`。
-3. 是否直接允许 `set/delete`。
-4. 是否在修改前通知用户并取得授权。
-5. 是否对 `sensitive=true` 的值进行日志过滤、界面遮罩和模型上下文隔离。
-
-推荐默认策略：
-
-- 结构发现使用 `include_values=false`；
-- 只有明确需要且已经授权时才使用 `include_values=true`；
-- `set/delete` 由宿主执行用户、租户、角色或交互确认策略；
-- 不把包含敏感值的响应写入普通日志；
-- 不把 `sensitive` 当作 LuaSkills 已实施的安全机制。
-
-## 12. 推荐统一宿主工具
-
-建议上层提供一个 `runtime-config` 工具：
-
-| action | 参数 | 用途 |
-|---|---|---|
-| `describe` | `skill_id?`、`include_values?` | 获取配置列表、说明、类型、约束、枚举和状态 |
-| `validate` | `skill_id` | 获取缺失、非法与 orphaned 数量 |
-| `list` | `skill_id?` | 获取原始持久化记录 |
-| `get` | `skill_id`、`key` | 获取原始持久化值 |
-| `set` | `skill_id`、`key`、`value` | 校验并设置声明项 |
-| `delete` | `skill_id`、`key` | 删除显式值或清理 orphaned |
-
-技能返回缺配置提示时，应指导 AI 先用 `describe` 发现参数要求，再由宿主决定直接设置、强制指定值、请求用户授权，或要求用户提供值。
-
-## 13. 文件路径与格式
-
-宿主可通过 `LuaRuntimeHostOptions.skill_config_file_path` 指定文件。未指定时使用：
+跨 Rust、Lua、TypeScript、Python、Go 和 JSON 的公共整数范围是：
 
 ```text
-<runtime_root>/config/skill_config.json
+-9007199254740991 .. 9007199254740991
 ```
 
-文件按 `skill_id` 分组，值全部为字符串：
+浮点必须是有限 IEEE-754 双精度值；负零规范化为 `0`。持久化值统一保存为规范字符串：
+
+- integer：十进制，无前导零；
+- float：规范有限十进制表示；
+- boolean：`true` 或 `false`；
+- string/enum：UTF-8 原文。
+
+唯一持久化文档格式为：
 
 ```json
 {
+  "format_version": 1,
+  "revision": "12",
   "skills": {
-    "example-skill": {
-      "api_token": "sk-xxx",
-      "retry_count": "3",
-      "temperature": "0.7",
-      "provider": "openai",
-      "telemetry_enabled": "false"
+    "example-config-skill": {
+      "api_token": "secret",
+      "retry_count": "3"
     }
   }
 }
 ```
 
-运行时使用进程内共享路径锁和临时文件原子替换。直接手工编辑可以产生不符合声明的旧值；运行时不会静默修复，而是通过 `status/validate/describe` 明确报告。
+没有旧格式迁移或兼容读取。`format_version`、`revision`、`skills` 之外的字段以及任意重复对象 key 都会失败。revision 使用规范无符号十进制字符串，避免跨语言精度损失。
 
-## 14. 可运行示例
+宿主必须显式提供绝对 `skill_config_root`。LuaSkills 不从当前目录或运行时根推导配置位置：
 
-仓库内的 [skill-package-config 示例](../../../examples/skill-package-config/README.md) 可以直接作为第三方包模板。它包含五种类型、两个共享配置的 entries、缺配置提示、合法规范化写入和非法范围写入。
+```text
+<skill_config_root>/skills/config.json
+<skill_config_root>/system-skills/config.json
+```
+
+`ROOT` 中的系统技能写入第二个用户级文件；其他根写入第一个文件。依赖仍保持系统级。卸载技能不会删除配置，清理由上级产品按自身生命周期策略负责。
+
+## 一致性、缓存与监听
+
+每个文件使用稳定伴随锁 `<config.json>.lock`。写入流程为：获取跨进程锁、重新读取磁盘最新合法版本、校验可选 expected revision、完成整批校验、写入同目录唯一临时文件、同步并原子替换、更新内存快照。默认锁等待 5 秒，可由宿主在 1–60000 毫秒内配置。
+
+普通读取只访问最后一个合法不可变缓存快照。父目录文件监听默认执行 200 毫秒防抖；外部合法且 revision 更大的原子替换会自动重载。相同 revision 不同内容、revision 回退、删除已有文件、非法 JSON 或超限文件都不会污染快照，并产生结构化失败事件。宿主也可以显式 `refresh`。
+
+本契约只保证同一台机器、同一文件系统上的强一致事务，不提供网络文件系统或分布式一致性承诺。
+
+## 批量修改与 CAS
+
+批量写入是唯一底层写实现。任意一项的声明、类型、范围或业务校验失败时，文件、revision、缓存和事件都不变。成功事务只增加一次 revision 并产生一个逻辑事件。
+
+Lua 侧支持：
+
+```lua
+vulcan.config.set("retry_count", 5)
+vulcan.config.set({
+    retry_count = 5,
+    telemetry_enabled = true,
+})
+```
+
+Lua 直接从当前执行上下文取得包标识，因此无法跨包读写。宿主管理面必须显式传入 `skill_id`，并可使用 `expected_revision` 实现 CAS。删除也支持 CAS，并允许清理 orphaned key。
+
+## 受限业务校验器
+
+`config_validator` 是技能包内相对路径，目标必须是普通 `.lua` 文件。脚本返回一个函数，该函数接收包含默认值与显式值的完整类型化配置：
+
+```lua
+return function(values)
+    if values.provider == "local" and values.temperature > 1.0 then
+        return {
+            {
+                key = "temperature",
+                code = "local_temperature_too_high",
+                message = "Local provider requires temperature at or below 1.0",
+            },
+        }
+    end
+    return {}
+end
+```
+
+问题的 `key` 可省略；存在时必须引用已声明键。`code` 会以 `skill.` 前缀进入宿主协议。校验器运行在独立 Lua 状态中，没有文件、网络、工具、技能调用、配置写入、动态加载或调试能力，并受源码大小、内存、指令、时间、问题数量和消息长度上限约束。
+
+校验器错误不得把敏感值写入错误消息。运行时会对 issue 消息中的已声明敏感有效值做替换，并把脚本异常收敛为不包含原始异常文本的稳定错误。
+
+## `runtime-config` 共同工具契约
+
+建议上级统一封装工具名 `runtime-config`，支持：
+
+| action | 参数 | 结果 |
+|---|---|---|
+| `describe` | `skill_id?`、`mode?`、`root_name?`、`include_values?` | 声明、类型、说明、约束、默认值、UI 元数据、状态 |
+| `validate` | `skill_id` | 完整性、静态问题、业务问题、orphaned |
+| `list` | `skill_id?` | 原始持久化条目；每条都携带 `store_scope`，可区分普通与系统存储中的同名历史记录 |
+| `get` | `skill_id`、`key` | 单个原始值 |
+| `set` | `skill_id`、`values` 或 `key/value`、`expected_revision?` | 原子写入结果 |
+| `delete` | `skill_id`、`key`、`expected_revision?` | 删除结果 |
+| `refresh` | `store_scope?` | 一个或两个存储的刷新结果 |
+
+请求拒绝未知字段，也拒绝“字段已知但与当前 action 无关”的组合。`set` 的 `values` 与 `key/value` 互斥，空批次失败。
+
+完整工具响应按流式 JSON 编码计数，超过 64 MiB 时返回 `CONFIG_RESPONSE_TOO_LARGE`，不会先构造第二份超大编码缓冲。非敏感值出现在诊断中时，单个预览最多 4096 个 UTF-8 字节，并在合法字符边界追加 `[truncated]`；敏感值不生成预览。
+
+### 模型可见模式
+
+LuaSkills 不做用户授权、敏感值披露判断或加密。上级宿主应：
+
+1. 默认只向模型开放 `describe(mode=effective, include_values=false)` 与 `validate`。
+2. 默认禁止模型选择 `mode=installed` 或 `root_name`，避免把物理安装路径作为普通模型上下文披露；确有诊断需要时由宿主授权并裁剪 `absolute_path`。
+3. 自行决定是否开放 `get`、`list`、`include_values=true`、`set`、`delete`、`refresh`。
+4. 对读取原始值或修改配置执行产品自己的显式允许、强制策略或用户确认。
+5. 不把敏感值写入普通日志、工具摘要或错误。
+
+`include_values=false` 时响应完全省略运行时 `value`，但始终保留声明的 `default`。`include_values=true` 返回未遮罩值，调用前必须由宿主完成授权。
+
+### 宿主私有模式
+
+同一个 dispatcher 可以不注册为模型工具，由宿主设置页、CLI、管理 API 或后台服务直接调用。权限仍由宿主决定；LuaSkills 只负责声明约束、包路由、事务、快照和事件。
+
+## 缺配置时的技能帮助
+
+技能发现配置不完整时，应先返回可执行的英文提示，避免猜测参数或要求用户编辑内部文件：
+
+```text
+This skill package configuration is incomplete.
+Ask the AI to call runtime-config with action=describe and this package id.
+After host or user authorization, set the missing declared keys.
+If mutation is unavailable, ask the user to provide the listed parameters.
+```
+
+技能可以通过 `vulcan.config.status()` 获得缺失项和问题，通过 `vulcan.config.describe()` 获得声明结构。不得把敏感当前值拼进帮助文本。
+
+## 事件
+
+配置事件使用引擎内单调十进制 `sequence`，来源只有 `local_write` 或 `external_reload`。事件包含存储作用域、revision、变更键、需要重启的键和可选完整性；失败事件包含稳定 code/message，不含配置值。
+
+事件队列有界。分页返回的 `next_sequence` 只前进到本页实际返回的最后一个事件，不能跳过尚未读取的事件；过期或超前游标会显式失败。SDK 提供 poll、wait 与 callback 封装。
+
+## installed 与 effective 发现
+
+`describe(mode=effective)` 返回当前根优先级下真正生效的包。`describe(mode=installed)` 只解析每个物理目录的 `skill.yaml`，不执行 Lua，可诊断被遮蔽、禁用、空目录停用标记和非法清单。installed 模式不返回配置值，并可用 `root_name` 过滤。
+
+## 相关入口
+
+- [技能开发指南](../../skill-development.md)
+- [FFI 对接指南](../ffi/integration-guide.md)
+- [完整示例](../../../examples/skill-package-config/README.md)

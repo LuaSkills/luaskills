@@ -20,7 +20,10 @@ Ask the AI to call the host runtime-config tool:
     end
 
     if args.action == "set_valid_demo" then
-        vulcan.config.set("retry_count", "005")
+        vulcan.config.set({
+            retry_count = 5,
+            telemetry_enabled = true,
+        })
     elseif args.action == "set_invalid_demo" then
         vulcan.config.set("retry_count", "99")
     end

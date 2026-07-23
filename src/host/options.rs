@@ -89,12 +89,6 @@ impl LuaRuntimeLayout {
         self.runtime_root.join("config")
     }
 
-    /// Return the unified runtime skill-config file path.
-    /// 返回统一运行时技能配置文件路径。
-    pub fn skill_config_file_path(&self) -> PathBuf {
-        self.config_dir().join("skill_config.json")
-    }
-
     /// Return the host-owned system Lua library directory.
     /// 返回宿主自有系统 Lua 库目录。
     pub fn system_lua_lib_dir(&self) -> PathBuf {
@@ -380,9 +374,15 @@ pub struct LuaRuntimeHostOptions {
     /// 在单个技能根父目录下存放技能数据库时使用的固定兄弟目录名称。
     #[serde(default)]
     pub database_dir_name: String,
-    /// Optional unified skill config file path owned by the host.
-    /// 由宿主拥有的可选统一技能配置文件路径。
-    pub skill_config_file_path: Option<PathBuf>,
+    /// Explicit user-level root containing normal and system skill configuration stores.
+    /// 包含普通技能与系统技能配置存储的显式用户级根目录。
+    pub skill_config_root: Option<PathBuf>,
+    /// Optional cross-process configuration lock timeout in milliseconds.
+    /// 可选的配置跨进程锁超时毫秒数。
+    pub skill_config_lock_timeout_ms: Option<u64>,
+    /// Optional configuration file watcher debounce interval in milliseconds.
+    /// 可选的配置文件监听防抖毫秒数。
+    pub skill_config_watch_debounce_ms: Option<u64>,
     /// Whether the runtime is allowed to perform network downloads while installing dependencies.
     /// 运行时在安装依赖时是否允许执行网络下载。
     pub allow_network_download: bool,
@@ -490,7 +490,6 @@ impl LuaRuntimeHostOptions {
         self.dependency_dir_name = "dependencies".to_string();
         self.state_dir_name = "state".to_string();
         self.database_dir_name = "databases".to_string();
-        self.skill_config_file_path = Some(layout.skill_config_file_path());
     }
 
     /// Return a normalized copy where `runtime_root` owns legacy derived paths and explicit managed roots remain intact.
@@ -645,10 +644,7 @@ mod tests {
             options.download_cache_root,
             Some(runtime_root.join("temp").join("downloads"))
         );
-        assert_eq!(
-            options.skill_config_file_path,
-            Some(runtime_root.join("config").join("skill_config.json"))
-        );
+        assert_eq!(options.skill_config_root, None);
         assert_eq!(options.dependency_dir_name, "dependencies");
         assert_eq!(options.state_dir_name, "state");
         assert_eq!(options.database_dir_name, "databases");

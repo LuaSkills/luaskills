@@ -88,7 +88,9 @@ typedef struct FfiLuaRuntimeHostOptions {
     Optional unified skill config file path owned by the host.
     由宿主拥有的可选统一技能配置文件路径。
     */
-    const char *skill_config_file_path;
+  const char *skill_config_root;
+  uint64_t skill_config_lock_timeout_ms;
+  uint64_t skill_config_watch_debounce_ms;
     uint8_t allow_network_download;
     const char *github_base_url;
     const char *github_api_base_url;
@@ -816,14 +818,15 @@ int32_t luaskills_ffi_skill_config_get(
 );
 
 /*
-Insert or replace one skill config value through the standard C ABI surface.
-通过标准 C ABI 接口插入或替换单个技能配置值。
+Atomically insert or replace one package configuration batch through the standard C ABI.
+通过标准 C ABI 原子插入或替换单个技能包配置批次。
 */
-int32_t luaskills_ffi_skill_config_set(
+int32_t luaskills_ffi_skill_config_set_values(
     uint64_t engine_id,
     const char *skill_id,
-    const char *key,
-    const char *value,
+    const char *values_json,
+    const char *expected_revision,
+    FfiOwnedBuffer *result_json_out,
     FfiOwnedBuffer *error_out
 );
 
@@ -835,7 +838,31 @@ int32_t luaskills_ffi_skill_config_delete(
     uint64_t engine_id,
     const char *skill_id,
     const char *key,
-    uint8_t *deleted_out,
+    const char *expected_revision,
+    FfiOwnedBuffer *result_json_out,
+    FfiOwnedBuffer *error_out
+);
+
+/*
+Explicitly refresh one selected skill configuration store or both stores.
+显式刷新一个选定技能配置存储或两个存储。
+*/
+int32_t luaskills_ffi_skill_config_refresh(
+    uint64_t engine_id,
+    const char *store_scope,
+    FfiOwnedBuffer *result_json_out,
+    FfiOwnedBuffer *error_out
+);
+
+/*
+Poll ordered skill configuration events through the standard C ABI.
+通过标准 C ABI 轮询有序技能配置事件。
+*/
+int32_t luaskills_ffi_skill_config_events_poll(
+    uint64_t engine_id,
+    const char *after_sequence,
+    uint64_t limit,
+    FfiOwnedBuffer *result_json_out,
     FfiOwnedBuffer *error_out
 );
 

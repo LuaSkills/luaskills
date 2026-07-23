@@ -33,9 +33,10 @@ use crate::runtime::managed_session_events::{
 use crate::runtime::render_host_visible_path;
 use crate::{
     LuaEngine, LuaEngineOptions, LuaRuntimeHostOptions, LuaVmPoolConfig, RuntimeSkillRoot,
-    SkillManagementAuthority,
+    SkillManagementAuthority, SkillPackageConfigDescribeMode, SkillPackageConfigInputValue,
 };
 use serde::ser::{Serialize, Serializer};
+use std::collections::BTreeMap;
 use std::ffi::{CString, c_void};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -2287,7 +2288,7 @@ fn write_config_test_skill(skill_root: &Path, skill_id: &str) -> PathBuf {
     std::fs::write(
         skill_dir.join("skill.yaml"),
         format!(
-            "name: {skill_id}\nversion: 0.1.0\nenable: true\ndebug: false\nconfig:\n  - key: api_token\n    type: string\n    required: true\n    sensitive: true\n    description: Service access token.\n    constraints:\n      min_length: 1\n      max_length: 4096\nentries:\n  - name: ping\n    description: Config ping entry.\n    lua_entry: runtime/ping.lua\n    lua_module: {skill_id}.ping\n"
+            "name: {skill_id}\nversion: 0.1.0\nenable: true\ndebug: false\nconfig:\n  - key: api_token\n    type: string\n    required: true\n    sensitive: true\n    description: Service access token.\n    constraints:\n      min_length: 1\n      max_length: 4096\n  - key: retries\n    type: integer\n    description: Retry count.\n    constraints:\n      minimum: 0\n      maximum: 10\nentries:\n  - name: ping\n    description: Config ping entry.\n    lua_entry: runtime/ping.lua\n    lua_module: {skill_id}.ping\n"
         ),
     )
     .expect("write config skill yaml");
@@ -2768,7 +2769,9 @@ fn ffi_engine_new_and_free_roundtrip() {
                 dependency_dir_name: "dependencies".to_string(),
                 state_dir_name: "state".to_string(),
                 database_dir_name: "databases".to_string(),
-                skill_config_file_path: None,
+                skill_config_root: None,
+                skill_config_lock_timeout_ms: None,
+                skill_config_watch_debounce_ms: None,
                 allow_network_download: false,
                 github_base_url: None,
                 github_api_base_url: None,
@@ -2873,7 +2876,9 @@ fn ffi_skill_config_json_roundtrip() {
                 idle_ttl_secs: 30,
             },
             crate::LuaRuntimeHostOptions {
-                skill_config_file_path: Some(temp_root.join("config").join("skill_config.json")),
+                skill_config_root: Some(temp_root.join("config")),
+                skill_config_lock_timeout_ms: None,
+                skill_config_watch_debounce_ms: None,
                 ..Default::default()
             },
         ),
@@ -2902,8 +2907,17 @@ fn ffi_skill_config_json_roundtrip() {
         serde_json::to_string(&SkillConfigSetJsonRequest {
             engine_id: result.engine_id,
             skill_id: "demo-skill".to_string(),
-            key: "api_token".to_string(),
-            value: "sk-json-ffi".to_string(),
+            values: BTreeMap::from([
+                (
+                    "api_token".to_string(),
+                    SkillPackageConfigInputValue::String("sk-json-ffi".to_string()),
+                ),
+                (
+                    "retries".to_string(),
+                    SkillPackageConfigInputValue::Integer(3),
+                ),
+            ]),
+            expected_revision: Some("0".to_string()),
         })
         .expect("set request json"),
     )
@@ -2916,14 +2930,18 @@ fn ffi_skill_config_json_roundtrip() {
     assert_eq!(set_response["ok"], true);
     assert_eq!(set_response["result"]["action"], "set");
     assert_eq!(set_response["result"]["skill_id"], "demo-skill");
-    assert_eq!(set_response["result"]["key"], "api_token");
-    assert_eq!(set_response["result"]["value"], "sk-json-ffi");
+    assert_eq!(set_response["result"]["revision"], "1");
+    assert_eq!(set_response["result"]["changed"], true);
+    assert_eq!(set_response["result"]["values"]["api_token"], "sk-json-ffi");
+    assert_eq!(set_response["result"]["values"]["retries"], "3");
 
     let describe_hidden_request = CString::new(
         serde_json::to_string(&SkillPackageConfigDescribeJsonRequest {
             engine_id: result.engine_id,
             skill_id: Some("demo-skill".to_string()),
             include_values: false,
+            mode: SkillPackageConfigDescribeMode::Effective,
+            root_name: None,
         })
         .expect("hidden describe request json"),
     )
@@ -2949,6 +2967,8 @@ fn ffi_skill_config_json_roundtrip() {
             engine_id: result.engine_id,
             skill_id: Some("demo-skill".to_string()),
             include_values: true,
+            mode: SkillPackageConfigDescribeMode::Effective,
+            root_name: None,
         })
         .expect("visible describe request json"),
     )
@@ -3012,10 +3032,13 @@ fn ffi_skill_config_json_roundtrip() {
         )))
     };
     assert_eq!(list_response["ok"], true);
-    assert_eq!(list_response["result"].as_array().map(Vec::len), Some(1));
+    assert_eq!(list_response["result"].as_array().map(Vec::len), Some(2));
+    assert_eq!(list_response["result"][0]["store_scope"], "system-skills");
     assert_eq!(list_response["result"][0]["skill_id"], "demo-skill");
     assert_eq!(list_response["result"][0]["key"], "api_token");
     assert_eq!(list_response["result"][0]["value"], "sk-json-ffi");
+    assert_eq!(list_response["result"][1]["key"], "retries");
+    assert_eq!(list_response["result"][1]["value"], "3");
 
     let delete_request = CString::new(
         serde_json::to_string(&SkillConfigGetJsonRequest {
