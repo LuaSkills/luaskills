@@ -12,7 +12,7 @@
     [string]$RuntimeRoot = "output",
     # Exact LuaSkills release tag used for the FFI SDK asset.
     # FFI SDK 资产使用的精确 LuaSkills 发布标签。
-    [string]$LuaSkillsVersion = "v0.5.3",
+    [string]$LuaSkillsVersion = "v0.5.4",
     # Compatible Lua runtime packages release series.
     # 兼容的 Lua runtime packages 发布协议线。
     [string]$LuaRuntimeSeries = "0.1",

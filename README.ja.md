@@ -110,7 +110,7 @@ asset は `{skill_id}-v{version}-skill.zip` と `{skill_id}-v{version}-checksums
 
 | コンポーネント | 現在のバージョン |
 | --- | --- |
-| LuaSkills core、FFI SDK、各言語 SDK の系列 | `0.5.3` |
+| LuaSkills core、FFI SDK、各言語 SDK の系列 | `0.5.4` |
 | Lua runtime packages の互換系列 | `0.1` |
 | 管理対象 Python / uv | `3.14.6` / `0.11.28` |
 | 管理対象 Node.js / pnpm | `24.18.0` / `11.11.0` |

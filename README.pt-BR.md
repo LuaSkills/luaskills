@@ -110,7 +110,7 @@ O host deve decidir roots, skills instaláveis, ações de gerenciamento, modo d
 
 | Componente | Versão atual |
 | --- | --- |
-| Núcleo LuaSkills, SDK FFI e linha dos SDKs de linguagem | `0.5.3` |
+| Núcleo LuaSkills, SDK FFI e linha dos SDKs de linguagem | `0.5.4` |
 | Série compatível dos pacotes do runtime Lua | `0.1` |
 | Python / uv gerenciados | `3.14.6` / `0.11.28` |
 | Node.js / pnpm gerenciados | `24.18.0` / `11.11.0` |

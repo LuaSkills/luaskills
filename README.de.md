@@ -110,7 +110,7 @@ Der Host muss roots, installierbare Skills, Verwaltungsaktionen, database provid
 
 | Komponente | Aktuelle Version |
 | --- | --- |
-| LuaSkills Core, FFI SDK und Sprach-SDK-Linie | `0.5.3` |
+| LuaSkills Core, FFI SDK und Sprach-SDK-Linie | `0.5.4` |
 | Kompatible Serie der Lua-Runtime-Pakete | `0.1` |
 | Verwaltetes Python / uv | `3.14.6` / `0.11.28` |
 | Verwaltetes Node.js / pnpm | `24.18.0` / `11.11.0` |
