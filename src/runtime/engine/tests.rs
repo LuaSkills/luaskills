@@ -18,7 +18,7 @@ use super::{
     LoadedSkill, LuaEngine, LuaVm, LuaVmPool, LuaVmPoolConfig, LuaVmPoolState,
     LuaVmRequestScopeGuard, ManagedRuntimeServices, ManagedRuntimeWorkerKey,
     ManagedRuntimeWorkerService, NativeLibrarySearchGuard, ResolvedEntryTarget,
-    RunLuaVmBuildContext, SkillApplyLifecycleAction, SkillConfigStore,
+    RunLuaVmBuildContext, SkillApplyLifecycleAction, SkillPackageConfigService,
     VulcanInternalExecutionContext, build_lua_call_dispatch_entries,
     copy_managed_node_package_import_root, default_runlua_vm_pool_config,
     find_vulcan_process_candidate, format_lifecycle_recovery_error, get_vulcan_context_table,
@@ -679,6 +679,10 @@ fn normalize_host_visible_path_text_preserves_posix_path() {
 /// Build one minimal engine instance used only for registry tests.
 /// 构造仅用于入口注册表测试的最小引擎实例。
 fn make_test_engine(skills: HashMap<String, LoadedSkill>) -> LuaEngine {
+    let skill_config_service = Arc::new(
+        SkillPackageConfigService::new(None).expect("create runtime test skill config service"),
+    );
+    skill_config_service.replace_registry(skills.values().map(|skill| &skill.meta));
     LuaEngine {
         skills,
         entry_registry: Default::default(),
@@ -702,9 +706,7 @@ fn make_test_engine(skills: HashMap<String, LoadedSkill>) -> LuaEngine {
             .expect("create managed runtime test services"),
         managed_runtime_workers: ManagedRuntimeWorkerService::new(),
         managed_runtime_roots: None,
-        skill_config_store: Arc::new(
-            SkillConfigStore::new(None).expect("create runtime test skill config store"),
-        ),
+        skill_config_service,
         lancedb_host: None,
         sqlite_host: None,
         database_provider_callbacks: Arc::new(RuntimeDatabaseProviderCallbacks::default()),
@@ -1632,17 +1634,52 @@ fn write_skill_config_test_skill(runtime_root: &Path, skill_id: &str) -> PathBuf
     let skill_dir = runtime_root.join("skills").join(skill_id);
     fs::create_dir_all(skill_dir.join("runtime")).expect("create config test runtime dir");
     fs::write(
-            skill_dir.join("skill.yaml"),
-            format!(
-                "name: {skill_id}\nversion: 0.1.0\nenable: true\ndebug: false\nentries:\n  - name: ping\n    description: Config ping entry.\n    lua_entry: runtime/ping.lua\n    lua_module: {skill_id}.ping\n"
-            ),
-        )
-        .expect("write config test skill yaml");
+        skill_dir.join("skill.yaml"),
+        format!(
+            "name: {skill_id}\nversion: 0.1.0\nenable: true\ndebug: false\nconfig:\n  - key: api_token\n    type: string\n    required: true\n    sensitive: true\n    description: Service access token.\n    constraints:\n      min_length: 1\n      max_length: 4096\nentries:\n  - name: ping\n    description: Config ping entry.\n    lua_entry: runtime/ping.lua\n    lua_module: {skill_id}.ping\n"
+        ),
+    )
+    .expect("write config test skill yaml");
     fs::write(
-            skill_dir.join("runtime").join("ping.lua"),
-            "return function(args)\n  local value = vulcan.config.get(\"api_token\")\n  if value == nil then\n    return \"missing\"\n  end\n  return value\nend\n",
-        )
-        .expect("write config test runtime entry");
+        skill_dir.join("runtime").join("ping.lua"),
+        "return function(args)\n  if args.action == \"describe\" then\n    return vulcan.json.encode(vulcan.config.describe())\n  end\n  if args.action == \"status\" then\n    return vulcan.json.encode(vulcan.config.status())\n  end\n  if args.action == \"set_undeclared\" then\n    return vulcan.config.set(\"undeclared\", \"blocked\")\n  end\n  if args.action == \"tamper_then_set\" then\n    vulcan.runtime.internal.skill_name = args.target_skill\n    vulcan.config.set(\"api_token\", args.value)\n  end\n  local value = vulcan.config.get(\"api_token\")\n  if value == nil then\n    return \"missing\"\n  end\n  return value\nend\n",
+    )
+    .expect("write config test runtime entry");
+    skill_dir
+}
+
+/// Write one config-aware skill fixture that calls another package and then rereads its own config.
+/// 写入一个配置感知技能夹具，它会调用另一个技能包并在返回后重新读取自身配置。
+///
+/// `runtime_root` owns the common test skill root.
+/// `runtime_root` 持有公共测试技能根目录。
+///
+/// `skill_id` identifies the caller package and `target_tool` identifies the nested entry.
+/// `skill_id` 标识调用方技能包，`target_tool` 标识嵌套入口。
+///
+/// Returns the created caller package directory.
+/// 返回已创建的调用方技能包目录。
+fn write_skill_config_caller_test_skill(
+    runtime_root: &Path,
+    skill_id: &str,
+    target_tool: &str,
+) -> PathBuf {
+    let skill_dir = runtime_root.join("skills").join(skill_id);
+    fs::create_dir_all(skill_dir.join("runtime")).expect("create config caller runtime dir");
+    fs::write(
+        skill_dir.join("skill.yaml"),
+        format!(
+        "name: {skill_id}\nversion: 0.1.0\nenable: true\ndebug: false\nconfig:\n  - key: api_token\n    type: string\n    required: true\n    sensitive: true\n    description: Service access token.\nentries:\n  - name: ping\n    description: Config caller entry.\n    lua_entry: runtime/ping.lua\n    lua_module: {skill_id}.ping\n"
+        ),
+    )
+    .expect("write config caller skill yaml");
+    fs::write(
+        skill_dir.join("runtime").join("ping.lua"),
+        format!(
+            "return function(args)\n  local nested = vulcan.call(\"{target_tool}\", {{}})\n  local own = vulcan.config.get(\"api_token\")\n  return nested .. \":\" .. own\nend\n"
+        ),
+    )
+    .expect("write config caller runtime entry");
     skill_dir
 }
 
@@ -4275,6 +4312,7 @@ fn skill_config_engine_api_persists_values_into_explicit_file() {
         let _ = fs::remove_dir_all(&runtime_root);
     }
     create_runtime_test_layout(&runtime_root);
+    write_skill_config_test_skill(&runtime_root, "demo-skill");
     let config_file = runtime_root.join("custom").join("skill_config.json");
 
     let mut engine = try_make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions {
@@ -4282,6 +4320,12 @@ fn skill_config_engine_api_persists_values_into_explicit_file() {
         ..Default::default()
     })
     .expect("create skill config test engine");
+    engine
+        .load_from_roots(&[crate::host::options::RuntimeSkillRoot {
+            name: "ROOT".to_string(),
+            skills_dir: runtime_root.join("skills"),
+        }])
+        .expect("load declared config test skill");
 
     engine
         .set_skill_config_value("demo-skill", "api_token", "sk-explicit")
@@ -4318,12 +4362,13 @@ fn skill_config_engine_api_persists_values_into_explicit_file() {
 /// Verify the unified skill config store falls back to `<runtime_root>/config/skill_config.json` after roots load.
 /// 验证统一技能配置存储会在加载根目录后回退到 `<runtime_root>/config/skill_config.json`。
 #[test]
-fn skill_config_store_uses_default_runtime_config_file_after_load() {
+fn skill_config_service_uses_default_runtime_config_file_after_load() {
     let runtime_root = make_temp_runtime_root("skill_config_default_path");
     if runtime_root.exists() {
         let _ = fs::remove_dir_all(&runtime_root);
     }
     create_runtime_test_layout(&runtime_root);
+    write_skill_config_test_skill(&runtime_root, "demo-skill");
 
     let mut engine =
         try_make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions::default())
@@ -4334,19 +4379,19 @@ fn skill_config_store_uses_default_runtime_config_file_after_load() {
             name: "ROOT".to_string(),
             skills_dir: runtime_root.join("skills"),
         }])
-        .expect("load empty roots for default skill config path");
+        .expect("load declared skill for default skill config path");
 
     let expected_path = runtime_root.join("config").join("skill_config.json");
     assert_eq!(
         engine
-            .skill_config_store
+            .skill_config_service
             .file_path()
             .expect("resolve default skill config file path"),
         expected_path
     );
 
     engine
-        .set_skill_config_value("demo-skill", "endpoint", "https://example.test")
+        .set_skill_config_value("demo-skill", "api_token", "sk-default-path")
         .expect("write default skill config");
     assert!(expected_path.exists());
 
@@ -4356,7 +4401,7 @@ fn skill_config_store_uses_default_runtime_config_file_after_load() {
 /// Verify the unified skill config store resolves the default config path even before the skills directory exists.
 /// 验证统一技能配置存储会在技能目录尚未创建前解析默认配置路径。
 #[test]
-fn skill_config_store_initializes_default_path_before_skills_dir_exists() {
+fn skill_config_service_initializes_default_path_before_skills_dir_exists() {
     let runtime_root = make_temp_runtime_root("skill_config_without_skills_dir");
     if runtime_root.exists() {
         let _ = fs::remove_dir_all(&runtime_root);
@@ -4378,16 +4423,17 @@ fn skill_config_store_initializes_default_path_before_skills_dir_exists() {
     let expected_path = runtime_root.join("config").join("skill_config.json");
     assert_eq!(
         engine
-            .skill_config_store
+            .skill_config_service
             .file_path()
             .expect("resolve config path without skills directory"),
         expected_path
     );
 
-    engine
+    let error = engine
         .set_skill_config_value("demo-skill", "api_token", "sk-before-install")
-        .expect("write config before any skills directory exists");
-    assert!(expected_path.exists());
+        .expect_err("reject config write before its package declaration is loaded");
+    assert!(error.contains("not loaded or effective"));
+    assert!(!expected_path.exists());
 
     let _ = fs::remove_dir_all(&runtime_root);
 }
@@ -4465,7 +4511,7 @@ fn reload_from_roots_preserves_state_after_ambiguous_config_root_error() {
         .load_from_roots(&[root_root, user_root])
         .expect("initial root and user runtime should load");
     let previous_config_path = engine
-        .skill_config_store
+        .skill_config_service
         .file_path()
         .expect("resolve previous skill config path");
 
@@ -4493,7 +4539,7 @@ fn reload_from_roots_preserves_state_after_ambiguous_config_root_error() {
     assert_eq!(result.content, "user");
     assert_eq!(
         engine
-            .skill_config_store
+            .skill_config_service
             .file_path()
             .expect("resolve config path after failed reload"),
         previous_config_path
@@ -4537,7 +4583,7 @@ fn reload_from_roots_updates_default_skill_config_path() {
         .expect("load first runtime root");
     assert_eq!(
         engine
-            .skill_config_store
+            .skill_config_service
             .file_path()
             .expect("resolve first config path"),
         first_runtime_root.join("config").join("skill_config.json")
@@ -4551,7 +4597,7 @@ fn reload_from_roots_updates_default_skill_config_path() {
         .expect("reload second runtime root");
     assert_eq!(
         engine
-            .skill_config_store
+            .skill_config_service
             .file_path()
             .expect("resolve second config path"),
         second_runtime_root.join("config").join("skill_config.json")
@@ -4607,7 +4653,7 @@ fn reload_from_roots_keeps_frozen_relative_explicit_skill_config_path() {
         .expect("load initial root for explicit relative config reload test");
     assert_eq!(
         engine
-            .skill_config_store
+            .skill_config_service
             .file_path()
             .expect("resolve explicit config path before reload"),
         expected_config_path
@@ -4622,7 +4668,7 @@ fn reload_from_roots_keeps_frozen_relative_explicit_skill_config_path() {
         .expect("reload should preserve frozen explicit config path");
     assert_eq!(
         engine
-            .skill_config_store
+            .skill_config_service
             .file_path()
             .expect("resolve explicit config path after reload"),
         expected_config_path
@@ -4671,7 +4717,7 @@ fn load_from_roots_accepts_explicit_skill_config_path_for_ambiguous_runtime_root
 
     assert_eq!(
         engine
-            .skill_config_store
+            .skill_config_service
             .file_path()
             .expect("resolve explicit config path"),
         explicit_config_file
@@ -4783,6 +4829,221 @@ fn call_skill_reads_own_skill_config_namespace() {
         .call_skill("demo-skill-ping", &json!({}), None)
         .expect("call skill with config");
     assert_eq!(result.content, "sk-from-config");
+
+    let _ = fs::remove_dir_all(&runtime_root);
+}
+
+/// Verify Lua package configuration structure and status APIs expose declared metadata only.
+/// 验证 Lua 技能包配置结构与状态 API 只暴露已声明元数据。
+#[test]
+fn lua_package_config_describe_status_and_declaration_guards() {
+    let runtime_root = make_temp_runtime_root("skill_config_lua_structure");
+    if runtime_root.exists() {
+        let _ = fs::remove_dir_all(&runtime_root);
+    }
+    create_runtime_test_layout(&runtime_root);
+    write_skill_config_test_skill(&runtime_root, "demo-skill");
+
+    let mut engine = make_runtime_test_engine();
+    engine
+        .load_from_roots(&[crate::host::options::RuntimeSkillRoot {
+            name: "ROOT".to_string(),
+            skills_dir: runtime_root.join("skills"),
+        }])
+        .expect("load Lua config structure test skill");
+
+    let status = engine
+        .call_skill("demo-skill-ping", &json!({"action": "status"}), None)
+        .expect("query incomplete Lua config status");
+    let status_json: Value =
+        serde_json::from_str(&status.content).expect("Lua config status should be JSON");
+    assert!(!status_json["complete"].as_bool().unwrap());
+    assert_eq!(status_json["missing"][0]["key"], "api_token");
+
+    let description = engine
+        .call_skill("demo-skill-ping", &json!({"action": "describe"}), None)
+        .expect("query Lua config structure");
+    let description_json: Value =
+        serde_json::from_str(&description.content).expect("Lua config descriptor should be JSON");
+    assert_eq!(description_json["skill_id"], "demo-skill");
+    assert_eq!(description_json["items"][0]["type"], "string");
+    assert_eq!(description_json["items"][0]["sensitive"], true);
+    assert!(description_json["items"][0].get("value").is_none());
+
+    let undeclared_error = engine
+        .call_skill(
+            "demo-skill-ping",
+            &json!({"action": "set_undeclared"}),
+            None,
+        )
+        .expect_err("Lua must reject writes to undeclared package config keys");
+    assert!(undeclared_error.contains("is not declared by skill package"));
+
+    let _ = fs::remove_dir_all(&runtime_root);
+}
+
+/// Verify Lua-visible runtime markers cannot redirect package-configuration writes across packages.
+/// 验证 Lua 可见运行时标记无法将技能包配置写入重定向到其他技能包。
+#[test]
+fn lua_visible_skill_marker_cannot_bypass_package_config_isolation() {
+    let runtime_root = make_temp_runtime_root("skill_config_visible_marker_isolation");
+    if runtime_root.exists() {
+        let _ = fs::remove_dir_all(&runtime_root);
+    }
+    create_runtime_test_layout(&runtime_root);
+    write_skill_config_test_skill(&runtime_root, "package-a");
+    write_skill_config_test_skill(&runtime_root, "package-b");
+
+    let mut engine = make_runtime_test_engine();
+    engine
+        .load_from_roots(&[crate::host::options::RuntimeSkillRoot {
+            name: "ROOT".to_string(),
+            skills_dir: runtime_root.join("skills"),
+        }])
+        .expect("load visible marker isolation skills");
+    engine
+        .set_skill_config_value("package-a", "api_token", "package-a-before")
+        .expect("seed package A config");
+    engine
+        .set_skill_config_value("package-b", "api_token", "package-b-before")
+        .expect("seed package B config");
+
+    let result = engine
+        .call_skill(
+            "package-a-ping",
+            &json!({
+                "action": "tamper_then_set",
+                "target_skill": "package-b",
+                "value": "package-a-after"
+            }),
+            None,
+        )
+        .expect("call package A after tampering with the Lua-visible marker");
+    assert_eq!(result.content, "package-a-after");
+    assert_eq!(
+        engine
+            .get_skill_config_value("package-a", "api_token")
+            .expect("read package A config")
+            .as_deref(),
+        Some("package-a-after")
+    );
+    assert_eq!(
+        engine
+            .get_skill_config_value("package-b", "api_token")
+            .expect("read package B config")
+            .as_deref(),
+        Some("package-b-before")
+    );
+
+    let _ = fs::remove_dir_all(&runtime_root);
+}
+
+/// Verify nested package calls switch configuration ownership and restore the caller afterward.
+/// 验证嵌套技能包调用会切换配置归属，并在返回后恢复调用方归属。
+#[test]
+fn nested_skill_call_isolates_and_restores_package_config_context() {
+    let runtime_root = make_temp_runtime_root("skill_config_nested_isolation");
+    if runtime_root.exists() {
+        let _ = fs::remove_dir_all(&runtime_root);
+    }
+    create_runtime_test_layout(&runtime_root);
+    write_skill_config_test_skill(&runtime_root, "package-b");
+    write_skill_config_caller_test_skill(&runtime_root, "package-a", "package-b-ping");
+
+    let mut engine = make_runtime_test_engine();
+    engine
+        .load_from_roots(&[crate::host::options::RuntimeSkillRoot {
+            name: "ROOT".to_string(),
+            skills_dir: runtime_root.join("skills"),
+        }])
+        .expect("load nested config isolation skills");
+    engine
+        .set_skill_config_value("package-a", "api_token", "package-a-value")
+        .expect("set caller package config");
+    engine
+        .set_skill_config_value("package-b", "api_token", "package-b-value")
+        .expect("set target package config");
+
+    let result = engine
+        .call_skill("package-a-ping", &json!({}), None)
+        .expect("call nested package config entry");
+    assert_eq!(result.content, "package-b-value:package-a-value");
+
+    let _ = fs::remove_dir_all(&runtime_root);
+}
+
+/// Verify the checked-in package configuration example loads and exercises its documented flow.
+/// 验证仓库内技能包配置示例可以加载并执行其文档化流程。
+#[test]
+fn package_config_example_skill_smoke_test() {
+    let runtime_root = make_temp_runtime_root("skill_config_example_smoke");
+    if runtime_root.exists() {
+        let _ = fs::remove_dir_all(&runtime_root);
+    }
+    fs::create_dir_all(&runtime_root).expect("create example smoke runtime root");
+    let config_file = runtime_root.join("config").join("skill_config.json");
+    let example_skills_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join("skill-package-config");
+
+    let mut engine = try_make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions {
+        skill_config_file_path: Some(config_file),
+        ..Default::default()
+    })
+    .expect("create example package config engine");
+    engine
+        .load_from_roots(&[crate::host::options::RuntimeSkillRoot {
+            name: "ROOT".to_string(),
+            skills_dir: example_skills_root,
+        }])
+        .expect("load checked-in config example");
+
+    let status_result = engine
+        .call_skill("example-config-skill-status", &json!({}), None)
+        .expect("call config example status");
+    let status_json: Value =
+        serde_json::from_str(&status_result.content).expect("example status should be JSON");
+    assert_eq!(
+        status_json["declaration"]["items"].as_array().map(Vec::len),
+        Some(5)
+    );
+    assert_eq!(status_json["status"]["complete"], false);
+    assert_eq!(status_json["status"]["missing"][0]["key"], "api_token");
+
+    engine
+        .set_skill_config_value("example-config-skill", "api_token", "example-token")
+        .expect("configure example token");
+    let query_result = engine
+        .call_skill("example-config-skill-query", &json!({}), None)
+        .expect("call configured example query");
+    let query_json: Value =
+        serde_json::from_str(&query_result.content).expect("example query should be JSON");
+    assert_eq!(query_json["retry_count"], 3);
+    assert_eq!(query_json["temperature"], 0.7);
+    assert_eq!(query_json["provider"], "openai");
+    assert_eq!(query_json["telemetry_enabled"], false);
+
+    let invalid_error = engine
+        .call_skill(
+            "example-config-skill-query",
+            &json!({"action": "set_invalid_demo"}),
+            None,
+        )
+        .expect_err("example invalid write should fail");
+    assert!(invalid_error.contains("exceeds maximum"));
+    engine
+        .call_skill(
+            "example-config-skill-query",
+            &json!({"action": "set_valid_demo"}),
+            None,
+        )
+        .expect("example valid write should succeed");
+    assert_eq!(
+        engine
+            .get_skill_config_value("example-config-skill", "retry_count")
+            .expect("read normalized example retry count"),
+        Some("5".to_string())
+    );
 
     let _ = fs::remove_dir_all(&runtime_root);
 }

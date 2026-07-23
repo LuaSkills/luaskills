@@ -1376,6 +1376,19 @@ fn standard_ffi_skill_config_round_trip() {
     std::fs::create_dir_all(temp_root.join("lua_packages")).expect("create lua_packages directory");
     std::fs::create_dir_all(temp_root.join("bin").join("tools")).expect("create tools directory");
     std::fs::create_dir_all(temp_root.join("libs")).expect("create libs directory");
+    let skills_root = temp_root.join("skills");
+    let skill_dir = skills_root.join("demo-skill");
+    std::fs::create_dir_all(skill_dir.join("runtime")).expect("create config skill runtime");
+    std::fs::write(
+        skill_dir.join("skill.yaml"),
+            "name: demo-skill\nversion: 0.1.0\nenable: true\ndebug: false\nconfig:\n  - key: api_token\n    type: string\n    required: true\n    sensitive: true\n    description: Service access token.\n    constraints:\n      min_length: 1\n      max_length: 4096\nentries:\n  - name: ping\n    description: Config ping entry.\n    lua_entry: runtime/ping.lua\n    lua_module: demo-skill.ping\n",
+    )
+    .expect("write config skill manifest");
+    std::fs::write(
+        skill_dir.join("runtime").join("ping.lua"),
+        "return function(args)\n  return vulcan.config.get('api_token')\nend\n",
+    )
+    .expect("write config skill runtime");
 
     let skill_config_file_path = temp_root.join("config").join("skill_config.json");
     let host_fixture = FfiStandardHostOptionsFixture::with_skill_config_file_path(
@@ -1406,6 +1419,32 @@ fn standard_ffi_skill_config_round_trip() {
     assert_eq!(engine_status, FFI_STATUS_OK);
     assert!(error_out.ptr.is_null());
 
+    let root_name = CString::new("ROOT").expect("root name cstring");
+    let skills_root_text = ffi_test_path_cstring(&skills_root, "skills_root");
+    let ffi_skill_roots = [FfiRuntimeSkillRoot {
+        name: root_name.as_ptr(),
+        skills_dir: skills_root_text.as_ptr(),
+    }];
+    let mut load_error = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let load_status = unsafe {
+        luaskills_ffi_load_from_roots(
+            engine_id,
+            ffi_skill_roots.as_ptr(),
+            ffi_skill_roots.len(),
+            &mut load_error,
+        )
+    };
+    assert_eq!(
+        load_status,
+        FFI_STATUS_OK,
+        "{}",
+        read_owned_buffer_text(&load_error)
+    );
+    assert!(load_error.ptr.is_null());
+
     let mut set_error = FfiOwnedBuffer {
         ptr: ptr::null_mut(),
         len: 0,
@@ -1421,6 +1460,108 @@ fn standard_ffi_skill_config_round_trip() {
     };
     assert_eq!(set_status, FFI_STATUS_OK);
     assert!(set_error.ptr.is_null());
+
+    let mut hidden_descriptor_out = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let mut hidden_descriptor_error = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let hidden_descriptor_status = unsafe {
+        luaskills_ffi_skill_config_describe(
+            engine_id,
+            skill_id.as_ptr(),
+            0,
+            &mut hidden_descriptor_out,
+            &mut hidden_descriptor_error,
+        )
+    };
+    assert_eq!(hidden_descriptor_status, FFI_STATUS_OK);
+    assert!(hidden_descriptor_error.ptr.is_null());
+    let hidden_descriptor_json: serde_json::Value =
+        serde_json::from_str(&read_owned_buffer_text(&hidden_descriptor_out))
+            .expect("hidden descriptor JSON should parse");
+    assert!(hidden_descriptor_json[0]["items"][0].get("value").is_none());
+    unsafe { luaskills_ffi_buffer_free(hidden_descriptor_out) };
+
+    let mut visible_descriptor_out = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let mut visible_descriptor_error = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let visible_descriptor_status = unsafe {
+        luaskills_ffi_skill_config_describe(
+            engine_id,
+            skill_id.as_ptr(),
+            1,
+            &mut visible_descriptor_out,
+            &mut visible_descriptor_error,
+        )
+    };
+    assert_eq!(visible_descriptor_status, FFI_STATUS_OK);
+    assert!(visible_descriptor_error.ptr.is_null());
+    let visible_descriptor_json: serde_json::Value =
+        serde_json::from_str(&read_owned_buffer_text(&visible_descriptor_out))
+            .expect("visible descriptor JSON should parse");
+    assert_eq!(
+        visible_descriptor_json[0]["items"][0]["value"],
+        "sk-standard-ffi"
+    );
+    unsafe { luaskills_ffi_buffer_free(visible_descriptor_out) };
+
+    let mut invalid_flag_out = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let mut invalid_flag_error = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let invalid_flag_status = unsafe {
+        luaskills_ffi_skill_config_describe(
+            engine_id,
+            skill_id.as_ptr(),
+            2,
+            &mut invalid_flag_out,
+            &mut invalid_flag_error,
+        )
+    };
+    assert_eq!(invalid_flag_status, FFI_STATUS_ERROR);
+    assert!(invalid_flag_out.ptr.is_null());
+    assert_eq!(
+        read_owned_buffer_text(&invalid_flag_error),
+        "include_values must be 0 or 1"
+    );
+    unsafe { luaskills_ffi_buffer_free(invalid_flag_error) };
+
+    let mut validate_out = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let mut validate_error = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let validate_status = unsafe {
+        luaskills_ffi_skill_config_validate(
+            engine_id,
+            skill_id.as_ptr(),
+            &mut validate_out,
+            &mut validate_error,
+        )
+    };
+    assert_eq!(validate_status, FFI_STATUS_OK);
+    assert!(validate_error.ptr.is_null());
+    let validate_json: serde_json::Value =
+        serde_json::from_str(&read_owned_buffer_text(&validate_out))
+            .expect("config validation JSON should parse");
+    assert_eq!(validate_json["complete"], true);
+    unsafe { luaskills_ffi_buffer_free(validate_out) };
 
     let mut value_out = FfiOwnedBuffer {
         ptr: ptr::null_mut(),
@@ -1461,8 +1602,9 @@ fn standard_ffi_skill_config_round_trip() {
             &mut empty_set_error,
         )
     };
-    assert_eq!(empty_set_status, FFI_STATUS_OK);
-    assert!(empty_set_error.ptr.is_null());
+    assert_eq!(empty_set_status, FFI_STATUS_ERROR);
+    assert!(read_owned_buffer_text(&empty_set_error).contains("below minimum"));
+    unsafe { luaskills_ffi_buffer_free(empty_set_error) };
 
     let mut empty_value_out = FfiOwnedBuffer {
         ptr: ptr::null_mut(),
@@ -1486,7 +1628,7 @@ fn standard_ffi_skill_config_round_trip() {
     assert_eq!(empty_get_status, FFI_STATUS_OK);
     assert!(empty_get_error.ptr.is_null());
     assert_eq!(empty_found_out, 1);
-    assert_eq!(read_owned_buffer_text(&empty_value_out), "");
+    assert_eq!(read_owned_buffer_text(&empty_value_out), "sk-standard-ffi");
     unsafe { luaskills_ffi_buffer_free(empty_value_out) };
 
     let mut list_out = FfiOwnedBuffer {
@@ -1512,7 +1654,7 @@ fn standard_ffi_skill_config_round_trip() {
     assert_eq!(list_json.as_array().map(Vec::len), Some(1));
     assert_eq!(list_json[0]["skill_id"], "demo-skill");
     assert_eq!(list_json[0]["key"], "api_token");
-    assert_eq!(list_json[0]["value"], "");
+    assert_eq!(list_json[0]["value"], "sk-standard-ffi");
     unsafe { luaskills_ffi_buffer_free(list_out) };
 
     let mut deleted_out = 0_u8;

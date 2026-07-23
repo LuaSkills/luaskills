@@ -1082,53 +1082,44 @@ bash scripts/debug-tools/managed_runtime_smoke.sh
 
 ### 5.10 `vulcan.config.*`
 
-这组能力用于读取和维护**当前 skill 自己的字符串配置**。
+这组能力用于读取和维护**当前技能包自己的已声明配置**。配置声明必须写在包根目录 `skill.yaml` 的顶层 `config`，包内全部 entries 共享同一配置命名空间。
 
 当前提供：
 
 | API | 参数与类型 | 返回值 | 说明 |
 | --- | --- | --- | --- |
-| `vulcan.config.get(key)` | `key: string` | `string \| nil` | 读取当前 skill 配置值 |
-| `vulcan.config.has(key)` | `key: string` | `boolean` | 判断键是否存在 |
-| `vulcan.config.set(key, value)` | `key: string`；`value: string` | `true` | 设置当前 skill 配置值 |
-| `vulcan.config.delete(key)` | `key: string` | `boolean` | 删除键；是否成功由底层 store 决定 |
-| `vulcan.config.list()` | 无 | `table<string, string>` | 列出当前 skill 命名空间下的全部字符串配置 |
+| `vulcan.config.get(key)` | `key: string` | `string \| nil` | 读取显式值或声明默认值；key 必须已声明 |
+| `vulcan.config.has(key)` | `key: string` | `boolean` | 判断是否存在显式值或声明默认值；key 必须已声明 |
+| `vulcan.config.set(key, value)` | `key: string`；`value: string` | `true` | 按声明类型和约束校验、规范化并持久化 |
+| `vulcan.config.delete(key)` | `key: string` | `boolean` | 删除显式值；之后可以回退到声明默认值 |
+| `vulcan.config.list()` | 无 | `table<string, string>` | 列出当前包全部声明项的有效值 |
+| `vulcan.config.describe()` | 无 | `table` | 获取当前包参数名、类型、作者提供的说明、约束、枚举和状态，不包含值 |
+| `vulcan.config.status()` | 无 | `table` | 获取完整性、缺失项、非法项和 orphaned 数量 |
 
 最小示例：
 
 ```lua
-local api_token = vulcan.config.get("api_token")
-
-if not api_token or api_token == "" then
-    return "当前未配置 `api_token`。请使用宿主提供的 runtime-config 工具为当前 skill 设置 `api_token`。"
+local status = vulcan.config.status()
+if not status.complete then
+    return [[当前技能包配置不完整。
+请让 AI 调用宿主 runtime-config 工具的 describe 动作查看参数要求，
+并在宿主或用户授权后使用 set；如果不能修改，请用户提供缺失参数。]]
 end
 
-local endpoint = vulcan.config.get("endpoint") or "https://api.example.com"
-
-vulcan.config.set("last_endpoint", endpoint)
-
-return {
-    ok = true,
-    endpoint = endpoint,
-}
-```
-
-`list()` 当前返回的是当前 skill 命名空间下的平面表：
-
-```lua
-local config = vulcan.config.list()
--- config.api_token
--- config.endpoint
+local api_token = vulcan.config.get("api_token")
+return use_service(api_token)
 ```
 
 注意事项：
 
-- 当前配置值第一版统一为 `string`。
-- 如果你确实需要复杂结构，建议把 JSON 文本作为字符串存入，再由 skill 自己 `vulcan.json.decode(...)`。
-- 配置默认只作用于当前 skill，不能直接跨 skill 读写其他命名空间。
+- 声明类型支持 `integer`、`string`、`float`、`enum`、`boolean`，持久化和 Lua 返回值统一为规范字符串。
+- 未声明 key 的 `get/has/set/delete` 都会报错，`list` 不会暴露遗留未声明项。
+- 配置严格按技能包隔离。嵌套调用目标包时切换到目标包，返回后恢复调用方。
 - 这组 API **要求当前存在活动 skill 上下文**；如果在没有当前 skill 身份的系统运行时里调用，会直接报错。
-- 当前不做“未配置即不加载”的自动策略；更推荐 skill 在缺配置时返回明确提示，告知用户如何完成配置。
+- 缺失或非法配置不会阻止技能包加载，具体 entry 应在需要时检查并提示。
 - 统一主配置文件默认位于 `<runtime_root>/config/skill_config.json`；宿主也可以显式覆盖路径。
+- 声明中的人类可读字段使用技能包作者选择的单一语言；面向广泛分发的技能包建议使用英文，但不强制。
+- 完整声明格式、类型存储规则、宿主权限边界和 FFI 对接见 [Skill 包级配置声明、运行时控制与宿主对接](architecture/skill-config-system-design.md)。
 
 ## 6. `vulcan.fs.*`
 

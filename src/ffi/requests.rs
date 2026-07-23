@@ -180,6 +180,37 @@ pub(super) struct SkillConfigListJsonRequest {
     pub(super) skill_id: Option<String>,
 }
 
+/// One JSON request used to describe effective package configuration declarations.
+/// 用于描述有效技能包配置声明的 JSON 请求。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SkillPackageConfigDescribeJsonRequest {
+    /// Stable numeric FFI handle id of the target engine.
+    /// 目标引擎的稳定数值 FFI 句柄标识。
+    pub(super) engine_id: u64,
+    /// Optional package identifier used to restrict the structure query.
+    /// 用于限制结构查询范围的可选技能包标识符。
+    #[serde(default)]
+    pub(super) skill_id: Option<String>,
+    /// Whether raw effective values must be included without masking.
+    /// 是否必须无掩码包含原始有效值。
+    #[serde(default)]
+    pub(super) include_values: bool,
+}
+
+/// One JSON request used to validate an effective package configuration.
+/// 用于校验有效技能包配置的 JSON 请求。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SkillPackageConfigValidateJsonRequest {
+    /// Stable numeric FFI handle id of the target engine.
+    /// 目标引擎的稳定数值 FFI 句柄标识。
+    pub(super) engine_id: u64,
+    /// Stable effective package identifier to validate.
+    /// 需要校验的稳定有效技能包标识符。
+    pub(super) skill_id: String,
+}
+
 /// One JSON request used to resolve one `(skill_id, key)` config pair.
 /// 用于解析单个 `(skill_id, key)` 配置对的 JSON 请求。
 #[derive(Debug, Serialize, Deserialize)]

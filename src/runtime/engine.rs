@@ -40,7 +40,10 @@ use crate::host::callbacks::{
 use crate::host::database::RuntimeDatabaseProviderCallbacks;
 use crate::lancedb_host::{LanceDbSkillBinding, LanceDbSkillHost, disabled_skill_status_json};
 use crate::lua_skill::{SkillMeta, validate_luaskills_identifier, validate_luaskills_version};
-use crate::runtime::config::{SkillConfigEntry, SkillConfigStore};
+use crate::runtime::config::SkillConfigEntry;
+use crate::runtime::config_service::{
+    RuntimeSkillPackageConfigDescriptor, RuntimeSkillPackageConfigStatus, SkillPackageConfigService,
+};
 use crate::runtime::encoding::{
     RuntimeTextEncoding, decode_runtime_text, default_runtime_text_encoding, encode_runtime_text,
 };
@@ -503,9 +506,9 @@ struct RunLuaVmBuildContext<'a> {
     /// Normalized host options shared with runtime bridges.
     /// 与运行时桥接共享的规范化宿主选项。
     host_options: Arc<LuaRuntimeHostOptions>,
-    /// Unified Skill configuration store installed into the runtime module.
-    /// 安装到运行时模块的统一 Skill 配置存储。
-    skill_config_store: Arc<SkillConfigStore>,
+    /// Package-aware Skill configuration service installed into the runtime module.
+    /// 安装到运行时模块的包级 Skill 配置服务。
+    skill_config_service: Arc<SkillPackageConfigService>,
     /// Runtime Skill roots used for dependency context resolution.
     /// 用于依赖上下文解析的运行时 Skill 根。
     runtime_skill_roots: Vec<RuntimeSkillRoot>,
@@ -541,7 +544,7 @@ impl<'a> RunLuaVmBuildContext<'a> {
             skills,
             entry_registry,
             host_options: Arc::clone(&engine.host_options),
-            skill_config_store: Arc::clone(&engine.skill_config_store),
+            skill_config_service: Arc::clone(&engine.skill_config_service),
             runtime_skill_roots: engine.runtime_skill_roots.clone(),
             lancedb_host: engine.lancedb_host.clone(),
             sqlite_host: engine.sqlite_host.clone(),
@@ -777,7 +780,9 @@ pub struct LuaEngine {
     /// Immutable host-selected roots shared by managed runtime package contexts when configured.
     /// 配置后由受管运行时包上下文共享的不可变宿主选定根集合。
     managed_runtime_roots: Option<Arc<ManagedRuntimeRoots>>,
-    skill_config_store: Arc<SkillConfigStore>,
+    /// Package-aware configuration service shared by host and Lua access paths.
+    /// 由宿主与 Lua 访问路径共享的包级配置服务。
+    skill_config_service: Arc<SkillPackageConfigService>,
     lancedb_host: Option<Arc<LanceDbSkillHost>>,
     sqlite_host: Option<Arc<SqliteSkillHost>>,
     database_provider_callbacks: Arc<RuntimeDatabaseProviderCallbacks>,
@@ -2043,6 +2048,15 @@ struct VulcanInternalExecutionContext {
     luaexec_caller_tool_name: Option<String>,
 }
 
+/// Rust-owned active skill identity used as the package-configuration authorization boundary.
+/// 由 Rust 持有、作为技能包配置授权边界的活动技能身份。
+#[derive(Debug, Clone, Default)]
+struct LuaSkillExecutionContextSlot {
+    /// Current package identifier that Lua code cannot replace through a visible table.
+    /// Lua 代码无法通过可见表替换的当前技能包标识符。
+    skill_id: Option<String>,
+}
+
 /// Parse one JSON value as an optional runtime request context.
 /// 将单个 JSON 值解析为可选运行时请求上下文。
 ///
@@ -2844,12 +2858,9 @@ fn capture_vulcan_internal_execution_context(
             error
         )
     })?;
-    let skill_name: Option<String> = internal.get("skill_name").map_err(|error| {
-        format!(
-            "Failed to read vulcan.runtime.internal.skill_name: {}",
-            error
-        )
-    })?;
+    // The visible internal table is diagnostic state, while the Rust app-data slot is authoritative.
+    // 可见 internal 表仅为诊断状态，Rust app-data 槽才是权威身份来源。
+    let skill_name = current_lua_skill_execution_context(lua);
     let entry_name: Option<String> = internal.get("entry_name").map_err(|error| {
         format!(
             "Failed to read vulcan.runtime.internal.entry_name: {}",
@@ -2975,18 +2986,25 @@ fn populate_vulcan_internal_execution_context(
             })?,
     }
 
+    // Publish the authorization identity only after every visible context field was populated.
+    // 仅在所有可见上下文字段填充成功后发布授权身份。
+    let _previous = lua.set_app_data(LuaSkillExecutionContextSlot {
+        skill_id: context.skill_name.clone(),
+    });
     Ok(())
 }
 
-/// Resolve the active skill identifier currently stored in the internal `vulcan` execution context.
-/// 解析当前存储在内部 `vulcan` 执行上下文中的活动技能标识符。
+/// Clone the Rust-owned active skill identity without consulting Lua-visible state.
+/// 在不读取 Lua 可见状态的情况下克隆由 Rust 持有的活动技能身份。
+fn current_lua_skill_execution_context(lua: &Lua) -> Option<String> {
+    lua.app_data_ref::<LuaSkillExecutionContextSlot>()
+        .and_then(|slot| slot.skill_id.clone())
+}
+
+/// Resolve the Rust-owned active skill identifier used by package-configuration APIs.
+/// 解析技能包配置 API 使用的、由 Rust 持有的活动技能标识符。
 fn current_vulcan_config_skill_id(lua: &Lua, api_name: &str) -> Result<String, mlua::Error> {
-    let internal = get_vulcan_runtime_internal_table(lua)
-        .map_err(|error| mlua::Error::runtime(format!("{}: {}", api_name, error)))?;
-    let skill_name: Option<String> = internal
-        .get("skill_name")
-        .map_err(|error| mlua::Error::runtime(format!("{}: {}", api_name, error)))?;
-    skill_name
+    current_lua_skill_execution_context(lua)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             mlua::Error::runtime(format!("{} requires one active skill context", api_name))
@@ -7207,8 +7225,8 @@ impl LuaEngine {
             managed_runtime_services,
             managed_runtime_workers,
             managed_runtime_roots,
-            skill_config_store: Arc::new(
-                SkillConfigStore::new(host_options.skill_config_file_path.clone())
+            skill_config_service: Arc::new(
+                SkillPackageConfigService::new(host_options.skill_config_file_path.clone())
                     .map_err(std::io::Error::other)?,
             ),
             lancedb_host: None,
@@ -7317,20 +7335,21 @@ impl LuaEngine {
         &self,
         skill_roots: &[RuntimeSkillRoot],
     ) -> Result<(), String> {
-        if self.skill_config_store.has_explicit_file_path() {
+        if self.skill_config_service.has_explicit_file_path() {
             return Ok(());
         }
         let runtime_root = self.canonical_skill_config_runtime_root(skill_roots)?;
-        self.skill_config_store
+        self.skill_config_service
             .set_default_runtime_root(&runtime_root)
     }
 
     /// Create an empty reload candidate that preserves immutable host policy and callback snapshots.
     /// 创建一个空的重载候选引擎，并保留不可变宿主策略与回调快照。
     fn empty_reload_candidate(&self) -> Result<Self, Box<dyn std::error::Error>> {
-        let explicit_skill_config_file_path = if self.skill_config_store.has_explicit_file_path() {
+        let explicit_skill_config_file_path = if self.skill_config_service.has_explicit_file_path()
+        {
             Some(
-                self.skill_config_store
+                self.skill_config_service
                     .file_path()
                     .map_err(std::io::Error::other)?,
             )
@@ -7348,8 +7367,8 @@ impl LuaEngine {
             managed_runtime_services: Arc::clone(&self.managed_runtime_services),
             managed_runtime_workers: Arc::clone(&self.managed_runtime_workers),
             managed_runtime_roots: self.managed_runtime_roots.clone(),
-            skill_config_store: Arc::new(
-                SkillConfigStore::new(explicit_skill_config_file_path)
+            skill_config_service: Arc::new(
+                SkillPackageConfigService::new(explicit_skill_config_file_path)
                     .map_err(std::io::Error::other)?,
             ),
             lancedb_host: None,
@@ -7371,7 +7390,7 @@ impl LuaEngine {
         self.runlua_pool = next.runlua_pool;
         self.public_runtime_sessions = next.public_runtime_sessions;
         self.managed_runtime_roots = next.managed_runtime_roots;
-        self.skill_config_store = next.skill_config_store;
+        self.skill_config_service = next.skill_config_service;
         self.lancedb_host = next.lancedb_host;
         self.sqlite_host = next.sqlite_host;
         self.database_provider_callbacks = next.database_provider_callbacks;
@@ -7888,6 +7907,8 @@ impl LuaEngine {
 
         self.rebuild_entry_registry()
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        self.skill_config_service
+            .replace_registry(self.skills.values().map(|skill| &skill.meta));
 
         self.pool
             .prewarm(|| self.create_vm())
@@ -9152,7 +9173,7 @@ impl LuaEngine {
         Self::register_vulcan_module(
             &lua,
             self.host_options.as_ref(),
-            self.skill_config_store.clone(),
+            self.skill_config_service.clone(),
             &self.runtime_skill_roots,
         )
         .map_err(|error| error.to_string())?;
@@ -9196,7 +9217,7 @@ impl LuaEngine {
             skills,
             entry_registry,
             host_options,
-            skill_config_store,
+            skill_config_service,
             runtime_skill_roots,
             lancedb_host,
             sqlite_host,
@@ -9211,7 +9232,7 @@ impl LuaEngine {
         Self::register_vulcan_module(
             &lua,
             host_options.as_ref(),
-            skill_config_store,
+            skill_config_service,
             &runtime_skill_roots,
         )
         .map_err(|error| error.to_string())?;
@@ -9243,7 +9264,7 @@ impl LuaEngine {
             skills: &skills,
             entry_registry: &entry_registry,
             host_options: Arc::clone(&self.host_options),
-            skill_config_store: Arc::clone(&self.skill_config_store),
+            skill_config_service: Arc::clone(&self.skill_config_service),
             runtime_skill_roots: Vec::new(),
             lancedb_host: None,
             sqlite_host: None,
@@ -9709,40 +9730,75 @@ impl LuaEngine {
         }
     }
 
-    /// List flattened skill config records for one optional skill namespace.
-    /// 列出某个可选技能命名空间下的扁平化技能配置记录。
+    /// List raw persisted package config records for one optional package namespace.
+    /// 列出某个可选技能包命名空间下的原始持久化配置记录。
     pub fn list_skill_config_entries(
         &self,
         skill_id: Option<&str>,
     ) -> Result<Vec<SkillConfigEntry>, String> {
-        self.skill_config_store.list_entries(skill_id)
+        self.skill_config_service.list_raw_entries(skill_id)
     }
 
-    /// Read one optional string config value for one `(skill_id, key)` pair.
-    /// 读取某个 `(skill_id, key)` 对下的可选字符串配置值。
+    /// Read one raw persisted string value for one `(skill_id, key)` pair.
+    /// 读取某个 `(skill_id, key)` 对下的原始持久化字符串值。
     pub fn get_skill_config_value(
         &self,
         skill_id: &str,
         key: &str,
     ) -> Result<Option<String>, String> {
-        self.skill_config_store.get_value(skill_id, key)
+        self.skill_config_service.get_raw_value(skill_id, key)
     }
 
-    /// Insert or replace one string config value for one `(skill_id, key)` pair.
-    /// 为某个 `(skill_id, key)` 对插入或替换一个字符串配置值。
+    /// Validate, normalize, and persist one declared package configuration value.
+    /// 校验、规范化并持久化单个已声明技能包配置值。
     pub fn set_skill_config_value(
         &mut self,
         skill_id: &str,
         key: &str,
         value: &str,
-    ) -> Result<(), String> {
-        self.skill_config_store.set_value(skill_id, key, value)
+    ) -> Result<String, String> {
+        self.skill_config_service
+            .set_declared_value(skill_id, key, value)
     }
 
-    /// Delete one config key from one skill namespace and report whether one value was removed.
-    /// 从某个技能命名空间删除单个配置键，并返回是否移除了一个值。
+    /// Delete one raw persisted value, including an orphaned undeclared key.
+    /// 删除单个原始持久化值，包括遗留的未声明 key。
     pub fn delete_skill_config_value(&mut self, skill_id: &str, key: &str) -> Result<bool, String> {
-        self.skill_config_store.delete_value(skill_id, key)
+        self.skill_config_service.delete_raw_value(skill_id, key)
+    }
+
+    /// Describe declared package configurations with optional explicit values.
+    /// 使用可选显式值开关描述已声明的技能包配置。
+    ///
+    /// `skill_id` limits the query to one effective package when present.
+    /// `skill_id` 存在时将查询限制为单个有效技能包。
+    ///
+    /// `include_values` controls whether raw effective values are returned without masking.
+    /// `include_values` 控制是否无掩码返回原始有效值。
+    ///
+    /// Returns descriptors ordered by package identifier.
+    /// 返回按技能包标识排序的描述列表。
+    pub fn describe_skill_package_config(
+        &self,
+        skill_id: Option<&str>,
+        include_values: bool,
+    ) -> Result<Vec<RuntimeSkillPackageConfigDescriptor>, String> {
+        self.skill_config_service.describe(skill_id, include_values)
+    }
+
+    /// Validate one effective package configuration without changing persisted values.
+    /// 在不修改持久化值的前提下校验单个有效技能包配置。
+    ///
+    /// `skill_id` identifies the effective package to validate.
+    /// `skill_id` 标识需要校验的有效技能包。
+    ///
+    /// Returns completeness, missing, invalid, and orphaned-value status.
+    /// 返回完整性、缺失项、非法项和遗留值状态。
+    pub fn validate_skill_package_config(
+        &self,
+        skill_id: &str,
+    ) -> Result<RuntimeSkillPackageConfigStatus, String> {
+        self.skill_config_service.status(skill_id)
     }
 
     /// Populate per-request context into the `vulcan` module.
@@ -10724,7 +10780,7 @@ impl LuaEngine {
     fn register_vulcan_module(
         lua: &Lua,
         host_options: &LuaRuntimeHostOptions,
-        skill_config_store: Arc<SkillConfigStore>,
+        skill_config_service: Arc<SkillPackageConfigService>,
         runtime_skill_roots: &[RuntimeSkillRoot],
     ) -> Result<(), Box<dyn std::error::Error>> {
         let vulcan = lua.create_table()?;
@@ -11231,12 +11287,12 @@ impl LuaEngine {
         })?;
         cache.set("delete", cache_delete_fn)?;
 
-        let config_get_store = skill_config_store.clone();
+        let config_get_service = skill_config_service.clone();
         let config_get_fn = lua.create_function(move |lua, key: LuaValue| {
             let key = require_string_arg(key, "config.get", "key", false)?;
             let skill_id = current_vulcan_config_skill_id(lua, "vulcan.config.get")?;
-            match config_get_store
-                .get_value(&skill_id, &key)
+            match config_get_service
+                .get_effective_value(&skill_id, &key)
                 .map_err(mlua::Error::runtime)?
             {
                 Some(value) => Ok(LuaValue::String(
@@ -11247,44 +11303,44 @@ impl LuaEngine {
         })?;
         config.set("get", config_get_fn)?;
 
-        let config_has_store = skill_config_store.clone();
+        let config_has_service = skill_config_service.clone();
         let config_has_fn = lua.create_function(move |lua, key: LuaValue| {
             let key = require_string_arg(key, "config.has", "key", false)?;
             let skill_id = current_vulcan_config_skill_id(lua, "vulcan.config.has")?;
-            config_has_store
-                .has_value(&skill_id, &key)
+            config_has_service
+                .has_effective_value(&skill_id, &key)
                 .map_err(mlua::Error::runtime)
         })?;
         config.set("has", config_has_fn)?;
 
-        let config_set_store = skill_config_store.clone();
+        let config_set_service = skill_config_service.clone();
         let config_set_fn =
             lua.create_function(move |lua, (key, value): (LuaValue, LuaValue)| {
                 let key = require_string_arg(key, "config.set", "key", false)?;
                 let value = require_string_arg(value, "config.set", "value", true)?;
                 let skill_id = current_vulcan_config_skill_id(lua, "vulcan.config.set")?;
-                config_set_store
-                    .set_value(&skill_id, &key, &value)
+                config_set_service
+                    .set_declared_value(&skill_id, &key, &value)
                     .map_err(mlua::Error::runtime)?;
                 Ok(true)
             })?;
         config.set("set", config_set_fn)?;
 
-        let config_delete_store = skill_config_store.clone();
+        let config_delete_service = skill_config_service.clone();
         let config_delete_fn = lua.create_function(move |lua, key: LuaValue| {
             let key = require_string_arg(key, "config.delete", "key", false)?;
             let skill_id = current_vulcan_config_skill_id(lua, "vulcan.config.delete")?;
-            config_delete_store
-                .delete_value(&skill_id, &key)
+            config_delete_service
+                .delete_declared_value(&skill_id, &key)
                 .map_err(mlua::Error::runtime)
         })?;
         config.set("delete", config_delete_fn)?;
 
-        let config_list_store = skill_config_store.clone();
+        let config_list_service = skill_config_service.clone();
         let config_list_fn = lua.create_function(move |lua, ()| {
             let skill_id = current_vulcan_config_skill_id(lua, "vulcan.config.list")?;
-            let items = config_list_store
-                .list_skill_values(&skill_id)
+            let items = config_list_service
+                .list_effective_values(&skill_id)
                 .map_err(mlua::Error::runtime)?;
             let table = lua.create_table().map_err(mlua::Error::runtime)?;
             for (key, value) in items {
@@ -11298,6 +11354,32 @@ impl LuaEngine {
             Ok(LuaValue::Table(table))
         })?;
         config.set("list", config_list_fn)?;
+
+        let config_describe_service = skill_config_service.clone();
+        let config_describe_fn = lua.create_function(move |lua, ()| {
+            let skill_id = current_vulcan_config_skill_id(lua, "vulcan.config.describe")?;
+            let descriptors = config_describe_service
+                .describe(Some(&skill_id), false)
+                .map_err(mlua::Error::runtime)?;
+            let descriptor = descriptors.into_iter().next().ok_or_else(|| {
+                mlua::Error::runtime(format!(
+                    "vulcan.config.describe: package '{}' has no effective declaration",
+                    skill_id
+                ))
+            })?;
+            lua.to_value(&descriptor).map_err(mlua::Error::runtime)
+        })?;
+        config.set("describe", config_describe_fn)?;
+
+        let config_status_service = skill_config_service;
+        let config_status_fn = lua.create_function(move |lua, ()| {
+            let skill_id = current_vulcan_config_skill_id(lua, "vulcan.config.status")?;
+            let status = config_status_service
+                .status(&skill_id)
+                .map_err(mlua::Error::runtime)?;
+            lua.to_value(&status).map_err(mlua::Error::runtime)
+        })?;
+        config.set("status", config_status_fn)?;
 
         host.set("list", create_host_tool_list_fn(lua)?)?;
         let host_has_fn = create_host_tool_has_fn(lua)?;

@@ -491,7 +491,7 @@ FFI 不直接暴露 `LuaEngine` 指针，而是通过内部注册表分配一个
 - 若宿主需要数据库 callback 或运行时技能管理 callback，必须先注册 callback，再创建 engine
 - callback 返回文本时，文本必须是合法 UTF-8；其中 JSON callback 与标准 provider callback 的 JSON 载荷还必须是合法 JSON 文本
 
-### 6.6 回调与快照规则
+### 6.7 回调与快照规则
 
 当前回调模型需要宿主特别注意：
 
@@ -812,11 +812,13 @@ System Plugin 租约不把整个 `system_lua_lib` 当成一个共享包。每次
 - 推荐工具签名：
 
 ```text
-runtime-config(action, skill_id?, key?, value?)
+runtime-config(action, skill_id?, key?, value?, include_values?)
 ```
 
 推荐动作：
 
+- `describe`
+- `validate`
 - `list`
 - `get`
 - `set`
@@ -1249,6 +1251,8 @@ system 版本的 `_json` 生命周期接口，以及可见性查询、prompt com
 标准 C ABI 接口：
 
 - `luaskills_ffi_skill_config_list`
+- `luaskills_ffi_skill_config_describe`
+- `luaskills_ffi_skill_config_validate`
 - `luaskills_ffi_skill_config_get`
 - `luaskills_ffi_skill_config_set`
 - `luaskills_ffi_skill_config_delete`
@@ -1256,15 +1260,23 @@ system 版本的 `_json` 生命周期接口，以及可见性查询、prompt com
 公共 `_json` FFI 接口：
 
 - `luaskills_ffi_skill_config_list_json`
+- `luaskills_ffi_skill_config_describe_json`
+- `luaskills_ffi_skill_config_validate_json`
 - `luaskills_ffi_skill_config_get_json`
 - `luaskills_ffi_skill_config_set_json`
 - `luaskills_ffi_skill_config_delete_json`
 
 说明：
 
-- skill config 按 `skill_id` 管理配置，不按 `ROOT` / `PROJECT` / `USER` 可见性过滤。
-- 配置只有在 Lua skill 主动通过 `vulcan.config.*` 读取时才会影响运行行为。
-- 如果宿主不希望客户修改某些配置，不应暴露对应 `set/delete` 工具；必须强制锁定的核心行为应通过宿主硬逻辑或内置核心 skill 实现。
+- skill config 按技能包 `skill_id` 管理，不属于某个独立 entry，也不按 `ROOT` / `PROJECT` / `USER` 可见性过滤。
+- 当前有效技能包必须在 `skill.yaml` 顶层声明配置项；宿主 `set` 不能写入未声明 key，也不能绕过类型和约束校验。
+- `describe` 返回参数名、类型、约束、枚举说明、技能包作者提供的文本和状态。`skill_id` 可为空。
+- 标准 C ABI 的 `include_values` 只接受 `0` 或 `1`；JSON FFI 中为布尔值且默认 `false`。
+- `include_values=false` 时响应完全省略每项的 `value`；为 `true` 时返回未遮罩原始有效值。
+- `validate` 是只读操作，返回 `complete`、`missing`、`invalid`、`orphaned_count`。
+- 原始 `list/get/delete` 可以管理技能包升级后留下的未声明值；`set` 始终要求当前声明。
+- LuaSkills 不对配置值执行用户授权，也不因 `sensitive=true` 自动遮罩。上级封装必须决定是否允许 `get/list`、是否允许 `include_values=true`、是否直接修改或先请求用户授权。
+- 完整请求响应与权限建议见 [Skill 包级配置声明、运行时控制与宿主对接](../architecture/skill-config-system-design.md)。
 
 ### 9.7 宿主工具桥接 callback
 
@@ -1505,12 +1517,16 @@ SDK 对接入口：
 作用：
 
 - 重新扫描技能根并重建运行时视图
+- 丢弃候选引擎的旧 entry、help、provider 与配置声明注册表
+- 基于同一组成功加载的有效技能包重建全部注册表
+- 候选构建失败时保留当前引擎及其配置声明注册表
 
 ### 10.6 `skill_config_*`
 
 作用：
 
-- 统一管理按 `skill_id + key + value` 存储的字符串配置
+- 发现和校验每个有效技能包在 `skill.yaml` 顶层声明的配置结构
+- 统一管理按 `skill_id + key + value` 持久化的规范字符串值
 
 调用逻辑：
 
@@ -1520,28 +1536,21 @@ SDK 对接入口：
    - `<runtime_root>/config/skill_config.json`
    - 即使 `skills/` 目录尚未存在，也仍然先解析这条默认路径
    - 若多个 skill root 指向不同的 `runtime_root`，则拒绝隐式猜测路径并要求宿主显式配置
-3. 在单一主配置文件中按 `skill_id` 读写当前配置
-4. `set` 统一承担新增与更新
-5. `delete` 返回是否真实删除了某个键
+3. 在单一主配置文件中按包级 `skill_id` 读写当前配置
+4. `describe/validate` 提供声明、类型、说明、约束和状态
+5. `set` 只允许当前有效包已声明的 key，并执行类型校验与规范化
+6. `delete` 返回是否真实删除了某个键，并允许清理 orphaned
 
 宿主包装建议：
 
 - 推荐把这组底层 API 封装成单工具：
-  - `runtime-config(action, skill_id?, key?, value?)`
-- 不建议把 `list/get/set/delete` 暴露成四个独立终端工具，避免占用过多上下文
-- 这组接口不是 ROOT 可见性查询接口；宿主如果开放它，应按自己的产品权限决定哪些 `skill_id` 可以读写
+  - `runtime-config(action, skill_id?, key?, value?, include_values?)`
+- 推荐动作是 `describe/validate/list/get/set/delete`
+- 不建议把这些动作暴露成多个独立终端工具，避免占用过多上下文
+- 这组接口不是 ROOT 可见性查询接口；宿主必须按产品权限决定哪些 `skill_id` 可以读写
+- LuaSkills 不执行用户授权或敏感值遮罩；宿主必须决定是否允许原始值查询、是否传 `include_values=true`、是否直接修改或先请求用户授权
 
-调用逻辑：
-
-1. 丢弃旧注册表快照
-2. 重新扫描生效 skill
-3. 重建 entry / help / provider 绑定
-
-说明：
-
-生命周期接口最终都会依赖 reload 来确认新状态生效。
-
-### 10.6 `list_entries`
+### 10.7 `list_entries`
 
 作用：
 
@@ -1563,7 +1572,7 @@ SDK 对接入口：
 - `_json` 请求需要包含 `"authority": "system"` 或 `"authority": "delegated_tool"`。
 - `DelegatedTool` 不返回 `ROOT` entries。
 
-### 10.7 `list_skill_help`
+### 10.8 `list_skill_help`
 
 作用：
 
@@ -1581,7 +1590,7 @@ SDK 对接入口：
 
 - `DelegatedTool` 不返回 `ROOT` help 树。
 
-### 10.8 `render_skill_help_detail`
+### 10.9 `render_skill_help_detail`
 
 作用：
 
@@ -1599,7 +1608,7 @@ SDK 对接入口：
 - 传空缓冲表示“不附带请求上下文”
 - `DelegatedTool` 请求 `ROOT` help detail 时返回未找到或空结果，不暴露 ROOT 内容。
 
-### 10.9 `prompt_argument_completions`
+### 10.10 `prompt_argument_completions`
 
 作用：
 
@@ -1616,7 +1625,7 @@ SDK 对接入口：
 - `_json` 请求需要包含 `"authority": "system"` 或 `"authority": "delegated_tool"`。
 - 当前接口仍返回空候选；后续若从 skill 元数据读取候选，必须保持同一 authority 可见性边界。
 
-### 10.10 `is_skill`
+### 10.11 `is_skill`
 
 作用：
 
@@ -1626,7 +1635,7 @@ SDK 对接入口：
 
 - `DelegatedTool` 对 ROOT tool name 返回 `false`。
 
-### 10.11 `skill_name_for_tool`
+### 10.12 `skill_name_for_tool`
 
 作用：
 
@@ -1636,7 +1645,7 @@ SDK 对接入口：
 
 - `DelegatedTool` 对 ROOT tool name 返回空归属。
 
-### 10.12 `call_skill`
+### 10.13 `call_skill`
 
 作用：
 
@@ -1669,7 +1678,7 @@ SDK 对接入口：
 5. 执行 Lua
 6. 结构化返回结果
 
-### 10.13 `vulcan.runtime.skills.*`
+### 10.14 `vulcan.runtime.skills.*`
 
 作用：
 
@@ -1725,7 +1734,7 @@ SDK 对接入口：
 
 `ROOT` 不应出现在普通桥接的可操作层级列表中。`layers()` 基于当前已加载 root 链生成，只返回实际存在的 `PROJECT` / `USER`；若当前没有项目上下文，则不会返回 `PROJECT`；若只有 `ROOT`，则返回空 `labels` / `layers`、没有 `default`，且顶层 `writable=false`。当 bridge 关闭时，顶层 `writable` 与每个 layer 的 `writable` 都必须为 `false`。`layers()` 只是能力发现接口，install / update / uninstall 等请求仍必须由宿主回调做最终校验。
 
-### 10.14 `vulcan.host.*`
+### 10.15 `vulcan.host.*`
 
 作用：
 
@@ -1818,7 +1827,7 @@ true
 - 未注册 callback 或 callback 返回 FFI 错误时，`call()` 返回 `{ ok = false, error = ... }` table，而不是让 Lua skill 自己解析 FFI 错误。
 - 如果 callback 的 `call` 响应不是 JSON object，运行时会包装为 `{ "ok": true, "value": ... }`，确保 Lua 侧拿到 table。
 
-### 10.15 `run_lua`
+### 10.16 `run_lua`
 
 作用：
 

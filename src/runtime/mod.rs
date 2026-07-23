@@ -1,5 +1,6 @@
 pub mod cache;
-pub mod config;
+pub(crate) mod config;
+pub(crate) mod config_service;
 pub mod context;
 pub mod encoding;
 pub mod engine;

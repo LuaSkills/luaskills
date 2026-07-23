@@ -200,6 +200,23 @@ List flattened skill config records as JSON.
 FfiOwnedBuffer luaskills_ffi_skill_config_list_json(FfiBorrowedBuffer input_json);
 
 /*
+Describe effective package configuration declarations as JSON.
+以 JSON 形式描述有效技能包配置声明。
+
+The request may contain skill_id and include_values. The host must
+authorize value disclosure before setting include_values=true; values are not masked.
+请求可包含 skill_id 与 include_values。宿主在设置 include_values=true
+之前必须完成值披露授权；返回值不会被遮罩。
+*/
+FfiOwnedBuffer luaskills_ffi_skill_config_describe_json(FfiBorrowedBuffer input_json);
+
+/*
+Validate one effective package configuration as JSON without changing state.
+以 JSON 形式校验单个有效技能包配置且不修改状态。
+*/
+FfiOwnedBuffer luaskills_ffi_skill_config_validate_json(FfiBorrowedBuffer input_json);
+
+/*
 Read one optional skill config value as JSON.
 以 JSON 形式读取单个可选技能配置值。
 */

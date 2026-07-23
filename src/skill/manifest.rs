@@ -5,6 +5,9 @@ use std::fs;
 use std::path::Path;
 
 use crate::runtime::path::render_host_visible_path;
+use crate::skill::config::{
+    SkillPackageConfigDeclaration, validate_skill_package_config_declarations,
+};
 
 // ============================================================
 // Lua Skill metadata (loaded from skill.yaml only)
@@ -179,6 +182,7 @@ pub struct SkillParam {
 /// Strict top-level entry metadata used by the new LuaSkills package layout.
 /// 新 LuaSkills 包结构使用的严格顶层入口元数据。
 #[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SkillToolMeta {
     /// Local entry name used inside the skill namespace.
     /// skill 命名空间内部使用的局部入口名称。
@@ -214,6 +218,7 @@ pub struct SkillToolMeta {
 /// Strict skill-level metadata loaded only from skill.yaml.
 /// 仅从 skill.yaml 加载的严格 skill 级元数据。
 #[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SkillMeta {
     /// Internal skill name, for example "vulcan-codekit".
     /// 内部 skill 名称，例如 "vulcan-codekit"。
@@ -229,6 +234,10 @@ pub struct SkillMeta {
     /// 调试模式：每次调用时都从磁盘热加载 Lua 源文件。
     #[serde(default)]
     pub debug: bool,
+    /// Package-level configuration declarations shared by every entry in this skill package.
+    /// 当前技能包全部入口共享的包级配置声明。
+    #[serde(default)]
+    pub config: Vec<SkillPackageConfigDeclaration>,
     /// Structured LanceDB configuration used by the host-managed binding.
     /// 宿主管理的 LanceDB 绑定所使用的结构化配置对象。
     #[serde(default)]
@@ -703,6 +712,8 @@ impl SkillMeta {
     /// Resolve every entry input schema into one final object schema before runtime export.
     /// 在运行时导出之前，把每个入口输入 schema 解析为最终对象 schema。
     pub fn resolve_entry_input_schemas(&mut self, skill_dir: &Path) -> Result<(), String> {
+        let skill_id = self.effective_skill_id().to_string();
+        validate_skill_package_config_declarations(&skill_id, &mut self.config)?;
         for tool in &mut self.entries {
             tool.resolve_input_schema(skill_dir)?;
         }
@@ -731,6 +742,19 @@ impl SkillMeta {
     /// 遍历当前 skill 下的全部顶层入口。
     pub fn entries(&self) -> impl Iterator<Item = &SkillToolMeta> {
         self.entries.iter()
+    }
+
+    /// Iterate over all package-level configuration declarations.
+    /// 遍历当前技能包的全部包级配置声明。
+    pub fn package_config(&self) -> impl Iterator<Item = &SkillPackageConfigDeclaration> {
+        self.config.iter()
+    }
+
+    /// Find one package-level configuration declaration by its stable key.
+    /// 根据稳定 key 查找单个包级配置声明。
+    pub fn find_package_config(&self, key: &str) -> Option<&SkillPackageConfigDeclaration> {
+        self.package_config()
+            .find(|declaration| declaration.key == key)
     }
 
     /// Build the unresolved base name of one entry before conflict indexing.
@@ -1157,4 +1181,48 @@ entries:
 
         fs::remove_dir_all(&skill_dir).expect("cleanup invalid schema description dir");
     }
+}
+
+/// Verify package configuration declarations are accepted only at the manifest top level.
+/// 验证技能包配置声明只允许出现在清单顶层。
+#[test]
+fn package_config_is_rejected_inside_individual_entries() {
+    let error = serde_yaml::from_str::<SkillMeta>(
+        r#"
+name: demo-package
+version: 1.0.0
+entries:
+  - name: ping
+    description: Ping.
+    lua_entry: runtime/ping.lua
+    lua_module: demo-package.ping
+    config:
+      - key: token
+        type: string
+        description: Token.
+"#,
+    )
+    .expect_err("entry-local configuration declarations must fail");
+    assert!(error.to_string().contains("unknown field"));
+    assert!(error.to_string().contains("config"));
+}
+
+/// Verify unknown top-level manifest fields fail instead of being silently ignored.
+/// 验证未知清单顶层字段会失败而不是被静默忽略。
+#[test]
+fn skill_meta_rejects_unknown_top_level_fields() {
+    let error = serde_yaml::from_str::<SkillMeta>(
+        r#"
+name: demo-package
+version: 1.0.0
+configuration:
+  - key: token
+    type: string
+    description: Token.
+entries: []
+"#,
+    )
+    .expect_err("unknown top-level configuration aliases must fail");
+    assert!(error.to_string().contains("unknown field"));
+    assert!(error.to_string().contains("configuration"));
 }

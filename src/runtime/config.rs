@@ -154,12 +154,6 @@ impl SkillConfigStore {
         })
     }
 
-    /// Return whether one `(skill_id, key)` pair currently exists in the store.
-    /// 返回某个 `(skill_id, key)` 对当前是否存在于存储中。
-    pub fn has_value(&self, skill_id: &str, key: &str) -> Result<bool, String> {
-        Ok(self.get_value(skill_id, key)?.is_some())
-    }
-
     /// Insert or replace one string config value under one `(skill_id, key)` pair.
     /// 在某个 `(skill_id, key)` 对下插入或替换单个字符串配置值。
     pub fn set_value(&self, skill_id: &str, key: &str, value: &str) -> Result<(), String> {

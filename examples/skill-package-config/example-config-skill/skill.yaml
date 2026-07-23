@@ -1,0 +1,57 @@
+name: example-config-skill
+version: 1.0.0
+enable: true
+debug: false
+
+config:
+  - key: api_token
+    type: string
+    required: true
+    sensitive: true
+    description: Service access token
+    constraints:
+      min_length: 1
+      max_length: 4096
+
+  - key: retry_count
+    type: integer
+    default: 3
+    description: Request retry count
+    constraints:
+      minimum: 0
+      maximum: 10
+
+  - key: temperature
+    type: float
+    default: 0.7
+    description: Model sampling temperature
+    constraints:
+      minimum: 0.0
+      maximum: 2.0
+
+  - key: provider
+    type: enum
+    default: openai
+    description: Service provider
+    options:
+      - value: openai
+        label: OpenAI
+        description: OpenAI service
+      - value: local
+        label: Local service
+        description: User-managed local service
+
+  - key: telemetry_enabled
+    type: boolean
+    default: false
+    description: Whether telemetry is enabled
+
+entries:
+  - name: query
+    description: Execute one example query with shared package configuration.
+    lua_entry: runtime/query.lua
+    lua_module: example-config-skill.query
+  - name: status
+    description: Return shared package configuration structure and completeness status.
+    lua_entry: runtime/status.lua
+    lua_module: example-config-skill.status

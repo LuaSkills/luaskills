@@ -230,6 +230,6 @@ The host can render help as:
 - [System Plugin managed runtime guide](../system-plugin-managed-runtime.md)
 - [System Plugin 受管运行时使用指南](../zh-CN/system-plugin-managed-runtime.md)
 - [Skill root layer policy](../zh-CN/architecture/skill-root-layer-policy.md)
-- [Skill config system design](../zh-CN/architecture/skill-config-system-design.md)
+- [Skill package configuration declaration and host integration](../zh-CN/architecture/skill-config-system-design.md)
 - [Lua Skill developer manual](../skill-development.md)
 - [Chinese Lua Skill developer manual](../zh-CN/skill-development.md)

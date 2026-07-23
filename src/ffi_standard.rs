@@ -1399,13 +1399,9 @@ fn runtime_model_error_status_field(
 /// 在错误包络或直接错误载荷中定位模型错误对象。
 fn runtime_model_error_object(value: &Value) -> Option<&serde_json::Map<String, Value>> {
     value.get("error").and_then(Value::as_object).or_else(|| {
-        value.as_object().and_then(|object| {
-            if object.contains_key("code") || object.contains_key("message") {
-                Some(object)
-            } else {
-                None
-            }
-        })
+        value
+            .as_object()
+            .filter(|object| object.contains_key("code") || object.contains_key("message"))
     })
 }
 
@@ -2878,6 +2874,107 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_list(
     }
 }
 
+/// Describe effective package configuration declarations through the standard C ABI.
+/// 通过标准 C ABI 描述有效技能包配置声明。
+///
+/// `skill_id` may be null. `include_values` must be exactly zero or one.
+/// `skill_id` 可以为空指针；`include_values` 必须严格为零或一。
+///
+/// The host owns authorization for value disclosure; requested values are never masked here.
+/// 宿主负责配置值披露授权；此处绝不遮罩已请求的值。
+///
+/// # Safety
+/// # 安全性
+///
+/// Optional strings must be null or valid UTF-8 C strings, and output pointers must be writable.
+/// 可选字符串必须为空指针或合法 UTF-8 C 字符串，输出指针必须可写。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_skill_config_describe(
+    engine_id: u64,
+    skill_id: *const c_char,
+    include_values: u8,
+    result_json_out: *mut FfiOwnedBuffer,
+    error_out: *mut FfiOwnedBuffer,
+) -> i32 {
+    clear_error_out(error_out);
+    clear_out_buffer(result_json_out);
+    if result_json_out.is_null() {
+        return ffi_error_status(error_out, "result_json_out must not be null");
+    }
+    if include_values > 1 {
+        return ffi_error_status(error_out, "include_values must be 0 or 1");
+    }
+    let skill_id = match parse_optional_string(skill_id, "skill_id") {
+        Ok(skill_id) => skill_id,
+        Err(error) => return ffi_error_status(error_out, error),
+    };
+    match with_engine(engine_id, |engine| {
+        engine.describe_skill_package_config(skill_id.as_deref(), include_values == 1)
+    }) {
+        Ok(descriptors) => match serde_json::to_string(&descriptors) {
+            Ok(result_json) => {
+                unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(
+                error_out,
+                format!(
+                    "failed to serialize skill package configuration descriptors: {}",
+                    error
+                ),
+            ),
+        },
+        Err(error) => ffi_error_status(error_out, error),
+    }
+}
+
+/// Validate one effective package configuration through the standard C ABI.
+/// 通过标准 C ABI 校验单个有效技能包配置。
+///
+/// The operation is read-only and returns one JSON status object.
+/// 当前操作只读并返回单个 JSON 状态对象。
+///
+/// # Safety
+/// # 安全性
+///
+/// `skill_id` must be a valid UTF-8 C string and output pointers must be writable.
+/// `skill_id` 必须是合法 UTF-8 C 字符串，输出指针必须可写。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_skill_config_validate(
+    engine_id: u64,
+    skill_id: *const c_char,
+    result_json_out: *mut FfiOwnedBuffer,
+    error_out: *mut FfiOwnedBuffer,
+) -> i32 {
+    clear_error_out(error_out);
+    clear_out_buffer(result_json_out);
+    if result_json_out.is_null() {
+        return ffi_error_status(error_out, "result_json_out must not be null");
+    }
+    let skill_id = match parse_required_string(skill_id, "skill_id") {
+        Ok(skill_id) => skill_id,
+        Err(error) => return ffi_error_status(error_out, error),
+    };
+    match with_engine(engine_id, |engine| {
+        engine.validate_skill_package_config(&skill_id)
+    }) {
+        Ok(status) => match serde_json::to_string(&status) {
+            Ok(result_json) => {
+                unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(
+                error_out,
+                format!(
+                    "failed to serialize skill package configuration status: {}",
+                    error
+                ),
+            ),
+        },
+        Err(error) => ffi_error_status(error_out, error),
+    }
+}
+
 /// Read one optional skill config value through the standard C ABI surface.
 /// 通过标准 C ABI 接口读取单个可选技能配置值。
 /// # Safety
@@ -2958,7 +3055,7 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_set(
     match with_engine_mut(engine_id, |engine| {
         engine.set_skill_config_value(&skill_id, &key, &value)
     }) {
-        Ok(()) => ffi_ok_status(error_out),
+        Ok(_) => ffi_ok_status(error_out),
         Err(error) => ffi_error_status(error_out, error),
     }
 }

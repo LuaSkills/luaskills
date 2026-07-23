@@ -396,6 +396,8 @@ pub(crate) fn exported_ffi_function_names() -> Vec<String> {
         "luaskills_ffi_is_skill",
         "luaskills_ffi_skill_name_for_tool",
         "luaskills_ffi_skill_config_list",
+        "luaskills_ffi_skill_config_describe",
+        "luaskills_ffi_skill_config_validate",
         "luaskills_ffi_skill_config_get",
         "luaskills_ffi_skill_config_set",
         "luaskills_ffi_skill_config_delete",
@@ -437,6 +439,8 @@ pub(crate) fn exported_ffi_function_names() -> Vec<String> {
         "luaskills_ffi_is_skill_json",
         "luaskills_ffi_skill_name_for_tool_json",
         "luaskills_ffi_skill_config_list_json",
+        "luaskills_ffi_skill_config_describe_json",
+        "luaskills_ffi_skill_config_validate_json",
         "luaskills_ffi_skill_config_get_json",
         "luaskills_ffi_skill_config_set_json",
         "luaskills_ffi_skill_config_delete_json",
@@ -915,6 +919,67 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_list_json(
     }
 }
 
+/// Describe effective package configuration declarations through the JSON FFI surface.
+/// 通过 JSON FFI 入口描述有效技能包配置声明。
+///
+/// `include_values` is an explicit host-side disclosure decision; LuaSkills returns requested
+/// values without masking and does not perform user authorization.
+/// `include_values` 是显式的宿主侧披露决定；LuaSkills 会无掩码返回请求值且不执行用户授权。
+///
+/// # Safety
+/// # 安全性
+///
+/// The caller must uphold the LuaSkills C ABI contract for the borrowed input buffer.
+/// 调用方必须遵守借用输入缓冲的 LuaSkills C ABI 契约。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_skill_config_describe_json(
+    input_json: FfiBorrowedBuffer,
+) -> FfiOwnedBuffer {
+    let request = match decode_json_request::<SkillPackageConfigDescribeJsonRequest>(
+        input_json,
+        "luaskills_ffi_skill_config_describe_json",
+    ) {
+        Ok(request) => request,
+        Err(error) => return ffi_error(error),
+    };
+    match with_engine(request.engine_id, |engine| {
+        engine.describe_skill_package_config(request.skill_id.as_deref(), request.include_values)
+    }) {
+        Ok(descriptors) => ffi_ok(descriptors),
+        Err(error) => ffi_error(error),
+    }
+}
+
+/// Validate one effective package configuration through the JSON FFI surface.
+/// 通过 JSON FFI 入口校验单个有效技能包配置。
+///
+/// This query never changes persisted configuration state.
+/// 当前查询永不修改持久化配置状态。
+///
+/// # Safety
+/// # 安全性
+///
+/// The caller must uphold the LuaSkills C ABI contract for the borrowed input buffer.
+/// 调用方必须遵守借用输入缓冲的 LuaSkills C ABI 契约。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_skill_config_validate_json(
+    input_json: FfiBorrowedBuffer,
+) -> FfiOwnedBuffer {
+    let request = match decode_json_request::<SkillPackageConfigValidateJsonRequest>(
+        input_json,
+        "luaskills_ffi_skill_config_validate_json",
+    ) {
+        Ok(request) => request,
+        Err(error) => return ffi_error(error),
+    };
+    match with_engine(request.engine_id, |engine| {
+        engine.validate_skill_package_config(&request.skill_id)
+    }) {
+        Ok(status) => ffi_ok(status),
+        Err(error) => ffi_error(error),
+    }
+}
+
 /// Read one optional skill config value through the JSON FFI surface.
 /// 通过 JSON FFI 入口读取单个可选技能配置值。
 /// Skill config only affects behavior when Lua skill code reads it explicitly.
@@ -973,11 +1038,11 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_set_json(
     match with_engine_mut(request.engine_id, |engine| {
         engine.set_skill_config_value(&request.skill_id, &request.key, &request.value)
     }) {
-        Ok(()) => ffi_ok(SkillConfigMutationJsonResult {
+        Ok(normalized_value) => ffi_ok(SkillConfigMutationJsonResult {
             action: "set".to_string(),
             skill_id: request.skill_id,
             key: request.key,
-            value: Some(request.value),
+            value: Some(normalized_value),
             deleted: None,
         }),
         Err(error) => ffi_error(error),

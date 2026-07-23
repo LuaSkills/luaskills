@@ -775,6 +775,34 @@ int32_t luaskills_ffi_skill_config_list(
 );
 
 /*
+Describe effective package configuration declarations through the standard C ABI.
+通过标准 C ABI 描述有效技能包配置声明。
+
+skill_id may be NULL. include_values must be 0 or 1. The host must
+authorize value disclosure before passing 1; returned values are not masked.
+skill_id 可以为 NULL。include_values 必须为 0 或 1。宿主在传入 1
+之前必须完成值披露授权；返回值不会被遮罩。
+*/
+int32_t luaskills_ffi_skill_config_describe(
+    uint64_t engine_id,
+    const char *skill_id,
+    uint8_t include_values,
+    FfiOwnedBuffer *result_json_out,
+    FfiOwnedBuffer *error_out
+);
+
+/*
+Validate one effective package configuration without changing persisted state.
+在不修改持久化状态的前提下校验单个有效技能包配置。
+*/
+int32_t luaskills_ffi_skill_config_validate(
+    uint64_t engine_id,
+    const char *skill_id,
+    FfiOwnedBuffer *result_json_out,
+    FfiOwnedBuffer *error_out
+);
+
+/*
 Read one optional skill config value through the standard C ABI surface.
 通过标准 C ABI 接口读取单个可选技能配置值。
 */
@@ -1144,4 +1172,3 @@ int32_t luaskills_ffi_system_update_skill(
 #endif
 
 #endif
-

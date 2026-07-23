@@ -89,7 +89,7 @@ Skill development is available in English. The deepest host, FFI, provider, and 
 - [FFI integration guide](zh-CN/ffi/integration-guide.md)
 - [Host database provider guide](zh-CN/providers/host-database-provider-guide.md)
 - [Skill root layer policy](zh-CN/architecture/skill-root-layer-policy.md)
-- [Skill config system design](zh-CN/architecture/skill-config-system-design.md)
+- [Skill package configuration declaration and host integration](zh-CN/architecture/skill-config-system-design.md)
 - [Host tooling result bridge and `system_lua_lib` design draft](zh-CN/architecture/host-tooling-result-bridge-design.md)
 - [FFI refactor draft archive](zh-CN/archive/ffi-refactor-draft.md)
 

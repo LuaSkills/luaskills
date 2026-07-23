@@ -1082,53 +1082,44 @@ bash scripts/debug-tools/managed_runtime_smoke.sh
 
 ### 5.10 `vulcan.config.*`
 
-These capabilities read and maintain **string config for the current skill itself**.
+These capabilities read and maintain **declared configuration for the current skill package**. Declarations belong to the top-level `config` field in the package `skill.yaml`, and every entry in that package shares the same namespace.
 
 Currently available:
 
 | API | Parameters And Types | Return Value | Notes |
 | --- | --- | --- | --- |
-| `vulcan.config.get(key)` | `key: string` | `string \| nil` | reads one current-skill config value |
-| `vulcan.config.has(key)` | `key: string` | `boolean` | checks whether one key exists |
-| `vulcan.config.set(key, value)` | `key: string`; `value: string` | `true` | writes one current-skill config value |
-| `vulcan.config.delete(key)` | `key: string` | `boolean` | deletes one key; exact return semantics come from the backing store |
-| `vulcan.config.list()` | none | `table<string, string>` | lists all string config values in the current skill namespace |
+| `vulcan.config.get(key)` | `key: string` | `string \| nil` | returns the stored value or declared default; key must be declared |
+| `vulcan.config.has(key)` | `key: string` | `boolean` | checks for a stored value or declared default |
+| `vulcan.config.set(key, value)` | `key: string`; `value: string` | `true` | validates, normalizes, and persists one declared value |
+| `vulcan.config.delete(key)` | `key: string` | `boolean` | deletes the stored value and may reveal the declared default |
+| `vulcan.config.list()` | none | `table<string, string>` | lists effective values for declared keys only |
+| `vulcan.config.describe()` | none | `table` | returns names, types, constraints, package-authored enum metadata and descriptions, and state without values |
+| `vulcan.config.status()` | none | `table` | returns completeness, missing values, invalid values, and the orphaned count |
 
 Minimal example:
 
 ```lua
-local api_token = vulcan.config.get("api_token")
-
-if not api_token or api_token == "" then
-    return "The current skill has no `api_token` configured. Use the host runtime-config tool to set `api_token` for this skill."
+local status = vulcan.config.status()
+if not status.complete then
+    return [[This skill package configuration is incomplete.
+Ask the AI to call the host runtime-config describe action, then use set only
+after host or user authorization. If mutation is unavailable, request the missing values.]]
 end
 
-local endpoint = vulcan.config.get("endpoint") or "https://api.example.com"
-
-vulcan.config.set("last_endpoint", endpoint)
-
-return {
-    ok = true,
-    endpoint = endpoint,
-}
-```
-
-`list()` currently returns a flat table for the current skill namespace:
-
-```lua
-local config = vulcan.config.list()
--- config.api_token
--- config.endpoint
+local api_token = vulcan.config.get("api_token")
+return use_service(api_token)
 ```
 
 Notes:
 
-- Config values are strings in the first version.
-- If you need complex structure, store JSON text as a string and decode it with `vulcan.json.decode(...)` inside the skill.
-- Config defaults to the current skill. Skills cannot directly read or write other skill namespaces.
+- Declarations support `integer`, `string`, `float`, `enum`, and `boolean`; persistence and Lua values use normalized strings.
+- Undeclared keys are rejected by `get/has/set/delete`, and `list` never exposes orphaned records.
+- Configuration is isolated by package. A nested call switches to the target package and restores the caller afterward.
 - These APIs **require one active skill context**. They raise an error in system runtimes that do not currently represent one skill identity.
-- The runtime does not automatically refuse to load a skill just because config is missing. Prefer returning clear guidance when required config is absent.
+- Missing or invalid configuration does not prevent package loading. Check it only where an entry needs it.
 - The unified main config file defaults to `<runtime_root>/config/skill_config.json`; hosts can explicitly override the path.
+- Human-readable declaration fields use the single language chosen by the package author. English is recommended for broadly distributed packages but is not enforced.
+- The complete declaration schema, storage formats, host authorization boundary, and FFI contract are documented in [Skill package configuration](zh-CN/architecture/skill-config-system-design.md).
 
 ## 6. `vulcan.fs.*`
 

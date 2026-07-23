@@ -124,7 +124,7 @@ Important technical docs:
 - [FFI host checklist](docs/zh-CN/ffi/host-checklist.md)
 - [Host database provider guide](docs/zh-CN/providers/host-database-provider-guide.md)
 - [Skill root layer policy](docs/zh-CN/architecture/skill-root-layer-policy.md)
-- [Skill config system design](docs/zh-CN/architecture/skill-config-system-design.md)
+- [Skill package configuration declaration and host integration](docs/zh-CN/architecture/skill-config-system-design.md)
 - [Host tooling result bridge and `system_lua_lib` design draft](docs/zh-CN/architecture/host-tooling-result-bridge-design.md)
 
 ## Integration Paths

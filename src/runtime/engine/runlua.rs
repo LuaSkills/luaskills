@@ -51,7 +51,9 @@ pub(super) struct RunLuaRuntimeContext {
     host_options: Arc<LuaRuntimeHostOptions>,
     /// Unified skill configuration store exposed inside the runlua VM.
     /// 暴露到 runlua 虚拟机内部的统一技能配置存储。
-    skill_config_store: Arc<SkillConfigStore>,
+    /// Package-aware configuration service shared with the parent engine.
+    /// 与父引擎共享的包级配置服务。
+    skill_config_service: Arc<SkillPackageConfigService>,
     /// Runtime skill roots used for dependency and context resolution.
     /// 用于依赖与上下文解析的运行时技能根列表。
     runtime_skill_roots: Vec<RuntimeSkillRoot>,
@@ -82,7 +84,7 @@ impl RunLuaRuntimeContext {
             skills,
             entry_registry,
             host_options: engine.host_options.clone(),
-            skill_config_store: engine.skill_config_store.clone(),
+            skill_config_service: engine.skill_config_service.clone(),
             runtime_skill_roots: engine.runtime_skill_roots.clone(),
             lancedb_host: engine.lancedb_host.clone(),
             sqlite_host: engine.sqlite_host.clone(),
@@ -1367,7 +1369,7 @@ impl LuaEngine {
                 skills: runtime_context.skills.as_ref(),
                 entry_registry: runtime_context.entry_registry.as_ref(),
                 host_options: runtime_context.host_options.clone(),
-                skill_config_store: runtime_context.skill_config_store.clone(),
+                skill_config_service: runtime_context.skill_config_service.clone(),
                 runtime_skill_roots: runtime_context.runtime_skill_roots.clone(),
                 lancedb_host: runtime_context.lancedb_host.clone(),
                 sqlite_host: runtime_context.sqlite_host.clone(),

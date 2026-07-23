@@ -1,17 +1,20 @@
 use super::{
     EngineHandleJsonResult, EngineIdJsonRequest, EngineNewJsonRequest, FFI_ENGINE_COUNTER,
     FfiEngineSlot, SkillConfigGetJsonRequest, SkillConfigListJsonRequest,
-    SkillConfigSetJsonRequest, encode_json_buffer, ffi_engine_registry, lock_ffi_engine_registry,
-    luaskills_ffi_call_skill_json, luaskills_ffi_describe_json, luaskills_ffi_engine_free_json,
-    luaskills_ffi_engine_new_json, luaskills_ffi_is_skill_json, luaskills_ffi_list_entries_json,
-    luaskills_ffi_list_skill_help_json, luaskills_ffi_managed_runtime_resolve_json,
-    luaskills_ffi_managed_session_events_poll_json, luaskills_ffi_managed_session_events_wait_json,
-    luaskills_ffi_prompt_argument_completions_json, luaskills_ffi_render_skill_help_detail_json,
-    luaskills_ffi_run_lua_json, luaskills_ffi_runtime_lease_close_json,
-    luaskills_ffi_runtime_lease_create_json, luaskills_ffi_runtime_lease_eval_json,
-    luaskills_ffi_runtime_lease_list_json, luaskills_ffi_skill_config_delete_json,
+    SkillConfigSetJsonRequest, SkillPackageConfigDescribeJsonRequest,
+    SkillPackageConfigValidateJsonRequest, encode_json_buffer, ffi_engine_registry,
+    lock_ffi_engine_registry, luaskills_ffi_call_skill_json, luaskills_ffi_describe_json,
+    luaskills_ffi_engine_free_json, luaskills_ffi_engine_new_json, luaskills_ffi_is_skill_json,
+    luaskills_ffi_list_entries_json, luaskills_ffi_list_skill_help_json,
+    luaskills_ffi_managed_runtime_resolve_json, luaskills_ffi_managed_session_events_poll_json,
+    luaskills_ffi_managed_session_events_wait_json, luaskills_ffi_prompt_argument_completions_json,
+    luaskills_ffi_render_skill_help_detail_json, luaskills_ffi_run_lua_json,
+    luaskills_ffi_runtime_lease_close_json, luaskills_ffi_runtime_lease_create_json,
+    luaskills_ffi_runtime_lease_eval_json, luaskills_ffi_runtime_lease_list_json,
+    luaskills_ffi_skill_config_delete_json, luaskills_ffi_skill_config_describe_json,
     luaskills_ffi_skill_config_get_json, luaskills_ffi_skill_config_list_json,
-    luaskills_ffi_skill_config_set_json, luaskills_ffi_skill_name_for_tool_json,
+    luaskills_ffi_skill_config_set_json, luaskills_ffi_skill_config_validate_json,
+    luaskills_ffi_skill_name_for_tool_json,
     luaskills_ffi_system_private_install_skill_from_url_manifest_json,
     luaskills_ffi_system_runtime_lease_close_json, luaskills_ffi_system_runtime_lease_create_json,
     luaskills_ffi_system_runtime_lease_eval_json, luaskills_ffi_system_runtime_lease_list_json,
@@ -2276,6 +2279,26 @@ fn write_query_test_skill(skill_root: &Path, skill_id: &str) -> PathBuf {
     skill_dir
 }
 
+/// Write one enabled package with a declared sensitive string configuration for FFI tests.
+/// 为 FFI 测试写入一个声明了敏感字符串配置的启用技能包。
+fn write_config_test_skill(skill_root: &Path, skill_id: &str) -> PathBuf {
+    let skill_dir = skill_root.join(skill_id);
+    std::fs::create_dir_all(skill_dir.join("runtime")).expect("create config runtime dir");
+    std::fs::write(
+        skill_dir.join("skill.yaml"),
+        format!(
+            "name: {skill_id}\nversion: 0.1.0\nenable: true\ndebug: false\nconfig:\n  - key: api_token\n    type: string\n    required: true\n    sensitive: true\n    description: Service access token.\n    constraints:\n      min_length: 1\n      max_length: 4096\nentries:\n  - name: ping\n    description: Config ping entry.\n    lua_entry: runtime/ping.lua\n    lua_module: {skill_id}.ping\n"
+        ),
+    )
+    .expect("write config skill yaml");
+    std::fs::write(
+        skill_dir.join("runtime").join("ping.lua"),
+        "return function(args)\n  return vulcan.config.get('api_token')\nend\n",
+    )
+    .expect("write config runtime entry");
+    skill_dir
+}
+
 /// Write one FFI query-test skill whose final input schema is provided by one external JSON file.
 /// 写入一个最终输入 schema 由外部 JSON 文件提供的 FFI 查询测试技能。
 fn write_query_schema_test_skill(skill_root: &Path, skill_id: &str) -> PathBuf {
@@ -2850,41 +2873,8 @@ fn ffi_skill_config_json_roundtrip() {
                 idle_ttl_secs: 30,
             },
             crate::LuaRuntimeHostOptions {
-                runtime_root: None,
-                managed_runtime_distribution_root: None,
-                managed_runtime_environment_root: None,
-                managed_runtime_config: Default::default(),
-                temp_dir: Some(temp_root.join("temp")),
-                resources_dir: Some(temp_root.join("resources")),
-                lua_packages_dir: Some(temp_root.join("lua_packages")),
-                host_provided_tool_root: Some(temp_root.join("bin").join("tools")),
-                host_provided_lua_root: Some(temp_root.join("lua_packages")),
-                host_provided_ffi_root: Some(temp_root.join("libs")),
-                system_lua_lib_dir: None,
-                download_cache_root: Some(temp_root.join("temp").join("downloads")),
-                dependency_dir_name: "dependencies".to_string(),
-                state_dir_name: "state".to_string(),
-                database_dir_name: "databases".to_string(),
                 skill_config_file_path: Some(temp_root.join("config").join("skill_config.json")),
-                allow_network_download: false,
-                github_base_url: None,
-                github_api_base_url: None,
-                official_skill_hub_base_url: None,
-                enable_private_url_skill_install: false,
-                private_skill_source_allowlist: Vec::new(),
-                default_text_encoding: None,
-                sqlite_library_path: None,
-                sqlite_provider_mode: crate::LuaRuntimeDatabaseProviderMode::DynamicLibrary,
-                sqlite_callback_mode: crate::LuaRuntimeDatabaseCallbackMode::Standard,
-                lancedb_library_path: None,
-                lancedb_provider_mode: crate::LuaRuntimeDatabaseProviderMode::DynamicLibrary,
-                lancedb_callback_mode: crate::LuaRuntimeDatabaseCallbackMode::Standard,
-                space_controller: crate::LuaRuntimeSpaceControllerOptions::default(),
-                cache_config: None,
-                runlua_pool_config: None,
-                reserved_entry_names: Vec::new(),
-                ignored_skill_ids: Vec::new(),
-                capabilities: Default::default(),
+                ..Default::default()
             },
         ),
     };
@@ -2896,6 +2886,17 @@ fn ffi_skill_config_json_roundtrip() {
     assert_eq!(response["ok"], true);
     let result: EngineHandleJsonResult =
         serde_json::from_value(response["result"].clone()).expect("engine result should parse");
+    let skill_root = temp_root.join("skills");
+    write_config_test_skill(&skill_root, "demo-skill");
+    with_engine_mut(result.engine_id, |engine| {
+        engine
+            .load_from_roots(&[RuntimeSkillRoot {
+                name: "ROOT".to_string(),
+                skills_dir: skill_root,
+            }])
+            .map_err(|error| error.to_string())
+    })
+    .expect("load declared config package into JSON FFI engine");
 
     let set_request = CString::new(
         serde_json::to_string(&SkillConfigSetJsonRequest {
@@ -2917,6 +2918,67 @@ fn ffi_skill_config_json_roundtrip() {
     assert_eq!(set_response["result"]["skill_id"], "demo-skill");
     assert_eq!(set_response["result"]["key"], "api_token");
     assert_eq!(set_response["result"]["value"], "sk-json-ffi");
+
+    let describe_hidden_request = CString::new(
+        serde_json::to_string(&SkillPackageConfigDescribeJsonRequest {
+            engine_id: result.engine_id,
+            skill_id: Some("demo-skill".to_string()),
+            include_values: false,
+        })
+        .expect("hidden describe request json"),
+    )
+    .expect("hidden describe request cstring");
+    let describe_hidden_response = unsafe {
+        decode_response_json(luaskills_ffi_skill_config_describe_json(
+            borrowed_json_buffer(&describe_hidden_request),
+        ))
+    };
+    assert_eq!(describe_hidden_response["ok"], true);
+    assert_eq!(
+        describe_hidden_response["result"][0]["items"][0]["description"],
+        "Service access token."
+    );
+    assert!(
+        describe_hidden_response["result"][0]["items"][0]
+            .get("value")
+            .is_none()
+    );
+
+    let describe_visible_request = CString::new(
+        serde_json::to_string(&SkillPackageConfigDescribeJsonRequest {
+            engine_id: result.engine_id,
+            skill_id: Some("demo-skill".to_string()),
+            include_values: true,
+        })
+        .expect("visible describe request json"),
+    )
+    .expect("visible describe request cstring");
+    let describe_visible_response = unsafe {
+        decode_response_json(luaskills_ffi_skill_config_describe_json(
+            borrowed_json_buffer(&describe_visible_request),
+        ))
+    };
+    assert_eq!(describe_visible_response["ok"], true);
+    assert_eq!(
+        describe_visible_response["result"][0]["items"][0]["value"],
+        "sk-json-ffi"
+    );
+
+    let validate_request = CString::new(
+        serde_json::to_string(&SkillPackageConfigValidateJsonRequest {
+            engine_id: result.engine_id,
+            skill_id: "demo-skill".to_string(),
+        })
+        .expect("validate request json"),
+    )
+    .expect("validate request cstring");
+    let validate_response = unsafe {
+        decode_response_json(luaskills_ffi_skill_config_validate_json(
+            borrowed_json_buffer(&validate_request),
+        ))
+    };
+    assert_eq!(validate_response["ok"], true);
+    assert_eq!(validate_response["result"]["complete"], true);
 
     let get_request = CString::new(
         serde_json::to_string(&SkillConfigGetJsonRequest {
