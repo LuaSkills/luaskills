@@ -12,44 +12,24 @@
 
 $ErrorActionPreference = "Stop"
 
-function Resolve-ProjectRoot {
-    <#
-    .SYNOPSIS
-    Resolve the repository root from script metadata or the caller location.
-    从脚本元数据或调用方位置解析仓库根目录。
+# ScriptDir points at the current script directory when PowerShell exposes it.
+# ScriptDir 在 PowerShell 提供脚本路径时指向当前脚本目录。
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($PSCommandPath) { Split-Path -Parent $PSCommandPath } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { "" }
 
-    .PARAMETER ScriptDirectory
-    Directory that contains the current script when PowerShell exposes it.
-    PowerShell 可用时当前脚本所在的目录。
+# ProjectRootHelperPath selects the shared build-script root resolver from script or repository context.
+# ProjectRootHelperPath 从脚本或仓库上下文选择共享构建脚本根解析器。
+$ProjectRootHelperPath = if ($ScriptDir) { Join-Path $ScriptDir "project_root.ps1" } else { Join-Path (Get-Location).Path "scripts\build\project_root.ps1" }
+. $ProjectRootHelperPath
 
-    .OUTPUTS
-    Repository root path that contains Cargo.toml and scripts.
-    包含 Cargo.toml 与 scripts 目录的仓库根路径。
-    #>
-    param([string]$ScriptDirectory)
+# ArchiveHelperPath selects the shared checked archive helper from script or repository context.
+# ArchiveHelperPath 从脚本或仓库上下文选择共享的受检归档辅助脚本。
+$ArchiveHelperPath = if ($ScriptDir) { Join-Path $ScriptDir "archive_helpers.ps1" } else { Join-Path (Get-Location).Path "scripts\build\archive_helpers.ps1" }
+. $ArchiveHelperPath
 
-    $Candidates = @()
-    if ($ScriptDirectory) {
-        $Candidates += $ScriptDirectory
-    }
-    $Candidates += (Get-Location).Path
-
-    foreach ($Candidate in $Candidates) {
-        $Current = $Candidate
-        while ($Current) {
-            if ((Test-Path -LiteralPath (Join-Path $Current "Cargo.toml")) -and (Test-Path -LiteralPath (Join-Path $Current "scripts"))) {
-                return $Current
-            }
-            $Parent = Split-Path -Parent $Current
-            if (-not $Parent -or $Parent -eq $Current) {
-                break
-            }
-            $Current = $Parent
-        }
-    }
-
-    throw "Unable to resolve project root from script or current directory."
-}
+# ProjectRoot points at the repository root regardless of the caller location.
+# ProjectRoot 指向仓库根目录，避免调用方当前位置影响路径解析。
+$ProjectRoot = Resolve-ProjectRoot -ScriptDirectory $ScriptDir
+Set-Location $ProjectRoot
 
 function Ensure-Dir {
     <#
@@ -68,38 +48,6 @@ function Ensure-Dir {
     }
     if (-not (Test-Path -LiteralPath $Path)) {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
-    }
-}
-
-function New-TarFromDirectory {
-    <#
-    .SYNOPSIS
-    Archive top-level children without adding a leading ./ entry.
-    按一级子项打包，避免归档内出现 ./ 前缀。
-
-    .PARAMETER SourceDir
-    Directory whose top-level children should be archived.
-    需要归档其一级子项的源目录。
-
-    .PARAMETER ArchivePath
-    Final archive path to create.
-    需要创建的最终归档路径。
-    #>
-    param(
-        [string]$SourceDir,
-        [string]$ArchivePath
-    )
-
-    $Members = @(Get-ChildItem -Force -LiteralPath $SourceDir | ForEach-Object { $_.Name })
-    if (-not $Members -or $Members.Count -eq 0) {
-        throw "Cannot create archive from empty directory: $SourceDir"
-    }
-
-    Push-Location $SourceDir
-    try {
-        tar -czf $ArchivePath @Members
-    } finally {
-        Pop-Location
     }
 }
 
@@ -874,10 +822,6 @@ function Write-DebugPackageReadme {
 
     ($ReadmeLines -join [Environment]::NewLine) | Set-Content -Path (Join-Path $PackageRoot "README.md") -Encoding UTF8
 }
-
-$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($PSCommandPath) { Split-Path -Parent $PSCommandPath } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { "" }
-$ProjectRoot = Resolve-ProjectRoot -ScriptDirectory $ScriptDir
-Set-Location $ProjectRoot
 
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
     $OutputDir = "target\release-packages"

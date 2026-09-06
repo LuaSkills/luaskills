@@ -12,14 +12,14 @@ luaskills 导出的公共高层 JSON FFI 接口面。
 Beta integration contract for v0.1.x:
 - This header is the public high-level JSON FFI for dynamic languages and rapid integrations.
 - Shared structs and free helpers come from luaskills_ffi.h.
-- Returned buffers must be released only with the matching luaskills free function.
+- Returned buffers use exact-length allocations; keep pointer and length unchanged and release exactly once with the matching luaskills free function.
 - JSON callbacks must be registered before engine creation when callback-based modes are used.
 - Callbacks must not unwind across the C ABI boundary.
 - Same-thread reentry into the same engine is not supported.
 v0.1.x beta 集成契约：
 - 当前头文件是面向动态语言与快速集成场景的公共高层 JSON FFI。
 - 共享结构体与释放辅助函数来自 luaskills_ffi.h。
-- 所有返回缓冲都只能使用匹配的 luaskills 释放函数处理。
+- 所有返回缓冲均使用精确长度分配；必须保持指针和长度不变，并使用匹配的 luaskills 释放函数恰好释放一次。
 - 使用 JSON callback 模式时，宿主必须先注册 callback，再创建 engine。
 - callback 不允许把异常跨越 C ABI 边界传播。
 - 不支持同一线程内对同一 engine 的重入调用。

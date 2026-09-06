@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
-    Arc, Mutex, MutexGuard, OnceLock,
+    Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak,
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc,
 };
@@ -62,10 +62,23 @@ const FORCED_CHILD_REAP_POLL: Duration = Duration::from_millis(10);
 /// Maximum number of killed attach-failure children retained by the global asynchronous reaper.
 /// 全局异步回收器最多保留的已终止附加失败子进程数量。
 const DETACHED_CHILD_REAPER_CAPACITY: usize = 256;
+/// Minimum poll interval used for newly registered or recently changed live children.
+/// 新注册或近期变化的活动子进程使用的最小轮询间隔。
+const LIVE_CHILD_WATCHER_MIN_POLL: Duration = Duration::from_millis(10);
+/// Maximum idle poll interval limiting exit latency while reducing stable-session status probes.
+/// 在降低稳定会话状态探测的同时限制退出延迟的最大空闲轮询间隔。
+const LIVE_CHILD_WATCHER_MAX_POLL: Duration = Duration::from_millis(250);
 
 /// Lazily initialized bounded reaper shared by rare attach-failure timeout paths.
 /// 由少见附加失败超时路径共享的延迟初始化有界回收器。
 static DETACHED_CHILD_REAPER: OnceLock<Result<DetachedChildReaper, String>> = OnceLock::new();
+/// Lazily initialized process-wide watcher shared by every observed live child.
+/// 由每个受观察活动子进程共享的惰性进程级监视服务。
+static LIVE_CHILD_WATCHER: OnceLock<Result<LiveChildWatcher, String>> = OnceLock::new();
+/// Number of process-wide watcher worker threads started in the current test process.
+/// 当前测试进程中启动的进程级监视工作线程数量。
+#[cfg(test)]
+static LIVE_CHILD_WATCHER_THREAD_STARTS: AtomicUsize = AtomicUsize::new(0);
 /// Maximum time allowed for Windows descendant attachment or termination convergence.
 /// Windows 后代归属或终止收敛允许的最长时间。
 #[cfg(windows)]
@@ -247,6 +260,72 @@ struct ManagedProcessOutputBuffer {
     dropped_bytes: u64,
 }
 
+/// Generation counter and condition variable used to wake blocked output reads.
+/// 用于唤醒阻塞输出读取的变更序号与条件变量。
+#[derive(Debug, Default)]
+struct ManagedProcessOutputChange {
+    /// Monotonic generation advanced after output append or reader completion.
+    /// 在输出追加或读取器完成后推进的单调变更序号。
+    generation: Mutex<u64>,
+    /// Condition variable notified whenever the generation advances.
+    /// 每当变更序号推进时收到通知的条件变量。
+    changed: Condvar,
+}
+
+/// Per-read incremental marker search positions for stdout and stderr.
+/// 单次读取中用于 stdout 与 stderr 增量标记搜索的位置。
+#[derive(Debug, Default)]
+struct ManagedProcessMarkerSearch {
+    /// Absolute stdout byte position already covered by the previous scan.
+    /// 上一次扫描已经覆盖的 stdout 绝对字节位置。
+    stdout_cursor: u64,
+    /// Absolute stderr byte position already covered by the previous scan.
+    /// 上一次扫描已经覆盖的 stderr 绝对字节位置。
+    stderr_cursor: u64,
+    /// Raw stdout overlap retained across scans for encoding and marker boundaries.
+    /// 跨扫描保留的 stdout 原始重叠长度，用于编码与标记边界。
+    stdout_overlap: usize,
+    /// Raw stderr overlap retained across scans for encoding and marker boundaries.
+    /// 跨扫描保留的 stderr 原始重叠长度，用于编码与标记边界。
+    stderr_overlap: usize,
+}
+
+impl ManagedProcessMarkerSearch {
+    /// Build per-stream overlap budgets for one optional marker.
+    /// 为一个可选标记构造各输出流的重叠预算。
+    ///
+    /// The marker parameter is the decoded text requested by the caller.
+    /// marker 参数是调用方请求的已解码文本。
+    ///
+    /// The encoding parameters describe how each output stream is decoded.
+    /// encoding 参数描述每个输出流的解码方式。
+    ///
+    /// Returns zeroed cursors with enough overlap for boundary-safe incremental scans.
+    /// 返回零起始游标，并提供足够重叠以安全执行跨边界增量扫描。
+    fn new(
+        marker: Option<&str>,
+        stdout_encoding: RuntimeTextEncoding,
+        stderr_encoding: RuntimeTextEncoding,
+    ) -> Self {
+        // stdout_overlap is computed once per read instead of once per wakeup.
+        // stdout_overlap 每次读取只计算一次，而不是每次唤醒都计算。
+        let stdout_overlap = marker
+            .map(|marker| marker_search_overlap_bytes(marker, stdout_encoding))
+            .unwrap_or(0);
+        // stderr_overlap is independently sized for its configured encoding.
+        // stderr_overlap 根据其配置编码独立确定长度。
+        let stderr_overlap = marker
+            .map(|marker| marker_search_overlap_bytes(marker, stderr_encoding))
+            .unwrap_or(0);
+        Self {
+            stdout_cursor: 0,
+            stderr_cursor: 0,
+            stdout_overlap,
+            stderr_overlap,
+        }
+    }
+}
+
 /// Output stream whose reader produced one background notification.
 /// 产生单个后台通知的输出流。
 #[derive(Clone, Copy)]
@@ -257,6 +336,29 @@ enum ManagedProcessOutputStream {
     /// Standard error stream.
     /// 标准错误流。
     Stderr,
+}
+
+/// Shared state and policy transferred into one fallible session pipe reader.
+/// 转移到一个可失败会话管道读取器中的共享状态与策略。
+struct SessionPipeReaderContext {
+    /// Bounded output buffer receiving bytes from this pipe.
+    /// 接收当前管道字节的有界输出缓冲区。
+    target: Arc<Mutex<ManagedProcessOutputBuffer>>,
+    /// Maximum bytes retained in the target ring buffer.
+    /// 目标环形缓冲区保留的最大字节数。
+    limit_bytes: usize,
+    /// Logical output stream used for names and observer routing.
+    /// 用于命名与观察器路由的逻辑输出流。
+    stream: ManagedProcessOutputStream,
+    /// Optional package-agnostic lifecycle observer.
+    /// 可选的包无关生命周期观察器。
+    observer: Option<Arc<dyn ManagedProcessSessionObserver>>,
+    /// Serialized gate preventing new callbacks after teardown begins.
+    /// 防止清理开始后产生新回调的串行化门。
+    observer_notifications_open: Arc<Mutex<bool>>,
+    /// Shared generation signal waking blocked reads after output changes.
+    /// 输出变化后唤醒阻塞读取的共享变更序号信号。
+    output_change: Arc<ManagedProcessOutputChange>,
 }
 
 /// Package-agnostic observer for managed-process background lifecycle events.
@@ -303,6 +405,9 @@ struct ManagedProcessSessionState {
     /// Accumulated stderr bytes drained by the background reader.
     /// 后台读取器排空并累计的 stderr 字节。
     stderr_buffer: Arc<Mutex<ManagedProcessOutputBuffer>>,
+    /// Shared output generation signal published by both pipe readers.
+    /// 由两个管道读取器共同发布的输出变更信号。
+    output_change: Arc<ManagedProcessOutputChange>,
     /// Encoding used for stdout reads.
     /// stdout 读取使用的编码。
     stdout_encoding: RuntimeTextEncoding,
@@ -359,8 +464,8 @@ enum ManagedProcessBackgroundThread {
     /// Reader draining the direct child's stderr pipe.
     /// 排空直接子进程 stderr 管道的读取器。
     StderrReader,
-    /// Observer-only direct-child exit watcher.
-    /// 仅用于观察器的直接子进程退出监视器。
+    /// Process-wide observer-only live-child watcher service.
+    /// 进程级且仅用于观察器的活动子进程监视服务。
     ExitWatcher,
 }
 
@@ -374,6 +479,30 @@ type ManagedProcessBackgroundThreadSpawner = fn(
     ManagedProcessBackgroundThread,
     ManagedProcessBackgroundTask,
 ) -> Result<thread::JoinHandle<()>, std::io::Error>;
+
+/// Fallible live-child registration hook used by production and launch rollback tests.
+/// 由生产代码与启动回滚测试使用的可失败活动子进程注册钩子。
+type ManagedProcessExitWatcherRegistrar =
+    fn(&Arc<ManagedProcessSessionState>) -> Result<(), String>;
+
+/// Process-wide live-child watcher backed by one bounded worker thread.
+/// 由单个有限工作线程支持的进程级活动子进程监视服务。
+struct LiveChildWatcher {
+    /// Shared registration queue owned independently from observed sessions.
+    /// 独立于受观察会话持有的共享注册队列。
+    queue: Arc<LiveChildWatcherQueue>,
+}
+
+/// Weak live-session registrations and the wakeup used by the watcher worker.
+/// 活动会话弱注册项以及监视工作线程使用的唤醒器。
+struct LiveChildWatcherQueue {
+    /// Weak session states pending or active in the next centralized probe.
+    /// 等待或活动于下一次集中探测的会话状态弱引用。
+    sessions: Mutex<Vec<Weak<ManagedProcessSessionState>>>,
+    /// Notification emitted whenever a new observed session is registered.
+    /// 每当注册新的受观察会话时发出的通知。
+    changed: Condvar,
+}
 
 /// Platform-specific process-tree controller retained for one managed session.
 /// 单个托管会话保留的平台相关进程树控制器。
@@ -609,6 +738,101 @@ impl ManagedChildProcessTree {
     }
 }
 
+/// Terminate, reap, and release one one-shot process together with every spawned descendant.
+/// 终止、回收并释放单次执行进程及其派生的全部后代。
+///
+/// The child parameter is the unchanged direct-child handle returned by managed process-tree spawn.
+/// child 参数是受管进程树启动后返回且未被替换的直接子进程句柄。
+///
+/// The process_tree parameter owns the platform-specific descendant termination strategy.
+/// process_tree 参数拥有平台相关的后代进程终止策略。
+///
+/// The reaper_permit parameter guarantees bounded asynchronous ownership handoff when synchronous cleanup cannot finish.
+/// reaper_permit 参数保证同步清理无法完成时可进行有界异步所有权交接。
+///
+/// The observed_status parameter carries a direct-child status already reaped by the caller, when available.
+/// observed_status 参数携带调用方已经回收得到的直接子进程状态（如果存在）。
+///
+/// The label parameter identifies the one-shot API in cleanup diagnostics.
+/// label 参数在清理诊断中标识对应的单次执行 API。
+///
+/// Returns the definitive direct-child status only after process-tree convergence, or a complete cleanup error after retaining unresolved ownership in the static reaper.
+/// 仅在进程树确定收敛后返回直接子进程终态；未完成的所有权会交给静态回收器保留，并返回完整清理错误。
+pub(crate) fn finalize_one_shot_process_tree(
+    mut child: Child,
+    process_tree: ManagedChildProcessTree,
+    reaper_permit: DetachedChildReaperPermit,
+    observed_status: Option<std::process::ExitStatus>,
+    label: &str,
+) -> Result<std::process::ExitStatus, String> {
+    // Cleanup diagnostics accumulated without skipping later fallback or ownership checks.
+    // 在不跳过后续后备操作与所有权检查的前提下累计的清理诊断。
+    let mut errors = Vec::new();
+    // Full process-tree termination result, including descendants that may still own inherited pipes.
+    // 完整进程树终止结果，包括仍可能持有继承管道的后代。
+    let tree_termination_succeeded = match process_tree.terminate(&child) {
+        Ok(()) => true,
+        Err(error) => {
+            errors.push(format!("terminate {label} process tree: {error}"));
+            false
+        }
+    };
+    // Direct-child fallback is required only while the direct child has not already been reaped.
+    // 仅当直接子进程尚未回收时才需要直接子进程后备终止。
+    if !tree_termination_succeeded
+        && observed_status.is_none()
+        && let Err(error) = child.kill()
+    {
+        errors.push(format!("kill {label} direct child: {error}"));
+    }
+    // Definitive direct-child status obtained either by the caller or by a bounded forced-reap wait.
+    // 由调用方或有界强制回收等待取得的确定直接子进程状态。
+    let direct_status = match observed_status {
+        Some(status) => Some(status),
+        None => match wait_for_child_exit_until(
+            &mut child,
+            Instant::now() + FORCED_CHILD_REAP_TIMEOUT,
+            &format!("{label} direct child"),
+        ) {
+            Ok(status) => Some(status),
+            Err(error) => {
+                errors.push(error);
+                None
+            }
+        },
+    };
+    // Authoritative tree convergence status needed before platform ownership guards may be released.
+    // 释放平台所有权固定器前所需的权威进程树收敛状态。
+    let descendant_tree_empty = match process_tree.detached_tree_is_empty() {
+        Ok(true) => true,
+        Ok(false) => {
+            errors.push(format!("{label} descendant process tree is still active"));
+            false
+        }
+        Err(error) => {
+            errors.push(format!("inspect {label} process-tree convergence: {error}"));
+            false
+        }
+    };
+    // Ownership is complete only after both the direct child and authoritative descendant tree converge.
+    // 只有直接子进程与权威后代进程树均收敛后，所有权才算完成。
+    let ownership_complete = direct_status.is_some() && descendant_tree_empty;
+    if ownership_complete {
+        process_tree.clear_detached_guard();
+        drop(reaper_permit);
+    } else {
+        // Static reaper retains unresolved child and platform guard so function return never discards ownership.
+        // 静态回收器保留未解决的子进程与平台固定器，确保函数返回时绝不丢弃所有权。
+        process_tree.handoff_to_reaper(reaper_permit, child, None);
+    }
+
+    if errors.is_empty() {
+        direct_status.ok_or_else(|| format!("{label} process finished without status"))
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 #[cfg(windows)]
 /// Windows Job Object wrapper that kills the entire process tree on termination or final drop.
 /// Windows Job Object 封装，在终止或最终析构时杀掉整个进程树。
@@ -741,6 +965,34 @@ fn lock_session_output_buffer(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Lock one output-change generation counter and recover it after poisoning.
+/// 锁定一个输出变更序号，并在 poison 后恢复继续使用。
+///
+/// The change parameter owns the generation mutex used by blocked readers.
+/// change 参数持有阻塞读取器使用的变更序号互斥锁。
+///
+/// Returns the protected generation value.
+/// 返回受保护的变更序号值。
+fn lock_output_change_generation(change: &ManagedProcessOutputChange) -> MutexGuard<'_, u64> {
+    change
+        .generation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Publish one output append or reader-completion change to every blocked read.
+/// 向所有阻塞读取发布一次输出追加或读取器完成变更。
+///
+/// The change parameter is the session-wide wakeup signal.
+/// change 参数是会话级唤醒信号。
+fn notify_output_change(change: &ManagedProcessOutputChange) {
+    // generation is advanced while holding the condition-variable predicate lock.
+    // generation 在持有条件变量谓词锁时推进。
+    let mut generation = lock_output_change_generation(change);
+    *generation = generation.wrapping_add(1);
+    change.changed.notify_all();
+}
+
 /// Acquire the process-tree termination flag and recover after lock poisoning.
 /// 获取进程树终止标记，并在锁 poison 后恢复继续使用。
 fn lock_process_tree_terminated_flag(terminated: &Mutex<bool>) -> MutexGuard<'_, bool> {
@@ -840,6 +1092,7 @@ impl ManagedProcessSessionCore {
             None,
             ProcessTreeController::attach,
             spawn_managed_process_background_thread,
+            register_direct_child_exit_watch,
         )
     }
 
@@ -862,6 +1115,7 @@ impl ManagedProcessSessionCore {
             keepalive,
             ProcessTreeController::attach,
             spawn_managed_process_background_thread,
+            register_direct_child_exit_watch,
         )
     }
 
@@ -898,6 +1152,7 @@ impl ManagedProcessSessionCore {
             None,
             attach,
             spawn_managed_process_background_thread,
+            register_direct_child_exit_watch,
         )
     }
 
@@ -914,6 +1169,7 @@ impl ManagedProcessSessionCore {
         mut final_reaper_keepalive: Option<Box<dyn FnOnce() + Send>>,
         attach: F,
         spawn_thread: ManagedProcessBackgroundThreadSpawner,
+        register_exit_watcher: ManagedProcessExitWatcherRegistrar,
     ) -> Result<Self, String>
     where
         F: FnOnce(&Child) -> Result<ProcessTreeController, String>,
@@ -972,6 +1228,9 @@ impl ManagedProcessSessionCore {
         // StderrBuffer is the independent bounded ring shared with the stderr reader thread.
         // StderrBuffer 是与 stderr 读取线程共享的独立有界环形缓冲区。
         let stderr_buffer = Arc::new(Mutex::new(ManagedProcessOutputBuffer::default()));
+        // OutputChange wakes blocked reads after either stream changes or completes.
+        // OutputChange 会在任一输出流变化或完成后唤醒阻塞读取。
+        let output_change = Arc::new(ManagedProcessOutputChange::default());
         // ObserverNotificationsOpen serializes notification delivery against session teardown.
         // ObserverNotificationsOpen 将通知投递与会话清理串行化。
         let observer_notifications_open = Arc::new(Mutex::new(observer.is_some()));
@@ -985,6 +1244,7 @@ impl ManagedProcessSessionCore {
             stdin: Mutex::new(stdin),
             stdout_buffer,
             stderr_buffer,
+            output_change,
             stdout_encoding: options.stdout_encoding,
             stderr_encoding: options.stderr_encoding,
             stdin_encoding: options.stdin_encoding,
@@ -1001,11 +1261,14 @@ impl ManagedProcessSessionCore {
             // StdoutReader 持续排空子进程管道，防止输出阻塞子进程。
             let stdout_reader = match spawn_session_pipe_reader(
                 stdout,
-                state.stdout_buffer.clone(),
-                options.buffer_limit_bytes,
-                ManagedProcessOutputStream::Stdout,
-                state.observer.clone(),
-                state.observer_notifications_open.clone(),
+                SessionPipeReaderContext {
+                    target: state.stdout_buffer.clone(),
+                    limit_bytes: options.buffer_limit_bytes,
+                    stream: ManagedProcessOutputStream::Stdout,
+                    observer: state.observer.clone(),
+                    observer_notifications_open: state.observer_notifications_open.clone(),
+                    output_change: state.output_change.clone(),
+                },
                 spawn_thread,
             ) {
                 Ok(reader) => reader,
@@ -1021,11 +1284,14 @@ impl ManagedProcessSessionCore {
             // StderrReader 在相同有界策略下独立排空诊断输出。
             let stderr_reader = match spawn_session_pipe_reader(
                 stderr,
-                state.stderr_buffer.clone(),
-                options.buffer_limit_bytes,
-                ManagedProcessOutputStream::Stderr,
-                state.observer.clone(),
-                state.observer_notifications_open.clone(),
+                SessionPipeReaderContext {
+                    target: state.stderr_buffer.clone(),
+                    limit_bytes: options.buffer_limit_bytes,
+                    stream: ManagedProcessOutputStream::Stderr,
+                    observer: state.observer.clone(),
+                    observer_notifications_open: state.observer_notifications_open.clone(),
+                    output_change: state.output_change.clone(),
+                },
                 spawn_thread,
             ) {
                 Ok(reader) => reader,
@@ -1033,7 +1299,7 @@ impl ManagedProcessSessionCore {
             };
             *lock_session_reader_slot(&state.stderr_reader) = Some(stderr_reader);
         }
-        if let Err(error) = spawn_direct_child_exit_watcher(&state, spawn_thread) {
+        if let Err(error) = register_exit_watcher(&state) {
             return Err(rollback_managed_process_launch(&state, error));
         }
         Ok(Self { state })
@@ -1078,24 +1344,43 @@ impl ManagedProcessSessionCore {
         // Deadline is validated before any wait so oversized values never mutate session state.
         // Deadline 在任何等待前完成校验，使超大值永远不会修改会话状态。
         let deadline = checked_timeout_deadline(request.timeout_ms, "read timeout_ms")?;
+        // MarkerSearch retains only per-stream incremental cursors and boundary overlap.
+        // MarkerSearch 仅保留各输出流的增量游标与边界重叠。
+        let mut marker_search = ManagedProcessMarkerSearch::new(
+            request.until_text.as_deref(),
+            self.state.stdout_encoding,
+            self.state.stderr_encoding,
+        );
+        // GenerationGuard is the condition-variable predicate preventing missed output wakeups.
+        // GenerationGuard 是防止遗漏输出唤醒的条件变量谓词。
+        let mut generation = lock_output_change_generation(&self.state.output_change);
         // TimedOut distinguishes deadline expiry from readable data or reader completion.
         // TimedOut 用于区分截止时间到期与数据可读或读取器完成。
         let mut timed_out = false;
         loop {
-            if self.has_readable_output(&request.until_text)
+            if self.has_readable_output(&request.until_text, &mut marker_search)
                 || self.state.output_readers_drained()?
             {
                 break;
             }
-            // Now is captured once per iteration for consistent deadline comparison and sleep.
-            // Now 每轮只捕获一次，用于一致的截止点比较与休眠。
+            // Now is captured once per iteration for consistent deadline comparison and waiting.
+            // Now 每轮只捕获一次，用于一致的截止点比较与等待。
             let now = Instant::now();
             if now >= deadline {
                 timed_out = true;
                 break;
             }
-            thread::sleep((deadline - now).min(Duration::from_millis(10)));
+            // WaitResult atomically releases the generation lock until output changes or time expires.
+            // WaitResult 会原子释放变更序号锁，直到输出变化或时间到期。
+            let (next_generation, _) = self
+                .state
+                .output_change
+                .changed
+                .wait_timeout(generation, deadline - now)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            generation = next_generation;
         }
+        drop(generation);
 
         // StdoutBytes and StdoutStats are captured atomically from the stdout ring.
         // StdoutBytes 与 StdoutStats 从 stdout 环形缓冲区原子获取。
@@ -1197,32 +1482,41 @@ impl ManagedProcessSessionCore {
 
     /// Return whether either output stream is readable under one optional marker condition.
     /// 返回在可选标记条件下任一输出流是否可读。
-    fn has_readable_output(&self, until_text: &Option<String>) -> bool {
-        // StdoutGuard protects one consistent stdout marker scan.
-        // StdoutGuard 保护一次一致的 stdout 标记扫描。
-        let stdout = lock_session_output_buffer(&self.state.stdout_buffer);
-        // StderrGuard protects the corresponding independent stderr scan.
-        // StderrGuard 保护对应的独立 stderr 扫描。
-        let stderr = lock_session_output_buffer(&self.state.stderr_buffer);
-        if stdout.bytes.is_empty() && stderr.bytes.is_empty() {
-            return false;
+    fn has_readable_output(
+        &self,
+        until_text: &Option<String>,
+        marker_search: &mut ManagedProcessMarkerSearch,
+    ) -> bool {
+        let Some(marker) = until_text else {
+            // stdout_ready observes whether the stdout ring already contains any readable byte.
+            // stdout_ready 观察 stdout 环形缓冲区是否已经包含可读字节。
+            let stdout_ready = !lock_session_output_buffer(&self.state.stdout_buffer)
+                .bytes
+                .is_empty();
+            if stdout_ready {
+                return true;
+            }
+            return !lock_session_output_buffer(&self.state.stderr_buffer)
+                .bytes
+                .is_empty();
+        };
+
+        if output_buffer_contains_marker_since(
+            &self.state.stdout_buffer,
+            self.state.stdout_encoding,
+            marker,
+            &mut marker_search.stdout_cursor,
+            marker_search.stdout_overlap,
+        ) {
+            return true;
         }
-        if let Some(marker) = until_text {
-            // StdoutBytes linearizes the ring only for encoding-aware marker matching.
-            // StdoutBytes 仅为编码感知的标记匹配线性化环形缓冲区。
-            let stdout_bytes = stdout.bytes.iter().copied().collect::<Vec<_>>();
-            // StderrBytes linearizes the other stream without changing retained data.
-            // StderrBytes 线性化另一个流，且不修改保留数据。
-            let stderr_bytes = stderr.bytes.iter().copied().collect::<Vec<_>>();
-            // StdoutText is the decoded marker-search view.
-            // StdoutText 是用于标记搜索的解码视图。
-            let stdout_text = decode_runtime_text(&stdout_bytes, self.state.stdout_encoding).text;
-            // StderrText is decoded independently for the same marker.
-            // StderrText 针对同一标记独立解码。
-            let stderr_text = decode_runtime_text(&stderr_bytes, self.state.stderr_encoding).text;
-            return stdout_text.contains(marker) || stderr_text.contains(marker);
-        }
-        true
+        output_buffer_contains_marker_since(
+            &self.state.stderr_buffer,
+            self.state.stderr_encoding,
+            marker,
+            &mut marker_search.stderr_cursor,
+            marker_search.stderr_overlap,
+        )
     }
 }
 
@@ -1964,7 +2258,7 @@ impl ManagedProcessBackgroundThread {
         match self {
             Self::StdoutReader => "managed-process-stdout-reader",
             Self::StderrReader => "managed-process-stderr-reader",
-            Self::ExitWatcher => "managed-process-exit-watcher",
+            Self::ExitWatcher => "managed-process-live-child-watcher",
         }
     }
 }
@@ -1988,8 +2282,8 @@ fn spawn_managed_process_background_thread(
 
 /// Spawn one fallible pipe reader that appends bytes into a bounded buffer.
 /// 启动一个可失败的管道读取器，将字节追加到有界缓冲区。
-/// `reader`, `target`, and `limit_bytes` define the pipe and retention policy; observer inputs are optional.
-/// `reader`、`target` 与 `limit_bytes` 定义管道及保留策略；观察器输入为可选项。
+/// `reader` owns the pipe while `context` carries retention, observer, and wakeup state.
+/// `reader` 拥有管道，`context` 携带保留策略、观察器与唤醒状态。
 /// `spawn_thread` is injectable only so tests can deterministically exercise OS creation failures.
 /// `spawn_thread` 仅为测试可注入，以确定性验证操作系统创建失败。
 ///
@@ -1997,16 +2291,22 @@ fn spawn_managed_process_background_thread(
 /// 返回可等待的读取器状态，或在所有权逃逸前返回启动错误。
 fn spawn_session_pipe_reader<R>(
     mut reader: R,
-    target: Arc<Mutex<ManagedProcessOutputBuffer>>,
-    limit_bytes: usize,
-    stream: ManagedProcessOutputStream,
-    observer: Option<Arc<dyn ManagedProcessSessionObserver>>,
-    observer_notifications_open: Arc<Mutex<bool>>,
+    context: SessionPipeReaderContext,
     spawn_thread: ManagedProcessBackgroundThreadSpawner,
 ) -> Result<SessionPipeReader, String>
 where
     R: Read + Send + 'static,
 {
+    // Context fields move independently into the reader task without expanding the function API.
+    // Context 字段独立移动到读取任务中，同时不扩张函数 API。
+    let SessionPipeReaderContext {
+        target,
+        limit_bytes,
+        stream,
+        observer,
+        observer_notifications_open,
+        output_change,
+    } = context;
     // DoneChannel lets teardown wait for EOF or failure before joining the thread.
     // DoneChannel 让清理流程在 join 线程前等待 EOF 或失败。
     let (done_tx, done_rx) = mpsc::channel();
@@ -2038,6 +2338,7 @@ where
                         let mut buffer = lock_session_output_buffer(&target);
                         append_bounded(&mut buffer, &chunk[..count], limit_bytes);
                     }
+                    notify_output_change(&output_change);
                     notify_managed_process_observer(
                         observer.as_ref(),
                         &observer_notifications_open,
@@ -2059,6 +2360,7 @@ where
             }
         }
         done_flag.store(true, Ordering::Release);
+        notify_output_change(&output_change);
         // Send failure only means teardown already discarded its completion receiver.
         // Send 失败只表示清理流程已经释放完成接收端。
         let _ = done_tx.send(());
@@ -2120,74 +2422,208 @@ fn notify_managed_process_observer<F>(
     }
 }
 
-/// Spawn a direct-child exit monitor that owns only a weak session reference.
-/// 启动一个仅持有会话弱引用的直接子进程退出监视器。
-/// `state` supplies non-reaping probes and `spawn_thread` performs fallible thread creation.
-/// `state` 提供非回收式探测，`spawn_thread` 执行可失败线程创建。
+/// Register one observed direct child with the process-wide live-child watcher.
+/// 向进程级活动子进程监视服务注册一个受观察直接子进程。
+/// `state` supplies a weak registration and non-reaping status probes.
+/// `state` 提供弱引用注册项与非回收式状态探测。
 ///
-/// Success leaves a detached bounded-poll watcher; failure retains ownership in the launch transaction.
-/// 成功时留下分离式有界轮询监视器；失败时所有权仍保留在启动事务中。
-fn spawn_direct_child_exit_watcher(
-    state: &Arc<ManagedProcessSessionState>,
-    spawn_thread: ManagedProcessBackgroundThreadSpawner,
-) -> Result<(), String> {
+/// Success uses the single shared worker; failure retains ownership in the launch transaction.
+/// 成功时使用唯一共享工作线程；失败时所有权仍保留在启动事务中。
+fn register_direct_child_exit_watch(state: &Arc<ManagedProcessSessionState>) -> Result<(), String> {
     if state.observer.is_none() {
         return Ok(());
     }
-    // WeakState ensures the watcher can never keep an otherwise abandoned process session alive.
-    // WeakState 确保监视器永远不会让本应释放的进程会话继续存活。
-    let weak_state = Arc::downgrade(state);
-    // Task owns only a weak state reference so it cannot extend the process lifetime.
-    // Task 只拥有状态弱引用，因此不会延长进程生命周期。
-    let task: ManagedProcessBackgroundTask = Box::new(move || {
-        loop {
-            // State is upgraded only for one probe and dropped before the polling sleep.
-            // State 仅在单次探测期间升级，并会在轮询休眠前释放。
+    live_child_watcher()?.register(state);
+    Ok(())
+}
+
+impl LiveChildWatcher {
+    /// Start the single process-wide worker before accepting registrations.
+    /// 在接受注册前启动唯一的进程级工作线程。
+    ///
+    /// Returns the live watcher or the operating-system thread creation failure.
+    /// 返回活动监视服务，或返回操作系统线程创建失败。
+    fn start() -> Result<Self, String> {
+        // queue owns weak registrations and the worker wakeup predicate.
+        // queue 持有弱引用注册项与工作线程唤醒谓词。
+        let queue = Arc::new(LiveChildWatcherQueue {
+            sessions: Mutex::new(Vec::new()),
+            changed: Condvar::new(),
+        });
+        // worker_queue transfers queue ownership into the permanent process worker.
+        // worker_queue 将队列所有权转移给永久进程工作线程。
+        let worker_queue = queue.clone();
+        // task runs centralized non-reaping probes for every observed session.
+        // task 为每个受观察会话执行集中式非回收探测。
+        let task: ManagedProcessBackgroundTask =
+            Box::new(move || run_live_child_watcher(worker_queue));
+        // handle proves worker creation succeeded before the watcher becomes globally visible.
+        // handle 证明工作线程创建成功后，监视服务才会全局可见。
+        let handle = spawn_managed_process_background_thread(
+            ManagedProcessBackgroundThread::ExitWatcher,
+            task,
+        )
+        .map_err(|error| format!("spawn managed process live-child watcher: {error}"))?;
+        drop(handle);
+        #[cfg(test)]
+        LIVE_CHILD_WATCHER_THREAD_STARTS.fetch_add(1, Ordering::SeqCst);
+        Ok(Self { queue })
+    }
+
+    /// Register one session weakly and wake the shared worker.
+    /// 以弱引用方式注册一个会话并唤醒共享工作线程。
+    ///
+    /// The state parameter remains owned by the session lifecycle.
+    /// state 参数仍由会话生命周期持有。
+    fn register(&self, state: &Arc<ManagedProcessSessionState>) {
+        // sessions guard serializes registration with centralized batch extraction.
+        // sessions 保护对象将注册与集中批次提取串行化。
+        let mut sessions = lock_live_child_watcher_sessions(&self.queue);
+        sessions.push(Arc::downgrade(state));
+        self.queue.changed.notify_one();
+    }
+}
+
+/// Acquire the centralized watcher registration queue and recover it after poisoning.
+/// 获取集中监视注册队列，并在 poison 后恢复继续使用。
+///
+/// The queue parameter owns all weak live-session registrations.
+/// queue 参数持有全部活动会话弱引用注册项。
+///
+/// Returns the protected registration vector.
+/// 返回受保护的注册向量。
+fn lock_live_child_watcher_sessions(
+    queue: &LiveChildWatcherQueue,
+) -> MutexGuard<'_, Vec<Weak<ManagedProcessSessionState>>> {
+    queue
+        .sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Return the lazily initialized process-wide live-child watcher.
+/// 返回惰性初始化的进程级活动子进程监视服务。
+///
+/// Returns a shared watcher reference or the stable startup failure.
+/// 返回共享监视服务引用，或返回稳定的启动失败。
+fn live_child_watcher() -> Result<&'static LiveChildWatcher, String> {
+    match LIVE_CHILD_WATCHER.get_or_init(LiveChildWatcher::start) {
+        Ok(watcher) => Ok(watcher),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+/// Return the next bounded exponential idle poll interval for the live-child watcher.
+/// 返回活动子进程监视服务下一次有界指数退避空闲轮询间隔。
+///
+/// The current parameter is the interval that just elapsed without a change.
+/// current 参数是刚刚在无变化情况下结束的间隔。
+///
+/// Returns twice the current duration capped by the maximum exit-latency budget.
+/// 返回当前时长的两倍，并受最大退出延迟预算限制。
+fn next_live_child_watcher_poll(current: Duration) -> Duration {
+    current.saturating_mul(2).min(LIVE_CHILD_WATCHER_MAX_POLL)
+}
+
+/// Run centralized non-reaping exit probes for every weakly registered observed session.
+/// 为每个弱引用注册的受观察会话执行集中式非回收退出探测。
+///
+/// The queue parameter owns registrations and the worker wakeup condition.
+/// queue 参数持有注册项与工作线程唤醒条件。
+fn run_live_child_watcher(queue: Arc<LiveChildWatcherQueue>) {
+    // sessions is retained across waits so the worker sleeps without active registrations.
+    // sessions 跨等待保留，使工作线程在没有活动注册项时休眠。
+    let mut sessions = lock_live_child_watcher_sessions(&queue);
+    // PollInterval backs off for unchanged sessions and resets for registrations or terminal events.
+    // PollInterval 对无变化会话执行退避，并在注册或终态事件时重置。
+    let mut poll_interval = LIVE_CHILD_WATCHER_MIN_POLL;
+    loop {
+        while sessions.is_empty() {
+            sessions = queue
+                .changed
+                .wait(sessions)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            poll_interval = LIVE_CHILD_WATCHER_MIN_POLL;
+        }
+        // probe_batch removes the current queue snapshot while allowing concurrent registration.
+        // probe_batch 取出当前队列快照，同时允许并发注册。
+        let probe_batch = sessions.drain(..).collect::<Vec<_>>();
+        drop(sessions);
+        // active_sessions retains only still-open running sessions for the next shared probe.
+        // active_sessions 仅保留仍开启且运行中的会话，供下一次共享探测使用。
+        let mut active_sessions = Vec::with_capacity(probe_batch.len());
+        // ObservedTerminal resets latency after any exit or probe failure changes queue membership.
+        // ObservedTerminal 在退出或探测失败改变队列成员后重置延迟。
+        let mut observed_terminal = false;
+
+        // Each weak registration is upgraded only for one non-reaping status probe.
+        // 每个弱引用注册项只在一次非回收状态探测期间升级。
+        for weak_state in probe_batch {
+            // state is omitted when the owning session has already been released.
+            // state 在所属会话已经释放时为空。
             let Some(state) = weak_state.upgrade() else {
-                return;
+                continue;
             };
             if !state.observer_notifications_are_open() {
-                return;
+                continue;
             }
-            // Status probes the direct child independently of stdout and stderr EOF.
-            // Status 独立于 stdout 与 stderr EOF 探测直接子进程。
+            // status observes direct-child exit independently from inherited pipe lifetime.
+            // status 独立于继承管道生命周期观察直接子进程退出。
             let status = match state.peek_status_snapshot() {
                 Ok(status) => status,
                 Err(error) => {
+                    observed_terminal = true;
                     notify_managed_process_observer(
                         state.observer.as_ref(),
                         &state.observer_notifications_open,
                         ManagedProcessSessionObserver::failed,
                     );
                     crate::runtime_logging::warn(format!(
-                        "[LuaSkill:warn] process.session exit watcher failed: {error}"
+                        "[LuaSkill:warn] process.session live-child watcher failed: {error}"
                     ));
-                    return;
+                    continue;
                 }
             };
             if status.exited {
+                observed_terminal = true;
                 notify_managed_process_observer(
                     state.observer.as_ref(),
                     &state.observer_notifications_open,
                     ManagedProcessSessionObserver::exited,
                 );
-                return;
+                continue;
             }
-            drop(state);
-            thread::sleep(Duration::from_millis(10));
+            active_sessions.push(Arc::downgrade(&state));
         }
-    });
-    // SpawnResult reports operating-system thread creation failure to the launch transaction.
-    // SpawnResult 把操作系统线程创建失败报告给启动事务。
-    let spawn_result = spawn_thread(ManagedProcessBackgroundThread::ExitWatcher, task);
-    match spawn_result {
-        Ok(handle) => {
-            // Handle is intentionally detached; WeakState guarantees prompt self-termination.
-            // Handle 被有意分离；WeakState 保证其及时自行终止。
-            drop(handle);
-            Ok(())
+
+        sessions = lock_live_child_watcher_sessions(&queue);
+        // HasNewRegistrations detects entries added while the previous batch was being probed.
+        // HasNewRegistrations 检测上一批次探测期间新增的注册项。
+        let has_new_registrations = !sessions.is_empty();
+        sessions.extend(active_sessions);
+        if sessions.is_empty() {
+            poll_interval = LIVE_CHILD_WATCHER_MIN_POLL;
+            continue;
         }
-        Err(error) => Err(format!("spawn managed process exit watcher: {error}")),
+        if has_new_registrations {
+            poll_interval = LIVE_CHILD_WATCHER_MIN_POLL;
+            continue;
+        }
+        if observed_terminal {
+            poll_interval = LIVE_CHILD_WATCHER_MIN_POLL;
+        }
+        // wait_result sleeps once per process-wide batch and wakes early for new registrations.
+        // wait_result 每个进程级批次只休眠一次，并会因新注册提前唤醒。
+        let (next_sessions, wait_result) = queue
+            .changed
+            .wait_timeout(sessions, poll_interval)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sessions = next_sessions;
+        poll_interval = if wait_result.timed_out() {
+            next_live_child_watcher_poll(poll_interval)
+        } else {
+            LIVE_CHILD_WATCHER_MIN_POLL
+        };
     }
 }
 
@@ -2948,6 +3384,97 @@ fn windows_job_active_processes(handle: HANDLE) -> Result<u32, String> {
         ));
     }
     Ok(accounting.ActiveProcesses)
+}
+
+/// Compute a conservative raw-byte overlap for one decoded marker search.
+/// 为一次解码标记搜索计算保守的原始字节重叠长度。
+///
+/// The marker parameter is the decoded text to match.
+/// marker 参数是要匹配的已解码文本。
+///
+/// The encoding parameter controls raw-to-text expansion and character boundaries.
+/// encoding 参数控制原始字节到文本的扩展关系与字符边界。
+///
+/// Returns enough overlap to retain a cross-chunk marker and one encoding boundary.
+/// 返回足以保留跨块标记与一个编码边界的重叠长度。
+fn marker_search_overlap_bytes(marker: &str, encoding: RuntimeTextEncoding) -> usize {
+    match encoding {
+        RuntimeTextEncoding::Base64 => marker.len().saturating_mul(3).div_ceil(4).saturating_add(6),
+        _ => encode_runtime_text(marker, encoding)
+            .map(|bytes| bytes.len().saturating_add(8))
+            .unwrap_or_else(|_| marker.len().saturating_mul(4).saturating_add(8)),
+    }
+}
+
+/// Search only newly appended output plus the boundary overlap retained from the previous scan.
+/// 仅搜索新追加的输出以及上次扫描保留的边界重叠。
+///
+/// The buffer parameter is one bounded output stream.
+/// buffer 参数是一个有界输出流。
+///
+/// The encoding and marker parameters define the decoded text predicate.
+/// encoding 与 marker 参数定义解码后的文本谓词。
+///
+/// The cursor parameter stores the absolute byte position covered by previous scans.
+/// cursor 参数存储先前扫描已覆盖的绝对字节位置。
+///
+/// The overlap parameter preserves cross-chunk encoding and marker boundaries.
+/// overlap 参数保留跨块编码与标记边界。
+///
+/// Returns whether the marker occurs in the incremental decoded window.
+/// 返回标记是否出现在增量解码窗口中。
+fn output_buffer_contains_marker_since(
+    buffer: &Arc<Mutex<ManagedProcessOutputBuffer>>,
+    encoding: RuntimeTextEncoding,
+    marker: &str,
+    cursor: &mut u64,
+    overlap: usize,
+) -> bool {
+    // guard provides one consistent retained range and cumulative byte position.
+    // guard 提供一致的保留范围与累计字节位置。
+    let guard = lock_session_output_buffer(buffer);
+    if guard.bytes.is_empty() {
+        *cursor = guard.total_bytes;
+        return false;
+    }
+    // retained_len converts the current bounded window size into absolute-position arithmetic.
+    // retained_len 将当前有界窗口长度转换为绝对位置运算值。
+    let retained_len = u64::try_from(guard.bytes.len()).unwrap_or(u64::MAX);
+    // retained_start is the absolute position of the oldest currently retained byte.
+    // retained_start 是当前保留的最旧字节的绝对位置。
+    let retained_start = guard.total_bytes.saturating_sub(retained_len);
+    // overlap_u64 safely participates in absolute cursor arithmetic.
+    // overlap_u64 安全参与绝对游标运算。
+    let overlap_u64 = u64::try_from(overlap).unwrap_or(u64::MAX);
+    // scan_start keeps only unseen bytes plus the required boundary overlap.
+    // scan_start 仅保留未扫描字节及所需的边界重叠。
+    let scan_start = cursor.saturating_sub(overlap_u64).max(retained_start);
+    // skip_bytes maps the absolute scan start back into the current ring window.
+    // skip_bytes 将绝对扫描起点映射回当前环形窗口。
+    let skip_bytes = usize::try_from(scan_start.saturating_sub(retained_start))
+        .unwrap_or(guard.bytes.len())
+        .min(guard.bytes.len());
+    // aligned_skip preserves Base64 triplet alignment relative to the retained-window origin.
+    // aligned_skip 保持相对于保留窗口起点的 Base64 三字节组对齐。
+    let aligned_skip = if encoding == RuntimeTextEncoding::Base64 {
+        skip_bytes - (skip_bytes % 3)
+    } else {
+        skip_bytes
+    };
+    // scan_bytes linearizes only the incremental window, not the full retained ring.
+    // scan_bytes 仅线性化增量窗口，而不是完整保留环形缓冲区。
+    let scan_bytes = guard
+        .bytes
+        .iter()
+        .skip(aligned_skip)
+        .copied()
+        .collect::<Vec<_>>();
+    *cursor = guard.total_bytes;
+    drop(guard);
+
+    decode_runtime_text(&scan_bytes, encoding)
+        .text
+        .contains(marker)
 }
 
 /// Append bytes while retaining only the newest bounded window.

@@ -76,11 +76,38 @@ Return the shared runtime root used by the repository FFI demos.
 返回仓库 FFI 演示共用的运行时根目录。
 */
 static const char *resolve_demo_runtime_root(void) {
-    const char *runtime_root = getenv("LUASKILLS_DEMO_ROOT");
-    if (runtime_root != NULL && runtime_root[0] != '\0') {
-        return runtime_root;
+    /*
+    Requested environment override or repository-relative default path.
+    请求的环境覆盖路径或仓库相对默认路径。
+    */
+    const char *requested_runtime_root = getenv("LUASKILLS_DEMO_ROOT");
+    if (requested_runtime_root == NULL || requested_runtime_root[0] == '\0') {
+        requested_runtime_root = "examples/ffi/standard_runtime/runtime_root";
     }
-    return "examples/ffi/standard_runtime/runtime_root";
+    /*
+    Create the requested root before Unix realpath requires the target to exist.
+    在 Unix realpath 要求目标存在之前创建请求的运行根。
+    */
+    ensure_directory(requested_runtime_root);
+    /*
+    Process-lifetime absolute path required by Windows DLL search-directory registration.
+    Windows DLL 搜索目录注册所需的进程生命周期绝对路径。
+    */
+    static char resolved_runtime_root[4096];
+#if defined(_WIN32)
+    if (_fullpath(
+            resolved_runtime_root,
+            requested_runtime_root,
+            sizeof(resolved_runtime_root)
+        ) == NULL) {
+        exit_with_message("failed to resolve the demo runtime root to an absolute path");
+    }
+#else
+    if (realpath(requested_runtime_root, resolved_runtime_root) == NULL) {
+        exit_with_message("failed to resolve the demo runtime root to an absolute path");
+    }
+#endif
+    return resolved_runtime_root;
 }
 
 /*

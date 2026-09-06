@@ -15,57 +15,24 @@
 
 $ErrorActionPreference = "Stop"
 
-function Resolve-ProjectRoot {
-    <#
-    .SYNOPSIS
-    Resolve the repository root from script metadata or the caller location.
-    从脚本元数据或调用方位置解析仓库根目录。
-
-    .PARAMETER ScriptDirectory
-    Directory that contains the current script when PowerShell exposes it.
-    PowerShell 可用时当前脚本所在的目录。
-
-    .OUTPUTS
-    Repository root path that contains Cargo.toml and scripts.
-    包含 Cargo.toml 与 scripts 目录的仓库根路径。
-    #>
-    param([string]$ScriptDirectory)
-
-    $Candidates = @()
-    if ($ScriptDirectory) {
-        $Candidates += $ScriptDirectory
-    }
-    $Candidates += (Get-Location).Path
-
-    foreach ($Candidate in $Candidates) {
-        $Current = $Candidate
-        while ($Current) {
-            if ((Test-Path -LiteralPath (Join-Path $Current "Cargo.toml")) -and (Test-Path -LiteralPath (Join-Path $Current "scripts"))) {
-                return $Current
-            }
-            $Parent = Split-Path -Parent $Current
-            if (-not $Parent -or $Parent -eq $Current) {
-                break
-            }
-            $Current = $Parent
-        }
-    }
-
-    throw "Unable to resolve project root from script or current directory."
-}
-
 # ScriptDir points at the current script directory when PowerShell exposes it.
 # ScriptDir 在 PowerShell 提供脚本路径时指向当前脚本目录。
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($PSCommandPath) { Split-Path -Parent $PSCommandPath } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { "" }
+
+# ProjectRootHelperPath selects the shared build-script root resolver from script or repository context.
+# ProjectRootHelperPath 从脚本或仓库上下文选择共享构建脚本根解析器。
+$ProjectRootHelperPath = if ($ScriptDir) { Join-Path $ScriptDir "project_root.ps1" } else { Join-Path (Get-Location).Path "scripts\build\project_root.ps1" }
+. $ProjectRootHelperPath
+
+# ArchiveHelperPath selects the shared checked archive helper from script or repository context.
+# ArchiveHelperPath 从脚本或仓库上下文选择共享的受检归档辅助脚本。
+$ArchiveHelperPath = if ($ScriptDir) { Join-Path $ScriptDir "archive_helpers.ps1" } else { Join-Path (Get-Location).Path "scripts\build\archive_helpers.ps1" }
+. $ArchiveHelperPath
 
 # ProjectRoot points at the repository root regardless of the caller location.
 # ProjectRoot 指向仓库根目录，避免调用方当前位置影响路径解析。
 $ProjectRoot = Resolve-ProjectRoot -ScriptDirectory $ScriptDir
 Set-Location $ProjectRoot
-
-# NativeRuntimeExtensions lists only files that are meaningful at runtime.
-# NativeRuntimeExtensions 只包含运行期真正需要的原生库扩展名。
-$NativeRuntimeExtensions = @("*.dll", "*.so", "*.so.*", "*.dylib")
 
 # ExcludedRuntimeLibraryNames prevents build-only LuaJIT shims from leaking into runtime packages.
 # ExcludedRuntimeLibraryNames 防止仅用于构建的 LuaJIT 兼容库泄漏到运行期包中。
@@ -218,17 +185,40 @@ function Copy-NativeRuntimeLibraries {
         return
     }
 
-    foreach ($Extension in $NativeRuntimeExtensions) {
-        Get-ChildItem -Recurse -File -Path $DepsDir -Filter $Extension -ErrorAction SilentlyContinue | ForEach-Object {
-            $Name = $_.Name.ToLowerInvariant()
-            if ($ExcludedRuntimeLibraryNames -contains $Name) {
-                return
-            }
-            $Destination = Join-Path $LibsDir $_.Name
-            Copy-Item -Force -LiteralPath $_.FullName -Destination $Destination
-            Add-BundledLibraryRecord -SourcePath $_.FullName -DestinationPath $Destination
+    Get-ChildItem -Recurse -File -Path $DepsDir -ErrorAction SilentlyContinue | Where-Object {
+        Test-NativeRuntimeLibraryName -Name $_.Name
+    } | ForEach-Object {
+        $Name = $_.Name.ToLowerInvariant()
+        if ($ExcludedRuntimeLibraryNames -contains $Name) {
+            return
         }
+        $Destination = Join-Path $LibsDir $_.Name
+        Copy-Item -Force -LiteralPath $_.FullName -Destination $Destination
+        Add-BundledLibraryRecord -SourcePath $_.FullName -DestinationPath $Destination
     }
+}
+
+function Test-NativeRuntimeLibraryName {
+    <#
+    .SYNOPSIS
+    Check whether one file name is a supported native runtime library.
+    检查一个文件名是否为受支持的原生运行时库。
+
+    .PARAMETER Name
+    File name evaluated once after directory enumeration.
+    目录枚举后仅评估一次的文件名。
+
+    .OUTPUTS
+    Boolean value indicating whether the file belongs to the runtime dependency queue.
+    表示文件是否属于运行时依赖队列的布尔值。
+    #>
+    param([string]$Name)
+
+    $LowerName = $Name.ToLowerInvariant()
+    return $LowerName.EndsWith(".dll") -or
+        $LowerName.EndsWith(".so") -or
+        $LowerName.Contains(".so.") -or
+        $LowerName.EndsWith(".dylib")
 }
 
 function Test-BundledNativeDependencyName {
@@ -337,35 +327,38 @@ function Copy-LinkedRuntimeDependencies {
     Iteratively copy allowlisted linked system libraries into runtime libs.
     迭代复制白名单内的已链接系统库到 runtime libs。
 
-    .PARAMETER ScanRoot
-    Directory that contains native binaries to inspect.
-    包含待检查原生二进制文件的目录。
+    .PARAMETER ScanRoots
+    Distinct directory roots containing native binaries to inspect as one closure.
+    作为单一闭包检查、包含原生二进制文件的不同目录根集合。
 
     .PARAMETER LibsDir
     Destination libs directory.
     目标 libs 目录。
     #>
     param(
-        [string]$ScanRoot,
+        [string[]]$ScanRoots,
         [string]$LibsDir
     )
-
-    if (-not (Test-Path -LiteralPath $ScanRoot)) {
-        return
-    }
 
     Ensure-Dir $LibsDir
     $Queue = New-Object 'System.Collections.Generic.Queue[string]'
     $Seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    # Canonical root set preventing nested runtime libs from becoming a duplicate scan entry.
+    # 防止嵌套 runtime libs 成为重复扫描入口的规范根集合。
+    $RootSeen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
-    foreach ($Root in @($ScanRoot, $LibsDir)) {
+    foreach ($Root in $ScanRoots) {
         if (-not (Test-Path -LiteralPath $Root)) {
             continue
         }
-        foreach ($Extension in $NativeRuntimeExtensions) {
-            Get-ChildItem -Recurse -File -Path $Root -Filter $Extension -ErrorAction SilentlyContinue | ForEach-Object {
-                $Queue.Enqueue($_.FullName)
-            }
+        $CanonicalRoot = (Resolve-Path -LiteralPath $Root).Path
+        if (-not $RootSeen.Add($CanonicalRoot)) {
+            continue
+        }
+        Get-ChildItem -Recurse -File -LiteralPath $CanonicalRoot -ErrorAction SilentlyContinue | Where-Object {
+            Test-NativeRuntimeLibraryName -Name $_.Name
+        } | ForEach-Object {
+            $Queue.Enqueue($_.FullName)
         }
     }
 
@@ -374,11 +367,12 @@ function Copy-LinkedRuntimeDependencies {
         if (-not (Test-Path -LiteralPath $BinaryPath)) {
             continue
         }
-        if (-not $Seen.Add($BinaryPath)) {
+        $CanonicalBinaryPath = (Resolve-Path -LiteralPath $BinaryPath).Path
+        if (-not $Seen.Add($CanonicalBinaryPath)) {
             continue
         }
 
-        foreach ($DependencyPath in (Get-LinkedDependencyPaths -BinaryPath $BinaryPath)) {
+        foreach ($DependencyPath in (Get-LinkedDependencyPaths -BinaryPath $CanonicalBinaryPath)) {
             if (-not $DependencyPath -or -not (Test-Path -LiteralPath $DependencyPath)) {
                 continue
             }
@@ -607,30 +601,6 @@ function Write-JsonFile {
     ConvertTo-Json -InputObject $Value -Depth 12 | Set-Content -Path $Path -Encoding UTF8
 }
 
-function New-TarFromDirectory {
-    <#
-    .SYNOPSIS
-    Archive top-level children without adding a leading ./ entry.
-    按一级子项打包，避免归档内出现 ./ 前缀。
-    #>
-    param(
-        [string]$SourceDir,
-        [string]$ArchivePath
-    )
-
-    $Members = @(Get-ChildItem -Force -LiteralPath $SourceDir | ForEach-Object { $_.Name })
-    if (-not $Members -or $Members.Count -eq 0) {
-        throw "Cannot create archive from empty directory: $SourceDir"
-    }
-
-    Push-Location $SourceDir
-    try {
-        tar -czf $ArchivePath @Members
-    } finally {
-        Pop-Location
-    }
-}
-
 if (-not $Platform) {
     $Arch = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant()
     if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
@@ -659,8 +629,7 @@ Ensure-Dir $OutputDir
 
 Copy-LuaPackagesRuntimeTree -LuaPackagesDir (Join-Path $ThirdPartyPath "lua_packages") -RuntimeRoot $RuntimeRoot
 Copy-NativeRuntimeLibraries -DepsDir (Join-Path $ThirdPartyPath "deps") -RuntimeRoot $RuntimeRoot
-Copy-LinkedRuntimeDependencies -ScanRoot $RuntimeRoot -LibsDir (Join-Path $RuntimeRoot "libs")
-Copy-LinkedRuntimeDependencies -ScanRoot (Join-Path $ProjectRoot "target\release") -LibsDir (Join-Path $RuntimeRoot "libs")
+Copy-LinkedRuntimeDependencies -ScanRoots @($RuntimeRoot, (Join-Path $ProjectRoot "target\release")) -LibsDir (Join-Path $RuntimeRoot "libs")
 
 Write-RuntimeEnvScripts -RuntimeRoot $RuntimeRoot -Platform $Platform
 Copy-LicenseCandidates -ComponentName "luaskills" -SearchRoots @($ProjectRoot) -LicenseRoot (Join-Path $RuntimeRoot "licenses")
@@ -741,6 +710,12 @@ Write-JsonFile -Path (Join-Path $RuntimeRoot "licenses\manifest.json") -Value $L
     --project-root $ProjectRoot `
     --runtime-root $RuntimeRoot `
     --platform $Platform
+# MetadataExitCode captures metadata generation failure before any archive is published.
+# MetadataExitCode 在发布任何归档前捕获元数据生成失败。
+$MetadataExitCode = $LASTEXITCODE
+if ($MetadataExitCode -ne 0) {
+    throw "Failed to generate runtime package metadata (exit $MetadataExitCode)"
+}
 
 $ArchiveName = "lua-runtime-$Platform.tar.gz"
 $ArchivePath = Join-Path $OutputDir $ArchiveName

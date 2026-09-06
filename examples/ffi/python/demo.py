@@ -75,6 +75,20 @@ class FfiLuaRuntimeHostOptions(ctypes.Structure):
     ]
 
 
+class FfiLuaEngineOptions(ctypes.Structure):
+    """
+    Plain V1 engine options retained for standard ABI lifecycle and query examples.
+    为标准 ABI 生命周期与查询示例保留的原生 V1 引擎选项。
+    """
+
+    # Fields preserve the exact C ABI order of pool followed by V1 host options.
+    # 字段保持先池配置、后 V1 宿主选项的精确 C ABI 顺序。
+    _fields_ = [
+        ("pool", FfiLuaVmPoolConfig),
+        ("host", FfiLuaRuntimeHostOptions),
+    ]
+
+
 class FfiLuaRuntimeHostOptionsV2(ctypes.Structure):
     """
     Version-two host options that add one canonical LuaSkills runtime root.

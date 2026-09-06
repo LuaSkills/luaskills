@@ -2,6 +2,8 @@ use super::*;
 use crate::runtime::encoding::default_runtime_text_encoding;
 use crate::runtime::test_support::process_env_test_guard;
 use std::fs;
+#[cfg(not(windows))]
+use std::io::{BufRead, BufReader};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,9 +24,288 @@ const WINDOWS_SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 /// 全量测试进程压力下后代探针允许的最大启动时长。
 const DESCENDANT_PROBE_START_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Descendant fixture lifetime long enough to survive full-suite scheduler pressure before cleanup.
+/// 足以承受全量套件调度压力并等待清理的后代夹具存活秒数。
+const DESCENDANT_FIXTURE_LIFETIME_SECONDS: u64 = 120;
+
+/// Fully-qualified test name used as the controlled Windows descendant-fixture root.
+/// 用作受控 Windows 后代夹具根进程的完整测试名称。
+const WINDOWS_DESCENDANT_FIXTURE_ROOT_TEST: &str =
+    "runtime::process_session::tests::vulcan_process_session_descendant_fixture_root";
+
+/// Fully-qualified test name used as the controlled Windows inherited-pipe fixture root.
+/// 用作受控 Windows 继承管道夹具根进程的完整测试名称。
+const WINDOWS_INHERITED_PIPE_FIXTURE_ROOT_TEST: &str =
+    "runtime::process_session::tests::vulcan_process_session_inherited_pipe_fixture_root";
+
+/// Fully-qualified test name used as the controlled long-lived Windows descendant.
+/// 用作受控长生命周期 Windows 后代进程的完整测试名称。
+const WINDOWS_DESCENDANT_FIXTURE_SLEEP_TEST: &str =
+    "runtime::process_session::tests::vulcan_process_session_descendant_fixture_sleep";
+
 /// Monotonic suffix that isolates descendant pid fixtures inside one parallel test process.
 /// 在单个并行测试进程内隔离后代 pid 夹具的单调后缀。
 static DESCENDANT_FIXTURE_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
+
+/// Return whether this test binary was launched for one exact fixture test.
+/// 返回当前测试二进制是否为某个精确夹具测试而启动。
+///
+/// `test_name` is the fully-qualified Rust test name expected beside the harness `--exact` flag.
+/// `test_name` 是预期与测试框架 `--exact` 标志共同出现的完整 Rust 测试名称。
+///
+/// Returns true only for the dedicated subprocess invocation, not during the normal full suite.
+/// 仅对专用子进程调用返回 true，正常全量测试运行时返回 false。
+#[cfg(windows)]
+fn is_exact_descendant_fixture_invocation(test_name: &str) -> bool {
+    // Arguments are inspected as a complete harness invocation so the ordinary suite stays a no-op.
+    // Arguments 以完整测试框架调用进行检查，确保普通全量运行保持空操作。
+    let arguments = std::env::args().collect::<Vec<_>>();
+    arguments.iter().any(|argument| argument == "--exact")
+        && arguments.iter().any(|argument| argument == test_name)
+}
+
+/// Return the out-of-band pid file used by one controlled Windows fixture root.
+/// 返回某个受控 Windows 夹具根进程使用的带外 pid 文件。
+///
+/// `root_pid` identifies the exact direct child created by the managed session.
+/// `root_pid` 标识受管会话创建的精确直接子进程。
+///
+/// Returns one process-local temporary path that avoids Rust test-harness stdout capture.
+/// 返回一个进程局部临时路径，以避开 Rust 测试框架的 stdout 捕获。
+fn windows_descendant_fixture_pid_path(root_pid: u32) -> PathBuf {
+    std::env::temp_dir().join(format!("luaskills-process-descendant-root-{root_pid}.pid"))
+}
+
+/// Run one controlled Windows fixture root and publish its long-lived descendant pid.
+/// 运行一个受控 Windows 夹具根进程，并发布其长生命周期后代 pid。
+///
+/// `inherit_output` keeps the descendant attached to the root output handles when true.
+/// `inherit_output` 为 true 时会让后代继续继承根进程的输出句柄。
+///
+/// Returns after the descendant identity is published and the root-exit ordering is stabilized.
+/// 在后代身份发布且根进程退出顺序稳定后返回。
+#[cfg(windows)]
+fn run_windows_descendant_fixture_root(inherit_output: bool) {
+    // TestExecutable is the exact current test binary, avoiding PATH and external Python discovery.
+    // TestExecutable 是当前测试二进制的精确路径，避免 PATH 与外部 Python 发现过程。
+    let test_executable = std::env::current_exe().expect("resolve descendant fixture test binary");
+    // DescendantCommand targets one exact sleeper test and never performs executable discovery.
+    // DescendantCommand 指向一个精确休眠测试，且绝不执行可执行文件发现。
+    let mut descendant_command = Command::new(&test_executable);
+    descendant_command
+        .args([
+            WINDOWS_DESCENDANT_FIXTURE_SLEEP_TEST,
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .stdin(Stdio::null());
+    if inherit_output {
+        descendant_command
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    } else {
+        descendant_command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    }
+    // Descendant is the exact long-lived child owned by this short-lived fixture root.
+    // Descendant 是由当前短生命周期夹具根进程拥有的精确长生命周期子进程。
+    let mut descendant = descendant_command
+        .spawn()
+        .expect("spawn controlled descendant fixture");
+    // DescendantPid is captured before ownership moves to the detached best-effort reaper.
+    // DescendantPid 在所有权移交给分离式尽力回收线程前完成捕获。
+    let descendant_pid = descendant.id();
+    // DescendantReaper owns the child handle while the fixture root remains alive.
+    // DescendantReaper 在夹具根进程存活期间拥有子进程句柄。
+    let _descendant_reaper = thread::spawn(move || {
+        let _ = descendant.wait();
+    });
+    // PidPath bypasses libtest output capture and is keyed by this exact managed root pid.
+    // PidPath 绕过 libtest 输出捕获，并以当前精确受管根进程 pid 为键。
+    let pid_path = windows_descendant_fixture_pid_path(std::process::id());
+    fs::write(&pid_path, descendant_pid.to_string()).expect("publish controlled descendant pid");
+    if inherit_output {
+        println!("{descendant_pid}");
+    }
+    thread::sleep(Duration::from_millis(300));
+}
+
+/// Run the controlled Windows fixture root with isolated descendant output handles.
+/// 运行后代输出句柄隔离的受控 Windows 夹具根进程。
+#[cfg(windows)]
+#[test]
+fn vulcan_process_session_descendant_fixture_root() {
+    if !is_exact_descendant_fixture_invocation(WINDOWS_DESCENDANT_FIXTURE_ROOT_TEST) {
+        return;
+    }
+    run_windows_descendant_fixture_root(false);
+}
+
+/// Run the controlled Windows fixture root whose descendant retains inherited output handles.
+/// 运行后代继续持有继承输出句柄的受控 Windows 夹具根进程。
+#[cfg(windows)]
+#[test]
+fn vulcan_process_session_inherited_pipe_fixture_root() {
+    if !is_exact_descendant_fixture_invocation(WINDOWS_INHERITED_PIPE_FIXTURE_ROOT_TEST) {
+        return;
+    }
+    run_windows_descendant_fixture_root(true);
+}
+
+/// Keep the controlled Windows descendant alive until process-tree cleanup terminates it.
+/// 保持受控 Windows 后代存活，直到进程树清理将其终止。
+#[cfg(windows)]
+#[test]
+fn vulcan_process_session_descendant_fixture_sleep() {
+    if !is_exact_descendant_fixture_invocation(WINDOWS_DESCENDANT_FIXTURE_SLEEP_TEST) {
+        return;
+    }
+    thread::sleep(Duration::from_secs(DESCENDANT_FIXTURE_LIFETIME_SECONDS));
+}
+
+/// Verify incremental UTF-8 marker search preserves a marker split across appends.
+/// 验证 UTF-8 增量标记搜索会保留跨追加拆分的标记。
+#[test]
+fn incremental_marker_search_matches_cross_append_utf8_text() {
+    // buffer models one bounded output stream without starting a child process.
+    // buffer 在不启动子进程的情况下模拟一个有界输出流。
+    let buffer = Arc::new(Mutex::new(ManagedProcessOutputBuffer::default()));
+    // marker is deliberately split between the two appended chunks.
+    // marker 被刻意拆分在两个追加块之间。
+    let marker = "child-ready";
+    // overlap is the production boundary budget for this marker and encoding.
+    // overlap 是生产逻辑针对该标记与编码计算的边界预算。
+    let overlap = marker_search_overlap_bytes(marker, RuntimeTextEncoding::Utf8);
+    // cursor records the cumulative stream position scanned so far.
+    // cursor 记录目前已扫描的累计流位置。
+    let mut cursor = 0;
+
+    {
+        // guard installs the first incomplete marker fragment.
+        // guard 写入第一个不完整标记片段。
+        let mut guard = lock_session_output_buffer(&buffer);
+        append_bounded(&mut guard, b"prefix-child-", 1024);
+    }
+    assert!(!output_buffer_contains_marker_since(
+        &buffer,
+        RuntimeTextEncoding::Utf8,
+        marker,
+        &mut cursor,
+        overlap,
+    ));
+    {
+        // guard appends the second fragment that completes the marker.
+        // guard 追加完成标记的第二个片段。
+        let mut guard = lock_session_output_buffer(&buffer);
+        append_bounded(&mut guard, b"ready-suffix", 1024);
+    }
+    assert!(output_buffer_contains_marker_since(
+        &buffer,
+        RuntimeTextEncoding::Utf8,
+        marker,
+        &mut cursor,
+        overlap,
+    ));
+}
+
+/// Verify incremental marker search preserves a GB18030 character split across appends.
+/// 验证增量标记搜索会保留跨追加拆分的 GB18030 字符。
+#[test]
+fn incremental_marker_search_matches_cross_append_gb18030_text() {
+    // buffer models the retained GB18030 output bytes.
+    // buffer 模拟保留的 GB18030 输出字节。
+    let buffer = Arc::new(Mutex::new(ManagedProcessOutputBuffer::default()));
+    // marker contains multibyte characters whose encoded bytes cross the append boundary.
+    // marker 包含编码字节跨越追加边界的多字节字符。
+    let marker = "中文完成";
+    // encoded_marker is the exact production encoding of the marker.
+    // encoded_marker 是标记的确切生产编码结果。
+    let encoded_marker =
+        encode_runtime_text(marker, RuntimeTextEncoding::Gb18030).expect("encode GB18030 marker");
+    // split falls inside the encoded marker instead of on its final boundary.
+    // split 位于标记编码内部，而不是最终边界。
+    let split = encoded_marker.len() - 1;
+    // overlap is the production boundary budget for GB18030.
+    // overlap 是生产逻辑针对 GB18030 计算的边界预算。
+    let overlap = marker_search_overlap_bytes(marker, RuntimeTextEncoding::Gb18030);
+    // cursor records the cumulative stream position scanned so far.
+    // cursor 记录目前已扫描的累计流位置。
+    let mut cursor = 0;
+
+    {
+        // guard installs the incomplete multibyte marker prefix.
+        // guard 写入不完整的多字节标记前缀。
+        let mut guard = lock_session_output_buffer(&buffer);
+        append_bounded(&mut guard, &encoded_marker[..split], 1024);
+    }
+    assert!(!output_buffer_contains_marker_since(
+        &buffer,
+        RuntimeTextEncoding::Gb18030,
+        marker,
+        &mut cursor,
+        overlap,
+    ));
+    {
+        // guard appends the final byte that completes the last encoded character.
+        // guard 追加完成最后一个编码字符的最终字节。
+        let mut guard = lock_session_output_buffer(&buffer);
+        append_bounded(&mut guard, &encoded_marker[split..], 1024);
+    }
+    assert!(output_buffer_contains_marker_since(
+        &buffer,
+        RuntimeTextEncoding::Gb18030,
+        marker,
+        &mut cursor,
+        overlap,
+    ));
+}
+
+/// Verify incremental marker cursors recover after bounded-buffer eviction.
+/// 验证增量标记游标会在有界缓冲区淘汰后恢复校正。
+#[test]
+fn incremental_marker_search_recovers_after_ring_eviction() {
+    // buffer retains only the newest sixteen bytes to force cursor rebasing.
+    // buffer 只保留最新十六字节，以强制游标重新校正。
+    let buffer = Arc::new(Mutex::new(ManagedProcessOutputBuffer::default()));
+    // marker is appended only after the first retained window has been evicted.
+    // marker 只在第一个保留窗口被淘汰后追加。
+    let marker = "ready";
+    // overlap is the production UTF-8 boundary budget.
+    // overlap 是生产 UTF-8 边界预算。
+    let overlap = marker_search_overlap_bytes(marker, RuntimeTextEncoding::Utf8);
+    // cursor first advances beyond bytes that will later be evicted.
+    // cursor 首先推进到随后将被淘汰的字节之后。
+    let mut cursor = 0;
+
+    {
+        // guard fills and advances the initial bounded window.
+        // guard 填充并推进初始有界窗口。
+        let mut guard = lock_session_output_buffer(&buffer);
+        append_bounded(&mut guard, b"0123456789abcdef", 16);
+    }
+    assert!(!output_buffer_contains_marker_since(
+        &buffer,
+        RuntimeTextEncoding::Utf8,
+        marker,
+        &mut cursor,
+        overlap,
+    ));
+    {
+        // guard evicts old bytes while appending the target marker.
+        // guard 在追加目标标记时淘汰旧字节。
+        let mut guard = lock_session_output_buffer(&buffer);
+        append_bounded(&mut guard, b"----ready", 16);
+    }
+    assert!(output_buffer_contains_marker_since(
+        &buffer,
+        RuntimeTextEncoding::Utf8,
+        marker,
+        &mut cursor,
+        overlap,
+    ));
+}
 
 /// Verify persistent process sessions reject unsupported Windows verbatim program and cwd paths.
 /// 验证持久进程会话会拒绝不受支持的 Windows verbatim 程序与 cwd 路径。
@@ -82,6 +363,9 @@ fn process_session_open_rejects_unsupported_windows_verbatim_namespaces() {
 /// 直接子进程回收辅助函数必须遵守绝对截止时间，且不得调用阻塞式 wait。
 #[test]
 fn direct_child_reaping_is_bounded_by_absolute_deadline() {
+    // Process-wide environment guard because the fixture executable is resolved through PATH.
+    // 进程级环境保护锁，因为夹具可执行文件通过 PATH 解析。
+    let _env_guard = process_env_test_guard();
     let mut command = if cfg!(windows) {
         let mut command = Command::new("powershell");
         command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
@@ -146,18 +430,29 @@ fn make_drop_cleanup_request() -> ProcessSessionOpenRequest {
 fn make_descendant_cleanup_request() -> (ProcessSessionOpenRequest, Option<PathBuf>) {
     let encoding = default_runtime_text_encoding();
     if cfg!(windows) {
-        (ProcessSessionOpenRequest {
-                program: "python".to_string(),
+        // TestExecutable is an absolute controlled fixture path independent of PATH and Python startup.
+        // TestExecutable 是独立于 PATH 与 Python 启动过程的受控绝对夹具路径。
+        let test_executable = std::env::current_exe()
+            .expect("resolve process descendant fixture test binary")
+            .to_string_lossy()
+            .into_owned();
+        (
+            ProcessSessionOpenRequest {
+                program: test_executable,
                 args: vec![
-                    "-c".to_string(),
-                    "import subprocess, sys, time; child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); print(child.pid, flush=True); time.sleep(0.3)".to_string(),
+                    WINDOWS_DESCENDANT_FIXTURE_ROOT_TEST.to_string(),
+                    "--exact".to_string(),
+                    "--nocapture".to_string(),
+                    "--test-threads=1".to_string(),
                 ],
                 cwd: None,
                 stdout_encoding: encoding,
                 stderr_encoding: encoding,
                 stdin_encoding: encoding,
                 buffer_limit_bytes: DEFAULT_SESSION_BUFFER_LIMIT_BYTES,
-            }, None)
+            },
+            None,
+        )
     } else {
         // FixtureSequence gives each parallel Unix process-tree test a private pid file.
         // FixtureSequence 为每个并行 Unix 进程树测试提供私有 pid 文件。
@@ -169,20 +464,28 @@ fn make_descendant_cleanup_request() -> (ProcessSessionOpenRequest, Option<PathB
             std::process::id()
         ));
         let _ = fs::remove_file(&pid_path);
-        (ProcessSessionOpenRequest {
-            program: "/bin/sh".to_string(),
-            args: vec![
-                "-c".to_string(),
-                "/bin/sleep 30 </dev/null >/dev/null 2>&1 & echo $!; echo $! > \"$1\"; /bin/sleep 0.3; exit 0".to_string(),
-                "managed-descendant-fixture".to_string(),
-                pid_path.to_string_lossy().into_owned(),
-            ],
-            cwd: None,
-            stdout_encoding: encoding,
-            stderr_encoding: encoding,
-            stdin_encoding: encoding,
-            buffer_limit_bytes: DEFAULT_SESSION_BUFFER_LIMIT_BYTES,
-        }, Some(pid_path))
+        // Script keeps the descendant alive until the test explicitly tears down its process group.
+        // Script 保持后代存活，直到测试显式清理其进程组。
+        let script = format!(
+            "/bin/sleep {DESCENDANT_FIXTURE_LIFETIME_SECONDS} </dev/null >/dev/null 2>&1 & echo $!; echo $! > \"$1\"; /bin/sleep 0.3; exit 0"
+        );
+        (
+            ProcessSessionOpenRequest {
+                program: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    script,
+                    "managed-descendant-fixture".to_string(),
+                    pid_path.to_string_lossy().into_owned(),
+                ],
+                cwd: None,
+                stdout_encoding: encoding,
+                stderr_encoding: encoding,
+                stdin_encoding: encoding,
+                buffer_limit_bytes: DEFAULT_SESSION_BUFFER_LIMIT_BYTES,
+            },
+            Some(pid_path),
+        )
     }
 }
 
@@ -271,19 +574,48 @@ fn make_output_then_sleep_command(output: &str) -> Command {
 /// 构建一个直接子进程退出、但后代继续持有输出管道的命令。
 fn make_inherited_pipe_descendant_command() -> Command {
     if cfg!(windows) {
-        // Command uses the Python runtime already required by Windows descendant lifecycle tests.
-        // Command 使用 Windows 后代生命周期测试已经依赖的 Python 运行时。
-        let mut command = Command::new("python");
+        // TestExecutable is the absolute current test binary used by the controlled fixture root.
+        // TestExecutable 是受控夹具根进程使用的当前测试二进制绝对路径。
+        let test_executable =
+            std::env::current_exe().expect("resolve inherited-pipe fixture test binary");
+        // Command launches only the exact inherited-pipe fixture without PATH discovery.
+        // Command 仅启动精确继承管道夹具，不执行 PATH 发现。
+        let mut command = Command::new(test_executable);
         command.args([
-            "-c",
-            "import subprocess, sys; child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], stdin=subprocess.DEVNULL); print(child.pid, flush=True)",
+            WINDOWS_INHERITED_PIPE_FIXTURE_ROOT_TEST,
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
         ]);
         command
     } else {
         // Command leaves stdout and stderr inherited by the sleeping POSIX descendant.
         // Command 让休眠中的 POSIX 后代继承 stdout 与 stderr。
+        let mut command = Command::new("/bin/sh");
+        // Script keeps inherited pipes open until the test closes the observed process group.
+        // Script 保持继承管道开启，直到测试关闭受观察进程组。
+        let script = format!(
+            "/bin/sleep {DESCENDANT_FIXTURE_LIFETIME_SECONDS} </dev/null & echo $!; exit 0"
+        );
+        command.args(["-c", &script]);
+        command
+    }
+}
+
+/// Build one minimal command whose direct child exits successfully without output.
+/// 构建一个不产生输出并立即成功退出的最小直接子进程命令。
+fn make_immediate_exit_command() -> Command {
+    if cfg!(windows) {
+        // Command uses cmd.exe to minimize per-session startup cost in the 256-session matrix.
+        // Command 使用 cmd.exe，以降低 256 会话矩阵中的单会话启动成本。
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/C", "exit", "0"]);
+        command
+    } else {
+        // Command uses the portable POSIX shell success builtin.
+        // Command 使用可移植的 POSIX shell 成功内建命令。
         let mut command = Command::new("sh");
-        command.args(["-c", "sleep 30 </dev/null & echo $!; exit 0"]);
+        command.args(["-c", "exit 0"]);
         command
     }
 }
@@ -411,13 +743,13 @@ fn fail_stderr_reader_spawn(
     spawn_background_thread_except(role, task, ManagedProcessBackgroundThread::StderrReader)
 }
 
-/// Reject exit-watcher creation after both real pipe readers have started.
-/// 在两个真实管道读取器启动后拒绝退出监视器创建。
-fn fail_exit_watcher_spawn(
-    role: ManagedProcessBackgroundThread,
-    task: ManagedProcessBackgroundTask,
-) -> Result<thread::JoinHandle<()>, std::io::Error> {
-    spawn_background_thread_except(role, task, ManagedProcessBackgroundThread::ExitWatcher)
+/// Reject centralized exit-watcher registration after both real pipe readers have started.
+/// 在两个真实管道读取器启动后拒绝集中式退出监视注册。
+fn fail_exit_watcher_registration(_state: &Arc<ManagedProcessSessionState>) -> Result<(), String> {
+    Err(format!(
+        "forced {} registration failure",
+        ManagedProcessBackgroundThread::ExitWatcher.name()
+    ))
 }
 
 /// Return whether one process exists without treating probe failures as successful exit.
@@ -500,15 +832,38 @@ fn assert_process_exits(pid: u32, timeout: Duration) {
     panic!("process {pid} should have exited after session drop");
 }
 
-/// Wait for one session to publish a descendant pid to stdout.
-/// 等待某个会话把后代进程 pid 输出到 stdout。
+/// Wait for one session to publish a descendant pid through its exact fixture channel.
+/// 等待某个会话通过其精确夹具通道发布后代进程 pid。
 fn wait_for_descendant_pid(
     session: &ManagedProcessSession,
     pid_path: Option<&Path>,
     timeout: Duration,
 ) -> u32 {
+    // DerivedPidPath addresses the controlled Windows root without relying on captured stdout.
+    // DerivedPidPath 用于定位受控 Windows 根进程，且不依赖被捕获的 stdout。
+    let derived_pid_path = if cfg!(windows) && pid_path.is_none() {
+        // RootPid is stable while the managed session retains direct-child ownership.
+        // RootPid 在受管会话保留直接子进程所有权期间保持稳定。
+        let root_pid = lock_session_child(&session.core.state.child)
+            .as_ref()
+            .expect("controlled descendant fixture root ownership")
+            .id();
+        Some(windows_descendant_fixture_pid_path(root_pid))
+    } else {
+        None
+    };
+    // EffectivePidPath prefers the explicit Unix fixture path and otherwise uses the Windows path.
+    // EffectivePidPath 优先使用显式 Unix 夹具路径，否则使用 Windows 派生路径。
+    let effective_pid_path = pid_path.or(derived_pid_path.as_deref());
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
+        if let Some(pid_path) = effective_pid_path
+            && let Ok(pid_text) = fs::read_to_string(pid_path)
+            && let Ok(pid) = pid_text.trim().parse::<u32>()
+        {
+            let _ = fs::remove_file(pid_path);
+            return pid;
+        }
         let stdout = session
             .core
             .state
@@ -516,35 +871,54 @@ fn wait_for_descendant_pid(
             .lock()
             .expect("lock stdout buffer");
         if !stdout.bytes.is_empty() {
+            // PidLines preserves line boundaries and rejects test-harness text instead of stripping it into digits.
+            // PidLines 保留行边界并拒绝测试框架文本，避免把其中数字剥离后误判为 pid。
             let pid_lines = stdout
                 .bytes
                 .iter()
-                .filter_map(|byte| match byte {
-                    b'0'..=b'9' => Some(char::from(*byte)),
-                    b'\r' | b'\n' => Some('\n'),
-                    _ => None,
-                })
+                .map(|byte| char::from(*byte))
                 .collect::<String>();
             drop(stdout);
             for pid_text in pid_lines
                 .lines()
                 .map(str::trim)
-                .filter(|line| !line.is_empty())
+                .filter(|line| !line.is_empty() && line.bytes().all(|byte| byte.is_ascii_digit()))
             {
                 if let Ok(pid) = pid_text.parse::<u32>() {
                     return pid;
                 }
             }
         }
-        if let Some(pid_path) = pid_path
-            && let Ok(pid_text) = fs::read_to_string(pid_path)
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("descendant pid should be published before cleanup");
+}
+
+/// Wait for one controlled fixture pid file to publish a numeric descendant identity.
+/// 等待一个受控夹具 pid 文件发布数字格式的后代身份。
+///
+/// `pid_path` is the exact out-of-band channel owned by one fixture root.
+/// `pid_path` 是由某个夹具根进程拥有的精确带外通道。
+/// `timeout` bounds file publication and scheduler delay.
+/// `timeout` 限制文件发布与调度延迟的最长时间。
+///
+/// Returns the published descendant pid and removes the consumed fixture file.
+/// 返回已发布的后代 pid，并删除已消费的夹具文件。
+#[cfg(windows)]
+fn wait_for_descendant_pid_file(pid_path: &Path, timeout: Duration) -> u32 {
+    // Deadline bounds the controlled out-of-band publication loop.
+    // Deadline 为受控带外发布轮询设置上限。
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(pid_text) = fs::read_to_string(pid_path)
             && let Ok(pid) = pid_text.trim().parse::<u32>()
         {
+            let _ = fs::remove_file(pid_path);
             return pid;
         }
         thread::sleep(Duration::from_millis(25));
     }
-    panic!("descendant pid should be published before cleanup");
+    panic!("descendant pid file should be published before cleanup");
 }
 
 /// Wait until the direct child reports exit without reaping it.
@@ -600,9 +974,6 @@ fn dropping_process_session_kills_child_process() {
 /// 验证显式清理会杀掉派生后代，并及时释放 reader 线程。
 #[test]
 fn killing_process_session_terminates_descendants_and_releases_readers() {
-    // Hold the shared PATH guard while the test spawns and probes named executables.
-    // 在测试按名称启动并探测可执行文件期间持有共享 PATH 保护锁。
-    let _env_guard = process_env_test_guard();
     let (request, pid_path) = make_descendant_cleanup_request();
     let session = ManagedProcessSession::open(request).expect("open descendant cleanup session");
     let descendant_pid = wait_for_descendant_pid(
@@ -636,14 +1007,88 @@ fn killing_process_session_terminates_descendants_and_releases_readers() {
     }
 }
 
+/// Verify one-shot finalization terminates descendants after the direct child has already exited.
+/// 验证单次执行收尾会在直接子进程已经退出后终止其残留后代。
+#[test]
+fn one_shot_finalization_terminates_inherited_pipe_descendant_after_root_exit() {
+    // Command whose root exits while one long-lived descendant retains inherited output pipes.
+    // 根进程退出但长生命周期后代仍保留继承输出管道的命令。
+    let mut command = make_inherited_pipe_descendant_command();
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // Complete managed ownership tuple used by the production one-shot finalizer.
+    // 生产单次执行收尾器使用的完整受管所有权元组。
+    let (mut child, process_tree, reaper_permit) =
+        ManagedChildProcessTree::spawn_with_keepalive(&mut command, "one-shot test", None)
+            .expect("spawn one-shot descendant fixture");
+    // WindowsPidPath is keyed by the exact managed root and bypasses libtest output capture.
+    // WindowsPidPath 以精确受管根进程为键，并绕过 libtest 输出捕获。
+    #[cfg(windows)]
+    let windows_pid_path = windows_descendant_fixture_pid_path(child.id());
+    // Published Windows descendant identity consumed from the controlled out-of-band channel.
+    // 从受控带外通道读取的 Windows 后代身份。
+    #[cfg(windows)]
+    let descendant_pid =
+        wait_for_descendant_pid_file(&windows_pid_path, DESCENDANT_PROBE_START_TIMEOUT);
+    // Buffered POSIX root stdout used only to receive the descendant process identifier.
+    // 仅用于接收后代进程标识符的 POSIX 根进程 stdout 缓冲读取器。
+    #[cfg(not(windows))]
+    let mut stdout = BufReader::new(
+        child
+            .stdout
+            .take()
+            .expect("one-shot fixture stdout should be piped"),
+    );
+    // Text line containing the descendant pid emitted before the root exits.
+    // 根进程退出前输出且包含后代 pid 的文本行。
+    #[cfg(not(windows))]
+    let mut descendant_pid_line = String::new();
+    #[cfg(not(windows))]
+    stdout
+        .read_line(&mut descendant_pid_line)
+        .expect("read one-shot descendant pid");
+    // Parsed descendant pid used for an external lifecycle probe after finalization.
+    // 收尾后用于外部生命周期探测的已解析后代 pid。
+    #[cfg(not(windows))]
+    let descendant_pid = descendant_pid_line
+        .trim()
+        .parse::<u32>()
+        .expect("one-shot descendant pid should be numeric");
+    // Root exit status observed before the descendant releases its inherited pipe.
+    // 后代释放继承管道前观察到的根进程退出状态。
+    let root_status = wait_for_child_exit_until(
+        &mut child,
+        Instant::now() + DESCENDANT_PROBE_START_TIMEOUT,
+        "one-shot fixture root",
+    )
+    .expect("one-shot fixture root should exit");
+    assert!(
+        process_exists(descendant_pid).expect("probe one-shot descendant before finalization"),
+        "one-shot descendant should still be running before finalization"
+    );
+
+    // Definitive root status returned only after the same finalizer terminates the full tree.
+    // 相同收尾器终止完整进程树后返回的确定根进程状态。
+    let finalized_status = finalize_one_shot_process_tree(
+        child,
+        process_tree,
+        reaper_permit,
+        Some(root_status),
+        "one-shot test",
+    )
+    .expect("finalize one-shot descendant fixture");
+
+    assert!(finalized_status.success());
+    assert_process_exits(descendant_pid, Duration::from_secs(5));
+}
+
 #[cfg(windows)]
 /// Verify the suspended root is resumed only after both root and later descendants inherit one Job.
 /// 验证挂起根进程只在归属 Job 后恢复，且根进程与后续后代共同继承同一 Job。
 #[test]
 fn windows_suspended_root_and_descendant_share_managed_job() {
-    // Hold the shared PATH guard while PowerShell and its descendant are launched and probed.
-    // 启动并探测 PowerShell 及其后代期间持有共享 PATH 保护锁。
-    let _env_guard = process_env_test_guard();
     let (request, pid_path) = make_descendant_cleanup_request();
     let session =
         ManagedProcessSession::open(request).expect("open Windows Job containment session");
@@ -754,9 +1199,6 @@ fn cloned_managed_process_session_core_retains_strong_lifetime() {
 /// 验证观察器投递覆盖可读数据及不依赖管道 EOF 的直接子进程退出。
 #[test]
 fn managed_process_session_observer_is_lifecycle_bounded() {
-    // Hold the shared PATH guard while the descendant process tree is active.
-    // 后代进程树存活期间持有共享 PATH 保护锁。
-    let _env_guard = process_env_test_guard();
     // Observer records every package-agnostic callback emitted by this core.
     // Observer 记录当前核心发出的每个包无关回调。
     let observer = Arc::new(CountingProcessSessionObserver::default());
@@ -792,6 +1234,80 @@ fn managed_process_session_observer_is_lifecycle_bounded() {
     );
     assert_eq!(observer.exited.load(Ordering::SeqCst), 1);
     assert_eq!(observer.failed.load(Ordering::SeqCst), 0);
+}
+
+/// Verify 1, 32, and 256 observed sessions reuse one process-wide exit-watcher thread.
+/// 验证 1、32 与 256 个受观察会话复用唯一的进程级退出观察线程。
+#[test]
+fn observed_session_scale_reuses_one_exit_watcher_thread() {
+    // Hold the shared PATH guard while the stress matrix launches platform shell children.
+    // 压力矩阵启动平台 shell 子进程期间持有共享 PATH 保护锁。
+    let _env_guard = process_env_test_guard();
+    // SessionCounts are the acceptance matrix from the priority repair plan.
+    // SessionCounts 是优先修复方案规定的验收矩阵。
+    let session_counts = [1_usize, 32, 256];
+
+    for session_count in session_counts {
+        // Sessions retain every core and observer until the current batch has reported exit.
+        // Sessions 保留当前批次的全部核心与观察器，直到它们均报告退出。
+        let mut sessions = Vec::with_capacity(session_count);
+        for _ in 0..session_count {
+            // Observer records the centralized exit notification for this distinct session.
+            // Observer 记录当前独立会话的集中式退出通知。
+            let observer = Arc::new(CountingProcessSessionObserver::default());
+            // Core registers weak state with the single process-wide watcher.
+            // Core 向唯一进程级 watcher 注册弱状态。
+            let core = ManagedProcessSessionCore::launch_with_observer(
+                make_immediate_exit_command(),
+                make_core_launch_options(DEFAULT_SESSION_BUFFER_LIMIT_BYTES),
+                observer.clone(),
+            )
+            .expect("launch observed immediate-exit core");
+            sessions.push((core, observer));
+        }
+
+        for (core, observer) in sessions {
+            wait_for_observer_count(&observer.exited, 1, Duration::from_secs(5));
+            assert_eq!(observer.exited.load(Ordering::SeqCst), 1);
+            assert_eq!(observer.failed.load(Ordering::SeqCst), 0);
+            core.close(0).expect("close observed immediate-exit core");
+        }
+        assert_eq!(
+            LIVE_CHILD_WATCHER_THREAD_STARTS.load(Ordering::SeqCst),
+            1,
+            "{session_count} observed sessions must reuse one exit-watcher thread"
+        );
+    }
+}
+
+/// Verify unchanged live sessions use bounded exponential watcher backoff instead of fixed 10 ms polls.
+/// 验证无变化活动会话使用有界指数退避，而不是固定 10 毫秒轮询。
+#[test]
+fn live_child_watcher_idle_poll_backoff_is_bounded() {
+    // Intervals model consecutive unchanged centralized probe batches.
+    // Intervals 模拟连续无变化的集中探测批次。
+    let mut intervals = Vec::new();
+    // Current starts at the minimum low-latency registration interval.
+    // Current 从低延迟注册使用的最小间隔开始。
+    let mut current = LIVE_CHILD_WATCHER_MIN_POLL;
+    for _ in 0..8 {
+        intervals.push(current);
+        current = next_live_child_watcher_poll(current);
+    }
+
+    assert_eq!(
+        intervals,
+        vec![
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+            Duration::from_millis(80),
+            Duration::from_millis(160),
+            Duration::from_millis(250),
+            Duration::from_millis(250),
+            Duration::from_millis(250),
+        ]
+    );
 }
 
 /// Verify zero-timeout core reads return immediately for empty and already-readable buffers.
@@ -1029,26 +1545,30 @@ fn process_session_background_thread_spawn_failures_are_transactional() {
     // Hold the shared PATH guard while each failure case launches one named executable.
     // 每个失败用例启动命名可执行文件期间持有共享 PATH 保护锁。
     let _env_guard = process_env_test_guard();
-    // Cases cover failure before readers, after one reader, and after both readers.
-    // Cases 覆盖读取器启动前、一个读取器启动后与两个读取器启动后的失败。
+    // Cases cover failure before readers, after one reader, and during centralized registration.
+    // Cases 覆盖读取器启动前、一个读取器启动后与集中注册阶段的失败。
     let cases: [(
         ManagedProcessBackgroundThread,
         ManagedProcessBackgroundThreadSpawner,
+        ManagedProcessExitWatcherRegistrar,
     ); 3] = [
         (
             ManagedProcessBackgroundThread::StdoutReader,
             fail_stdout_reader_spawn,
+            register_direct_child_exit_watch,
         ),
         (
             ManagedProcessBackgroundThread::StderrReader,
             fail_stderr_reader_spawn,
+            register_direct_child_exit_watch,
         ),
         (
             ManagedProcessBackgroundThread::ExitWatcher,
-            fail_exit_watcher_spawn,
+            spawn_managed_process_background_thread,
+            fail_exit_watcher_registration,
         ),
     ];
-    for (failed_role, spawn_thread) in cases {
+    for (failed_role, spawn_thread, register_exit_watcher) in cases {
         // SpawnedPid captures the exact direct child that rollback must reap before returning.
         // SpawnedPid 捕获回滚返回前必须回收的精确直接子进程。
         let spawned_pid = Arc::new(Mutex::new(None));
@@ -1070,6 +1590,7 @@ fn process_session_background_thread_spawn_failures_are_transactional() {
                 ProcessTreeController::attach(child)
             },
             spawn_thread,
+            register_exit_watcher,
         );
         // Error is extracted without requiring the owning core to implement Debug.
         // Error 在不要求拥有型核心实现 Debug 的情况下取出。
@@ -1593,9 +2114,6 @@ fn process_session_child_lock_recovers_after_poisoned_lock() {
 /// 验证 close() 会在进程树清理完成前保持子进程未被提前 reap。
 #[test]
 fn closing_process_session_after_child_exit_still_cleans_descendants() {
-    // Hold the shared PATH guard while the test spawns and probes named executables.
-    // 在测试按名称启动并探测可执行文件期间持有共享 PATH 保护锁。
-    let _env_guard = process_env_test_guard();
     let lua = Lua::new();
     let (request, pid_path) = make_descendant_cleanup_request();
     let session =

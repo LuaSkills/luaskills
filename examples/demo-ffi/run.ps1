@@ -59,7 +59,7 @@ $ProjectRoot = Resolve-ProjectRoot -ScriptDirectory $ScriptDir
 $RuntimeRoot = Join-Path $ProjectRoot "examples\ffi\standard_runtime\runtime_root"
 
 if ($Fetch -ne "none") {
-    & (Join-Path $ProjectRoot "scripts\fetch_runtime_deps.ps1") -Target $Fetch -RuntimeRoot $RuntimeRoot
+    & (Join-Path $ProjectRoot "scripts\deps\fetch_deps.ps1") -Target $Fetch -RuntimeRoot $RuntimeRoot
 }
 
 cargo build --release --manifest-path (Join-Path $ProjectRoot "Cargo.toml")

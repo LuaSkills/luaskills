@@ -26,30 +26,6 @@ fn render_skill_manager_path(path: &Path) -> String {
     render_host_visible_path(path)
 }
 
-/// Inspect whether one skill-root path is a directory without hiding filesystem probe errors.
-/// 检查单个技能根路径是否为目录，同时不隐藏文件系统探测错误。
-///
-/// The root parameter is the skill-root path that should be inspected before directory traversal.
-/// root 参数是目录遍历前需要检查的技能根路径。
-///
-/// Return true for an existing directory, false for a confirmed missing path, or an explicit probe/type error.
-/// 已存在目录返回 true，确认缺失路径返回 false；探测或类型失败时返回显式错误。
-fn skill_root_path_is_directory(root: &Path) -> Result<bool, String> {
-    match fs::metadata(root) {
-        Ok(metadata) if metadata.is_dir() => Ok(true),
-        Ok(_) => Err(format!(
-            "Skill root is not a directory: {}",
-            render_skill_manager_path(root)
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(format!(
-            "Failed to inspect skill root {}: {}",
-            render_skill_manager_path(root),
-            error
-        )),
-    }
-}
-
 /// Inspect whether one skill manifest path is a file without hiding filesystem probe errors.
 /// 检查单个技能清单路径是否为文件，同时不隐藏文件系统探测错误。
 ///
@@ -328,10 +304,10 @@ pub struct PreparedSkillInstall {
     pub result: SkillApplyResult,
     /// Final target directory where the installed skill has been staged.
     /// 已暂存安装技能的最终目标目录。
-    pub target_dir: PathBuf,
+    pub(crate) target_dir: PathBuf,
     /// Install record that should be persisted only after runtime reload succeeds.
     /// 只有运行时重载成功后才应持久化的安装记录。
-    pub install_record: InstalledSkillRecord,
+    pub(crate) install_record: InstalledSkillRecord,
 }
 
 /// One staged update mutation prepared before the runtime reload is attempted.
@@ -343,16 +319,16 @@ pub struct PreparedSkillUpdate {
     pub result: SkillApplyResult,
     /// Final target directory currently holding the staged new skill package.
     /// 当前持有已暂存新技能包的最终目标目录。
-    pub target_dir: PathBuf,
+    pub(crate) target_dir: PathBuf,
     /// Backup directory that still contains the previous skill package until commit completes.
     /// 在提交完成前仍保存旧技能包的备份目录。
-    pub backup_dir: PathBuf,
+    pub(crate) backup_dir: PathBuf,
     /// Updated install record that should be persisted only after runtime reload succeeds.
     /// 只有运行时重载成功后才应持久化的更新后安装记录。
-    pub install_record: InstalledSkillRecord,
+    pub(crate) install_record: InstalledSkillRecord,
     /// Previous install record that should be restored if the update commit partially fails.
     /// 如果更新提交发生部分失败则需要恢复的旧安装记录。
-    pub previous_install_record: InstalledSkillRecord,
+    pub(crate) previous_install_record: InstalledSkillRecord,
 }
 
 /// One staged uninstall mutation prepared before the runtime reload is attempted.
@@ -364,16 +340,16 @@ pub struct PreparedSkillUninstall {
     pub result: SkillUninstallResult,
     /// Final target directory currently reserved for the installed skill.
     /// 当前为已安装技能保留的最终目标目录。
-    pub target_dir: PathBuf,
+    pub(crate) target_dir: PathBuf,
     /// Backup directory that still contains the previous skill package until commit completes.
     /// 在提交完成前仍保存旧技能包的备份目录。
-    pub backup_dir: Option<PathBuf>,
+    pub(crate) backup_dir: Option<PathBuf>,
     /// Previous disabled-state record that should be restored if uninstall rollback is needed.
     /// 如果需要回滚卸载则应恢复的旧停用状态记录。
-    pub previous_disabled_record: Option<DisabledSkillRecord>,
+    pub(crate) previous_disabled_record: Option<DisabledSkillRecord>,
     /// Previous managed install record that should be restored if uninstall rollback is needed.
     /// 如果需要回滚卸载则应恢复的旧受管安装记录。
-    pub previous_install_record: Option<InstalledSkillRecord>,
+    pub(crate) previous_install_record: Option<InstalledSkillRecord>,
 }
 
 /// Optional database cleanup switches accepted by skill uninstall operations.
@@ -453,8 +429,15 @@ pub struct DisabledSkillRecord {
 /// Skill manager that owns persisted skill enabled/disabled state.
 /// 持有技能启用/停用持久状态的技能管理器。
 pub struct SkillManager {
+    /// Immutable host configuration governing skill state and download policy.
+    /// 管理技能状态与下载策略的不可变宿主配置。
     config: SkillManagerConfig,
+    /// Optional operation progress emitter supplied by the runtime host.
+    /// 由运行时宿主提供的可选操作进度发射器。
     progress: Option<RuntimeSkillOperationProgressEmitter>,
+    /// Configuration-generation downloader reused by all manager operations.
+    /// 由当前配置代的全部管理操作复用的下载器。
+    downloader: DownloadManager,
 }
 
 /// Drop guard that removes one staging directory unless the caller explicitly disarms it.
@@ -499,10 +482,7 @@ impl SkillManager {
     /// Create one skill manager from a shared configuration object.
     /// 基于共享配置对象创建一个技能管理器实例。
     pub fn new(config: SkillManagerConfig) -> Self {
-        Self {
-            config,
-            progress: None,
-        }
+        Self::new_with_progress(config, None)
     }
 
     /// Create one skill manager with an operation-scoped progress emitter.
@@ -511,7 +491,19 @@ impl SkillManager {
         config: SkillManagerConfig,
         progress: Option<RuntimeSkillOperationProgressEmitter>,
     ) -> Self {
-        Self { config, progress }
+        // Downloader is created once for this configuration generation and cloned cheaply per operation.
+        // Downloader 在当前配置代仅创建一次，并在每次操作中低成本克隆。
+        let downloader = DownloadManager::new(DownloadManagerConfig {
+            cache_root: config.download_cache_root.clone(),
+            allow_network_download: config.allow_network_download,
+            github_base_url: config.github_base_url.clone(),
+            github_api_base_url: config.github_api_base_url.clone(),
+        });
+        Self {
+            config,
+            progress,
+            downloader,
+        }
     }
 
     /// Ensure the skill-state root and its child directories exist.
@@ -705,6 +697,17 @@ impl SkillManager {
         skill_dir: &Path,
     ) -> Result<PreparedSkillUninstall, String> {
         self.guard_operation(plane, SkillLifecycleAction::Uninstall, skill_id)?;
+        // Sole package directory owned by this manager and the validated skill identifier.
+        // 当前管理器与已验证技能标识符唯一拥有的包目录。
+        let expected_skill_dir = self.config.skill_root.skills_dir.join(skill_id);
+        if skill_dir != expected_skill_dir {
+            return Err(format!(
+                "Refusing to uninstall skill '{}' from unmanaged directory {}; expected {}",
+                skill_id,
+                render_skill_manager_path(skill_dir),
+                render_skill_manager_path(&expected_skill_dir)
+            ));
+        }
         self.ensure_state_layout()?;
         let previous_disabled_record = self.disabled_record(skill_id)?;
         let previous_install_record = self.install_record(skill_id)?;
@@ -1502,15 +1505,7 @@ impl SkillManager {
             "started",
             Some("moving updated skill into place"),
         );
-        if let Err(error) = fs::rename(&extracted_skill_dir, &target_dir) {
-            let _ = fs::rename(&backup_dir, &target_dir);
-            return Err(format!(
-                "Failed to move updated skill {} into {}: {}",
-                render_skill_manager_path(&extracted_skill_dir),
-                render_skill_manager_path(&target_dir),
-                error
-            ));
-        }
+        publish_staged_skill_update(&extracted_skill_dir, &target_dir, &backup_dir)?;
         update_temp_guard.disarm();
         let _ = fs::remove_dir_all(&temp_root);
 
@@ -1906,12 +1901,7 @@ impl SkillManager {
     /// Build one downloader configured for managed install and update flows.
     /// 为受管安装与更新流程构造单个下载器。
     fn downloader(&self) -> DownloadManager {
-        DownloadManager::new(DownloadManagerConfig {
-            cache_root: self.config.download_cache_root.clone(),
-            allow_network_download: self.config.allow_network_download,
-            github_base_url: self.config.github_base_url.clone(),
-            github_api_base_url: self.config.github_api_base_url.clone(),
-        })
+        self.downloader.clone()
     }
 
     /// Build one downloader that emits archive-download progress for the current skill operation.
@@ -1925,15 +1915,7 @@ impl SkillManager {
             .progress
             .as_ref()
             .map(|progress| progress.download_callback(source_type, skill_id.to_string()));
-        DownloadManager::new_with_progress(
-            DownloadManagerConfig {
-                cache_root: self.config.download_cache_root.clone(),
-                allow_network_download: self.config.allow_network_download,
-                github_base_url: self.config.github_base_url.clone(),
-                github_api_base_url: self.config.github_api_base_url.clone(),
-            },
-            progress_callback,
-        )
+        self.downloader.with_progress_callback(progress_callback)
     }
 
     /// Emit one simple progress phase when an operation-scoped progress emitter exists.
@@ -1986,8 +1968,12 @@ fn is_allowed_private_source_url(url: &str, allowlist: &[String]) -> bool {
     }
     allowlist.iter().any(|entry| {
         let prefix = entry.trim().trim_end_matches('/').to_ascii_lowercase();
+        // A stripped remainder enforces the path boundary without allocating a formatted prefix per entry.
+        // 使用剥离后的剩余部分校验路径边界，避免为每个 allowlist 项分配格式化前缀。
         !prefix.is_empty()
-            && (candidate == prefix || candidate.starts_with(format!("{}/", prefix).as_str()))
+            && candidate
+                .strip_prefix(prefix.as_str())
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
     })
 }
 
@@ -2147,6 +2133,52 @@ where
         message.push_str(&format!(". rollback failed: {}", error));
     }
     message
+}
+
+/// Publish one staged skill update and restore the previous package when publication fails.
+/// 发布单个已暂存技能更新，并在发布失败时恢复旧版本包。
+///
+/// The extracted_skill_dir parameter is the validated new package directory waiting to be published.
+/// extracted_skill_dir 参数是等待发布的已校验新版本包目录。
+///
+/// The target_dir parameter is the canonical installed-skill directory vacated before this call.
+/// target_dir 参数是本次调用前已经腾空的规范技能安装目录。
+///
+/// The backup_dir parameter contains the previous package that must be restored after publication failure.
+/// backup_dir 参数包含发布失败后必须恢复的旧版本包。
+///
+/// Returns success after the new directory is published, or a complete error that also reports rollback failure and uncertain disk state.
+/// 新目录发布成功后返回成功；失败时返回同时包含回滚失败与磁盘状态不确定性的完整错误。
+fn publish_staged_skill_update(
+    extracted_skill_dir: &Path,
+    target_dir: &Path,
+    backup_dir: &Path,
+) -> Result<(), String> {
+    // Primary filesystem publication attempt that moves the validated new package into its canonical location.
+    // 把已校验新版本包移动到规范位置的主要文件系统发布尝试。
+    let Err(publish_error) = fs::rename(extracted_skill_dir, target_dir) else {
+        return Ok(());
+    };
+
+    // Primary publication failure retained even when restoring the previous package succeeds.
+    // 即使旧版本包恢复成功也必须保留的主要发布失败信息。
+    let mut message = format!(
+        "Failed to move updated skill {} into {}: {}",
+        render_skill_manager_path(extracted_skill_dir),
+        render_skill_manager_path(target_dir),
+        publish_error
+    );
+    // Rollback failure means neither directory is authoritative, so callers must receive both errors explicitly.
+    // 回滚失败意味着两个目录都不能再视为权威状态，因此调用方必须显式收到两项错误。
+    if let Err(rollback_error) = fs::rename(backup_dir, target_dir) {
+        message.push_str(&format!(
+            "; rollback failed to restore {} from {}: {}. skill disk state is uncertain",
+            render_skill_manager_path(target_dir),
+            render_skill_manager_path(backup_dir),
+            rollback_error
+        ));
+    }
+    Err(message)
 }
 
 /// Build one stable download-cache key for a managed skill package.
@@ -2342,17 +2374,23 @@ pub fn resolve_declared_skill_instance_from_roots(
 fn collect_named_skill_dirs(
     root: &Path,
 ) -> Result<std::collections::BTreeMap<String, PathBuf>, String> {
+    // Output map populated only from valid UTF-8 directory entries with strict skill identifiers.
+    // 仅由有效 UTF-8 目录项和严格技能标识符填充的输出映射。
     let mut output = std::collections::BTreeMap::new();
-    if !skill_root_path_is_directory(root)? {
-        return Ok(output);
-    }
-    for entry in fs::read_dir(root).map_err(|error| {
-        format!(
-            "Failed to read {}: {}",
-            render_skill_manager_path(root),
-            error
-        )
-    })? {
+    // Single directory-open operation that distinguishes an absent optional root from every real traversal failure.
+    // 单次目录打开操作，用于区分缺失的可选根目录与所有真实遍历失败。
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(output),
+        Err(error) => {
+            return Err(format!(
+                "Failed to read skill root {}: {}",
+                render_skill_manager_path(root),
+                error
+            ));
+        }
+    };
+    for entry in entries {
         let entry = entry.map_err(|error| format!("Failed to read skill entry: {}", error))?;
         let file_type = entry
             .file_type()

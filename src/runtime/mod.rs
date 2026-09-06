@@ -6,6 +6,8 @@ pub mod context;
 pub mod encoding;
 pub mod engine;
 pub mod entry;
+pub(crate) mod file_system;
+pub(crate) mod file_watcher;
 pub mod help;
 pub mod logging;
 pub mod managed_io;

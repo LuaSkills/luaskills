@@ -102,8 +102,8 @@ fn require_present_string_field_preserves_empty_text() {
 /// 验证缺失 SQLite 动态库会通过宿主可见路径渲染器输出路径。
 #[test]
 fn sqlite_missing_library_error_uses_host_visible_path() {
-    // Missing library path used to exercise the provider loader's preflight check.
-    // 用于触发 provider 加载器预检失败的缺失动态库路径。
+    // Missing library path used to exercise the shared real loader operation.
+    // 用于触发共享真实加载操作的缺失动态库路径。
     let library_path = std::env::temp_dir().join(format!(
         "luaskills-missing-sqlite-provider-{}.dll",
         std::process::id()
@@ -114,14 +114,17 @@ fn sqlite_missing_library_error_uses_host_visible_path() {
         Ok(_) => panic!("missing SQLite library should fail"),
         Err(error) => error,
     };
-    // Expected diagnostic text rendered with the shared host-visible path formatter.
-    // 使用共享宿主可见路径渲染器生成的期望诊断文本。
-    let expected_error = format!(
-        "SQLite dynamic library path does not exist: {}",
+    // Stable diagnostic prefix rendered with the shared host-visible path formatter.
+    // 使用共享宿主可见路径渲染器生成的稳定诊断前缀。
+    let expected_prefix = format!(
+        "failed to load SQLite dynamic library {}:",
         render_host_visible_path(&library_path)
     );
 
-    assert_eq!(error, expected_error);
+    assert!(
+        error.starts_with(&expected_prefix),
+        "unexpected error: {error}"
+    );
 }
 
 /// Build one deterministic SQLite binding context for provider binding-state tests.

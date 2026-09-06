@@ -115,7 +115,8 @@ for asset in data.get("assets", []):
         print(asset.get("browser_download_url", ""))
         print(asset.get("digest", ""))
         raise SystemExit(0)
-raise SystemExit(f"asset not found: {asset_name}")
+print(f"asset not found: {asset_name}", file=sys.stderr)
+raise SystemExit(2)
 ' "$asset_name"
 }
 
@@ -162,8 +163,21 @@ save_release_asset_with_digest() {
   local tag="$2"
   local asset_name="$3"
   local destination="$4"
-  local asset_url asset_digest expected actual
-  mapfile -t asset_info < <(release_asset_info "$repo" "$tag" "$asset_name")
+  # Lookup payload and status kept separately so only an exact missing-asset result may use compatibility fallback.
+  # 分开保存查询载荷与状态，确保只有明确的资产缺失结果可以使用兼容回退。
+  local asset_url asset_digest expected actual asset_info_text lookup_status
+  if asset_info_text="$(release_asset_info "$repo" "$tag" "$asset_name")"; then
+    lookup_status=0
+  else
+    lookup_status=$?
+  fi
+  if [ "$lookup_status" -ne 0 ]; then
+    if [ "$lookup_status" -eq 2 ]; then
+      return 2
+    fi
+    return 1
+  fi
+  mapfile -t asset_info <<< "$asset_info_text"
   asset_url="${asset_info[0]:-}"
   asset_digest="${asset_info[1]:-}"
   if [[ "$asset_digest" != sha256:* ]]; then
@@ -204,14 +218,32 @@ install_lua_runtime() {
   local archive="$temp_dir/$asset_name"
   local extract_dir="$temp_dir/extract"
   ensure_dir "$extract_dir"
-  if ! save_release_asset_with_digest "$LUA_RUNTIME_REPO" "$resolved_lua_runtime_tag" "$asset_name" "$archive"; then
-    if [ -d "$RUNTIME_ROOT/skills" ] || [ -d "$RUNTIME_ROOT/lua_packages" ]; then
+  # Classified download result used to separate exact asset absence from integrity or transport failures.
+  # 用于区分明确资产缺失与完整性或传输失败的分类下载结果。
+  local download_status=0
+  save_release_asset_with_digest "$LUA_RUNTIME_REPO" "$resolved_lua_runtime_tag" "$asset_name" "$archive" || download_status=$?
+  if [ "$download_status" -ne 0 ]; then
+    if [ "$download_status" -eq 2 ] && { [ -d "$RUNTIME_ROOT/skills" ] || [ -d "$RUNTIME_ROOT/lua_packages" ]; }; then
       echo "WARNING: Lua runtime packages asset '$asset_name' was not found in $LUA_RUNTIME_REPO@$resolved_lua_runtime_tag. Existing packaged runtime content will be used." >&2
       return 0
     fi
     return 1
   fi
   tar -xzf "$archive" -C "$extract_dir"
+  [ -d "$extract_dir/lua_packages" ] || {
+    echo "Downloaded $asset_name does not contain lua_packages" >&2
+    return 1
+  }
+  if [ "$LUA_PACKAGES_ONLY" != "1" ]; then
+    [ -f "$extract_dir/resources/lua-runtime-manifest.json" ] || {
+      echo "Downloaded $asset_name does not contain resources/lua-runtime-manifest.json" >&2
+      return 1
+    }
+    [ -f "$extract_dir/resources/luaskills-packages-manifest.json" ] || {
+      echo "Downloaded $asset_name does not contain resources/luaskills-packages-manifest.json" >&2
+      return 1
+    }
+  fi
   ensure_dir "$RUNTIME_ROOT"
   local runtime_dirs=(lua_packages)
   if [ "$LUA_PACKAGES_ONLY" != "1" ]; then
@@ -232,14 +264,6 @@ install_lua_runtime() {
       ensure_dir "$RUNTIME_ROOT/licenses"
       cp -a "$extract_dir/licenses"/. "$RUNTIME_ROOT/licenses"/
     fi
-    [ -f "$RUNTIME_ROOT/resources/lua-runtime-manifest.json" ] || {
-      echo "Lua runtime manifest was not found after installing $asset_name" >&2
-      return 1
-    }
-    [ -f "$RUNTIME_ROOT/resources/luaskills-packages-manifest.json" ] || {
-      echo "LuaSkills packages manifest was not found after installing $asset_name" >&2
-      return 1
-    }
   fi
 }
 

@@ -215,6 +215,9 @@ function main(): void {
     host_provided_tool_root: "str",
     host_provided_lua_root: "str",
     host_provided_ffi_root: "str",
+    // These fields preserve the complete current V1 host-options layout before download and provider fields.
+    // 这些字段在下载与 Provider 字段之前保持当前完整的 V1 宿主选项布局。
+    system_lua_lib_dir: "str",
     download_cache_root: "str",
     dependency_dir_name: "str",
     state_dir_name: "str",
@@ -225,6 +228,10 @@ function main(): void {
     allow_network_download: "uint8_t",
     github_base_url: "str",
     github_api_base_url: "str",
+    official_skill_hub_base_url: "str",
+    enable_private_url_skill_install: "uint8_t",
+    private_skill_source_allowlist: "void *",
+    private_skill_source_allowlist_len: "size_t",
     sqlite_library_path: "str",
     sqlite_provider_mode: "int32_t",
     sqlite_callback_mode: "int32_t",
@@ -299,6 +306,9 @@ function main(): void {
       host_provided_tool_root: path.join(runtimeRoot, "bin", "tools"),
       host_provided_lua_root: path.join(runtimeRoot, "lua_packages"),
       host_provided_ffi_root: path.join(runtimeRoot, "libs"),
+      // V1-only lifecycle demo still supplies every field in the public header order.
+      // 仅使用 V1 的生命周期示例仍按公共头文件顺序提供全部字段。
+      system_lua_lib_dir: path.join(runtimeRoot, "system_lua_lib"),
       download_cache_root: path.join(runtimeRoot, "temp", "downloads"),
       dependency_dir_name: "dependencies",
       state_dir_name: "state",
@@ -309,6 +319,10 @@ function main(): void {
       allow_network_download: 0,
       github_base_url: null,
       github_api_base_url: null,
+      official_skill_hub_base_url: null,
+      enable_private_url_skill_install: 0,
+      private_skill_source_allowlist: null,
+      private_skill_source_allowlist_len: 0,
       sqlite_library_path: null,
       sqlite_provider_mode: 0,
       sqlite_callback_mode: 0,

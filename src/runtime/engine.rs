@@ -100,7 +100,7 @@ use crate::sqlite_host::{
     SqliteSkillBinding, SqliteSkillHost,
     disabled_skill_status_json as disabled_sqlite_skill_status_json,
 };
-use crate::tool_cache::{ToolCacheConfig, configure_global_tool_cache, global_tool_cache};
+use crate::tool_cache::{global_tool_cache, try_configure_global_tool_cache};
 
 mod bridge;
 mod host_result;
@@ -131,6 +131,9 @@ struct LoadedSkill {
     meta: SkillMeta,
     dir: std::path::PathBuf,
     root_name: String,
+    /// Non-debug Lua entry sources cached for the lifetime of this immutable load generation.
+    /// 在当前不可变加载代生命周期内缓存的非调试 Lua 入口源码。
+    entry_sources: HashMap<String, Arc<str>>,
     /// Trusted managed-runtime package context built by the skill loader.
     /// 由 Skill 加载器构造的可信受管运行时包上下文。
     managed_package: Arc<ManagedRuntimePackageContext>,
@@ -762,8 +765,12 @@ fn windows_wide_null_path(path: &Path) -> Result<Vec<u16>, String> {
 // ============================================================
 
 pub struct LuaEngine {
-    skills: HashMap<String, LoadedSkill>,
-    entry_registry: BTreeMap<String, ResolvedEntryTarget>,
+    /// Immutable loaded-skill map shared by every VM created from the current load generation.
+    /// 当前加载代创建的所有虚拟机共享的不可变已加载技能映射。
+    skills: Arc<HashMap<String, LoadedSkill>>,
+    /// Immutable canonical entry registry shared by every VM in the current load generation.
+    /// 当前加载代所有虚拟机共享的不可变规范入口注册表。
+    entry_registry: Arc<BTreeMap<String, ResolvedEntryTarget>>,
     runtime_skill_roots: Vec<RuntimeSkillRoot>,
     pool: Arc<LuaVmPool>,
     runlua_pool: Arc<LuaVmPool>,
@@ -3359,7 +3366,7 @@ fn parse_managed_runtime_session_args(
     for index in 1..=length {
         // Required UTF-8 argument at the current dense array index.
         // 当前稠密数组索引处必需的 UTF-8 参数。
-        let argument: mlua::String = args_table.get(index).map_err(|error| {
+        let argument: mlua::LuaString = args_table.get(index).map_err(|error| {
             mlua::Error::runtime(format!(
                 "{api_name}: args[{index}] must be a string: {error}"
             ))
@@ -6808,7 +6815,16 @@ impl LuaVmPool {
     {
         loop {
             let mut state = self.lock_state();
-            self.reap_idle_locked(&mut state);
+            // Detached idle VMs selected without running their destructors under the pool lock.
+            // 在不于池锁内运行析构函数的前提下筛选出的已摘除空闲虚拟机。
+            let retired_vms = self.reap_idle_locked(&mut state);
+            if !retired_vms.is_empty() {
+                // State guard is released before destroying the detached Lua states.
+                // 在销毁已摘除 Lua 状态前释放状态保护。
+                drop(state);
+                drop(retired_vms);
+                continue;
+            }
 
             if let Some(mut vm) = state.available.pop() {
                 vm.last_used_at = Instant::now();
@@ -6844,10 +6860,20 @@ impl LuaVmPool {
     /// Return a VM back into the pool.
     /// 将虚拟机归还到池中。
     fn release(&self, vm: LuaVm) {
-        let mut state = self.lock_state();
-        state.available.push(vm);
-        self.reap_idle_locked(&mut state);
-        self.condvar.notify_one();
+        // Retired VMs are detached while locked and destroyed only after the state guard is gone.
+        // 退役虚拟机在锁内摘除，仅在状态保护释放后析构。
+        let retired_vms = {
+            // Pool state guard used for publication, accounting, and idle selection.
+            // 用于发布、计数和空闲筛选的池状态保护。
+            let mut state = self.lock_state();
+            state.available.push(vm);
+            // Detached VM list whose destructors must not run under the pool lock.
+            // 析构函数不得在池锁内运行的已摘除虚拟机列表。
+            let retired_vms = self.reap_idle_locked(&mut state);
+            self.condvar.notify_one();
+            retired_vms
+        };
+        drop(retired_vms);
     }
 
     /// Retire one broken VM so later borrowers receive a fresh instance instead of stale state.
@@ -6887,26 +6913,38 @@ impl LuaVmPool {
 
     /// Reap idle available VMs while respecting the minimum pool size.
     /// 在保证最小池规模的前提下回收空闲虚拟机。
-    fn reap_idle_locked(&self, state: &mut LuaVmPoolState) {
+    fn reap_idle_locked(&self, state: &mut LuaVmPoolState) -> Vec<LuaVm> {
         if state.total_count <= self.config.min_size {
-            return;
+            return Vec::new();
         }
 
+        // Idle threshold used to select only VMs eligible for retirement.
+        // 仅用于选择可退役虚拟机的空闲阈值。
         let idle_limit = Duration::from_secs(self.config.idle_ttl_secs);
+        // Shared comparison instant for the complete locked selection pass.
+        // 整个锁内筛选过程共用的比较时刻。
         let now = Instant::now();
+        // Current available-vector index inspected during swap removal.
+        // 在交换删除期间检查的当前可用向量索引。
         let mut index = 0usize;
+        // Detached VMs returned to the caller for destruction after lock release.
+        // 返回给调用方并在锁释放后析构的已摘除虚拟机。
+        let mut retired_vms = Vec::new();
         while index < state.available.len() && state.total_count > self.config.min_size {
+            // Retirement decision for the current available VM.
+            // 当前可用虚拟机的退役判断。
             let should_remove = now
                 .checked_duration_since(state.available[index].last_used_at)
                 .map(|idle| idle >= idle_limit)
                 .unwrap_or(false);
             if should_remove {
-                state.available.swap_remove(index);
+                retired_vms.push(state.available.swap_remove(index));
                 state.total_count = state.total_count.saturating_sub(1);
             } else {
                 index += 1;
             }
         }
+        retired_vms
     }
 }
 
@@ -7220,12 +7258,12 @@ impl LuaEngine {
                 idle_ttl_secs: config.idle_ttl_secs,
             })
             .unwrap_or_else(default_runlua_vm_pool_config);
-        configure_global_tool_cache(
-            host_options
-                .cache_config
-                .clone()
-                .unwrap_or_else(ToolCacheConfig::default),
-        );
+        match host_options.cache_config.clone() {
+            Some(cache_config) => {
+                try_configure_global_tool_cache(cache_config).map_err(std::io::Error::other)?
+            }
+            None => drop(global_tool_cache()),
+        }
         let native_library_search_guard =
             NativeLibrarySearchGuard::new(&host_options).map_err(std::io::Error::other)?;
         let database_provider_callbacks =
@@ -7241,8 +7279,8 @@ impl LuaEngine {
             ManagedRuntimeWorkerService::new_with_config(host_options.managed_runtime_config)
                 .map_err(std::io::Error::other)?;
         Ok(Self {
-            skills: HashMap::new(),
-            entry_registry: BTreeMap::new(),
+            skills: Arc::new(HashMap::new()),
+            entry_registry: Arc::new(BTreeMap::new()),
             runtime_skill_roots: Vec::new(),
             pool: Arc::new(LuaVmPool::new(pool_config)),
             runlua_pool: Arc::new(LuaVmPool::new(runlua_pool_config)),
@@ -7369,8 +7407,8 @@ impl LuaEngine {
     /// 创建一个空的重载候选引擎，并保留不可变宿主策略与回调快照。
     fn empty_reload_candidate(&self) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            skills: HashMap::new(),
-            entry_registry: BTreeMap::new(),
+            skills: Arc::new(HashMap::new()),
+            entry_registry: Arc::new(BTreeMap::new()),
             runtime_skill_roots: Vec::new(),
             pool: Arc::new(LuaVmPool::new(self.pool.config)),
             runlua_pool: Arc::new(LuaVmPool::new(self.runlua_pool.config)),
@@ -7746,8 +7784,11 @@ impl LuaEngine {
             module_name: String,
         }
 
+        // Uniquely owned load-generation map mutated only before VM publication.
+        // 仅在虚拟机发布前修改的加载代唯一所有映射。
+        let skills = Arc::make_mut(&mut self.skills);
         let mut seeds = Vec::new();
-        for (skill_storage_key, skill) in &self.skills {
+        for (skill_storage_key, skill) in skills.iter() {
             for tool in skill.meta.entries() {
                 let local_name = tool.name.trim().to_string();
                 if seeds.iter().any(|seed: &EntrySeed| {
@@ -7800,7 +7841,7 @@ impl LuaEngine {
                 ))
         });
 
-        for skill in self.skills.values_mut() {
+        for skill in skills.values_mut() {
             skill.resolved_entry_names.clear();
         }
 
@@ -7836,21 +7877,18 @@ impl LuaEngine {
             };
             registry.insert(canonical_name.clone(), resolved_target);
 
-            let skill = self
-                .skills
-                .get_mut(&seed.skill_storage_key)
-                .ok_or_else(|| {
-                    format!(
-                        "internal error: missing loaded skill '{}' while building entry registry",
-                        seed.skill_storage_key
-                    )
-                })?;
+            let skill = skills.get_mut(&seed.skill_storage_key).ok_or_else(|| {
+                format!(
+                    "internal error: missing loaded skill '{}' while building entry registry",
+                    seed.skill_storage_key
+                )
+            })?;
             skill
                 .resolved_entry_names
                 .insert(seed.local_name.clone(), canonical_name);
         }
 
-        self.entry_registry = registry;
+        self.entry_registry = Arc::new(registry);
         Ok(())
     }
 
@@ -9063,6 +9101,29 @@ impl LuaEngine {
             }
         }
 
+        // Non-debug source cache published only after every entry has been read successfully.
+        // 仅在全部入口源码成功读取后发布的非调试源码缓存。
+        let mut entry_sources = HashMap::with_capacity(meta.entries().count());
+        if !meta.debug {
+            for tool in meta.entries() {
+                // Exact validated entry path read once for this load generation.
+                // 当前加载代只读取一次的精确已验证入口路径。
+                let lua_path = tool_entry_path(dir, tool);
+                // Immutable source shared by every VM while each Lua state still compiles independently.
+                // 所有虚拟机共享但仍由各 Lua 状态独立编译的不可变源码。
+                let source: Arc<str> = std::fs::read_to_string(&lua_path)
+                    .map_err(|error| {
+                        format!(
+                            "Failed to read {}: {}",
+                            render_log_friendly_path(&lua_path),
+                            error
+                        )
+                    })?
+                    .into();
+                entry_sources.insert(tool.lua_entry.clone(), source);
+            }
+        }
+
         if !meta.help.main.file.trim().is_empty() {
             validate_skill_relative_path(&meta.help.main.file, "help", "help.main.file")
                 .map_err(|error| format!("skill {} help main: {}", meta.name, error))?;
@@ -9168,12 +9229,13 @@ impl LuaEngine {
             dependency_manifest,
         )?;
 
-        self.skills.insert(
+        Arc::make_mut(&mut self.skills).insert(
             meta.effective_skill_id().to_string(),
             LoadedSkill {
                 meta,
                 dir: dir.to_path_buf(),
                 root_name: root_name.to_string(),
+                entry_sources,
                 managed_package,
                 lancedb_binding,
                 sqlite_binding,
@@ -9188,11 +9250,11 @@ impl LuaEngine {
     /// 基于一份显式运行时状态快照创建全新的 Lua 虚拟机实例。
     fn create_vm_with_runtime_state(
         &self,
-        skills: HashMap<String, LoadedSkill>,
-        entry_registry: BTreeMap<String, ResolvedEntryTarget>,
+        skills: Arc<HashMap<String, LoadedSkill>>,
+        entry_registry: Arc<BTreeMap<String, ResolvedEntryTarget>>,
     ) -> Result<LuaVm, String> {
-        let skills = Arc::new(skills);
-        let entry_registry = Arc::new(entry_registry);
+        // Fresh independent Lua state compiled from one immutable shared load generation.
+        // 基于一个不可变共享加载代编译的全新独立 Lua 状态。
         let lua = unsafe { Lua::unsafe_new() };
         lua.set_app_data(Arc::clone(&self.managed_runtime_services));
         lua.set_app_data(Arc::clone(&self.managed_runtime_workers));
@@ -9207,7 +9269,11 @@ impl LuaEngine {
         .map_err(|error| error.to_string())?;
         Self::populate_vulcan_luaexec_bridge(
             &lua,
-            RunLuaRuntimeContext::from_engine(self, skills.clone(), entry_registry.clone()),
+            RunLuaRuntimeContext::from_engine(
+                self,
+                Arc::clone(&skills),
+                Arc::clone(&entry_registry),
+            ),
         )?;
         Self::register_skill_functions(&lua, skills.as_ref())?;
         Self::populate_vulcan_call_for_lua(
@@ -9227,7 +9293,10 @@ impl LuaEngine {
     /// Build a fresh Lua VM instance with all loaded skills registered.
     /// 创建一个全新的 Lua 虚拟机实例，并注册当前已加载的全部技能。
     fn create_vm(&self) -> Result<LuaVm, String> {
-        self.create_vm_with_runtime_state(self.skills.clone(), self.entry_registry.clone())
+        self.create_vm_with_runtime_state(
+            Arc::clone(&self.skills),
+            Arc::clone(&self.entry_registry),
+        )
     }
 
     /// Borrow a Lua VM from the pool for one operation.
@@ -9327,14 +9396,30 @@ impl LuaEngine {
         tool: &crate::lua_skill::SkillToolMeta,
         always_reload: bool,
     ) -> Result<(), String> {
+        // Exact validated entry path used for live debug reads and diagnostics.
+        // 用于实时调试读取与诊断的精确已验证入口路径。
         let lua_path = tool_entry_path(&skill.dir, tool);
-        let source = std::fs::read_to_string(&lua_path).map_err(|error| {
-            format!(
-                "Failed to read {}: {}",
-                render_log_friendly_path(&lua_path),
-                error
-            )
-        })?;
+        // Immutable source selected from live debug storage or the current load-generation cache.
+        // 从实时调试存储或当前加载代缓存中选择的不可变源码。
+        let source: Arc<str> = if always_reload || skill.meta.debug {
+            std::fs::read_to_string(&lua_path)
+                .map_err(|error| {
+                    format!(
+                        "Failed to read {}: {}",
+                        render_log_friendly_path(&lua_path),
+                        error
+                    )
+                })?
+                .into()
+        } else {
+            Arc::clone(skill.entry_sources.get(&tool.lua_entry).ok_or_else(|| {
+                format!(
+                    "internal error: non-debug source '{}' is missing from loaded skill '{}'",
+                    tool.lua_entry,
+                    skill.meta.effective_skill_id()
+                )
+            })?)
+        };
         if always_reload {
             log_info(format!(
                 "[LuaSkill] Hot reload {}: {}",
@@ -9343,13 +9428,19 @@ impl LuaEngine {
             ));
         }
 
-        let chunk = lua.load(&source).set_name(&tool.lua_module);
+        // Lua chunk compiled independently inside the destination VM from shared immutable text.
+        // 在目标虚拟机内基于共享不可变文本独立编译的 Lua chunk。
+        let chunk = lua.load(source.as_ref()).set_name(&tool.lua_module);
+        // Outer factory function compiled from the selected entry source.
+        // 从选定入口源码编译得到的外层工厂函数。
         let outer: Function = chunk.into_function().map_err(|error| {
             format!(
                 "Failed to compile skill '{}::{}': {}",
                 skill.meta.name, tool.lua_module, error
             )
         })?;
+        // Per-VM handler initialized by invoking the compiled factory.
+        // 通过调用已编译工厂在每个虚拟机内初始化的处理函数。
         let handler: Function = outer.call(()).map_err(|error| {
             format!(
                 "Failed to initialize skill '{}::{}': {}",
@@ -10841,11 +10932,11 @@ impl LuaEngine {
         // Prepend to existing paths
         // 将宿主指定路径前置到现有 package 搜索链，避免覆盖 Lua 默认行为。
         let package: Table = lua.globals().get("package")?;
-        let old_cpath: mlua::String = package.get("cpath")?;
+        let old_cpath: mlua::LuaString = package.get("cpath")?;
         let new_cpath = format!("{}{}", cpath_pattern, old_cpath.to_str()?);
         package.set("cpath", lua.create_string(&new_cpath)?)?;
 
-        let old_path: mlua::String = package.get("path")?;
+        let old_path: mlua::LuaString = package.get("path")?;
         let new_path = format!("{}{}", path_pattern, old_path.to_str()?);
         package.set("path", lua.create_string(&new_path)?)?;
         Ok(())

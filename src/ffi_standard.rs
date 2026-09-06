@@ -178,17 +178,58 @@ fn alloc_c_string(value: &CStr) -> *mut c_char {
 /// Convert one byte slice into one owned FFI buffer.
 /// 将单个字节切片转换为一个拥有所有权的 FFI 缓冲。
 fn alloc_owned_buffer_from_bytes(value: &[u8]) -> FfiOwnedBuffer {
-    if value.is_empty() {
-        return FfiOwnedBuffer {
-            ptr: ptr::null_mut(),
-            len: 0,
-        };
-    }
-    let mut bytes = value.to_vec();
-    let pointer = bytes.as_mut_ptr();
-    let len = bytes.len();
-    std::mem::forget(bytes);
+    alloc_owned_buffer_from_vec(value.to_vec())
+}
+
+/// Transfer one owned byte vector into the exact-length LuaSkills FFI allocation contract.
+/// 将一个拥有所有权的字节向量移交给精确长度的 LuaSkills FFI 分配契约。
+///
+/// `value` supplies the complete byte payload and relinquishes Rust vector ownership.
+/// `value` 提供完整字节载荷并交出 Rust 向量所有权。
+///
+/// Returns a pointer-length pair freed only by `luaskills_ffi_buffer_free` or `luaskills_ffi_bytes_free`.
+/// 返回只能由 `luaskills_ffi_buffer_free` 或 `luaskills_ffi_bytes_free` 释放的指针长度对。
+pub(crate) fn alloc_owned_buffer_from_vec(value: Vec<u8>) -> FfiOwnedBuffer {
+    // Exact boxed allocation shared by JSON, standard buffers, callback clones, and nested fields.
+    // 由 JSON、标准缓冲、回调克隆及嵌套字段共享的精确 boxed 分配。
+    let (pointer, len) = alloc_ffi_boxed_slice(value);
     FfiOwnedBuffer { ptr: pointer, len }
+}
+
+/// Transfer one vector into an exact-length boxed slice for an ABI pointer-length pair.
+/// 将一个向量移交为精确长度 boxed slice，供 ABI 指针长度对使用。
+///
+/// `values` contains every element whose ownership crosses the FFI boundary.
+/// `values` 包含所有跨越 FFI 边界的元素。
+///
+/// Returns a null-zero pair for empty input or a raw pointer plus exact allocation length.
+/// 空输入返回空指针零长度，否则返回原始指针及精确分配长度。
+fn alloc_ffi_boxed_slice<T>(values: Vec<T>) -> (*mut T, usize) {
+    if values.is_empty() {
+        return (ptr::null_mut(), 0);
+    }
+    // Exact boxed slice whose allocation layout is fully described by its element count.
+    // 分配布局完全由元素数量描述的精确 boxed slice。
+    let values = values.into_boxed_slice();
+    let len = values.len();
+    let pointer = Box::into_raw(values) as *mut T;
+    (pointer, len)
+}
+
+/// Reclaim one exact-length boxed slice previously transferred across the FFI boundary.
+/// 回收此前跨越 FFI 边界移交的精确长度 boxed slice。
+///
+/// `value` and `len` must be the unchanged pointer-length pair returned by `alloc_ffi_boxed_slice`.
+/// `value` 与 `len` 必须是 `alloc_ffi_boxed_slice` 返回且未经修改的指针长度对。
+///
+/// Returns ownership as `Box<[T]>`; null-zero input returns `None`.
+/// 以 `Box<[T]>` 返回所有权；空指针零长度输入返回 `None`。
+unsafe fn take_ffi_boxed_slice<T>(value: *mut T, len: usize) -> Option<Box<[T]>> {
+    if value.is_null() || len == 0 {
+        return None;
+    }
+    let slice = ptr::slice_from_raw_parts_mut(value, len);
+    Some(unsafe { Box::from_raw(slice) })
 }
 
 /// Convert one Rust string into one owned UTF-8 FFI buffer.
@@ -831,14 +872,11 @@ fn parse_uninstall_options(value: Option<&FfiSkillUninstallOptions>) -> SkillUni
 /// Convert one string vector into one owned C string array.
 /// 将一个字符串向量转换为一个拥有所有权的 C 字符串数组。
 fn alloc_string_array(values: &[String]) -> FfiStringArray {
-    let mut items: Vec<FfiOwnedBuffer> =
-        values.iter().map(alloc_owned_buffer_from_string).collect();
-    let result = FfiStringArray {
-        items: items.as_mut_ptr(),
-        len: items.len(),
-    };
-    std::mem::forget(items);
-    result
+    // Exact owned item array whose length completely describes its allocation layout.
+    // 长度可完整描述其分配布局的精确拥有型条目数组。
+    let items: Vec<FfiOwnedBuffer> = values.iter().map(alloc_owned_buffer_from_string).collect();
+    let (items, len) = alloc_ffi_boxed_slice(items);
+    FfiStringArray { items, len }
 }
 
 /// Convert one runtime entry parameter descriptor into one C ABI descriptor.
@@ -875,14 +913,14 @@ fn alloc_entry_descriptor(
     // Serialize before allocating nested FFI buffers so a schema error cannot leave partial ownership behind.
     // 先完成序列化再分配嵌套 FFI 缓冲，避免 schema 错误留下部分所有权。
     let input_schema_json = serialize_entry_input_schema_json(&value.input_schema)?;
-    let mut parameters: Vec<FfiRuntimeEntryParameterDescriptor> = value
+    // Exact parameter array transferred under the common boxed-slice ownership contract.
+    // 按公共 boxed-slice 所有权契约移交的精确参数数组。
+    let parameters: Vec<FfiRuntimeEntryParameterDescriptor> = value
         .parameters
         .iter()
         .map(alloc_entry_parameter_descriptor)
         .collect();
-    let parameters_ptr = parameters.as_mut_ptr();
-    let parameters_len = parameters.len();
-    std::mem::forget(parameters);
+    let (parameters_ptr, parameters_len) = alloc_ffi_boxed_slice(parameters);
     Ok(FfiRuntimeEntryDescriptor {
         canonical_name: alloc_owned_buffer_from_string(&value.canonical_name),
         skill_id: alloc_owned_buffer_from_string(&value.skill_id),
@@ -919,12 +957,10 @@ fn alloc_entry_descriptor_list(
             }
         }
     }
-    let result = FfiRuntimeEntryDescriptorList {
-        items: items.as_mut_ptr(),
-        len: items.len(),
-    };
-    std::mem::forget(items);
-    Ok(result)
+    // Exact descriptor array transferred only after every nested allocation succeeds.
+    // 仅在全部嵌套分配成功后移交的精确描述符数组。
+    let (items, len) = alloc_ffi_boxed_slice(items);
+    Ok(FfiRuntimeEntryDescriptorList { items, len })
 }
 
 /// Convert one help node descriptor into one C ABI descriptor.
@@ -943,11 +979,11 @@ fn alloc_help_node_descriptor(value: &RuntimeHelpNodeDescriptor) -> FfiRuntimeHe
 /// Convert one runtime help tree descriptor into one C ABI descriptor.
 /// 将单个运行时帮助树描述转换为一个 C ABI 描述结构。
 fn alloc_help_descriptor(value: &RuntimeSkillHelpDescriptor) -> FfiRuntimeSkillHelpDescriptor {
-    let mut flows: Vec<FfiRuntimeHelpNodeDescriptor> =
+    // Exact flow array using the same pointer-length allocation contract as every other FFI list.
+    // 与其他全部 FFI 列表使用相同指针长度分配契约的精确流程数组。
+    let flows: Vec<FfiRuntimeHelpNodeDescriptor> =
         value.flows.iter().map(alloc_help_node_descriptor).collect();
-    let flows_ptr = flows.as_mut_ptr();
-    let flows_len = flows.len();
-    std::mem::forget(flows);
+    let (flows_ptr, flows_len) = alloc_ffi_boxed_slice(flows);
     FfiRuntimeSkillHelpDescriptor {
         skill_id: alloc_owned_buffer_from_string(&value.skill_id),
         skill_name: alloc_owned_buffer_from_string(&value.skill_name),
@@ -1652,21 +1688,16 @@ fn take_optional_owned_ffi_string_buffer(
 /// Free one owned byte buffer allocated by one FFI callback helper.
 /// 释放由某个 FFI 回调辅助函数分配的拥有型字节缓冲。
 unsafe fn free_ffi_bytes(value: *mut u8, len: usize) {
-    if value.is_null() || len == 0 {
-        return;
-    }
-    let _ = unsafe { Vec::from_raw_parts(value, len, len) };
+    drop(unsafe { take_ffi_boxed_slice(value, len) });
 }
 
 /// Free one owned string array and all nested string items.
 /// 释放单个拥有所有权的字符串数组以及其嵌套字符串条目。
 unsafe fn free_string_array_parts(items: *mut FfiOwnedBuffer, len: usize) {
-    if items.is_null() || len == 0 {
-        return;
-    }
-    let values = unsafe { Vec::from_raw_parts(items, len, len) };
-    for value in values {
-        unsafe { luaskills_ffi_buffer_free(value) };
+    if let Some(values) = unsafe { take_ffi_boxed_slice(items, len) } {
+        for value in values {
+            unsafe { luaskills_ffi_buffer_free(value) };
+        }
     }
 }
 
@@ -1688,10 +1719,9 @@ unsafe fn free_entry_descriptor(value: FfiRuntimeEntryDescriptor) {
     unsafe { luaskills_ffi_buffer_free(value.skill_dir) };
     unsafe { luaskills_ffi_buffer_free(value.description) };
     unsafe { luaskills_ffi_buffer_free(value.input_schema_json) };
-    if !value.parameters.is_null() && value.parameters_len > 0 {
-        let parameters = unsafe {
-            Vec::from_raw_parts(value.parameters, value.parameters_len, value.parameters_len)
-        };
+    if let Some(parameters) =
+        unsafe { take_ffi_boxed_slice(value.parameters, value.parameters_len) }
+    {
         for parameter in parameters {
             unsafe { free_entry_parameter_descriptor(parameter) };
         }
@@ -1891,10 +1921,7 @@ pub unsafe extern "C" fn luaskills_ffi_bytes_clone(value: *const u8, len: usize)
         return ptr::null_mut();
     }
     let slice = unsafe { std::slice::from_raw_parts(value, len) };
-    let mut bytes = slice.to_vec();
-    let pointer = bytes.as_mut_ptr();
-    std::mem::forget(bytes);
-    pointer
+    alloc_owned_buffer_from_bytes(slice).ptr
 }
 
 /// Free one LuaSkills-owned heap byte buffer created by `luaskills_ffi_bytes_clone`.
@@ -2179,8 +2206,7 @@ pub unsafe extern "C" fn luaskills_ffi_entry_list_free(value: *mut FfiRuntimeEnt
         return;
     }
     let value = unsafe { Box::from_raw(value) };
-    if !value.items.is_null() && value.len > 0 {
-        let items = unsafe { Vec::from_raw_parts(value.items, value.len, value.len) };
+    if let Some(items) = unsafe { take_ffi_boxed_slice(value.items, value.len) } {
         for item in items {
             unsafe { free_entry_descriptor(item) };
         }
@@ -2203,8 +2229,7 @@ pub unsafe extern "C" fn luaskills_ffi_help_list_free(
         return;
     }
     let value = unsafe { Box::from_raw(value) };
-    if !value.items.is_null() && value.len > 0 {
-        let items = unsafe { Vec::from_raw_parts(value.items, value.len, value.len) };
+    if let Some(items) = unsafe { take_ffi_boxed_slice(value.items, value.len) } {
         for item in items {
             unsafe { luaskills_ffi_buffer_free(item.skill_id) };
             unsafe { luaskills_ffi_buffer_free(item.skill_name) };
@@ -2212,9 +2237,7 @@ pub unsafe extern "C" fn luaskills_ffi_help_list_free(
             unsafe { luaskills_ffi_buffer_free(item.root_name) };
             unsafe { luaskills_ffi_buffer_free(item.skill_dir) };
             unsafe { free_help_node_descriptor(item.main) };
-            if !item.flows.is_null() && item.flows_len > 0 {
-                let flows =
-                    unsafe { Vec::from_raw_parts(item.flows, item.flows_len, item.flows_len) };
+            if let Some(flows) = unsafe { take_ffi_boxed_slice(item.flows, item.flows_len) } {
                 for flow in flows {
                     unsafe { free_help_node_descriptor(flow) };
                 }
@@ -2629,13 +2652,12 @@ pub unsafe extern "C" fn luaskills_ffi_list_skill_help(
         engine.list_skill_help_for_authority(authority)
     }) {
         Ok(help_descriptors) => {
-            let mut items: Vec<FfiRuntimeSkillHelpDescriptor> =
+            // Exact top-level help array matching the shared boxed-slice free contract.
+            // 与共享 boxed-slice 释放契约匹配的精确顶层帮助数组。
+            let items: Vec<FfiRuntimeSkillHelpDescriptor> =
                 help_descriptors.iter().map(alloc_help_descriptor).collect();
-            let list = FfiRuntimeSkillHelpDescriptorList {
-                items: items.as_mut_ptr(),
-                len: items.len(),
-            };
-            std::mem::forget(items);
+            let (items, len) = alloc_ffi_boxed_slice(items);
+            let list = FfiRuntimeSkillHelpDescriptorList { items, len };
             unsafe { *help_out = Box::into_raw(Box::new(list)) };
             ffi_ok_status(error_out)
         }

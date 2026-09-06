@@ -267,8 +267,33 @@ impl LuaEngine {
         &mut self,
         request: RuntimeSkillConfigToolRequest,
     ) -> RuntimeSkillConfigToolResponse {
+        // Action is retained so an oversized typed response can return the same request identity.
+        // 保留动作，以便超限的类型化响应仍可返回相同请求标识。
         let action = request.action;
-        let response = match self.dispatch_runtime_config_tool_inner(request) {
+        // Response is built without encoding so the typed API keeps its structured contract.
+        // 不经编码构建响应，使类型化 API 保持结构化契约。
+        let response = self.build_runtime_config_tool_response(request);
+        match validate_runtime_config_tool_response_size(&response) {
+            Ok(()) => response,
+            Err(message) => RuntimeSkillConfigToolResponse {
+                ok: false,
+                action: Some(action),
+                result: None,
+                error: Some(runtime_config_tool_error(message)),
+            },
+        }
+    }
+
+    /// Build one runtime configuration response without performing boundary-specific encoding.
+    /// 构建一个运行时配置响应，不执行边界专属编码。
+    fn build_runtime_config_tool_response(
+        &mut self,
+        request: RuntimeSkillConfigToolRequest,
+    ) -> RuntimeSkillConfigToolResponse {
+        // Action is copied before dispatch consumes the normalized request.
+        // 在分发消耗规范化请求前复制动作。
+        let action = request.action;
+        match self.dispatch_runtime_config_tool_inner(request) {
             Ok(result) => RuntimeSkillConfigToolResponse {
                 ok: true,
                 action: Some(action),
@@ -281,23 +306,16 @@ impl LuaEngine {
                 result: None,
                 error: Some(runtime_config_tool_error(message)),
             },
-        };
-        match validate_runtime_config_tool_response_size(&response) {
-            Ok(()) => response,
-            Err(message) => RuntimeSkillConfigToolResponse {
-                ok: false,
-                action: Some(action),
-                result: None,
-                error: Some(runtime_config_tool_error(message)),
-            },
         }
     }
 
     /// Dispatch one strict JSON request and return the stable JSON response envelope.
     /// 分发一个严格 JSON 请求并返回稳定 JSON 响应包络。
     pub fn dispatch_runtime_config_tool_json(&mut self, input: &str) -> String {
+        // Response is built directly for the JSON boundary and encoded exactly once on normal paths.
+        // 直接为 JSON 边界构建响应，正常路径只编码一次。
         let response = match serde_json::from_str::<RuntimeSkillConfigToolRequest>(input) {
-            Ok(request) => self.dispatch_runtime_config_tool(request),
+            Ok(request) => self.build_runtime_config_tool_response(request),
             Err(error) => RuntimeSkillConfigToolResponse {
                 ok: false,
                 action: None,
@@ -309,8 +327,7 @@ impl LuaEngine {
                 }),
             },
         };
-        serde_json::to_string(&response)
-            .expect("runtime configuration response serialization cannot fail")
+        encode_runtime_config_tool_response(response)
     }
 
     /// Execute one normalized dispatcher action after strict request decoding.
@@ -400,6 +417,42 @@ impl LuaEngine {
             }
         }
     }
+}
+
+/// Encode one JSON-boundary response once and replace oversized payloads with a bounded error.
+/// 对一个 JSON 边界响应执行一次编码，并把超限载荷替换为有界错误。
+fn encode_runtime_config_tool_response(response: RuntimeSkillConfigToolResponse) -> String {
+    // Action is retained before the response is serialized.
+    // 在响应序列化前保留动作。
+    let action = response.action;
+    // Encoded response is the sole normal-path serialization buffer and size source.
+    // 编码响应是正常路径唯一的序列化缓冲和大小来源。
+    let encoded = serde_json::to_string(&response)
+        .expect("runtime configuration response serialization cannot fail");
+    if encoded.len() <= SKILL_CONFIG_MAX_TOOL_RESPONSE_BYTES {
+        return encoded;
+    }
+
+    // Bounded response replaces only the rejected oversized payload.
+    // 有界响应仅替换被拒绝的超限载荷。
+    let bounded_response = RuntimeSkillConfigToolResponse {
+        ok: false,
+        action,
+        result: None,
+        error: Some(runtime_config_tool_error(format!(
+            "CONFIG_RESPONSE_TOO_LARGE: runtime-config response exceeds the hard limit {} encoded bytes",
+            SKILL_CONFIG_MAX_TOOL_RESPONSE_BYTES
+        ))),
+    };
+    // Bounded encoding is a second traversal only on the rejected oversize path.
+    // 有界编码仅在被拒绝的超限路径上执行第二次遍历。
+    let bounded_encoded = serde_json::to_string(&bounded_response)
+        .expect("runtime configuration size-error response serialization cannot fail");
+    assert!(
+        bounded_encoded.len() <= SKILL_CONFIG_MAX_TOOL_RESPONSE_BYTES,
+        "runtime configuration size-error response must fit the hard limit"
+    );
+    bounded_encoded
 }
 
 /// Convert one impossible dispatcher result-serialization failure into a stable public error.
@@ -595,6 +648,36 @@ mod tests {
         );
         assert_eq!(error.code, "CONFIG_PACKAGE_NOT_FOUND");
         assert!(error.details.is_empty());
+    }
+
+    /// Verify JSON-boundary encoding replaces one oversized payload with a bounded stable error.
+    /// 验证 JSON 边界编码会把一个超限载荷替换为有界稳定错误。
+    #[test]
+    fn runtime_config_tool_json_encoding_bounds_oversized_payload() {
+        // Oversized response whose string payload alone exceeds the public hard limit.
+        // 仅字符串载荷就超过公开硬上限的超限响应。
+        let response = RuntimeSkillConfigToolResponse {
+            ok: true,
+            action: Some(RuntimeSkillConfigToolAction::List),
+            result: Some(JsonValue::String(
+                "x".repeat(SKILL_CONFIG_MAX_TOOL_RESPONSE_BYTES + 1),
+            )),
+            error: None,
+        };
+        // Encoded replacement returned by the same helper used by the public JSON boundary.
+        // 公共 JSON 边界所用同一辅助函数返回的编码替换响应。
+        let encoded = encode_runtime_config_tool_response(response);
+        // Parsed bounded envelope used to verify the stable public error code.
+        // 用于验证稳定公共错误码的已解析有界包络。
+        let bounded = serde_json::from_str::<RuntimeSkillConfigToolResponse>(&encoded)
+            .expect("bounded response should remain valid JSON");
+
+        assert!(encoded.len() <= SKILL_CONFIG_MAX_TOOL_RESPONSE_BYTES);
+        assert!(!bounded.ok);
+        assert_eq!(
+            bounded.error.expect("bounded response error").code,
+            "CONFIG_RESPONSE_TOO_LARGE"
+        );
     }
 
     /// Verify bounded response serialization rejects overflow without retaining oversized bytes.

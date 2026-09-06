@@ -31,6 +31,69 @@ fn test_manager() -> (DependencyManager, PathBuf) {
     (DependencyManager::new(config), root)
 }
 
+/// Dependency path normalization preserves portable names and hashes every unsafe component.
+/// 依赖路径规范化会保留可移植名称，并散列全部不安全片段。
+#[test]
+fn dependency_path_component_normalization_is_safe_and_collision_resistant() {
+    assert_eq!(normalize_dependency_path_component("rg"), "rg");
+    assert_eq!(normalize_dependency_path_component("v1.2.3"), "v1.2.3");
+    // UnsafeComponents cover traversal, empty, separator, Windows device, and trailing-dot forms.
+    // UnsafeComponents 覆盖穿越、空值、分隔符、Windows 设备名与末尾点号形式。
+    let unsafe_components = ["", ".", "..", "a/b", r"a\b", "CON", "nul.txt", "name."];
+    for unsafe_component in unsafe_components {
+        // Normalized is one fixed digest component with no remaining path grammar.
+        // Normalized 是不再包含路径语法的单个固定摘要片段。
+        let normalized = normalize_dependency_path_component(unsafe_component);
+        assert!(
+            normalized.starts_with("sha256-"),
+            "unexpected normalization for {unsafe_component:?}: {normalized}"
+        );
+        assert_eq!(
+            Path::new(&normalized).components().count(),
+            1,
+            "normalized component must remain singular"
+        );
+    }
+    assert_ne!(
+        normalize_dependency_path_component("a/b"),
+        normalize_dependency_path_component("a?b"),
+        "distinct unsafe values must not collapse to one install root"
+    );
+}
+
+/// Dependency install-root construction keeps special dependency names and versions beneath root.
+/// 依赖安装根构造会使特殊依赖名称与版本始终位于根目录下。
+#[test]
+fn dependency_install_root_cannot_escape_through_special_components() {
+    // Root is a lexical ownership boundary; no filesystem setup is required for this constructor test.
+    // Root 是词法归属边界；该构造测试不需要文件系统准备。
+    let root = Path::new("dependency-root");
+    // InstallRoot uses traversal tokens in both raw caller-controlled components.
+    // InstallRoot 在两个调用方可控原始片段中都使用穿越标记。
+    let install_root = build_dependency_install_root(
+        root,
+        DependencyScope::Host,
+        "valid-skill",
+        "..",
+        Some(".."),
+        "windows-x64",
+    );
+    // RelativeComponents are every component appended after the trusted root.
+    // RelativeComponents 是可信根目录之后追加的全部路径片段。
+    let relative_components = install_root
+        .strip_prefix(root)
+        .expect("install root should remain beneath dependency root")
+        .components()
+        .collect::<Vec<_>>();
+
+    assert_eq!(relative_components.len(), 3);
+    assert!(
+        relative_components
+            .iter()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    );
+}
+
 /// Return one shared guard for tests that temporarily replace the global runtime log callback.
 /// 返回一把共享保护锁，用于临时替换全局运行时日志回调的测试。
 fn runtime_log_callback_test_guard() -> MutexGuard<'static, ()> {
@@ -472,6 +535,113 @@ fn detect_dependency_reports_export_target_probe_errors() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// Dependency detection must treat a directory at one export path as missing rather than ready.
+/// 依赖检测必须把占据导出路径的目录视为缺失，而不是就绪。
+#[test]
+fn detect_dependency_rejects_directory_export_target() {
+    // Manager and Root isolate the concrete resolved request under a unique temporary directory.
+    // Manager 与 Root 把具体解析请求隔离在唯一临时目录下。
+    let (manager, root) = test_manager();
+    // InstallRoot contains the directory that must not satisfy a regular-file export.
+    // InstallRoot 包含不能满足普通文件导出的目录。
+    let install_root = root.join("dependencies").join("tools");
+    // TargetPath is deliberately created as a directory instead of the declared file.
+    // TargetPath 被有意创建为目录，而不是声明的文件。
+    let target_path = install_root.join("bin").join("demo.bin");
+    fs::create_dir_all(&target_path).expect("directory target should be created");
+    // Request declares the exact path as one ordinary file export.
+    // Request 把该精确路径声明为普通文件导出。
+    let request = ResolvedDependencyRequest {
+        kind: SkillDependencyKind::Tool,
+        name: "demo-tool".to_string(),
+        scope: DependencyScope::Skill,
+        platform_key: "test-platform".to_string(),
+        download_url: String::new(),
+        version: Some("1.2.3".to_string()),
+        install_root,
+        archive_type: DependencyArchiveType::Raw,
+        exports: vec![DependencyExportSpec {
+            archive_path: "demo.bin".to_string(),
+            target_path: "bin/demo.bin".to_string(),
+            executable: false,
+        }],
+    };
+
+    // Status must enter the existing missing-dependency recovery path.
+    // Status 必须进入既有依赖缺失恢复路径。
+    let status = manager
+        .detect_dependency(&request)
+        .expect("directory type mismatch should be a recoverable detection result");
+
+    assert_eq!(status, DependencyDetectionStatus::Missing);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Public dependency installation rejects an invalid skill id even when no dependencies are declared.
+/// 即使没有声明依赖，公开依赖安装入口也会拒绝非法技能标识符。
+#[test]
+fn ensure_skill_dependencies_validates_public_skill_id_boundary() {
+    // Manager and Root isolate the public boundary call without requiring network access.
+    // Manager 与 Root 隔离公开边界调用，且不需要网络访问。
+    let (manager, root) = test_manager();
+    // Manifest is empty so identifier validation is the only authorized first operation.
+    // Manifest 为空，因此标识符校验是唯一获准的首个操作。
+    let manifest = PackageDependencyManifest::default();
+
+    // Error proves the public manager does not depend on an engine caller to validate ownership paths.
+    // Error 证明公开管理器不依赖引擎调用方来验证归属路径。
+    let error = manager
+        .ensure_skill_dependencies("../outside", &manifest)
+        .expect_err("traversal skill id should fail");
+
+    assert!(
+        error.contains("skill_id must match"),
+        "unexpected error: {error}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Unix dependency detection must require execute permission for executable exports.
+/// Unix 依赖检测必须为可执行导出要求执行权限。
+#[cfg(unix)]
+#[test]
+fn dependency_export_readiness_checks_unix_execute_bits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Root isolates one ordinary export file whose mode is changed during the test.
+    // Root 隔离一个在测试期间修改模式的普通导出文件。
+    let root = std::env::temp_dir().join(format!(
+        "luaskills_dependency_executable_test_{}",
+        std::process::id()
+    ));
+    if root.exists() {
+        // Stale fixture cleanup result is intentionally ignored before recreation.
+        // 重建前对陈旧夹具的清理结果有意忽略。
+        let _ = fs::remove_dir_all(&root);
+    }
+    fs::create_dir_all(&root).expect("executable test root should be created");
+    // TargetPath begins as a non-executable regular file.
+    // TargetPath 初始为没有执行位的普通文件。
+    let target_path = root.join("tool");
+    fs::write(&target_path, b"tool").expect("tool fixture should be written");
+    fs::set_permissions(&target_path, fs::Permissions::from_mode(0o644))
+        .expect("non-executable mode should be set");
+
+    assert!(
+        !dependency_export_target_is_ready("demo-tool", &target_path, true)
+            .expect("non-executable file should be inspected"),
+        "missing execute bits must make the export unready"
+    );
+    fs::set_permissions(&target_path, fs::Permissions::from_mode(0o755))
+        .expect("executable mode should be set");
+    assert!(
+        dependency_export_target_is_ready("demo-tool", &target_path, true)
+            .expect("executable file should be inspected"),
+        "execute bits must make the export ready"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 /// Updated-skill cleanup removes stale private dependency roots while preserving unchanged ones.
 /// 更新后的清理流程会删除过期的私有依赖根，同时保留未变化的依赖。
 #[test]
@@ -873,21 +1043,17 @@ fn cleanup_uninstalled_skill_dependencies_rejects_file_private_root() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// Uninstalled-skill cleanup should report private-root removal errors explicitly.
-/// 卸载后的清理流程应显式报告私有根目录删除错误。
+/// The private-root filesystem helper should report invalid path probe errors explicitly.
+/// 私有根文件系统 helper 应显式报告非法路径探测错误。
 #[test]
-fn cleanup_uninstalled_skill_dependencies_reports_invalid_private_root_path() {
-    // Dependency manager and temporary root for this invalid-path fixture.
-    // 本次非法路径夹具使用的依赖管理器和临时根目录。
-    let (manager, root) = test_manager();
-    // Removed skill identifier containing an embedded NUL rejected by metadata probing.
-    // 包含内嵌 NUL、会被元数据探测拒绝的已移除技能标识符。
-    let removed_skill_id = "invalid\0skill";
+fn skill_private_dependency_root_probe_reports_invalid_path() {
+    // InvalidRoot contains an embedded NUL rejected by metadata probing.
+    // InvalidRoot 包含会被元数据探测拒绝的内嵌 NUL。
+    let invalid_root = Path::new("invalid\0skill");
 
     // Error returned before an invalid private root can be removed or treated as already absent.
     // 在非法私有根目录被删除或当作已经不存在前返回的错误。
-    let error = manager
-        .cleanup_uninstalled_skill_dependencies_from_roots(&[], removed_skill_id, None)
+    let error = remove_skill_private_dependency_root(invalid_root)
         .expect_err("invalid private dependency root removal should fail");
 
     assert!(
@@ -896,6 +1062,40 @@ fn cleanup_uninstalled_skill_dependencies_reports_invalid_private_root_path() {
         error
     );
     assert!(error.contains("invalid"), "unexpected error: {}", error);
+}
+
+/// Public uninstall cleanup rejects a traversal id before removing any path outside configured roots.
+/// 公开卸载清理会在删除配置根之外的任何路径前拒绝穿越标识符。
+#[test]
+fn cleanup_uninstalled_skill_dependencies_rejects_traversal_skill_id_before_delete() {
+    // Manager and Root provide the concrete tool root whose parent contains the protected fixture.
+    // Manager 与 Root 提供具体工具根，其父目录包含受保护夹具。
+    let (manager, root) = test_manager();
+    // ProtectedRoot is exactly where tool_root.join("../protected") would resolve lexically.
+    // ProtectedRoot 正是 tool_root.join("../protected") 在词法上会解析到的位置。
+    let protected_root = manager
+        .config
+        .tool_root
+        .parent()
+        .expect("tool root should have a parent")
+        .join("protected");
+    fs::create_dir_all(&protected_root).expect("protected root should be created");
+    // Marker proves no destructive cleanup occurred before validation.
+    // Marker 证明校验前没有发生破坏性清理。
+    let marker = protected_root.join("keep.txt");
+    fs::write(&marker, b"keep").expect("protected marker should be written");
+
+    // Error must precede remove_skill_private_dependency_roots for every configured dependency kind.
+    // Error 必须先于所有配置依赖类型的 remove_skill_private_dependency_roots。
+    let error = manager
+        .cleanup_uninstalled_skill_dependencies_from_roots(&[], "../protected", None)
+        .expect_err("traversal cleanup id should fail");
+
+    assert!(
+        error.contains("removed_skill_id must match"),
+        "unexpected error: {error}"
+    );
+    assert!(marker.is_file(), "protected marker must not be removed");
 
     let _ = fs::remove_dir_all(root);
 }

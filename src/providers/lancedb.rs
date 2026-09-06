@@ -127,21 +127,10 @@ impl LoadedLanceDbApi {
     /// Load the LanceDB dynamic library using host conventions, preferring an explicit environment variable and runtime libs directories.
     /// 按宿主约定加载 LanceDB 动态库，优先查找显式环境变量与运行时 libs 目录。
     fn load(library_path: &Path) -> Result<Self, String> {
-        if !library_path.exists() {
-            return Err(format!(
-                "LanceDB dynamic library path does not exist: {}",
-                render_host_visible_path(library_path)
-            ));
-        }
-
-        let library = unsafe { Library::new(library_path) }.map_err(|error| {
-            format!(
-                "failed to load {}: {}: {}",
-                render_host_visible_path(library_path),
-                error,
-                error
-            )
-        })?;
+        // Shared loader performs the only filesystem/load attempt and preserves the native error once.
+        // 共享加载器只执行一次文件系统/加载尝试，并仅保留一次原生错误。
+        let library =
+            unsafe { crate::providers::load_provider_dynamic_library(library_path, "LanceDB") }?;
         unsafe { Self::from_library(library_path.to_path_buf(), library) }
     }
 
@@ -1059,8 +1048,8 @@ mod tests {
     /// 验证缺失 LanceDB 动态库会通过宿主可见路径渲染器输出路径。
     #[test]
     fn lancedb_missing_library_error_uses_host_visible_path() {
-        // Missing library path used to exercise the provider loader's preflight check.
-        // 用于触发 provider 加载器预检失败的缺失动态库路径。
+        // Missing library path used to exercise the shared real loader operation.
+        // 用于触发共享真实加载操作的缺失动态库路径。
         let library_path = std::env::temp_dir().join(format!(
             "luaskills-missing-lancedb-provider-{}.dll",
             std::process::id()
@@ -1071,14 +1060,17 @@ mod tests {
             Ok(_) => panic!("missing LanceDB library should fail"),
             Err(error) => error,
         };
-        // Expected diagnostic text rendered with the shared host-visible path formatter.
-        // 使用共享宿主可见路径渲染器生成的期望诊断文本。
-        let expected_error = format!(
-            "LanceDB dynamic library path does not exist: {}",
+        // Stable diagnostic prefix rendered with the shared host-visible path formatter.
+        // 使用共享宿主可见路径渲染器生成的稳定诊断前缀。
+        let expected_prefix = format!(
+            "failed to load LanceDB dynamic library {}:",
             render_host_visible_path(&library_path)
         );
 
-        assert_eq!(error, expected_error);
+        assert!(
+            error.starts_with(&expected_prefix),
+            "unexpected error: {error}"
+        );
     }
 
     /// Build one deterministic LanceDB binding context for provider binding-state tests.

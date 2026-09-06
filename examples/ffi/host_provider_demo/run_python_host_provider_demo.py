@@ -42,6 +42,9 @@ class FfiLuaRuntimeHostOptions(ctypes.Structure):
         ("host_provided_tool_root", ctypes.c_char_p),
         ("host_provided_lua_root", ctypes.c_char_p),
         ("host_provided_ffi_root", ctypes.c_char_p),
+        # Current V1 layout places the system Lua root before the download cache root.
+        # 当前 V1 布局将系统 Lua 根放在下载缓存根之前。
+        ("system_lua_lib_dir", ctypes.c_char_p),
         ("download_cache_root", ctypes.c_char_p),
         ("dependency_dir_name", ctypes.c_char_p),
         ("state_dir_name", ctypes.c_char_p),
@@ -52,6 +55,12 @@ class FfiLuaRuntimeHostOptions(ctypes.Structure):
         ("allow_network_download", ctypes.c_uint8),
         ("github_base_url", ctypes.c_char_p),
         ("github_api_base_url", ctypes.c_char_p),
+        # Source-policy fields complete the public V1 host-options layout.
+        # 来源策略字段补全公共 V1 宿主选项布局。
+        ("official_skill_hub_base_url", ctypes.c_char_p),
+        ("enable_private_url_skill_install", ctypes.c_uint8),
+        ("private_skill_source_allowlist", ctypes.POINTER(ctypes.c_char_p)),
+        ("private_skill_source_allowlist_len", ctypes.c_size_t),
         ("sqlite_library_path", ctypes.c_char_p),
         ("sqlite_provider_mode", ctypes.c_int32),
         ("sqlite_callback_mode", ctypes.c_int32),
@@ -456,6 +465,9 @@ def main() -> None:
     host.host_provided_tool_root = str((runtime_root / "bin" / "tools").resolve()).replace("\\", "/").encode("utf-8")
     host.host_provided_lua_root = str((runtime_root / "lua_packages").resolve()).replace("\\", "/").encode("utf-8")
     host.host_provided_ffi_root = str((runtime_root / "libs").resolve()).replace("\\", "/").encode("utf-8")
+    # System Lua root occupies its exact public V1 slot for accurate ctypes layout.
+    # 系统 Lua 根占据公共 V1 的精确槽位，以保持 ctypes 布局准确。
+    host.system_lua_lib_dir = str((runtime_root / "system_lua_lib").resolve()).replace("\\", "/").encode("utf-8")
     host.download_cache_root = str((runtime_root / "temp" / "downloads").resolve()).replace("\\", "/").encode("utf-8")
     host.dependency_dir_name = b"dependencies"
     host.state_dir_name = b"state"
@@ -466,6 +478,12 @@ def main() -> None:
     host.allow_network_download = 0
     host.github_base_url = None
     host.github_api_base_url = None
+    # Source-policy defaults keep private URL installation disabled for this provider demo.
+    # 来源策略默认值使本 Provider 示例保持禁用私有 URL 安装。
+    host.official_skill_hub_base_url = None
+    host.enable_private_url_skill_install = 0
+    host.private_skill_source_allowlist = None
+    host.private_skill_source_allowlist_len = 0
     host.sqlite_library_path = None
     host.sqlite_provider_mode = FFI_PROVIDER_MODE_HOST_CALLBACK
     host.sqlite_callback_mode = FFI_CALLBACK_MODE_JSON

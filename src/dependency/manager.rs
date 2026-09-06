@@ -1,5 +1,6 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
@@ -11,8 +12,9 @@ use crate::dependency::types::{
     DependencyDetectionStatus, DependencyScope, DependencySourceType, ResolvedDependencyRequest,
     SkillDependencyKind,
 };
-use crate::download::archive::install_downloaded_payload;
+use crate::download::archive::{install_downloaded_payload, resolve_dependency_export_target};
 use crate::download::manager::{DownloadManager, DownloadManagerConfig, DownloadRequest};
+use crate::lua_skill::validate_luaskills_identifier;
 use crate::runtime::path::render_host_visible_path;
 use crate::runtime_logging::{info as log_info, warn as log_warn};
 use crate::runtime_options::RuntimeSkillRoot;
@@ -90,6 +92,7 @@ impl DependencyManager {
         skill_id: &str,
         manifest: &PackageDependencyManifest,
     ) -> Result<(), String> {
+        validate_luaskills_identifier(skill_id, "skill_id")?;
         let platform_key = current_platform_key();
         if platform_key == "unknown" {
             return Err(
@@ -652,6 +655,7 @@ impl DependencyManager {
         removed_skill_id: &str,
         removed_manifest: Option<&PackageDependencyManifest>,
     ) -> Result<(), String> {
+        validate_luaskills_identifier(removed_skill_id, "removed_skill_id")?;
         self.remove_skill_private_dependency_roots(removed_skill_id)?;
         let _ = (skill_roots, removed_manifest);
         Ok(())
@@ -665,6 +669,7 @@ impl DependencyManager {
         previous_manifest: Option<&PackageDependencyManifest>,
         current_manifest: Option<&PackageDependencyManifest>,
     ) -> Result<(), String> {
+        validate_luaskills_identifier(skill_id, "skill_id")?;
         let platform_key = current_platform_key();
         if platform_key == "unknown" {
             return Ok(());
@@ -790,12 +795,15 @@ impl DependencyManager {
         }
 
         for export in &request.exports {
-            let target_path = request.install_root.join(
-                export
-                    .target_path
-                    .replace('/', std::path::MAIN_SEPARATOR_STR),
-            );
-            if !dependency_export_target_exists(request.name.as_str(), &target_path)? {
+            // TargetPath reuses the installer boundary so detection cannot inspect outside the dependency root.
+            // TargetPath 复用安装器边界，确保存在性检测不会探测依赖根目录之外的路径。
+            let target_path =
+                resolve_dependency_export_target(&request.install_root, &export.target_path)?;
+            if !dependency_export_target_is_ready(
+                request.name.as_str(),
+                &target_path,
+                export.executable,
+            )? {
                 return Ok(DependencyDetectionStatus::Missing);
             }
         }
@@ -909,8 +917,8 @@ fn local_dependency_version_component_from_file_name(file_name: OsString) -> Opt
     file_name.into_string().ok()
 }
 
-/// Inspect whether one declared dependency export target exists without hiding probe errors.
-/// 检查单个依赖声明导出目标是否存在，同时不隐藏探测错误。
+/// Inspect whether one declared dependency export target is a ready regular file.
+/// 检查单个依赖声明导出目标是否为已经就绪的普通文件。
 ///
 /// The dependency_name parameter identifies the dependency whose export target is being checked.
 /// dependency_name 参数标识当前正在检查导出目标的依赖。
@@ -918,20 +926,43 @@ fn local_dependency_version_component_from_file_name(file_name: OsString) -> Opt
 /// The target_path parameter is the concrete installed export path resolved from the request.
 /// target_path 参数是从请求中解析出的具体已安装导出路径。
 ///
-/// Return true for an existing export, false for a confirmed missing export, or an explicit probe error.
-/// 导出已存在返回 true，确认缺失返回 false；探测失败时返回显式错误。
-fn dependency_export_target_exists(
+/// The executable parameter requires at least one Unix execute bit when the declaration requests it.
+/// executable 参数在声明要求时使 Unix 文件必须至少具有一个执行位。
+///
+/// Return true only for a ready file, false for missing/type/mode mismatches, or an explicit probe error.
+/// 仅就绪文件返回 true；缺失、类型或模式不匹配返回 false，探测失败返回显式错误。
+fn dependency_export_target_is_ready(
     dependency_name: &str,
     target_path: &Path,
+    executable: bool,
 ) -> Result<bool, String> {
-    target_path.try_exists().map_err(|error| {
-        format!(
+    match fs::symlink_metadata(target_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Ok(false),
+        Ok(metadata) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                if executable && metadata.permissions().mode() & 0o111 == 0 {
+                    return Ok(false);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                // Executable is a declaration-only hint on hosts without Unix mode bits.
+                // Executable 在没有 Unix 模式位的宿主上仅作为声明提示。
+                let _ = (&metadata, executable);
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
             "Failed to inspect dependency export target '{}' at {}: {}",
             dependency_name,
             render_dependency_manager_path(target_path),
             error
-        )
-    })
+        )),
+    }
 }
 
 /// Remove one stale dependency root while treating an already-missing root as cleaned.
@@ -1139,19 +1170,64 @@ fn local_dependency_probe_request_variants_for_root(
 /// Normalize one dependency path component for stable cross-platform directory generation.
 /// 归一化单个依赖路径片段，以生成稳定的跨平台目录结构。
 fn normalize_dependency_path_component(raw: &str) -> String {
-    let mut output = String::with_capacity(raw.len());
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
-            output.push(ch);
-        } else {
-            output.push('_');
-        }
+    if dependency_path_component_is_portable(raw) {
+        return raw.to_string();
     }
-    if output.is_empty() {
-        "unnamed".to_string()
-    } else {
-        output
+    // Digest preserves a one-to-one practical identity for unsafe raw values without path syntax.
+    // Digest 在不保留路径语法的前提下，为不安全原始值保持实际唯一的身份。
+    let digest = Sha256::digest(raw.as_bytes());
+    format!("sha256-{digest:x}")
+}
+
+/// Return whether one raw dependency component is portable and cannot change path ownership.
+/// 返回单个原始依赖片段是否可移植且无法改变路径归属。
+///
+/// The raw parameter is a dependency name, version, or normalized platform identifier.
+/// raw 参数是依赖名称、版本或标准化平台标识符。
+///
+/// Return true only for non-special ASCII components safe on both Unix and Windows.
+/// 仅对 Unix 与 Windows 均安全的非特殊 ASCII 路径片段返回 true。
+fn dependency_path_component_is_portable(raw: &str) -> bool {
+    if raw.is_empty()
+        || raw == "."
+        || raw == ".."
+        || raw.ends_with('.')
+        || !raw
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+    {
+        return false;
     }
+    // WindowsStem determines device-name reservation even when a normal-looking extension follows.
+    // WindowsStem 用于判断即使带有普通扩展名仍然生效的 Windows 设备名保留规则。
+    let windows_stem = raw.split('.').next().unwrap_or(raw);
+    !dependency_path_component_is_windows_reserved(windows_stem)
+}
+
+/// Return whether one case-insensitive Windows filename stem names a reserved device.
+/// 返回单个不区分大小写的 Windows 文件名主干是否为保留设备名。
+///
+/// The stem parameter excludes any extension because Windows reserves device stems with extensions too.
+/// stem 参数不含扩展名，因为 Windows 对带扩展名的设备主干同样保留。
+///
+/// Return true for CON, PRN, AUX, NUL, COM1-COM9, or LPT1-LPT9.
+/// 对 CON、PRN、AUX、NUL、COM1-COM9 或 LPT1-LPT9 返回 true。
+fn dependency_path_component_is_windows_reserved(stem: &str) -> bool {
+    if ["CON", "PRN", "AUX", "NUL"]
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+    {
+        return true;
+    }
+    // UpperStem enables compact numeric COM/LPT device matching without locale-sensitive rules.
+    // UpperStem 使用不受区域设置影响的规则紧凑匹配数字 COM/LPT 设备名。
+    let upper_stem = stem.to_ascii_uppercase();
+    // Bytes exposes the fixed ASCII prefix and final device digit.
+    // Bytes 暴露固定 ASCII 前缀与末尾设备数字。
+    let bytes = upper_stem.as_bytes();
+    bytes.len() == 4
+        && (bytes.starts_with(b"COM") || bytes.starts_with(b"LPT"))
+        && matches!(bytes[3], b'1'..=b'9')
 }
 
 /// Resolve export-path templates using the final normalized version and tag values.

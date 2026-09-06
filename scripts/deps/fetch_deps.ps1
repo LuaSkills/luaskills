@@ -20,6 +20,14 @@
 
 $ErrorActionPreference = "Stop"
 
+# Dedicated failure type emitted only when a resolved GitHub Release lacks the requested asset.
+# 仅在已解析的 GitHub Release 缺少所请求资产时发出的专用失败类型。
+class ReleaseAssetNotFoundException : System.Exception {
+    # Create one classified missing-asset failure with the supplied diagnostic message.
+    # 使用给定诊断消息创建一个已分类的资产缺失失败。
+    ReleaseAssetNotFoundException([string]$Message) : base($Message) {}
+}
+
 function Resolve-ProjectRoot {
     <#
     .SYNOPSIS
@@ -76,9 +84,6 @@ $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($PSCommandPath) { Spli
 # ProjectRoot points at the repository root regardless of the caller location.
 # ProjectRoot 指向仓库根目录，避免调用方当前位置影响路径解析。
 $ProjectRoot = Resolve-ProjectRoot -ScriptDirectory $ScriptDir
-if (-not $ProjectRoot) {
-    $ProjectRoot = (Resolve-Path -LiteralPath (Get-Location).Path).Path
-}
 Set-Location $ProjectRoot
 
 function Ensure-Dir {
@@ -191,7 +196,9 @@ function Get-ReleaseAssetInfo {
     $Asset = $Release.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
     if (-not $Asset) {
         $Available = ($Release.assets | ForEach-Object { $_.name }) -join ", "
-        throw "Asset '$AssetName' not found in $Repo@$Tag. Available: $Available"
+        throw [ReleaseAssetNotFoundException]::new(
+            "Asset '$AssetName' not found in $Repo@$Tag. Available: $Available"
+        )
     }
     return [PSCustomObject]@{
         Url = $Asset.browser_download_url
@@ -243,28 +250,31 @@ function Resolve-ReleaseTagForSeries {
 
     $ApiUrl = "https://api.github.com/repos/$Repo/releases?per_page=100"
     $Releases = Invoke-RestMethod -Uri $ApiUrl -UseBasicParsing
-    $Matches = @()
-    foreach ($Release in $Releases) {
-        if ($Release.draft -or $Release.prerelease) {
-            continue
+    # Matches collects eligible releases in one array materialization to avoid repeated array growth.
+    # Matches 通过一次数组物化收集符合条件的 release，避免反复扩展数组。
+    $Matches = @(
+        foreach ($Release in $Releases) {
+            if ($Release.draft -or $Release.prerelease) {
+                continue
+            }
+            $TagName = [string]$Release.tag_name
+            try {
+                $Version = Convert-TagToSemVer -Tag $TagName
+            } catch {
+                continue
+            }
+            $ReleaseSeries = "$($Version.Major).$($Version.Minor)"
+            if ($ReleaseSeries -ne $Series) {
+                continue
+            }
+            [PSCustomObject]@{
+                Tag = $TagName
+                Version = $Version
+            }
         }
-        $TagName = [string]$Release.tag_name
-        try {
-            $Version = Convert-TagToSemVer -Tag $TagName
-        } catch {
-            continue
-        }
-        $ReleaseSeries = "$($Version.Major).$($Version.Minor)"
-        if ($ReleaseSeries -ne $Series) {
-            continue
-        }
-        $Matches += [PSCustomObject]@{
-            Tag = $TagName
-            Version = $Version
-        }
-    }
+    )
 
-    if (-not $Matches -or $Matches.Count -eq 0) {
+    if ($Matches.Count -eq 0) {
         throw "No published release found for $Repo series $Series"
     }
 
@@ -439,7 +449,7 @@ function Install-LuaRuntime {
     try {
         try {
             Save-ReleaseAssetWithDigest -Repo $LuaRuntimeRepo -Tag $ResolvedLuaRuntimeTag -AssetName $AssetName -Destination $ArchivePath
-        } catch {
+        } catch [ReleaseAssetNotFoundException] {
             if (Test-ExistingRuntimeContent -RuntimeRootPath $RuntimeRootPath) {
                 Write-Warning "Lua runtime packages asset '$AssetName' was not found in $LuaRuntimeRepo@$ResolvedLuaRuntimeTag. Existing packaged runtime content will be used."
                 return
@@ -447,6 +457,25 @@ function Install-LuaRuntime {
             throw
         }
         Expand-ArchiveSmart -ArchivePath $ArchivePath -Destination $ExtractDir
+
+        # Required extracted package directory validated before any existing runtime content is mutated.
+        # 在修改任何现有运行时内容之前校验必需的解压包目录。
+        $ExtractedLuaPackages = Join-Path $ExtractDir "lua_packages"
+        if (-not (Test-Path -LiteralPath $ExtractedLuaPackages -PathType Container)) {
+            throw "Downloaded $AssetName does not contain lua_packages"
+        }
+        if (-not $LuaPackagesOnly) {
+            # Required source manifests that cannot be satisfied by stale files in the destination.
+            # 不能由目标中陈旧文件满足的必需源清单。
+            $ExtractedRuntimeManifest = Join-Path $ExtractDir "resources\lua-runtime-manifest.json"
+            $ExtractedPackagesManifest = Join-Path $ExtractDir "resources\luaskills-packages-manifest.json"
+            if (-not (Test-Path -LiteralPath $ExtractedRuntimeManifest -PathType Leaf)) {
+                throw "Downloaded $AssetName does not contain resources/lua-runtime-manifest.json"
+            }
+            if (-not (Test-Path -LiteralPath $ExtractedPackagesManifest -PathType Leaf)) {
+                throw "Downloaded $AssetName does not contain resources/luaskills-packages-manifest.json"
+            }
+        }
 
         if ($LuaPackagesOnly) {
             $RuntimeDirNames = @("lua_packages")
@@ -460,7 +489,7 @@ function Install-LuaRuntime {
             $Source = Join-Path $ExtractDir $DirName
             if (Test-Path -LiteralPath $Source) {
                 Ensure-Dir (Join-Path $RuntimeRootPath $DirName)
-                Copy-Item -Recurse -Force -Path (Join-Path $Source "*") -Destination (Join-Path $RuntimeRootPath $DirName) -ErrorAction SilentlyContinue
+                Copy-Item -Recurse -Force -Path (Join-Path $Source "*") -Destination (Join-Path $RuntimeRootPath $DirName) -ErrorAction Stop
             }
         }
 
@@ -469,17 +498,9 @@ function Install-LuaRuntime {
             if (Test-Path -LiteralPath $LicenseSource) {
                 $LicenseDest = Join-Path $RuntimeRootPath "licenses"
                 Ensure-Dir $LicenseDest
-                Copy-Item -Recurse -Force -Path (Join-Path $LicenseSource "*") -Destination $LicenseDest -ErrorAction SilentlyContinue
+                Copy-Item -Recurse -Force -Path (Join-Path $LicenseSource "*") -Destination $LicenseDest -ErrorAction Stop
             }
 
-            $RuntimeManifestPath = Join-Path $RuntimeRootPath "resources\lua-runtime-manifest.json"
-            $PackagesManifestPath = Join-Path $RuntimeRootPath "resources\luaskills-packages-manifest.json"
-            if (-not (Test-Path -LiteralPath $RuntimeManifestPath)) {
-                throw "Lua runtime manifest was not found after installing $AssetName"
-            }
-            if (-not (Test-Path -LiteralPath $PackagesManifestPath)) {
-                throw "LuaSkills packages manifest was not found after installing $AssetName"
-            }
         }
     } finally {
         Remove-Item -LiteralPath $TempDir -Recurse -Force -ErrorAction SilentlyContinue

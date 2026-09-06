@@ -59,7 +59,7 @@ $ProjectRoot = Resolve-ProjectRoot -ScriptDirectory $ScriptDir
 $RuntimeRoot = Join-Path $ProjectRoot "examples\ffi\standard_runtime\runtime_root"
 
 if ($Fetch -ne "none") {
-    & (Join-Path $ProjectRoot "scripts\fetch_runtime_deps.ps1") -Target $Fetch -RuntimeRoot $RuntimeRoot
+    & (Join-Path $ProjectRoot "scripts\deps\fetch_deps.ps1") -Target $Fetch -RuntimeRoot $RuntimeRoot
 }
 
 if (Test-Path -LiteralPath (Join-Path $RuntimeRoot "resources\runtime-env.ps1")) {

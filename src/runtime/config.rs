@@ -1,11 +1,13 @@
 use crate::lua_skill::validate_luaskills_identifier;
+use crate::runtime::file_system::replace_file_atomically;
+use crate::runtime::file_watcher::{LiveWatchRegistration, SharedLiveFileWatcher};
 #[cfg(windows)]
 use crate::runtime::path::normalize_host_visible_path_text;
 use crate::runtime::path::render_host_visible_path;
 use crate::skill::config::{
     SKILL_CONFIG_MAX_ITEMS_PER_PACKAGE, SKILL_CONFIG_MAX_VALUE_BYTES, is_valid_skill_config_key,
 };
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::Event;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,12 +16,12 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{
+    Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
+};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-#[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 
 /// Render one skill-config filesystem path for user-facing error messages.
 /// 为面向用户的技能配置错误消息渲染单个文件系统路径。
@@ -374,15 +376,71 @@ pub struct SkillConfigStore {
 /// Live parent-directory watcher that debounces events for one exact configuration file.
 /// 对单个精确配置文件事件执行防抖的活动父目录监听器。
 pub(crate) struct SkillConfigReloadWatcher {
-    /// Native watcher retained for the complete lifetime of the worker.
-    /// 在工作线程完整生命周期内保留的原生监听器。
-    _watcher: RecommendedWatcher,
+    /// Single shared native watcher retained for every configuration domain.
+    /// 为所有配置域保留的单个共享原生监听器。
+    _watcher: SharedLiveFileWatcher,
+    /// Logical parent-directory registrations released after the worker joins.
+    /// 工作线程回收后释放的逻辑父目录注册。
+    _registrations: Vec<LiveWatchRegistration>,
     /// Cooperative shutdown signal observed by the worker.
     /// 工作线程观察的协作停止信号。
     stop: Arc<AtomicBool>,
     /// Debounce worker that owns refresh sequencing.
     /// 拥有刷新排序逻辑的防抖工作线程。
     worker: Option<JoinHandle<()>>,
+}
+
+/// One exact configuration target routed through the shared watcher.
+/// 通过共享监听器路由的单个精确配置目标。
+pub(crate) struct SkillConfigReloadTarget {
+    /// Store refreshed after an accepted native event batch.
+    /// 接受原生事件批次后刷新的存储。
+    store: Arc<SkillConfigStore>,
+    /// Ordered callback receiving refresh results or backend failures.
+    /// 接收刷新结果或后端失败的有序回调。
+    callback: Arc<dyn Fn(Result<SkillConfigRefreshResult, String>) + Send + Sync>,
+}
+
+impl SkillConfigReloadTarget {
+    /// Create one exact store-and-callback watcher target.
+    /// 创建一个精确的存储与回调监听目标。
+    pub(crate) fn new(
+        store: Arc<SkillConfigStore>,
+        callback: Arc<dyn Fn(Result<SkillConfigRefreshResult, String>) + Send + Sync>,
+    ) -> Self {
+        Self { store, callback }
+    }
+}
+
+/// Worker-owned target state with an absolute exact file path.
+/// 工作线程拥有的目标状态及其绝对精确文件路径。
+struct SkillConfigReloadWorkerTarget {
+    /// Store refreshed after the debounce window closes.
+    /// 防抖窗口关闭后刷新的存储。
+    store: Arc<SkillConfigStore>,
+    /// Absolute file path used for exact event filtering.
+    /// 用于精确事件过滤的绝对文件路径。
+    file_path: PathBuf,
+    /// Ordered callback receiving one completed batch result.
+    /// 接收单个已完成批次结果的有序回调。
+    callback: Arc<dyn Fn(Result<SkillConfigRefreshResult, String>) + Send + Sync>,
+    /// Current trailing-debounce state when a batch is pending.
+    /// 批次待处理时的当前尾随防抖状态。
+    pending: Option<SkillConfigPendingRefresh>,
+}
+
+/// Pending trailing-debounce state for one exact configuration target.
+/// 单个精确配置目标的待处理尾随防抖状态。
+struct SkillConfigPendingRefresh {
+    /// Earliest emission time after the latest accepted event.
+    /// 最近一次接受事件后的最早发出时间。
+    quiet_deadline: Instant,
+    /// Absolute batch deadline that prevents indefinite postponement.
+    /// 防止无限推迟的批次绝对截止时间。
+    maximum_deadline: Instant,
+    /// Latest shared backend failure associated with the pending batch.
+    /// 与待处理批次关联的最近共享后端失败。
+    backend_error: Option<String>,
 }
 
 impl std::fmt::Debug for SkillConfigReloadWatcher {
@@ -397,12 +455,11 @@ impl std::fmt::Debug for SkillConfigReloadWatcher {
 }
 
 impl SkillConfigReloadWatcher {
-    /// Start one exact-file watcher and route accepted or failed reload attempts to a callback.
-    /// 启动单个精确文件监听器，并把接受或失败的重载尝试路由到回调。
+    /// Start one shared native watcher and route exact-file batches to target callbacks.
+    /// 启动单个共享原生监听器，并把精确文件批次路由到目标回调。
     pub(crate) fn start(
-        store: Arc<SkillConfigStore>,
+        targets: Vec<SkillConfigReloadTarget>,
         debounce: Duration,
-        callback: Arc<dyn Fn(Result<SkillConfigRefreshResult, String>) + Send + Sync>,
     ) -> Result<Self, String> {
         if debounce.is_zero() || debounce > Duration::from_secs(5) {
             return Err(
@@ -410,90 +467,108 @@ impl SkillConfigReloadWatcher {
                     .to_string(),
             );
         }
-        let file_path = store.file_path()?;
-        let parent = file_path.parent().ok_or_else(|| {
-            "CONFIG_WATCHER_FAILED: configuration file has no parent directory".to_string()
-        })?;
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "CONFIG_WATCHER_FAILED: failed to create configuration watch directory '{}': {}",
-                render_skill_config_path(parent),
-                error
-            )
-        })?;
-        let (event_tx, event_rx) = mpsc::channel::<Result<Event, notify::Error>>();
-        let mut watcher = notify::recommended_watcher(move |event| {
-            let _send_result = event_tx.send(event);
-        })
-        .map_err(|error| format!("CONFIG_WATCHER_FAILED: {error}"))?;
-        watcher
-            .watch(parent, RecursiveMode::NonRecursive)
-            .map_err(|error| format!("CONFIG_WATCHER_FAILED: {error}"))?;
+        if targets.is_empty() {
+            return Err(
+                "CONFIG_WATCHER_FAILED: at least one configuration watch target is required"
+                    .to_string(),
+            );
+        }
+
+        // Single shared native watcher and raw event receiver for every target.
+        // 为所有目标创建的单个共享原生监听器与原始事件接收器。
+        let (watcher, event_rx) = SharedLiveFileWatcher::new()?;
+        // Logical registrations retained until the debounce worker has stopped.
+        // 保留到防抖工作线程停止后的逻辑注册集合。
+        let mut registrations = Vec::with_capacity(targets.len());
+        // Worker-owned exact targets assembled only after every registration succeeds.
+        // 仅在每项注册成功后组装的工作线程精确目标集合。
+        let mut worker_targets = Vec::with_capacity(targets.len());
+
+        for target in targets {
+            // Absolute configuration file path owned by the current store.
+            // 当前存储拥有的绝对配置文件路径。
+            let file_path = target.store.file_path()?;
+            // Parent directory watched to preserve atomic-replacement events.
+            // 为保留原子替换事件而监听的父目录。
+            let parent = file_path.parent().ok_or_else(|| {
+                "CONFIG_WATCHER_FAILED: configuration file has no parent directory".to_string()
+            })?;
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "CONFIG_WATCHER_FAILED: failed to create configuration watch directory '{}': {}",
+                    render_skill_config_path(parent),
+                    error
+                )
+            })?;
+            // RAII parent registration sharing the single notify backend.
+            // 共享单个 notify 后端的 RAII 父目录注册。
+            let registration = watcher.register_path(parent.to_path_buf(), false)?;
+            registrations.push(registration);
+            worker_targets.push(SkillConfigReloadWorkerTarget {
+                store: target.store,
+                file_path,
+                callback: target.callback,
+                pending: None,
+            });
+        }
+
+        // Cooperative shutdown state observed by the synchronous event worker.
+        // 同步事件工作线程观察的协作停止状态。
         let stop = Arc::new(AtomicBool::new(false));
+        // Worker-specific shutdown reference.
+        // 工作线程专用的停止状态引用。
         let worker_stop = Arc::clone(&stop);
-        let worker_file_path = file_path;
+        // Worker-specific watcher reference used for fallback-path refresh.
+        // 工作线程用于刷新回退路径的监听器引用。
+        let worker_watcher = watcher.clone();
+        // Joined worker that preserves trailing debounce and maximum-window semantics.
+        // 保留尾随防抖与最大等待窗口语义并在析构时回收的工作线程。
         let worker = thread::Builder::new()
             .name("luaskills-config-watch".to_string())
             .spawn(move || {
                 while !worker_stop.load(Ordering::Acquire) {
-                    match event_rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok(Ok(event)) if config_event_targets_file(&event, &worker_file_path) => {
-                            let mut backend_error = None;
-                            let started_at = Instant::now();
-                            let maximum_window = std::cmp::max(debounce, Duration::from_secs(2))
-                                .min(Duration::from_secs(5));
-                            let maximum_deadline = started_at + maximum_window;
-                            let mut quiet_deadline =
-                                std::cmp::min(started_at + debounce, maximum_deadline);
-                            loop {
-                                if worker_stop.load(Ordering::Acquire) {
-                                    return;
-                                }
-                                let now = Instant::now();
-                                if now >= quiet_deadline || now >= maximum_deadline {
-                                    break;
-                                }
-                                let wait = quiet_deadline
-                                    .saturating_duration_since(now)
-                                    .min(Duration::from_millis(100));
-                                match event_rx.recv_timeout(wait) {
-                                    Ok(Ok(next))
-                                        if config_event_targets_file(&next, &worker_file_path) =>
-                                    {
-                                        quiet_deadline = std::cmp::min(
-                                            Instant::now() + debounce,
-                                            maximum_deadline,
-                                        );
-                                    }
-                                    Ok(Ok(_)) => {}
-                                    Ok(Err(error)) => {
-                                        backend_error = Some(error.to_string());
-                                    }
-                                    Err(RecvTimeoutError::Timeout) => {}
-                                    Err(RecvTimeoutError::Disconnected) => return,
-                                }
-                            }
-                            if let Some(error) = backend_error {
-                                callback(Err(format!("CONFIG_WATCHER_FAILED: {error}")));
+                    // Bounded wait keeps shutdown latency finite and wakes at pending deadlines.
+                    // 有界等待用于限制关闭延迟并在待处理截止时间唤醒。
+                    let wait = next_skill_config_watch_wait(&worker_targets);
+                    match event_rx.recv_timeout(wait) {
+                        Ok(Ok(event)) => {
+                            if let Err(error) = worker_watcher.refresh_fallback_paths() {
+                                record_shared_config_watch_error(&mut worker_targets, error);
                             } else {
-                                callback(store.refresh());
+                                for target in &mut worker_targets {
+                                    if config_event_targets_file(&event, &target.file_path) {
+                                        record_skill_config_watch_event(target, debounce);
+                                    }
+                                }
                             }
                         }
-                        Ok(Ok(_)) => {}
                         Ok(Err(error)) => {
-                            callback(Err(format!("CONFIG_WATCHER_FAILED: {error}")));
+                            record_shared_config_watch_error(
+                                &mut worker_targets,
+                                format!("CONFIG_WATCHER_FAILED: {error}"),
+                            );
                         }
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
+                    flush_due_skill_config_watch_targets(&mut worker_targets);
                 }
             })
             .map_err(|error| format!("CONFIG_WATCHER_FAILED: {error}"))?;
+
         Ok(Self {
             _watcher: watcher,
+            _registrations: registrations,
             stop,
             worker: Some(worker),
         })
+    }
+
+    /// Return the shared backend path count for watcher topology tests.
+    /// 返回供监听拓扑测试使用的共享后端路径数量。
+    #[cfg(test)]
+    pub(crate) fn backend_watch_path_count_for_test(&self) -> usize {
+        self._watcher.backend_watch_path_count_for_test()
     }
 }
 
@@ -504,6 +579,92 @@ impl Drop for SkillConfigReloadWatcher {
         self.stop.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
             let _join_result = worker.join();
+        }
+    }
+}
+
+/// Record one accepted exact-file event using trailing debounce and a maximum window.
+/// 使用尾随防抖与最大等待窗口记录单个已接受的精确文件事件。
+fn record_skill_config_watch_event(target: &mut SkillConfigReloadWorkerTarget, debounce: Duration) {
+    // Current monotonic time anchors new or extended deadlines.
+    // 当前单调时间用于锚定新建或延长的截止时间。
+    let now = Instant::now();
+    if let Some(pending) = target.pending.as_mut() {
+        pending.quiet_deadline = std::cmp::min(now + debounce, pending.maximum_deadline);
+        return;
+    }
+    // Bounded maximum window preserves the existing two-to-five-second contract.
+    // 有界最大窗口用于保留现有两到五秒契约。
+    let maximum_window =
+        std::cmp::max(debounce, Duration::from_secs(2)).min(Duration::from_secs(5));
+    // Absolute deadline shared by every event in this batch.
+    // 当前批次所有事件共享的绝对截止时间。
+    let maximum_deadline = now + maximum_window;
+    target.pending = Some(SkillConfigPendingRefresh {
+        quiet_deadline: std::cmp::min(now + debounce, maximum_deadline),
+        maximum_deadline,
+        backend_error: None,
+    });
+}
+
+/// Record one shared backend failure for every target and make it immediately due.
+/// 为所有目标记录单个共享后端失败并使其立即到期。
+fn record_shared_config_watch_error(targets: &mut [SkillConfigReloadWorkerTarget], error: String) {
+    // Current monotonic deadline emits the backend failure in the same worker turn.
+    // 当前单调截止时间用于在同一工作线程轮次发出后端失败。
+    let now = Instant::now();
+    for target in targets {
+        target.pending = Some(SkillConfigPendingRefresh {
+            quiet_deadline: now,
+            maximum_deadline: now,
+            backend_error: Some(error.clone()),
+        });
+    }
+}
+
+/// Return the bounded receive wait for the nearest pending target deadline.
+/// 返回距离最近待处理目标截止时间的有界接收等待时长。
+fn next_skill_config_watch_wait(targets: &[SkillConfigReloadWorkerTarget]) -> Duration {
+    // Current monotonic time used to convert deadlines into durations.
+    // 用于把截止时间转换为持续时间的当前单调时间。
+    let now = Instant::now();
+    // Default wait bounds shutdown latency while no target is pending.
+    // 无目标待处理时限制关闭延迟的默认等待。
+    let maximum_wait = Duration::from_millis(100);
+    targets
+        .iter()
+        .filter_map(|target| target.pending.as_ref())
+        .map(|pending| std::cmp::min(pending.quiet_deadline, pending.maximum_deadline))
+        .min()
+        .map(|deadline| deadline.saturating_duration_since(now).min(maximum_wait))
+        .unwrap_or(maximum_wait)
+}
+
+/// Emit every due target exactly once and clear its pending batch state.
+/// 恰好发出一次每个到期目标并清除其待处理批次状态。
+fn flush_due_skill_config_watch_targets(targets: &mut [SkillConfigReloadWorkerTarget]) {
+    // Current monotonic time compared against both debounce deadlines.
+    // 与两个防抖截止时间比较的当前单调时间。
+    let now = Instant::now();
+    for target in targets {
+        // Due flag is computed without extending the mutable borrow into callback execution.
+        // 到期标志在不把可变借用延伸到回调执行的情况下计算。
+        let due = target.pending.as_ref().is_some_and(|pending| {
+            now >= pending.quiet_deadline || now >= pending.maximum_deadline
+        });
+        if !due {
+            continue;
+        }
+        // Completed pending state consumed exactly once for this batch.
+        // 当前批次恰好消费一次的已完成待处理状态。
+        let pending = target
+            .pending
+            .take()
+            .expect("due configuration target must retain pending state");
+        if let Some(error) = pending.backend_error {
+            (target.callback)(Err(error));
+        } else {
+            (target.callback)(target.store.refresh());
         }
     }
 }
@@ -1027,17 +1188,18 @@ impl SkillConfigStore {
             Ok(())
         })();
         if let Err(error) = write_result {
-            let _cleanup_result = fs::remove_file(&temp_path);
-            return Err(error);
+            return Err(cleanup_skill_config_temp_after_failure(&temp_path, &error));
         }
         replace_file_atomically(&temp_path, file_path).map_err(|error| {
-            let _cleanup_result = fs::remove_file(&temp_path);
-            format!(
+            // Primary atomic-promotion failure retained if cleanup succeeds or the temp file is already absent.
+            // 清理成功或临时文件已不存在时保留的原子发布主错误。
+            let primary_error = format!(
                 "CONFIG_ATOMIC_REPLACE_FAILED: failed to promote skill config temp file '{}' to '{}': {}",
                 render_skill_config_path(&temp_path),
                 render_skill_config_path(file_path),
                 error
-            )
+            );
+            cleanup_skill_config_temp_after_failure(&temp_path, &primary_error)
         })?;
         let content_digest = hex_sha256(&serialized);
         let durability_error = sync_skill_config_parent(parent).err();
@@ -1324,6 +1486,30 @@ fn unique_skill_config_temp_path(file_path: &Path) -> Result<PathBuf, String> {
     Ok(file_path.with_file_name(temp_name))
 }
 
+/// Remove one failed atomic-write temporary file while preserving both primary and cleanup diagnostics.
+/// 删除一次原子写入失败留下的临时文件，同时保留主错误与清理错误诊断。
+///
+/// The temp_path parameter is the exact same-directory temporary file created for the failed write.
+/// temp_path 参数是为失败写入创建的同目录精确临时文件路径。
+///
+/// The primary_error parameter is the write or promotion error that caused cleanup to run.
+/// primary_error 参数是触发清理的写入或发布主错误。
+///
+/// Return the primary error unchanged after successful/already-complete cleanup, otherwise append the cleanup failure.
+/// 清理成功或已完成时原样返回主错误，否则追加清理失败信息。
+fn cleanup_skill_config_temp_after_failure(temp_path: &Path, primary_error: &str) -> String {
+    match fs::remove_file(temp_path) {
+        Ok(()) => primary_error.to_string(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => primary_error.to_string(),
+        Err(error) => format!(
+            "{}. Failed to remove skill config temp file '{}': {}",
+            primary_error,
+            render_skill_config_path(temp_path),
+            error
+        ),
+    }
+}
+
 /// Synchronize the containing directory after one atomic configuration replacement.
 /// 在完成一次配置原子替换后同步其父目录。
 fn sync_skill_config_parent(parent: &Path) -> Result<(), String> {
@@ -1370,14 +1556,16 @@ fn skill_config_file_is_file(file_path: &Path) -> Result<bool, String> {
 
 /// Return the process-wide lock registry keyed by effective skill-config file path.
 /// 返回按生效技能配置文件路径建立索引的进程级锁注册表。
-fn skill_config_lock_registry() -> &'static Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>> {
-    static REGISTRY: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+fn skill_config_lock_registry() -> &'static Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>> {
+    /// Process-wide weak registry that never owns a path lock's lifetime.
+    /// 永不持有路径锁生命周期的进程级弱引用注册表。
+    static REGISTRY: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 /// Acquire the process-wide skill-config lock registry and return its guard, recovering after lock poisoning.
 /// 获取并返回进程级 skill-config 锁注册表保护对象；如果锁已 poison，则恢复继续使用。
-fn lock_skill_config_lock_registry() -> MutexGuard<'static, BTreeMap<PathBuf, Arc<Mutex<()>>>> {
+fn lock_skill_config_lock_registry() -> MutexGuard<'static, BTreeMap<PathBuf, Weak<Mutex<()>>>> {
     skill_config_lock_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1495,12 +1683,22 @@ fn normalize_windows_skill_config_lock_identity_path(path: &Path) -> Result<Path
 /// Return one process-wide shared mutex for the current effective skill-config file path.
 /// 返回当前生效技能配置文件路径对应的进程级共享互斥锁。
 fn shared_skill_config_path_lock(file_path: &Path) -> Result<Arc<Mutex<()>>, String> {
+    // lock_key is the normalized effective path used for process-wide lock identity.
+    // lock_key 是用于进程级锁标识的归一化有效路径。
     let lock_key = skill_config_lock_key(file_path)?;
+    // registry guard serializes stale cleanup, lookup, and replacement as one operation.
+    // registry 保护对象将过期清理、查找与替换串行为一个操作。
     let mut registry = lock_skill_config_lock_registry();
-    Ok(registry
-        .entry(lock_key)
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone())
+    registry.retain(|_, path_lock| path_lock.strong_count() > 0);
+    if let Some(path_lock) = registry.get(&lock_key).and_then(Weak::upgrade) {
+        return Ok(path_lock);
+    }
+
+    // path_lock is the sole newly created strong owner for this normalized path.
+    // path_lock 是该归一化路径新建的唯一强引用所有者。
+    let path_lock = Arc::new(Mutex::new(()));
+    registry.insert(lock_key, Arc::downgrade(&path_lock));
+    Ok(path_lock)
 }
 
 /// Acquire one shared skill-config file IO lock and return its guard, recovering after lock poisoning.
@@ -1537,64 +1735,17 @@ fn validate_skill_config_key(key: &str) -> Result<String, String> {
     Ok(key.to_string())
 }
 
-/// Replace one destination file with one temp file using one platform-safe atomic commit strategy.
-/// 使用平台安全的原子提交策略，以临时文件替换目标文件。
-fn replace_file_atomically(
-    temp_path: &Path,
-    destination_path: &Path,
-) -> Result<(), std::io::Error> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-
-        // Destination existence probe kept explicit so metadata errors are not folded into a rename attempt.
-        // 显式探测目标文件是否存在，避免将元数据错误折叠成一次重命名尝试。
-        let destination_exists = destination_path.try_exists()?;
-        if !destination_exists {
-            return fs::rename(temp_path, destination_path);
-        }
-
-        let destination_wide: Vec<u16> = destination_path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let temp_wide: Vec<u16> = temp_path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let replaced = unsafe {
-            ReplaceFileW(
-                destination_wide.as_ptr(),
-                temp_wide.as_ptr(),
-                std::ptr::null(),
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        if replaced == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        fs::rename(temp_path, destination_path)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #[cfg(windows)]
     use super::normalize_windows_skill_config_lock_identity_path;
     use super::{
         SKILL_CONFIG_FORMAT_VERSION, SkillConfigDocument, SkillConfigEntry,
-        SkillConfigReloadWatcher, SkillConfigSnapshot, SkillConfigStore,
-        shared_skill_config_path_lock, skill_config_companion_lock_path,
-        skill_config_lock_registry, skill_config_lock_retry_delay,
+        SkillConfigReloadTarget, SkillConfigReloadWatcher, SkillConfigSnapshot, SkillConfigStore,
+        cleanup_skill_config_temp_after_failure, lock_skill_config_lock_registry,
+        record_skill_config_watch_event, shared_skill_config_path_lock,
+        skill_config_companion_lock_path, skill_config_lock_key, skill_config_lock_registry,
+        skill_config_lock_retry_delay,
     };
     use crate::runtime::path::render_host_visible_path;
     use std::collections::BTreeMap;
@@ -1616,6 +1767,38 @@ mod tests {
             .expect("system time before unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("luaskills_skill_config_{}_{}", label, nonce))
+    }
+
+    /// Verify failed temporary-file cleanup is surfaced alongside the primary atomic-write error.
+    /// 验证临时文件清理失败会与原子写入主错误一并返回。
+    #[test]
+    fn failed_skill_config_temp_cleanup_preserves_both_errors() {
+        // Temporary root that isolates the cleanup-error fixture.
+        // 隔离清理错误夹具的临时根目录。
+        let runtime_root = unique_temp_runtime_root("cleanup_error");
+        // Directory occupying the temporary-file path so remove_file deterministically fails.
+        // 占据临时文件路径并使 remove_file 确定性失败的目录。
+        let temp_path = runtime_root.join("config.tmp");
+        fs::create_dir_all(&temp_path).expect("temp-path directory should be created");
+
+        // Combined diagnostic returned by the shared failed-write cleanup path.
+        // 由共享失败写入清理路径返回的组合诊断。
+        let error = cleanup_skill_config_temp_after_failure(&temp_path, "primary write failure");
+
+        assert!(
+            error.contains("primary write failure"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("Failed to remove skill config temp file"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains(&render_host_visible_path(&temp_path)),
+            "unexpected error: {error}"
+        );
+        assert!(temp_path.is_dir(), "failed cleanup target should remain");
+        let _ = fs::remove_dir_all(&runtime_root);
     }
 
     /// Verify config values persist inside one explicit unified file path.
@@ -1844,6 +2027,68 @@ mod tests {
         let second_lock =
             shared_skill_config_path_lock(&file_path).expect("resolve second shared lock");
         assert!(Arc::ptr_eq(&first_lock, &second_lock));
+    }
+
+    /// Verify the process-wide registry releases inactive historical path entries.
+    /// 验证进程级注册表会释放不再活动的历史路径条目。
+    #[test]
+    fn skill_config_lock_registry_discards_inactive_paths() {
+        // runtime_root gives every historical path in this test a unique common prefix.
+        // runtime_root 为本测试中的每个历史路径提供唯一公共前缀。
+        let runtime_root = unique_temp_runtime_root("shared_lock_cleanup");
+        // lock_keys records the normalized registry identities created by this test.
+        // lock_keys 记录本测试创建的归一化注册表标识。
+        let mut lock_keys = Vec::new();
+        // active_locks keeps every generated path active until the registry is fully populated.
+        // active_locks 让每个生成路径保持活动，直到注册表完全填充。
+        let mut active_locks = Vec::new();
+
+        // Each iteration creates one distinct historical path and its only external strong owner.
+        // 每次迭代创建一个不同历史路径及其唯一外部强引用所有者。
+        for index in 0..64 {
+            // file_path is one unique effective configuration path.
+            // file_path 是一个唯一的生效配置路径。
+            let file_path = runtime_root
+                .join(format!("history-{index}"))
+                .join("skill_config.json");
+            // lock_key is the exact normalized identity stored by the registry.
+            // lock_key 是注册表存储的确切归一化标识。
+            let lock_key = skill_config_lock_key(&file_path).expect("normalize historical path");
+            // path_lock is the active strong owner returned for this path.
+            // path_lock 是为该路径返回的活动强引用所有者。
+            let path_lock =
+                shared_skill_config_path_lock(&file_path).expect("resolve historical path lock");
+            lock_keys.push(lock_key);
+            active_locks.push(path_lock);
+        }
+
+        {
+            // registry proves every active path has a live weak entry without owning it.
+            // registry 证明每个活动路径都有存活的弱引用条目，但注册表不拥有它。
+            let registry = lock_skill_config_lock_registry();
+            assert!(lock_keys.iter().all(|key| {
+                registry
+                    .get(key)
+                    .is_some_and(|path_lock| path_lock.strong_count() == 1)
+            }));
+        }
+
+        drop(active_locks);
+        // cleanup_trigger is a new live path whose lookup performs deterministic stale cleanup.
+        // cleanup_trigger 是一个新活动路径，其查找会执行确定性的过期清理。
+        let cleanup_trigger = runtime_root.join("cleanup-trigger.json");
+        // trigger_lock keeps the cleanup-trigger entry active while the registry is inspected.
+        // trigger_lock 在检查注册表期间保持清理触发条目活动。
+        let trigger_lock =
+            shared_skill_config_path_lock(&cleanup_trigger).expect("trigger stale lock cleanup");
+
+        {
+            // registry is inspected only after cleanup has completed under its own lock.
+            // registry 仅在清理已于其自身锁下完成后检查。
+            let registry = lock_skill_config_lock_registry();
+            assert!(lock_keys.iter().all(|key| !registry.contains_key(key)));
+        }
+        drop(trigger_lock);
     }
 
     /// Verify one relative explicit config file path is rejected.
@@ -2122,9 +2367,11 @@ mod tests {
             let _send_result = result_tx.send(result);
         });
         let watcher = SkillConfigReloadWatcher::start(
-            Arc::clone(&watched_store),
+            vec![SkillConfigReloadTarget::new(
+                Arc::clone(&watched_store),
+                callback,
+            )],
             Duration::from_millis(25),
-            callback,
         )
         .expect("start config watcher");
 
@@ -2150,6 +2397,208 @@ mod tests {
 
         drop(watcher);
         let _ = fs::remove_dir_all(runtime_root);
+    }
+
+    /// Verify two configuration domains share one watcher while retaining exact routing.
+    /// 验证两个配置域共享一个监听器，同时保留精确路由。
+    #[test]
+    fn watcher_shares_backend_across_two_exact_configuration_domains() {
+        // Isolated root containing normal and system configuration domains.
+        // 包含普通与系统配置域的隔离根目录。
+        let runtime_root = unique_temp_runtime_root("watcher_shared_domains");
+        // Exact normal and system configuration file paths.
+        // 普通与系统配置的精确文件路径。
+        let normal_path = runtime_root.join("skills").join("skill_config.json");
+        let system_path = runtime_root.join("system-skills").join("skill_config.json");
+        // Watched stores retaining independent snapshots for each domain.
+        // 为每个配置域保留独立快照的被监听存储。
+        let normal_store = Arc::new(
+            SkillConfigStore::new(normal_path.clone()).expect("create normal watched store"),
+        );
+        let system_store = Arc::new(
+            SkillConfigStore::new(system_path.clone()).expect("create system watched store"),
+        );
+        // External writer handles that exercise atomic file replacement.
+        // 用于执行原子文件替换的外部写入句柄。
+        let normal_writer =
+            SkillConfigStore::new(normal_path.clone()).expect("create normal writer");
+        let system_writer =
+            SkillConfigStore::new(system_path.clone()).expect("create system writer");
+        // Independent result channels used to prove exact domain routing.
+        // 用于证明精确配置域路由的独立结果通道。
+        let (normal_tx, normal_rx) = mpsc::channel();
+        let (system_tx, system_rx) = mpsc::channel();
+        // Normal-domain callback forwarding completed batches to the test.
+        // 把普通配置域已完成批次转发给测试的回调。
+        let normal_callback = Arc::new(move |result| {
+            let _send_result = normal_tx.send(result);
+        });
+        // System-domain callback forwarding completed batches to the test.
+        // 把系统配置域已完成批次转发给测试的回调。
+        let system_callback = Arc::new(move |result| {
+            let _send_result = system_tx.send(result);
+        });
+        // Single shared watcher containing two logical parent registrations.
+        // 包含两个逻辑父目录注册的单个共享监听器。
+        let watcher = SkillConfigReloadWatcher::start(
+            vec![
+                SkillConfigReloadTarget::new(Arc::clone(&normal_store), normal_callback),
+                SkillConfigReloadTarget::new(Arc::clone(&system_store), system_callback),
+            ],
+            Duration::from_millis(40),
+        )
+        .expect("start shared config watcher");
+        assert_eq!(watcher.backend_watch_path_count_for_test(), 2);
+
+        fs::write(
+            runtime_root.join("skills").join("unrelated.txt"),
+            b"ignored",
+        )
+        .expect("write unrelated sibling");
+        assert!(normal_rx.recv_timeout(Duration::from_millis(150)).is_err());
+        assert!(system_rx.recv_timeout(Duration::from_millis(150)).is_err());
+
+        normal_writer
+            .set_value("demo-skill", "normal", "1")
+            .expect("write normal domain");
+        system_writer
+            .set_value("demo-skill", "system", "2")
+            .expect("write system domain");
+        // Normal-domain refresh proving exact matching and independent snapshot update.
+        // 证明精确匹配与独立快照更新的普通配置域刷新结果。
+        let normal_refresh = normal_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("normal watcher result")
+            .expect("normal watcher refresh");
+        // System-domain refresh proving exact matching and independent snapshot update.
+        // 证明精确匹配与独立快照更新的系统配置域刷新结果。
+        let system_refresh = system_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("system watcher result")
+            .expect("system watcher refresh");
+        assert!(normal_refresh.changed);
+        assert!(system_refresh.changed);
+        assert_eq!(normal_refresh.revision, "1");
+        assert_eq!(system_refresh.revision, "1");
+
+        drop(watcher);
+        let _cleanup_result = fs::remove_dir_all(runtime_root);
+    }
+
+    /// Verify a rapid write burst produces one trailing refresh at the final revision.
+    /// 验证快速写入突发仅在最终修订号产生一次尾随刷新。
+    #[test]
+    fn watcher_coalesces_rapid_writes_into_one_trailing_refresh() {
+        // Isolated exact configuration file used for one write burst.
+        // 用于单次写入突发的隔离精确配置文件。
+        let runtime_root = unique_temp_runtime_root("watcher_burst");
+        let file_path = runtime_root.join("custom").join("skill_config.json");
+        // Watched store and independent writer for atomic replacement events.
+        // 用于原子替换事件的被监听存储与独立写入器。
+        let watched_store =
+            Arc::new(SkillConfigStore::new(file_path.clone()).expect("create burst watched store"));
+        let writer_store =
+            SkillConfigStore::new(file_path.clone()).expect("create burst writer store");
+        // Result channel counting completed debounced batches.
+        // 用于统计已完成防抖批次的结果通道。
+        let (result_tx, result_rx) = mpsc::channel();
+        let callback = Arc::new(move |result| {
+            let _send_result = result_tx.send(result);
+        });
+        // Shared watcher configured with enough quiet time to merge this synchronous burst.
+        // 配置足够静默时间以合并当前同步突发的共享监听器。
+        let watcher = SkillConfigReloadWatcher::start(
+            vec![SkillConfigReloadTarget::new(
+                Arc::clone(&watched_store),
+                callback,
+            )],
+            Duration::from_millis(100),
+        )
+        .expect("start burst watcher");
+
+        for value in ["1", "2", "3"] {
+            writer_store
+                .set_value("demo-skill", "burst", value)
+                .expect("write burst revision");
+        }
+        // Single trailing refresh produced after the final native event.
+        // 最后一次原生事件后产生的单个尾随刷新结果。
+        let refresh = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("burst watcher result")
+            .expect("burst watcher refresh");
+        assert_eq!(refresh.revision, "3");
+        assert!(result_rx.recv_timeout(Duration::from_millis(300)).is_err());
+
+        drop(watcher);
+        let _cleanup_result = fs::remove_dir_all(runtime_root);
+    }
+
+    /// Verify repeated events extend only the quiet deadline, not the maximum window.
+    /// 验证重复事件只延长静默截止时间，不延长最大等待窗口。
+    #[test]
+    fn watcher_pending_batch_keeps_original_maximum_deadline() {
+        // Isolated store required by the worker-target state.
+        // 工作线程目标状态所需的隔离存储。
+        let runtime_root = unique_temp_runtime_root("watcher_maximum_deadline");
+        let file_path = runtime_root.join("custom").join("skill_config.json");
+        let store =
+            Arc::new(SkillConfigStore::new(file_path.clone()).expect("create target store"));
+        // No-op callback used because this test inspects only deadline state.
+        // 当前测试仅检查截止时间状态，因此使用空操作回调。
+        let callback = Arc::new(|_result| {});
+        // Mutable worker target receiving two synthetic accepted events.
+        // 接收两次合成已接受事件的可变工作线程目标。
+        let mut target = super::SkillConfigReloadWorkerTarget {
+            store,
+            file_path,
+            callback,
+            pending: None,
+        };
+        record_skill_config_watch_event(&mut target, Duration::from_millis(50));
+        // Original absolute deadline retained across later events.
+        // 在后续事件之间保留的原始绝对截止时间。
+        let original_maximum_deadline = target
+            .pending
+            .as_ref()
+            .expect("first pending batch")
+            .maximum_deadline;
+        thread::sleep(Duration::from_millis(5));
+        record_skill_config_watch_event(&mut target, Duration::from_millis(50));
+        assert_eq!(
+            target
+                .pending
+                .as_ref()
+                .expect("extended pending batch")
+                .maximum_deadline,
+            original_maximum_deadline
+        );
+        let _cleanup_result = fs::remove_dir_all(runtime_root);
+    }
+
+    /// Verify dropping the shared watcher joins its worker within the bounded poll interval.
+    /// 验证析构共享监听器会在有界轮询间隔内回收工作线程。
+    #[test]
+    fn watcher_drop_joins_worker_promptly() {
+        // Isolated watched store retained only for lifecycle timing.
+        // 仅用于生命周期计时的隔离被监听存储。
+        let runtime_root = unique_temp_runtime_root("watcher_drop");
+        let file_path = runtime_root.join("custom").join("skill_config.json");
+        let store = Arc::new(SkillConfigStore::new(file_path).expect("create drop watched store"));
+        // No-op callback because no filesystem event is emitted.
+        // 因未发出文件系统事件而使用的空操作回调。
+        let callback = Arc::new(|_result| {});
+        let watcher = SkillConfigReloadWatcher::start(
+            vec![SkillConfigReloadTarget::new(store, callback)],
+            Duration::from_millis(25),
+        )
+        .expect("start drop watcher");
+        // Monotonic drop duration proving the worker is joined rather than detached.
+        // 证明工作线程被回收而非分离的单调析构持续时间。
+        let started_at = Instant::now();
+        drop(watcher);
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+        let _cleanup_result = fs::remove_dir_all(runtime_root);
     }
 
     /// Verify strict persisted decoding rejects duplicate package and value keys.

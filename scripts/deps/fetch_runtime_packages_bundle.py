@@ -12,8 +12,10 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import urllib.error
 import urllib.request
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -95,11 +97,19 @@ def request_json_or_none(url: str) -> Any | None:
         raise
 
 
-def download_bytes(url: str) -> bytes:
-    """Download one binary asset with optional token support.
-    使用可选令牌下载一个二进制资产。
+def download_verified_file(
+    url: str,
+    destination: Path,
+    expected_hash: str,
+    asset_name: str,
+) -> None:
+    """Stream one binary asset into a unique file and verify SHA-256 before returning.
+    将一个二进制资产流式写入唯一文件，并在返回前校验 SHA-256。
     """
 
+    # Fixed one-MiB block bounding peak download memory independently of bundle size.
+    # 固定一 MiB 块，使下载峰值内存不随 bundle 大小增长。
+    chunk_size = 1024 * 1024
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "luaskills-runtime-packages-fetcher"},
@@ -107,8 +117,34 @@ def download_bytes(url: str) -> bytes:
     token = os.environ.get("GITHUB_TOKEN", "").strip()
     if token:
         request.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(request, timeout=120) as response:
-        return response.read()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise RuntimeError(f"temporary bundle archive already exists: {destination}")
+    # Incremental digest bound to the exact bytes written into the temporary archive.
+    # 与写入临时归档的精确字节绑定的增量摘要。
+    digest = hashlib.sha256()
+    created = False
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            with destination.open("xb") as output:
+                created = True
+                while True:
+                    # Current bounded response block; an empty block marks EOF.
+                    # 当前有界响应块；空块表示 EOF。
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    digest.update(chunk)
+        actual_hash = digest.hexdigest().lower()
+        if actual_hash != expected_hash:
+            raise RuntimeError(
+                f"sha256 mismatch for {asset_name}: expected {expected_hash}, got {actual_hash}"
+            )
+    except BaseException:
+        if created:
+            destination.unlink(missing_ok=True)
+        raise
 
 
 def load_binding_config(project_root: Path) -> dict[str, Any]:
@@ -228,16 +264,28 @@ def asset_download_info(release: dict[str, Any], asset_name: str) -> tuple[str, 
     )
 
 
-def verify_sha256(data: bytes, expected_hash: str, asset_name: str) -> None:
-    """Verify the sha256 digest for one downloaded bundle asset.
-    校验一个已下载 bundle 资产的 sha256 摘要。
+def publish_staged_bundle(staged_root: Path, bundle_root: Path) -> None:
+    """Publish one verified staged bundle while preserving a valid previous bundle on failure.
+    发布一个已验证暂存 bundle，并在失败时保留有效旧 bundle。
     """
 
-    actual_hash = hashlib.sha256(data).hexdigest().lower()
-    if actual_hash != expected_hash:
-        raise RuntimeError(
-            f"sha256 mismatch for {asset_name}: expected {expected_hash}, got {actual_hash}"
-        )
+    # Unique sibling backup enabling same-volume directory renames and deterministic rollback.
+    # 唯一同级备份，支持同卷目录重命名与确定性回滚。
+    backup_root = bundle_root.with_name(
+        f".{bundle_root.name}.backup-{os.getpid()}-{uuid.uuid4().hex}"
+    )
+    previous_moved = False
+    try:
+        if bundle_root.exists():
+            os.replace(bundle_root, backup_root)
+            previous_moved = True
+        os.replace(staged_root, bundle_root)
+    except BaseException:
+        if previous_moved and backup_root.exists() and not bundle_root.exists():
+            os.replace(backup_root, bundle_root)
+        raise
+    if backup_root.exists():
+        shutil.rmtree(backup_root)
 
 
 def prepare_override_bundle_root(external_root: Path, project_root: Path) -> dict[str, Any]:
@@ -276,7 +324,11 @@ def write_active_bundle_state(project_root: Path, active_state: dict[str, Any]) 
         legacy_generated_from_path.unlink()
 
 
-def stage_release_bundle(project_root: Path, binding: dict[str, str], refresh: bool) -> dict[str, Any]:
+def stage_release_bundle(
+    project_root: Path,
+    binding: dict[str, str],
+    refresh: bool,
+) -> dict[str, Any]:
     """Download or reuse one release bundle and return the staged active-state payload.
     下载或复用一个 release bundle，并返回暂存后的活动状态载荷。
     """
@@ -292,7 +344,8 @@ def stage_release_bundle(project_root: Path, binding: dict[str, str], refresh: b
         )
 
     resolved_tag = release["tag_name"]
-    bundle_root = project_root / "target" / "runtime-packages" / "bundles" / resolved_tag
+    bundles_root = project_root / "target" / "runtime-packages" / "bundles"
+    bundle_root = bundles_root / resolved_tag
     dist_root = bundle_root / "dist"
     compat_path = dist_root / "lua_packages.txt"
 
@@ -312,20 +365,36 @@ def stage_release_bundle(project_root: Path, binding: dict[str, str], refresh: b
 
     bundle_asset_name = binding["bundle_asset_template"].format(tag=resolved_tag)
     bundle_url, expected_hash = asset_download_info(release, bundle_asset_name)
-    bundle_bytes = download_bytes(bundle_url)
-    verify_sha256(bundle_bytes, expected_hash, bundle_asset_name)
+    bundles_root.mkdir(parents=True, exist_ok=True)
+    # Same-volume temporary directory containing the only archive and extracted candidate tree.
+    # 包含唯一归档与解压候选目录树的同卷临时目录。
+    with tempfile.TemporaryDirectory(
+        prefix=f".{resolved_tag}-",
+        dir=bundles_root,
+    ) as temporary_directory:
+        temporary_root = Path(temporary_directory)
+        staged_root = temporary_root / "bundle"
+        staged_dist_root = staged_root / "dist"
+        staged_dist_root.mkdir(parents=True, exist_ok=True)
+        # Unique temporary archive filled and hashed incrementally before any extraction.
+        # 在任何解压前以增量方式写入并哈希的唯一临时归档。
+        archive_path = staged_root / bundle_asset_name
+        download_verified_file(
+            bundle_url,
+            archive_path,
+            expected_hash,
+            bundle_asset_name,
+        )
+        with zipfile.ZipFile(archive_path) as archive:
+            archive.extractall(staged_dist_root)
+        archive_path.unlink(missing_ok=True)
 
-    if bundle_root.exists():
-        shutil.rmtree(bundle_root)
-    dist_root.mkdir(parents=True, exist_ok=True)
-    archive_path = bundle_root / bundle_asset_name
-    archive_path.write_bytes(bundle_bytes)
-    with zipfile.ZipFile(archive_path) as archive:
-        archive.extractall(dist_root)
-    archive_path.unlink(missing_ok=True)
-
-    if not compat_path.exists():
-        raise RuntimeError(f"downloaded bundle does not contain lua_packages.txt: {dist_root}")
+        staged_compat_path = staged_dist_root / "lua_packages.txt"
+        if not staged_compat_path.is_file():
+            raise RuntimeError(
+                f"downloaded bundle does not contain lua_packages.txt: {staged_dist_root}"
+            )
+        publish_staged_bundle(staged_root, bundle_root)
 
     return {
         "schema_version": 1,

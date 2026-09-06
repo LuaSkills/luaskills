@@ -1,6 +1,7 @@
 use super::lease::default_runlua_exec_args;
 use super::*;
 use crate::runtime::path::normalize_host_input_path_text;
+use crate::runtime::process_session::finalize_one_shot_process_tree;
 use std::sync::OnceLock;
 
 /// RunLua execution request accepted by `vulcan.runtime.lua.exec`.
@@ -1066,13 +1067,16 @@ pub(super) fn execute_exec_request(request: ExecRequest) -> ExecResult {
         Stdio::null()
     });
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            let error_text = format!("failed to spawn process: {}", error);
-            return exec_error_result(error_text, &request, false);
-        }
-    };
+    // Managed one-shot ownership tuple that covers the direct child, descendants, and bounded reaper capacity.
+    // 覆盖直接子进程、后代进程与有界回收容量的受管单次执行所有权元组。
+    let (mut child, process_tree, reaper_permit) =
+        match ManagedChildProcessTree::spawn_with_keepalive(&mut command, "process.exec", None) {
+            Ok(ownership) => ownership,
+            Err(error) => {
+                let error_text = format!("failed to spawn process: {}", error);
+                return exec_error_result(error_text, &request, false);
+            }
+        };
 
     let stdout_handle = child
         .stdout
@@ -1094,7 +1098,12 @@ pub(super) fn execute_exec_request(request: ExecRequest) -> ExecResult {
     // 用于将已运行时间与请求超时时长比较的进程启动时间点。
     let started_at = Instant::now();
 
-    let final_status = loop {
+    // Direct-child wait failure retained until the same unified process-tree finalizer has preserved ownership.
+    // 保留到统一进程树收尾器完成所有权保护后的直接子进程等待失败。
+    let mut wait_error = None;
+    // Direct-child status observed before the unified finalizer terminates any remaining descendants.
+    // 统一收尾器终止残留后代前观察到的直接子进程状态。
+    let observed_status = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 break Some(status);
@@ -1104,20 +1113,41 @@ pub(super) fn execute_exec_request(request: ExecRequest) -> ExecResult {
                     && started_at.elapsed() >= Duration::from_millis(timeout_ms)
                 {
                     timed_out_after_ms = Some(timeout_ms);
-                    let _ = child.kill();
-                    break crate::runtime::process_session::wait_for_child_exit_until(
-                        &mut child,
-                        Instant::now() + Duration::from_secs(5),
-                        "runlua timed-out direct child",
-                    )
-                    .ok();
+                    break None;
                 }
                 thread::sleep(Duration::from_millis(10));
             }
             Err(error) => {
-                let error_text = format!("failed to wait for process: {}", error);
-                return exec_error_result(error_text, &request, timed_out_after_ms.is_some());
+                wait_error = Some(format!("failed to wait for process: {}", error));
+                break None;
             }
+        }
+    };
+    // Final direct-child status returned only after the complete one-shot process tree is closed.
+    // 仅在完整单次执行进程树关闭后返回的最终直接子进程状态。
+    let final_status = match finalize_one_shot_process_tree(
+        child,
+        process_tree,
+        reaper_permit,
+        observed_status,
+        "process.exec",
+    ) {
+        Ok(status) if wait_error.is_none() => Some(status),
+        Ok(_) => {
+            return exec_error_result(
+                wait_error.unwrap_or_else(|| "failed to wait for process".to_string()),
+                &request,
+                timed_out_after_ms.is_some(),
+            );
+        }
+        Err(cleanup_error) => {
+            // Combined wait and cleanup error prevents the primary lifecycle failure from being hidden.
+            // 组合等待与清理错误，避免主要生命周期失败被隐藏。
+            let error_text = match wait_error {
+                Some(wait_error) => format!("{wait_error}; cleanup failed: {cleanup_error}"),
+                None => cleanup_error,
+            };
+            return exec_error_result(error_text, &request, timed_out_after_ms.is_some());
         }
     };
 
@@ -1440,7 +1470,9 @@ impl LuaEngine {
             .map_err(|error| error.to_string())?;
         let execution_result = Self::execute_runlua_wrapper(lua, &wrapper, entry_file.as_deref());
         Self::remove_runlua_timeout_guard(lua);
-        let printed_output = lock_runlua_print_capture(&captured_output).clone();
+        // Printed output transfers out of the request-local capture buffer to avoid cloning every line.
+        // 打印输出从请求局部捕获缓冲区直接转移，避免逐行克隆完整结果。
+        let printed_output = std::mem::take(&mut *lock_runlua_print_capture(&captured_output));
 
         let render_result = match execution_result {
             Ok(returned_values) => {
@@ -1467,10 +1499,12 @@ impl LuaEngine {
     /// Execute one isolated runlua request using the current engine snapshots.
     /// 使用当前引擎快照执行一次隔离 runlua 请求。
     fn execute_runlua_request_inline(&self, request: &RunLuaExecRequest) -> Result<String, String> {
+        // Runtime context shares the exact immutable maps owned by the current engine load generation.
+        // 运行时上下文共享当前引擎加载代拥有的精确不可变映射。
         let runtime_context = RunLuaRuntimeContext::from_engine(
             self,
-            Arc::new(self.skills.clone()),
-            Arc::new(self.entry_registry.clone()),
+            Arc::clone(&self.skills),
+            Arc::clone(&self.entry_registry),
         );
         Self::execute_runlua_request_inline_with_runtime(request, runtime_context)
     }

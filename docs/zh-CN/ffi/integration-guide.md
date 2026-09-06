@@ -2145,8 +2145,8 @@ Go 宿主如果希望用 Go module 封装主链，建议优先使用独立仓库
 `demo_runtime` 会：
 
 - 使用仓库内空 runtime root
-- 动态安装 `LuaSkills/luaskills-demo-skill`
-- 调用 `luaskills-demo-skill-demo-status`
+- 动态安装 `LuaSkills/demo-skill`
+- 调用 `demo-skill-demo-status`
 - 输出 success
 
 ### 15.1 示例选型速查

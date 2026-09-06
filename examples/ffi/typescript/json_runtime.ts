@@ -221,12 +221,27 @@ Small JSON FFI adapter that owns buffer decoding and envelope validation.
  */
 export class JsonFfiClient {
   /**
-  Bind one loaded luaskills dynamic library and the owned-buffer ABI shape.
-  绑定一个已加载的 luaskills 动态库以及拥有型缓冲 ABI 结构。
+  Loaded dynamic library that owns every JSON FFI function binding.
+  拥有全部 JSON FFI 函数绑定的已加载动态库。
+   */
+  private readonly library: koffi.IKoffiLib;
+
+  /**
+  Lazily cached self-description returned by the library.
+  由动态库返回的惰性缓存自描述信息。
    */
   private describeCache: JsonMap | null = null;
 
-  constructor(private readonly library: koffi.IKoffiLib) {}
+  /**
+  Bind one loaded luaskills dynamic library to the JSON FFI client.
+  将一个已加载的 luaskills 动态库绑定到 JSON FFI 客户端。
+
+  @param library Loaded Koffi library that owns the exported function addresses.
+  library 参数：持有导出函数地址的已加载 Koffi 动态库。
+   */
+  constructor(library: koffi.IKoffiLib) {
+    this.library = library;
+  }
 
   /**
   Call one JSON FFI function with one payload and return the decoded result body.
@@ -361,13 +376,29 @@ Shared host wrapper around the repository standard-runtime fixture root.
  */
 export class StandardFixtureRuntimeClient {
   /**
+  Low-level JSON FFI transport shared by this fixture wrapper.
+  当前夹具包装器共享的底层 JSON FFI 传输器。
+   */
+  private readonly client: JsonFfiClient;
+
+  /**
+  Absolute runtime root used by every fixture request.
+  每个夹具请求使用的绝对运行时根目录。
+   */
+  readonly runtimeRoot: string;
+
+  /**
   Bind one JSON client to one runtime root and ensure the fixture layout exists.
   将一个 JSON 客户端绑定到一个运行时根目录，并确保夹具目录结构存在。
+
+  @param client Low-level JSON FFI transport shared by the wrapper.
+  client 参数：包装器共享的底层 JSON FFI 传输器。
+  @param runtimeRoot Absolute runtime root used to build fixture paths.
+  runtimeRoot 参数：用于构造夹具路径的绝对运行时根目录。
    */
-  constructor(
-    private readonly client: JsonFfiClient,
-    readonly runtimeRoot: string,
-  ) {
+  constructor(client: JsonFfiClient, runtimeRoot: string) {
+    this.client = client;
+    this.runtimeRoot = runtimeRoot;
     ensureStandardFixtureLayout(runtimeRoot);
   }
 
@@ -577,15 +608,52 @@ Stateful host helper that wraps one engine's runtime-lease JSON API.
  */
 export class RuntimeLeaseClient {
   /**
+  Low-level JSON FFI transport used for runtime-lease requests.
+  运行时租约请求使用的底层 JSON FFI 传输器。
+   */
+  private readonly client: JsonFfiClient;
+
+  /**
+  Stable numeric engine handle that owns the requested leases.
+  拥有所请求租约的稳定数值引擎句柄。
+   */
+  private readonly engineId: number;
+
+  /**
+  Optional host-injected authority selecting dedicated system endpoints.
+  用于选择专用 system 入口的可选宿主注入权限。
+   */
+  private readonly systemToolAuthority?: SkillManagementAuthority;
+
+  /**
+  Optional authoritative system package supplied to system lease creation.
+  提供给 system 租约创建的可选权威系统包。
+   */
+  private readonly systemPackage?: SystemRuntimePackageDescriptor;
+
+  /**
   Bind one JSON client to one existing engine id.
   将一个 JSON 客户端绑定到一个已有引擎标识。
+
+  @param client Low-level JSON FFI transport used for lease requests.
+  client 参数：租约请求使用的底层 JSON FFI 传输器。
+  @param engineId Existing positive engine handle.
+  engineId 参数：现有的正数引擎句柄。
+  @param systemToolAuthority Optional authority selecting system lease endpoints.
+  systemToolAuthority 参数：选择 system 租约入口的可选权限。
+  @param systemPackage Optional package identity required by system lease creation.
+  systemPackage 参数：system 租约创建要求的可选包身份。
    */
   constructor(
-    private readonly client: JsonFfiClient,
-    private readonly engineId: number,
-    private readonly systemToolAuthority?: SkillManagementAuthority,
-    private readonly systemPackage?: SystemRuntimePackageDescriptor,
+    client: JsonFfiClient,
+    engineId: number,
+    systemToolAuthority?: SkillManagementAuthority,
+    systemPackage?: SystemRuntimePackageDescriptor,
   ) {
+    this.client = client;
+    this.engineId = engineId;
+    this.systemToolAuthority = systemToolAuthority;
+    this.systemPackage = systemPackage;
     requireJsonSafeInteger(engineId, "engine_id", 1);
   }
 
@@ -795,6 +863,24 @@ Authority-bound JSON client for engine-level System managed-session events.
  */
 export class ManagedSessionEventsClient {
   /**
+  Low-level JSON FFI transport used for event polling and waiting.
+  事件轮询与等待使用的底层 JSON FFI 传输器。
+   */
+  private readonly client: JsonFfiClient;
+
+  /**
+  Stable numeric engine handle whose managed-session events are consumed.
+  被消费受管会话事件所属的稳定数值引擎句柄。
+   */
+  private readonly engineId: number;
+
+  /**
+  Host-injected authority required by managed-session event endpoints.
+  受管会话事件入口要求的宿主注入权限。
+   */
+  private readonly authority: SkillManagementAuthority;
+
+  /**
   Bind one JSON client, engine id, and host-injected authority.
   绑定一个 JSON 客户端、引擎标识与宿主注入的 authority。
 
@@ -806,10 +892,13 @@ export class ManagedSessionEventsClient {
   authority 参数：事件接口要求的宿主注入权限。
    */
   constructor(
-    private readonly client: JsonFfiClient,
-    private readonly engineId: number,
-    private readonly authority: SkillManagementAuthority,
+    client: JsonFfiClient,
+    engineId: number,
+    authority: SkillManagementAuthority,
   ) {
+    this.client = client;
+    this.engineId = engineId;
+    this.authority = authority;
     requireJsonSafeInteger(engineId, "engine_id", 1);
   }
 
@@ -861,16 +950,62 @@ Authority-bound helper that wraps one engine's system JSON FFI entrypoints.
  */
 export class SystemEngineJsonClient {
   /**
+  Low-level JSON FFI transport used by system operations.
+  system 操作使用的底层 JSON FFI 传输器。
+   */
+  private readonly client: JsonFfiClient;
+
+  /**
+  Stable numeric engine handle bound to this wrapper.
+  绑定到当前包装器的稳定数值引擎句柄。
+   */
+  private readonly engineId: number;
+
+  /**
+  Host-injected authority attached to every system request.
+  附加到每个 system 请求的宿主注入权限。
+   */
+  private readonly authority: SkillManagementAuthority;
+
+  /**
+  Default ordered skill-root chain used when a call does not override roots.
+  调用未覆盖根目录时使用的默认有序技能根链。
+   */
+  private readonly defaultSkillRoots: JsonMap[];
+
+  /**
+  Optional default system package used by system runtime-lease helpers.
+  system 运行时租约辅助器使用的可选默认系统包。
+   */
+  private readonly defaultSystemPackage?: SystemRuntimePackageDescriptor;
+
+  /**
   Bind one JSON client, engine id, authority, and optional default skill-root chain.
   绑定一个 JSON 客户端、引擎标识、authority 与可选默认技能根链。
+
+  @param client Low-level JSON FFI transport used by system operations.
+  client 参数：system 操作使用的底层 JSON FFI 传输器。
+  @param engineId Existing positive engine handle.
+  engineId 参数：现有的正数引擎句柄。
+  @param authority Host-injected authority attached to each request.
+  authority 参数：附加到每个请求的宿主注入权限。
+  @param defaultSkillRoots Ordered fallback roots used when a call omits roots.
+  defaultSkillRoots 参数：调用省略根目录时使用的有序后备根链。
+  @param defaultSystemPackage Optional package identity used by system lease helpers.
+  defaultSystemPackage 参数：system 租约辅助器使用的可选包身份。
    */
   constructor(
-    private readonly client: JsonFfiClient,
-    private readonly engineId: number,
-    private readonly authority: SkillManagementAuthority,
-    private readonly defaultSkillRoots: JsonMap[] = [],
-    private readonly defaultSystemPackage?: SystemRuntimePackageDescriptor,
+    client: JsonFfiClient,
+    engineId: number,
+    authority: SkillManagementAuthority,
+    defaultSkillRoots: JsonMap[] = [],
+    defaultSystemPackage?: SystemRuntimePackageDescriptor,
   ) {
+    this.client = client;
+    this.engineId = engineId;
+    this.authority = authority;
+    this.defaultSkillRoots = defaultSkillRoots;
+    this.defaultSystemPackage = defaultSystemPackage;
     requireJsonSafeInteger(engineId, "engine_id", 1);
   }
 
@@ -1124,15 +1259,53 @@ Stable host-side runtime-lease handle that carries lease identity guards automat
  */
 export class RuntimeLeaseHandle {
   /**
+  Runtime-lease client used for all operations on this identity.
+  当前身份全部操作使用的运行时租约客户端。
+   */
+  private readonly sessions: RuntimeLeaseClient;
+
+  /**
+  Stable lease identifier returned by the runtime.
+  运行时返回的稳定租约标识。
+   */
+  readonly leaseId: string;
+
+  /**
+  Caller-selected stable session identifier.
+  调用方选择的稳定会话标识。
+   */
+  readonly sid: string;
+
+  /**
+  Lease generation used to reject stale handles.
+  用于拒绝陈旧句柄的租约代数。
+   */
+  readonly generation: number;
+
+  /**
   Bind one session client to one concrete lease identity triplet.
   将一个会话客户端绑定到一个具体的租约身份三元组。
+
+  @param sessions Runtime-lease client used for identity-bound operations.
+  sessions 参数：身份绑定操作使用的运行时租约客户端。
+  @param leaseId Stable runtime-generated lease identifier.
+  leaseId 参数：运行时生成的稳定租约标识。
+  @param sid Stable caller-selected session identifier.
+  sid 参数：调用方选择的稳定会话标识。
+  @param generation Lease generation used to reject stale handles.
+  generation 参数：用于拒绝陈旧句柄的租约代数。
    */
   constructor(
-    private readonly sessions: RuntimeLeaseClient,
-    readonly leaseId: string,
-    readonly sid: string,
-    readonly generation: number,
-  ) {}
+    sessions: RuntimeLeaseClient,
+    leaseId: string,
+    sid: string,
+    generation: number,
+  ) {
+    this.sessions = sessions;
+    this.leaseId = leaseId;
+    this.sid = sid;
+    this.generation = generation;
+  }
 
   /**
   Construct one runtime-lease handle from one JSON payload that contains identity fields.

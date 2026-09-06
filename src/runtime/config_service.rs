@@ -18,8 +18,8 @@ use mlua::{
 use crate::host::options::RuntimeSkillRoot;
 use crate::lua_skill::{validate_luaskills_identifier, validate_luaskills_version};
 use crate::runtime::config::{
-    SkillConfigDeleteResult, SkillConfigEntry, SkillConfigRefreshResult, SkillConfigReloadWatcher,
-    SkillConfigStore, SkillConfigWriteResult,
+    SkillConfigDeleteResult, SkillConfigEntry, SkillConfigRefreshResult, SkillConfigReloadTarget,
+    SkillConfigReloadWatcher, SkillConfigStore, SkillConfigWriteResult,
 };
 use crate::skill::config::{
     SkillPackageConfigConstraints, SkillPackageConfigDeclaration, SkillPackageConfigFormat,
@@ -688,9 +688,9 @@ pub(crate) struct SkillPackageConfigService {
     /// Root-aware normal and system package configuration stores.
     /// 感知根归属的普通与系统技能包配置存储。
     stores: Option<SkillConfigStoreRouter>,
-    /// Active native file watchers retained for the service lifetime.
-    /// 在服务生命周期内保留的活动原生文件监听器。
-    _watchers: Vec<SkillConfigReloadWatcher>,
+    /// Single shared native file watcher retained for the service lifetime.
+    /// 在服务生命周期内保留的单个共享原生文件监听器。
+    _watcher: Option<SkillConfigReloadWatcher>,
     /// Ordered configuration event queue shared with watcher callbacks.
     /// 与监听回调共享的有序配置事件队列。
     events: Arc<SkillConfigEventQueue>,
@@ -724,19 +724,35 @@ impl SkillPackageConfigService {
                 SKILL_CONFIG_MAX_WATCH_DEBOUNCE_MS
             ));
         }
+        // Optional root-aware store router created only when persistence is enabled.
+        // 仅在启用持久化时创建的可选根感知存储路由器。
         let stores = skill_config_root
             .map(|root| SkillConfigStoreRouter::new(root, lock_timeout))
             .transpose()?;
+        // Ordered event queue shared by synchronous API calls and watcher callbacks.
+        // 同步 API 调用与监听器回调共享的有序事件队列。
         let events = Arc::new(SkillConfigEventQueue::new());
-        let mut watchers = Vec::new();
-        if let Some(stores) = stores.as_ref() {
+        // One native watcher shared by normal and system configuration domains.
+        // 普通与系统配置域共享的单个原生监听器。
+        let watcher = if let Some(stores) = stores.as_ref() {
+            // Exact target list routed through the shared watcher worker.
+            // 通过共享监听工作线程路由的精确目标列表。
+            let mut targets = Vec::with_capacity(2);
             for (scope, store) in [
                 ("skills", Arc::clone(&stores.normal)),
                 ("system-skills", Arc::clone(&stores.system)),
             ] {
+                // Queue reference captured by this domain's ordered callback.
+                // 当前配置域有序回调捕获的队列引用。
                 let callback_events = Arc::clone(&events);
+                // Store reference used to project refresh events after reload.
+                // 重载后用于投影刷新事件的存储引用。
                 let callback_store = Arc::clone(&store);
+                // Stable store scope included in every emitted event.
+                // 每个发出事件包含的稳定存储作用域。
                 let callback_scope = scope.to_string();
+                // Domain callback preserving existing event projection and ordering.
+                // 保留现有事件投影与顺序的配置域回调。
                 let callback = Arc::new(move |result: Result<SkillConfigRefreshResult, String>| {
                     publish_external_refresh_events(
                         callback_events.as_ref(),
@@ -745,24 +761,19 @@ impl SkillPackageConfigService {
                         result,
                     );
                 });
-                match SkillConfigReloadWatcher::start(store, watch_debounce, callback) {
-                    Ok(watcher) => watchers.push(watcher),
-                    Err(error) => publish_external_refresh_events(
-                        events.as_ref(),
-                        scope,
-                        if scope == "skills" {
-                            stores.normal.as_ref()
-                        } else {
-                            stores.system.as_ref()
-                        },
-                        Err(error),
-                    ),
-                }
+                targets.push(SkillConfigReloadTarget::new(store, callback));
             }
-        }
+            retain_config_watcher_or_publish_start_failure(
+                SkillConfigReloadWatcher::start(targets, watch_debounce),
+                stores,
+                events.as_ref(),
+            )
+        } else {
+            None
+        };
         Ok(Self {
             stores,
-            _watchers: watchers,
+            _watcher: watcher,
             events,
             registry: RwLock::new(BTreeMap::new()),
             installed: RwLock::new(Vec::new()),
@@ -1135,8 +1146,21 @@ impl SkillPackageConfigService {
         skill_id: &str,
         key: &str,
     ) -> Result<Option<String>, String> {
-        let declaration = self.declaration(skill_id, key)?;
-        if let Some(stored) = self.store_for_skill(skill_id)?.get_value(skill_id, key)? {
+        // Package is cloned once while the registry read lock is held and reused after lock release.
+        // 包注册项仅在持有注册表读锁时克隆一次，并在锁释放后复用。
+        let package = self.package(skill_id)?;
+        // Declaration is resolved from the same immutable package snapshot used for store routing.
+        // 声明从同一不可变包快照解析，并与存储路由共用该快照。
+        let declaration = package.find(key).cloned().ok_or_else(|| {
+            format!(
+                "CONFIG_KEY_UNDECLARED: configuration key '{}' is not declared by skill package '{}'",
+                key, skill_id
+            )
+        })?;
+        // Store is selected from the already-resolved package without another registry lookup.
+        // 存储从已解析包中选择，不再执行第二次注册表查找。
+        let store = self.store_for_package(&package)?;
+        if let Some(stored) = store.get_value(skill_id, key)? {
             return declaration
                 .normalize_value_detailed(&stored)
                 .map(Some)
@@ -1638,6 +1662,39 @@ impl SkillPackageConfigService {
         self.registry
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Retain one successfully started configuration watcher or publish a recoverable startup failure for every store domain.
+/// 保留一个成功启动的配置监听器，或为每个存储域发布可恢复的启动失败事件。
+///
+/// The watcher_result parameter is the single shared backend startup result.
+/// watcher_result 参数是单个共享后端的启动结果。
+///
+/// The stores parameter provides the exact ordinary and system stores associated with the failed backend.
+/// stores 参数提供与失败后端关联的精确普通存储和系统存储。
+///
+/// The events parameter receives one ordered failure event per affected store domain.
+/// events 参数为每个受影响的存储域接收一条有序失败事件。
+///
+/// Returns the live watcher on success or None after publishing a recoverable failure.
+/// 成功时返回活动监听器；发布可恢复失败后返回 None。
+fn retain_config_watcher_or_publish_start_failure(
+    watcher_result: Result<SkillConfigReloadWatcher, String>,
+    stores: &SkillConfigStoreRouter,
+    events: &SkillConfigEventQueue,
+) -> Option<SkillConfigReloadWatcher> {
+    match watcher_result {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            for (store_scope, store) in [
+                ("skills", stores.normal.as_ref()),
+                ("system-skills", stores.system.as_ref()),
+            ] {
+                publish_external_refresh_events(events, store_scope, store, Err(error.clone()));
+            }
+            None
+        }
     }
 }
 
@@ -2898,5 +2955,44 @@ end"#,
         );
 
         let _ = std::fs::remove_dir_all(&config_file);
+    }
+
+    /// Verify a shared watcher startup failure is reported for both domains without becoming a service-construction error.
+    /// 验证共享监听器启动失败会向两个配置域报告，同时不会升级为服务构造错误。
+    #[test]
+    fn watcher_start_failure_is_published_as_recoverable_domain_events() {
+        // ConfigRoot provides two valid stores while the watcher failure itself is injected deterministically.
+        // ConfigRoot 提供两个有效存储，同时以确定性方式注入监听器失败。
+        let config_root = test_config_file("watcher_start_failure");
+        // Stores model the already-usable persistence layer that must survive watcher unavailability.
+        // Stores 模拟监听器不可用时仍必须保留的可用持久化层。
+        let stores = SkillConfigStoreRouter::new(config_root.clone(), Duration::from_secs(5))
+            .expect("create config stores");
+        // Events receive the recoverable failure projections for both exact domains.
+        // Events 接收两个精确配置域的可恢复失败投影。
+        let events = SkillConfigEventQueue::new();
+
+        let watcher = retain_config_watcher_or_publish_start_failure(
+            Err("CONFIG_WATCHER_FAILED: injected startup failure".to_string()),
+            &stores,
+            &events,
+        );
+
+        assert!(watcher.is_none());
+        // Batch proves both domains remain independently observable after one shared backend failure.
+        // Batch 证明单个共享后端失败后两个配置域仍可被独立观察。
+        let batch = events.poll(None, 10).expect("poll watcher failures");
+        assert_eq!(batch.events.len(), 2);
+        assert_eq!(batch.events[0].store_scope, "skills");
+        assert_eq!(batch.events[1].store_scope, "system-skills");
+        assert!(batch.events.iter().all(|event| {
+            event.event_type == "skill_config_reload_failed"
+                && event
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.code == "CONFIG_WATCHER_FAILED")
+        }));
+
+        let _cleanup_result = std::fs::remove_dir_all(config_root);
     }
 }

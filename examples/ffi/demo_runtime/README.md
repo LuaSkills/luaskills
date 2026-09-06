@@ -6,8 +6,8 @@
 
 - 创建空运行时目录
 - 通过 FFI 创建引擎
-- 通过 system install 动态安装 `LuaSkills/luaskills-demo-skill`
-- 调用 `luaskills-demo-skill-demo-status`
+- 通过 system install 动态安装 `LuaSkills/demo-skill`
+- 调用 `demo-skill-demo-status`
 - 输出 success 级别的烟测结果
 
 注意：这个 smoke demo 使用单一 `ROOT` 演示 root 验证 system 安装链路，并显式注入 `authority = "system"`，不代表正式产品的用户可见层级设计。正式宿主启动或加载时必须传入 `ROOT` root；若要开放普通用户安装，应额外传入 `PROJECT` 或 `USER`，并让普通 install/update/uninstall 只落到这些层。若把 system tools 封装给普通 tools，应固定注入 `DelegatedTool` authority，不要把 `ROOT` 级调整能力暴露给普通用户。
@@ -38,8 +38,8 @@ python .\examples\ffi\demo_runtime\run_python_install_demo.py
 1. 清理 demo skill 在当前 runtime root 下的旧安装痕迹
 2. 创建引擎
 3. 加载包含 `ROOT` 的 root 链
-4. 通过 `luaskills_ffi_system_install_skill_json` 动态安装 `LuaSkills/luaskills-demo-skill` 到 `ROOT`
-5. 调用 `luaskills-demo-skill-demo-status`
+4. 通过 `luaskills_ffi_system_install_skill_json` 动态安装 `LuaSkills/demo-skill` 到 `ROOT`
+5. 调用 `demo-skill-demo-status`
 6. 校验返回结果
 7. 输出 success
 

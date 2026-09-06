@@ -4,9 +4,9 @@ use super::{
     SkillManagerConfig, SkillOperationPlane, SkillUninstallResult, TempDirGuard,
     collect_effective_skill_instances, collect_effective_skill_instances_from_roots,
     format_uninstall_finalization_error, github_repo_skill_id, is_allowed_private_source_url,
-    is_skill_manifest_enabled, normalize_github_repo_locator, remove_staging_dir_if_present,
-    resolve_effective_skill_instance, resolve_requested_skill_id, staging_temp_root_is_directory,
-    unix_millis_from_system_time,
+    is_skill_manifest_enabled, normalize_github_repo_locator, publish_staged_skill_update,
+    remove_staging_dir_if_present, resolve_effective_skill_instance, resolve_requested_skill_id,
+    staging_temp_root_is_directory, unix_millis_from_system_time,
 };
 use crate::runtime::path::render_host_visible_path;
 use crate::runtime_options::RuntimeSkillRoot;
@@ -136,6 +136,90 @@ fn uninstall_finalization_error_appends_rollback_failure() {
     );
 }
 
+/// Verify a failed staged update publication restores the previous package into the canonical target.
+/// 验证已暂存更新发布失败时会把旧版本包恢复到规范目标目录。
+#[test]
+fn staged_update_publish_failure_restores_previous_package() {
+    // Isolated filesystem root for the deterministic publication-failure fixture.
+    // 确定性发布失败夹具使用的隔离文件系统根目录。
+    let temp_root = std::env::temp_dir().join(format!(
+        "luaskills_update_publish_rollback_success_test_{}",
+        std::process::id()
+    ));
+    if temp_root.exists() {
+        // Stale fixture cleanup is intentionally ignored before deterministic recreation.
+        // 确定性重建前对陈旧夹具的清理结果有意忽略。
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+    std::fs::create_dir_all(&temp_root).expect("temporary root should be created");
+    // Missing staged directory that deterministically makes the primary publication rename fail.
+    // 确定性触发主要发布重命名失败的缺失暂存目录。
+    let staged_dir = temp_root.join("missing-staged");
+    // Canonical target that must receive the restored previous package.
+    // 必须接收已恢复旧版本包的规范目标目录。
+    let target_dir = temp_root.join("installed");
+    // Existing backup directory that makes the rollback rename succeed.
+    // 使回滚重命名成功的现有备份目录。
+    let backup_dir = temp_root.join("backup");
+    std::fs::create_dir_all(&backup_dir).expect("backup directory should be created");
+    std::fs::write(backup_dir.join("old.txt"), "old")
+        .expect("previous package marker should be written");
+
+    // Publication error returned after the previous package has been restored successfully.
+    // 旧版本包成功恢复后返回的发布错误。
+    let error = publish_staged_skill_update(&staged_dir, &target_dir, &backup_dir)
+        .expect_err("missing staged directory should fail publication");
+
+    assert!(error.contains("Failed to move updated skill"));
+    assert!(!error.contains("rollback failed"));
+    assert_eq!(
+        std::fs::read_to_string(target_dir.join("old.txt"))
+            .expect("restored previous package marker should be readable"),
+        "old"
+    );
+    assert!(!backup_dir.exists());
+    std::fs::remove_dir_all(&temp_root).expect("temporary root should be removed");
+}
+
+/// Verify a failed staged update rollback is reported together with uncertain disk state.
+/// 验证已暂存更新回滚失败时会同时报告失败并标明磁盘状态不确定。
+#[test]
+fn staged_update_publish_failure_reports_rollback_failure() {
+    // Isolated filesystem root for the deterministic double-failure fixture.
+    // 确定性双重失败夹具使用的隔离文件系统根目录。
+    let temp_root = std::env::temp_dir().join(format!(
+        "luaskills_update_publish_rollback_failure_test_{}",
+        std::process::id()
+    ));
+    if temp_root.exists() {
+        // Stale fixture cleanup is intentionally ignored before deterministic recreation.
+        // 确定性重建前对陈旧夹具的清理结果有意忽略。
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+    std::fs::create_dir_all(&temp_root).expect("temporary root should be created");
+    // Missing staged directory that deterministically makes primary publication fail.
+    // 确定性触发主要发布失败的缺失暂存目录。
+    let staged_dir = temp_root.join("missing-staged");
+    // Missing canonical target retained to prove no package was silently restored.
+    // 保持缺失以证明没有静默恢复任何包的规范目标目录。
+    let target_dir = temp_root.join("installed");
+    // Missing backup directory that deterministically makes rollback fail too.
+    // 确定性触发回滚也失败的缺失备份目录。
+    let backup_dir = temp_root.join("missing-backup");
+
+    // Combined failure that must preserve both the publication and rollback diagnostics.
+    // 必须同时保留发布与回滚诊断的组合失败。
+    let error = publish_staged_skill_update(&staged_dir, &target_dir, &backup_dir)
+        .expect_err("missing staged and backup directories should fail publication and rollback");
+
+    assert!(error.contains("Failed to move updated skill"));
+    assert!(error.contains("rollback failed to restore"));
+    assert!(error.contains("skill disk state is uncertain"));
+    assert!(error.contains(&render_host_visible_path(&backup_dir)));
+    assert!(!target_dir.exists());
+    std::fs::remove_dir_all(&temp_root).expect("temporary root should be removed");
+}
+
 /// Verify that the staging-directory guard cleans temp roots on drop.
 /// 验证暂存目录守卫会在析构时清理临时根目录。
 #[test]
@@ -247,24 +331,24 @@ fn staging_temp_root_rejects_file_path() {
     let _ = std::fs::remove_dir_all(&temp_root);
 }
 
-/// Verify effective skill collection reports root probe errors instead of treating invalid roots as empty.
-/// 验证生效技能收集会报告根目录探测错误，而不是把非法根目录当作空目录。
+/// Verify effective skill collection reports directory-open errors instead of treating invalid roots as empty.
+/// 验证生效技能收集会报告目录打开错误，而不是把非法根目录当作空目录。
 #[test]
 fn collect_effective_skill_instances_rejects_skill_root_probe_errors() {
-    // Runtime skill root containing one embedded NUL that filesystem metadata cannot inspect.
-    // 包含内嵌 NUL 的运行时技能根，文件系统元数据无法探测该路径。
+    // Runtime skill root containing one embedded NUL that the filesystem cannot open.
+    // 包含内嵌 NUL 且文件系统无法打开的运行时技能根。
     let invalid_root = RuntimeSkillRoot {
         name: "ROOT".to_string(),
         skills_dir: std::path::PathBuf::from("invalid\0skills"),
     };
 
-    // Error returned before the invalid root can behave like an empty root map.
-    // 在非法根表现得像空根映射之前返回的错误。
+    // Error returned by the single real directory-open operation.
+    // 单次真实目录打开操作返回的错误。
     let error = collect_effective_skill_instances_from_roots(&[invalid_root])
         .expect_err("invalid skill root metadata probe should fail");
 
     assert!(
-        error.contains("Failed to inspect skill root"),
+        error.contains("Failed to read skill root"),
         "unexpected error: {}",
         error
     );
@@ -296,13 +380,13 @@ fn collect_effective_skill_instances_rejects_file_skill_root() {
         skills_dir: file_root.clone(),
     };
 
-    // Error returned before the file root can fall through to directory traversal.
-    // 在文件型根继续进入目录遍历之前返回的错误。
+    // Error returned directly by opening the file path as a directory.
+    // 直接把文件路径作为目录打开时返回的错误。
     let error = collect_effective_skill_instances_from_roots(&[root])
         .expect_err("file skill root should fail");
 
     assert!(
-        error.contains("Skill root is not a directory"),
+        error.contains("Failed to read skill root"),
         "unexpected error: {}",
         error
     );
@@ -720,6 +804,66 @@ fn uninstall_skill_reports_not_removed_when_package_dir_is_missing() {
 
     assert!(!result.skill_removed);
     assert_eq!(result.message, "skill package directory not found");
+    let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+/// Verify the path-aware uninstall API rejects a directory outside the manager-owned skill root.
+/// 验证带路径卸载 API 会拒绝管理器所拥有技能根之外的目录。
+#[test]
+fn uninstall_skill_at_path_rejects_unmanaged_directory_without_side_effects() {
+    // Temporary root that isolates the manager root and the protected external directory.
+    // 隔离管理器根目录与受保护外部目录的临时根。
+    let temp_root = std::env::temp_dir().join(format!(
+        "luaskills_unmanaged_uninstall_path_test_{}",
+        std::process::id()
+    ));
+    if temp_root.exists() {
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+    // Skill root exclusively owned by the manager under test.
+    // 被测管理器唯一拥有的技能根目录。
+    let skill_root = temp_root.join("skills");
+    // External directory that must never be staged or deleted by this manager.
+    // 绝不能被当前管理器暂存或删除的外部目录。
+    let protected_dir = temp_root.join("protected");
+    // Marker proving that rejection happens without moving or deleting external contents.
+    // 用于证明拒绝过程不会移动或删除外部内容的标记文件。
+    let marker_path = protected_dir.join("keep.txt");
+    std::fs::create_dir_all(&protected_dir).expect("protected directory should be created");
+    std::fs::write(&marker_path, "keep").expect("protected marker should be written");
+    // Manager whose valid uninstall target is skills/vulcan-codekit, not protected/.
+    // 合法卸载目标是 skills/vulcan-codekit 而非 protected/ 的管理器。
+    let manager = SkillManager::new(test_manager_config(
+        &temp_root,
+        RuntimeSkillRoot {
+            name: "USER".to_string(),
+            skills_dir: skill_root,
+        },
+    ));
+
+    // Error returned before lifecycle state creation or any external-directory mutation.
+    // 在创建生命周期状态或修改外部目录之前返回的错误。
+    let error = manager
+        .prepare_uninstall_skill_at_path_in_plane(
+            SkillOperationPlane::Skills,
+            "vulcan-codekit",
+            &protected_dir,
+        )
+        .expect_err("unmanaged uninstall directory should be rejected");
+
+    assert!(
+        error.contains("unmanaged directory"),
+        "unexpected error: {}",
+        error
+    );
+    assert!(
+        marker_path.is_file(),
+        "protected marker should remain after rejection"
+    );
+    assert!(
+        !temp_root.join("state").exists(),
+        "lifecycle state should not be created before target ownership validation"
+    );
     let _ = std::fs::remove_dir_all(&temp_root);
 }
 

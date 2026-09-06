@@ -416,21 +416,10 @@ impl LoadedSqliteApi {
     /// Load the SQLite dynamic library using host conventions, preferring an explicit environment variable and runtime directories.
     /// 按宿主约定加载 SQLite 动态库，优先查找显式环境变量和运行时目录。
     fn load(library_path: &Path) -> Result<Self, String> {
-        if !library_path.exists() {
-            return Err(format!(
-                "SQLite dynamic library path does not exist: {}",
-                render_host_visible_path(library_path)
-            ));
-        }
-
-        let library = unsafe { Library::new(library_path) }.map_err(|error| {
-            format!(
-                "failed to load {}: {}: {}",
-                render_host_visible_path(library_path),
-                error,
-                error
-            )
-        })?;
+        // Shared loader performs the only filesystem/load attempt and preserves the native error once.
+        // 共享加载器只执行一次文件系统/加载尝试，并仅保留一次原生错误。
+        let library =
+            unsafe { crate::providers::load_provider_dynamic_library(library_path, "SQLite") }?;
         unsafe { Self::from_library(library_path.to_path_buf(), library) }
     }
 

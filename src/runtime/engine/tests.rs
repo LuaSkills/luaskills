@@ -53,6 +53,7 @@ use crate::runtime::managed_session_events::{
 };
 use crate::runtime_options::LuaRuntimeRunLuaPoolConfig;
 use crate::skill::dependencies::PackageDependencyManifest;
+use crate::tool_cache::{TOOL_CACHE_CONFIG_CONFLICT_ERROR, ToolCacheConfig, global_tool_cache};
 use crate::{
     LuaEngineOptions, LuaRuntimeCapabilityOptions, LuaRuntimeHostOptions,
     LuaRuntimeManagedRuntimeConfig, RuntimeClientInfo, RuntimeHostToolAction,
@@ -64,7 +65,7 @@ use crate::{
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use mlua::{Lua, Table, Value as LuaValue};
+use mlua::{Lua, Table, UserData, Value as LuaValue};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -83,7 +84,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Barrier, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Barrier, Condvar, Mutex, MutexGuard, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(windows)]
@@ -620,6 +621,7 @@ fn make_loaded_skill(
         lancedb_binding: None,
         sqlite_binding: None,
         resolved_entry_names: HashMap::new(),
+        entry_sources: HashMap::new(),
     }
 }
 
@@ -687,8 +689,8 @@ fn make_test_engine(skills: HashMap<String, LoadedSkill>) -> LuaEngine {
             .map(|skill| (&skill.meta, skill.root_name.as_str(), skill.dir.as_path())),
     );
     LuaEngine {
-        skills,
-        entry_registry: Default::default(),
+        skills: Arc::new(skills),
+        entry_registry: Arc::new(BTreeMap::new()),
         runtime_skill_roots: Vec::new(),
         pool: Arc::new(LuaVmPool {
             config: LuaVmPoolConfig {
@@ -2746,8 +2748,7 @@ fn authority_entry_queries_reject_stale_registry_targets() {
         skill_id: "ghost-skill".to_string(),
         local_name: "ping".to_string(),
     };
-    engine
-        .entry_registry
+    Arc::make_mut(&mut engine.entry_registry)
         .insert(stale_target.canonical_name.clone(), stale_target);
 
     // Error returned by the visibility query instead of silently hiding the stale target.
@@ -2791,7 +2792,7 @@ fn list_entries_rejects_stale_registry_targets() {
         skill_id: "ghost-skill".to_string(),
         local_name: "ping".to_string(),
     };
-    missing_skill_engine.entry_registry.insert(
+    Arc::make_mut(&mut missing_skill_engine.entry_registry).insert(
         missing_skill_target.canonical_name.clone(),
         missing_skill_target,
     );
@@ -2822,7 +2823,7 @@ fn list_entries_rejects_stale_registry_targets() {
         skill_id: "alpha-skill".to_string(),
         local_name: "missing".to_string(),
     };
-    missing_entry_engine.entry_registry.insert(
+    Arc::make_mut(&mut missing_entry_engine.entry_registry).insert(
         missing_entry_target.canonical_name.clone(),
         missing_entry_target,
     );
@@ -4187,8 +4188,38 @@ fn managed_runtime_config_reaches_worker_and_session_services() {
     );
 }
 
-/// Verify invalid managed-runtime policy fails before an explicit environment root is created.
-/// 验证非法受管运行时策略会在创建显式环境根之前失败。
+/// Verify engine construction propagates a process-wide cache configuration conflict.
+/// 验证引擎构造会传播进程级缓存配置冲突。
+#[test]
+fn engine_creation_reports_process_cache_configuration_conflict() {
+    // default_cache initializes the authoritative process-wide default before the conflict.
+    // default_cache 在冲突前初始化权威的进程级默认缓存。
+    drop(global_tool_cache());
+    // host_options requests a configuration that is deliberately different from the default.
+    // host_options 请求一个刻意不同于默认值的配置。
+    let host_options = LuaRuntimeHostOptions {
+        cache_config: Some(ToolCacheConfig {
+            max_entries: 7,
+            default_ttl_secs: 11,
+            max_ttl_secs: 13,
+        }),
+        ..LuaRuntimeHostOptions::default()
+    };
+    // error is propagated through the real engine constructor instead of being ignored.
+    // error 通过真实引擎构造器传播，不再被忽略。
+    let error = LuaEngine::new(runtime_test_engine_options(host_options))
+        .err()
+        .expect("conflicting process cache configuration must reject engine creation")
+        .to_string();
+
+    assert!(
+        error.contains(TOOL_CACHE_CONFIG_CONFLICT_ERROR),
+        "unexpected cache conflict error: {error}"
+    );
+}
+
+/// Verify invalid managed-runtime policy is rejected before writable roots are allocated.
+/// 验证非法托管运行时策略会在分配可写根目录之前被拒绝。
 #[test]
 fn managed_runtime_config_validation_precedes_filesystem_allocation() {
     // FixtureRoot owns the existing runtime data root and the intentionally absent environment root.
@@ -5859,9 +5890,10 @@ fn compile_skill_into_lua_read_error_uses_host_visible_path() {
     let skill_dir = make_temp_runtime_root("compile-skill-read-path").join("skills/demo-skill");
     let _ = fs::remove_dir_all(&skill_dir);
     fs::create_dir_all(&skill_dir).expect("create compile skill fixture dir");
-    // Loaded skill metadata whose entry points at runtime/test.lua.
-    // 入口指向 runtime/test.lua 的已加载 skill 元数据。
+    // Loaded debug skill metadata whose entry points at runtime/test.lua.
+    // 入口指向 runtime/test.lua 的已加载调试 skill 元数据。
     let mut skill = make_loaded_skill("demo-skill", "demo-skill", "run", "demo_skill.run");
+    skill.meta.debug = true;
     skill.dir = skill_dir.clone();
     // Tool entry consumed by the real compile helper.
     // 真实编译辅助函数消费的工具入口。
@@ -5897,6 +5929,133 @@ fn compile_skill_into_lua_read_error_uses_host_visible_path() {
             .and_then(Path::parent)
             .expect("test skill dir should have runtime root"),
     );
+}
+
+/// Verify non-debug VM creation compiles the immutable source captured by the active load generation.
+/// 验证非调试 VM 创建会编译活动加载代捕获的不可变源码。
+#[test]
+fn nondebug_vm_creation_reuses_loaded_source_generation() {
+    // Temporary formal ROOT used to load one ordinary non-debug Skill.
+    // 用于加载一个普通非调试 Skill 的临时正式 ROOT。
+    let runtime_root = make_temp_runtime_root("nondebug-source-generation");
+    let _ = fs::remove_dir_all(&runtime_root);
+    let skill_root = RuntimeSkillRoot {
+        name: "ROOT".to_string(),
+        skills_dir: runtime_root.join("root_skills"),
+    };
+    // Skill directory whose valid source is captured during the initial load.
+    // 有效源码会在初次加载时被捕获的 Skill 目录。
+    let skill_dir =
+        write_minimal_skill_to_root_with_response(&skill_root.skills_dir, "generation-skill", "v1");
+    // Engine owning the immutable loaded-source generation under test.
+    // 持有待测不可变已加载源码代的引擎。
+    let mut engine = make_runtime_test_engine();
+    engine
+        .load_from_roots(std::slice::from_ref(&skill_root))
+        .expect("load non-debug source generation");
+
+    fs::write(
+        skill_dir.join("runtime/ping.lua"),
+        "this is intentionally invalid lua",
+    )
+    .expect("replace source after generation load");
+    engine
+        .create_vm()
+        .expect("non-debug VM should compile the captured source generation");
+
+    let _ = fs::remove_dir_all(&runtime_root);
+}
+
+/// Verify debug VM creation still rereads the live source instead of using the generation cache.
+/// 验证调试 VM 创建仍会重读实时源码而不是使用加载代缓存。
+#[test]
+fn debug_vm_creation_keeps_live_source_reload() {
+    // Temporary formal ROOT used to load one debug Skill.
+    // 用于加载一个调试 Skill 的临时正式 ROOT。
+    let runtime_root = make_temp_runtime_root("debug-live-source");
+    let _ = fs::remove_dir_all(&runtime_root);
+    let skill_root = RuntimeSkillRoot {
+        name: "ROOT".to_string(),
+        skills_dir: runtime_root.join("root_skills"),
+    };
+    // Skill directory whose manifest is switched to debug mode before loading.
+    // 在加载前将清单切换为调试模式的 Skill 目录。
+    let skill_dir =
+        write_minimal_skill_to_root_with_response(&skill_root.skills_dir, "debug-skill", "v1");
+    fs::write(
+        skill_dir.join("skill.yaml"),
+        "name: debug-skill\nversion: 0.1.0\nenable: true\ndebug: true\nentries:\n  - name: ping\n    description: Debug ping entry.\n    lua_entry: runtime/ping.lua\n    lua_module: debug-skill.ping\n",
+    )
+    .expect("enable debug mode in test manifest");
+    // Engine that prewarms successfully from the initial valid live source.
+    // 从初始有效实时源码成功预热的引擎。
+    let mut engine = make_runtime_test_engine();
+    engine
+        .load_from_roots(std::slice::from_ref(&skill_root))
+        .expect("load debug live source");
+
+    fs::write(
+        skill_dir.join("runtime/ping.lua"),
+        "this is intentionally invalid lua",
+    )
+    .expect("replace debug source after initial load");
+    // Compilation error returned after the debug VM rereads invalid live source.
+    // 调试 VM 重读无效实时源码后返回的编译错误。
+    let error = match engine.create_vm() {
+        Ok(_) => panic!("debug VM should reread and reject invalid live source"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("Failed to compile"),
+        "unexpected error: {error}"
+    );
+
+    let _ = fs::remove_dir_all(&runtime_root);
+}
+
+/// Verify a reload candidate that cannot compile never replaces the active source generation.
+/// 验证无法编译的重载候选绝不会替换活动源码代。
+#[test]
+fn failed_reload_preserves_active_source_generation() {
+    // Temporary formal ROOT shared by the active and candidate generations.
+    // 活动代与候选代共用的临时正式 ROOT。
+    let runtime_root = make_temp_runtime_root("failed-reload-source-generation");
+    let _ = fs::remove_dir_all(&runtime_root);
+    let skill_root = RuntimeSkillRoot {
+        name: "ROOT".to_string(),
+        skills_dir: runtime_root.join("root_skills"),
+    };
+    // Skill directory initially containing the valid active-generation source.
+    // 初始包含有效活动代源码的 Skill 目录。
+    let skill_dir = write_minimal_skill_to_root_with_response(
+        &skill_root.skills_dir,
+        "reload-generation-skill",
+        "stable",
+    );
+    // Engine whose currently active state must survive candidate failure.
+    // 当前活动状态必须在候选失败后继续存活的引擎。
+    let mut engine = make_runtime_test_engine();
+    engine
+        .load_from_roots(std::slice::from_ref(&skill_root))
+        .expect("load active source generation");
+
+    fs::write(
+        skill_dir.join("runtime/ping.lua"),
+        "this is intentionally invalid lua",
+    )
+    .expect("write invalid candidate source");
+    engine
+        .reload_from_roots(std::slice::from_ref(&skill_root))
+        .expect_err("invalid candidate generation should fail prewarm");
+
+    // Invocation result proving that the previous VM generation remains active.
+    // 证明上一 VM 代仍保持活动的调用结果。
+    let result = engine
+        .call_skill("reload-generation-skill-ping", &json!({}), None)
+        .expect("call active generation after failed reload");
+    assert_eq!(result.content, "stable");
+
+    let _ = fs::remove_dir_all(&runtime_root);
 }
 
 /// Verify that host-ignored skills are skipped before dependency, database, or entry setup.
@@ -6329,6 +6488,85 @@ fn run_lua_json_containers_reject_invalid_structures() {
             "expected `{expected_error}` in `{error}`"
         );
     }
+}
+
+/// Lua userdata probe that observes whether pool state is unlocked during VM destruction.
+/// Lua 用户数据探针，用于观测虚拟机析构时池状态是否未加锁。
+struct LuaVmPoolStateDropProbe {
+    /// Weak pool reference that avoids making a pooled VM retain its owning pool forever.
+    /// 避免池内虚拟机永久持有所属池的弱引用。
+    pool: std::sync::Weak<LuaVmPool>,
+    /// Channel that publishes the non-blocking lock observation from the destructor.
+    /// 从析构函数发布非阻塞锁观测结果的通道。
+    observation: mpsc::Sender<bool>,
+}
+
+/// Expose the pool-state probe as inert Lua userdata retained until Lua state destruction.
+/// 将池状态探针暴露为惰性 Lua 用户数据，并保留到 Lua 状态析构。
+impl UserData for LuaVmPoolStateDropProbe {}
+
+/// Publish whether the VM pool lock is available when the Lua-owned probe is destroyed.
+/// 发布 Lua 所有探针析构时虚拟机池锁是否可用。
+impl Drop for LuaVmPoolStateDropProbe {
+    fn drop(&mut self) {
+        // Lock observation is true only when destruction happens outside the pool state guard.
+        // 仅当析构发生在池状态保护之外时，锁观测结果才为真。
+        let pool_state_is_unlocked = self
+            .pool
+            .upgrade()
+            .is_some_and(|pool| pool.state.try_lock().is_ok());
+        // Send failure is harmless when a panicking test has already dropped its receiver.
+        // 测试 panic 已丢弃接收端时，发送失败无害。
+        let _send_result = self.observation.send(pool_state_is_unlocked);
+    }
+}
+
+/// Verify idle Lua VM destruction runs after the pool state lock is released.
+/// 验证空闲 Lua 虚拟机析构发生在池状态锁释放之后。
+#[test]
+fn lua_vm_pool_reaps_idle_vm_outside_state_lock() {
+    // Two-slot pool whose returned VM is older than the normalized one-second TTL.
+    // 双槽池，其中归还虚拟机的空闲时间超过规范化后的一秒 TTL。
+    let pool = Arc::new(LuaVmPool::new(LuaVmPoolConfig {
+        min_size: 1,
+        max_size: 2,
+        idle_ttl_secs: 1,
+    }));
+    {
+        // Reserved count representing the one VM about to be returned.
+        // 表示即将归还的一个虚拟机的预留计数。
+        let mut state = pool.lock_state();
+        state.total_count = 2;
+    }
+    // Observation channel receiving the destructor's pool-lock result.
+    // 接收析构函数池锁观测结果的通道。
+    let (observation_tx, observation_rx) = mpsc::channel();
+    // Lua state that owns the drop probe through its globals table.
+    // 通过全局表持有析构探针的 Lua 状态。
+    let lua = Lua::new();
+    // Userdata wrapper retained until the complete Lua VM is destroyed.
+    // 保留到完整 Lua 虚拟机析构时的用户数据包装。
+    let probe = lua
+        .create_userdata(LuaVmPoolStateDropProbe {
+            pool: Arc::downgrade(&pool),
+            observation: observation_tx,
+        })
+        .expect("lua vm pool state drop probe should be created");
+    lua.globals()
+        .set("__lua_vm_pool_state_drop_probe", probe)
+        .expect("lua vm pool state drop probe should be retained");
+
+    pool.release(LuaVm {
+        lua,
+        last_used_at: Instant::now() - Duration::from_secs(2),
+    });
+
+    assert_eq!(pool.total_count(), 1);
+    assert!(
+        observation_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("idle VM destructor should publish a lock observation")
+    );
 }
 
 /// Verify the Lua VM pool recovers state access and condition-variable wakeups after lock poisoning.
@@ -7402,28 +7640,52 @@ fn execute_runlua_request_inline_supports_vulcan_process_exec_with_explicit_shel
     assert!(result.contains("explicit-shell-ok"));
 }
 
+/// Provide one controlled sleeping child only when launched by the timeout fixture.
+/// 仅在超时夹具启动时提供一个受控睡眠子进程。
+#[test]
+fn vulcan_process_exec_timeout_child() {
+    if std::env::var_os("LUASKILLS_PROCESS_EXEC_TIMEOUT_CHILD").is_none() {
+        return;
+    }
+    thread::sleep(Duration::from_secs(30));
+}
+
 /// Verify `vulcan.process.exec` timeout diagnostics report the explicit requested timeout.
 /// 验证 `vulcan.process.exec` 超时诊断会报告显式请求的超时时长。
 #[test]
 fn execute_runlua_request_inline_reports_vulcan_process_exec_timeout_ms() {
-    // Process-wide environment guard because the shell command may resolve helper executables through PATH.
-    // 进程级环境保护锁，因为 shell 命令可能会通过 PATH 解析辅助可执行文件。
-    let _env_guard = process_env_test_guard();
-    // Runtime engine used to execute one process command that should exceed the timeout.
-    // 用于执行一个预期超过超时时长的进程命令的运行时引擎。
+    // Runtime engine used to execute one deterministic child test that exceeds the timeout.
+    // 用于执行一个确定性超时子测试的运行时引擎。
     let engine = make_runtime_test_engine();
+    // Absolute current test executable avoids PATH and platform shell-command dependencies.
+    // 当前测试可执行文件的绝对路径用于避免 PATH 与平台 shell 命令依赖。
+    let test_executable = std::env::current_exe().expect("resolve current test executable");
+    // Lua-compatible JSON string literal carrying the absolute executable path.
+    // 携带绝对可执行文件路径的 Lua 兼容 JSON 字符串字面量。
+    let test_executable_literal =
+        serde_json::to_string(&test_executable.to_string_lossy().into_owned())
+            .expect("encode current test executable path");
+    // Inline Lua source launching only the controlled sleeping child test.
+    // 仅启动受控睡眠子测试的内联 Lua 源码。
+    let code = format!(
+        "local executed = vulcan.process.exec({{ program = {test_executable_literal}, args = {{ '--exact', 'runtime::engine::tests::vulcan_process_exec_timeout_child', '--nocapture' }}, env = {{ LUASKILLS_PROCESS_EXEC_TIMEOUT_CHILD = '1' }}, timeout_ms = 50, encoding = 'utf-8' }}); return vulcan.json.encode({{ timed_out = executed.timed_out, success = executed.success, error = executed.error }})"
+    );
+    // JSON request envelope carrying the generated deterministic Lua source.
+    // 携带已生成确定性 Lua 源码的 JSON 请求包络。
+    let request = serde_json::json!({ "code": code }).to_string();
     // Rendered runlua result carrying the structured process timeout envelope.
     // 携带结构化进程超时结果包络的已渲染 runlua 结果。
     let result = engine
-        .execute_runlua_request_json_inline(
-            r#"{"code":"local info = vulcan.os.info(); local command; if info.os == 'windows' then command = 'ping -n 3 127.0.0.1 >NUL' else command = 'sleep 1' end; local executed = vulcan.process.exec({ command = command, timeout_ms = 50, encoding = 'utf-8' }); return vulcan.json.encode({ timed_out = executed.timed_out, success = executed.success, error = executed.error })"}"#,
-        )
+        .execute_runlua_request_json_inline(&request)
         .expect("inline runlua should return one process timeout result");
 
-    assert!(result.contains("SUCCESS"));
-    assert!(result.contains("\"timed_out\":true"));
-    assert!(result.contains("\"success\":false"));
-    assert!(result.contains("process execution timed out after 50 ms"));
+    assert!(result.contains("SUCCESS"), "{result}");
+    assert!(result.contains("\"timed_out\":true"), "{result}");
+    assert!(result.contains("\"success\":false"), "{result}");
+    assert!(
+        result.contains("process execution timed out after 50 ms"),
+        "{result}"
+    );
 }
 
 /// Verify `vulcan.process.exec` can spawn one PATH-discovered Windows shell launcher using its resolved executable path.

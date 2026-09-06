@@ -1,6 +1,6 @@
-use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Read};
-use std::path::PathBuf;
+use std::fs::{self, File, Metadata, OpenOptions};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc, Mutex, MutexGuard,
@@ -9,10 +9,22 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandle,
+    GetFileInformationByHandleEx,
+};
+
 use mlua::{Function, Lua, MultiValue, Table, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::runtime::encoding::{RuntimeTextEncoding, decode_runtime_text, encode_runtime_text};
 use crate::runtime::path::normalize_host_input_path_text;
+use crate::runtime::process_session::{ManagedChildProcessTree, finalize_one_shot_process_tree};
 
 /// Process-local monotonic suffix used to reserve managed temporary file names.
 /// 用于预留托管临时文件名的进程内单调后缀。
@@ -66,9 +78,22 @@ struct ManagedIoFileState {
     /// Current read cursor inside the buffer.
     /// 缓冲区内的当前读取游标。
     cursor: usize,
-    /// Number of append-mode bytes already flushed to disk.
-    /// 追加模式下已刷新到磁盘的字节数。
+    /// Number of buffer bytes represented by the last successful flush.
+    /// 上次成功刷新后已由磁盘表示的缓冲区字节数。
     flushed_len: usize,
+    /// Whether the writable backing file has completed its initial create/truncate publication.
+    /// 可写底层文件是否已经完成首次创建或截断发布。
+    flush_initialized: bool,
+    /// Cheap metadata fingerprint used to recognize an unchanged backing file before every incremental flush.
+    /// 用于避免每次增量刷新前重复处理未变化底层文件的低成本元数据指纹。
+    flushed_fingerprint: Option<ManagedIoBackingFingerprint>,
+    /// Smallest contiguous buffer range covering all unflushed update-mode writes.
+    /// 覆盖所有尚未刷新更新模式写入的最小连续缓冲区范围。
+    dirty_range: Option<(usize, usize)>,
+    /// Successful physical payload bytes written by flush operations in tests.
+    /// 测试中刷新操作成功写入的物理载荷字节数。
+    #[cfg(test)]
+    physical_write_bytes: usize,
     /// Whether this handle has already been closed.
     /// 此句柄是否已经关闭。
     closed: bool,
@@ -78,6 +103,193 @@ struct ManagedIoFileState {
     /// Optional process status returned when this handle was created by popen.
     /// 当此句柄由 popen 创建时返回的可选进程状态。
     close_status: Option<ManagedIoCloseStatus>,
+}
+
+/// Cheap backing-file generation fingerprint used before incremental publication.
+/// 增量发布前使用的低成本底层文件代指纹。
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedIoBackingFingerprint {
+    /// Current file length in bytes.
+    /// 当前文件字节长度。
+    len: u64,
+    /// Last modification timestamp when the filesystem exposes one.
+    /// 文件系统能够提供时的最后修改时间戳。
+    modified: Option<SystemTime>,
+    /// Creation timestamp when the filesystem exposes one, allowing replacement detection.
+    /// 文件系统能够提供时的创建时间戳，用于检测文件替换。
+    created: Option<SystemTime>,
+    /// Platform file identity and change generation when the host exposes reliable values.
+    /// 宿主能够提供可靠值时的平台文件身份与变更代。
+    platform_generation: Option<ManagedIoPlatformGeneration>,
+}
+
+impl ManagedIoBackingFingerprint {
+    /// Build one cheap generation fingerprint from an exact open file handle.
+    /// 从一个精确打开的文件句柄构造低成本代指纹。
+    ///
+    /// The file parameter identifies the exact open object whose observable generation is validated.
+    /// file 参数标识需要校验可观察变更代的精确打开对象。
+    ///
+    /// Returns length, portable timestamps, and platform change-generation data.
+    /// 返回文件长度、可移植时间戳与平台变更代数据。
+    fn from_file(file: &File) -> std::io::Result<Self> {
+        // Metadata is tied to the same handle used for platform generation collection.
+        // Metadata 绑定到用于采集平台变更代的同一个句柄。
+        let metadata = file.metadata()?;
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            platform_generation: managed_io_platform_generation(file, &metadata)?,
+        })
+    }
+}
+
+/// Platform file identity and content-change generation used without reading the payload.
+/// 无需读取载荷即可使用的平台文件身份与内容变更代。
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedIoPlatformGeneration {
+    /// Filesystem or volume identity owning the file.
+    /// 拥有文件的文件系统或卷标识。
+    storage_id: u64,
+    /// Stable file identity inside the owning filesystem or volume.
+    /// 文件在所属文件系统或卷内的稳定标识。
+    file_id: u64,
+    /// Platform content-change time in seconds or native ticks.
+    /// 以秒或平台原生 tick 表示的内容变更时间。
+    change_time: i64,
+    /// Subsecond component used by Unix ctime; zero for tick-based platforms.
+    /// Unix ctime 使用的亚秒分量；基于 tick 的平台为零。
+    change_time_subsecond: i64,
+}
+
+/// Read platform file identity and change generation from one exact open handle.
+/// 从一个精确打开的句柄读取平台文件身份与变更代。
+///
+/// The file parameter identifies the handle whose generation must be captured.
+/// file 参数标识必须捕获变更代的句柄。
+///
+/// The metadata parameter belongs to the same handle and supplies portable file identity fields.
+/// metadata 参数属于同一句柄，并提供可移植文件身份字段。
+///
+/// Returns a platform generation when supported, otherwise no generation on unsupported targets.
+/// 在受支持平台返回平台变更代；不支持的平台返回空值。
+#[cfg(windows)]
+fn managed_io_platform_generation(
+    file: &File,
+    _metadata: &Metadata,
+) -> std::io::Result<Option<ManagedIoPlatformGeneration>> {
+    // BasicInfo receives the NT change time, which changes for same-length in-place rewrites.
+    // BasicInfo 接收 NT 变更时间，该时间会在同长度原地重写时变化。
+    let mut basic_info = FILE_BASIC_INFO::default();
+    // SAFETY: RawHandle remains valid for the call, BasicInfo is writable and its exact byte length is supplied.
+    // 安全性：RawHandle 在调用期间保持有效，BasicInfo 可写且传入了其精确字节长度。
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            std::ptr::from_mut(&mut basic_info).cast(),
+            u32::try_from(std::mem::size_of::<FILE_BASIC_INFO>())
+                .expect("FILE_BASIC_INFO size must fit in u32"),
+        )
+    };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // HandleInfo receives stable volume and file identifiers for replacement detection.
+    // HandleInfo 接收稳定的卷与文件标识，用于检测文件替换。
+    let mut handle_info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: RawHandle remains valid for the call and HandleInfo is a writable exact-layout output buffer.
+    // 安全性：RawHandle 在调用期间保持有效，HandleInfo 是可写且布局精确的输出缓冲区。
+    let succeeded = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle(), std::ptr::from_mut(&mut handle_info))
+    };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // FileId combines the documented high and low halves without lossy conversion.
+    // FileId 无损合并文档定义的高低两部分。
+    let file_id =
+        (u64::from(handle_info.nFileIndexHigh) << 32) | u64::from(handle_info.nFileIndexLow);
+    Ok(Some(ManagedIoPlatformGeneration {
+        storage_id: u64::from(handle_info.dwVolumeSerialNumber),
+        file_id,
+        change_time: basic_info.ChangeTime,
+        change_time_subsecond: 0,
+    }))
+}
+
+/// Read platform file identity and change generation from one exact open handle.
+/// 从一个精确打开的句柄读取平台文件身份与变更代。
+///
+/// The file parameter keeps the cross-platform signature aligned and is unused on Unix.
+/// file 参数用于保持跨平台签名一致，在 Unix 上不使用。
+///
+/// The metadata parameter supplies Unix device, inode, and nanosecond ctime values.
+/// metadata 参数提供 Unix 设备、inode 与纳秒级 ctime 值。
+///
+/// Returns the Unix file identity and content-change generation.
+/// 返回 Unix 文件身份与内容变更代。
+#[cfg(unix)]
+fn managed_io_platform_generation(
+    _file: &File,
+    metadata: &Metadata,
+) -> std::io::Result<Option<ManagedIoPlatformGeneration>> {
+    Ok(Some(ManagedIoPlatformGeneration {
+        storage_id: metadata.dev(),
+        file_id: metadata.ino(),
+        change_time: metadata.ctime(),
+        change_time_subsecond: metadata.ctime_nsec(),
+    }))
+}
+
+/// Return no platform generation on targets without a supported identity API.
+/// 在没有受支持身份 API 的目标平台上不返回平台变更代。
+///
+/// The file and metadata parameters keep the portable call surface uniform.
+/// file 与 metadata 参数用于保持可移植调用界面统一。
+///
+/// Returns no generation so callers safely fall back to full publication.
+/// 返回空变更代，使调用方安全回退到完整发布。
+#[cfg(not(any(unix, windows)))]
+fn managed_io_platform_generation(
+    _file: &File,
+    _metadata: &Metadata,
+) -> std::io::Result<Option<ManagedIoPlatformGeneration>> {
+    Ok(None)
+}
+
+/// Read one update-capable buffer and its generation from the same stable file handle.
+/// 从同一稳定文件句柄读取支持更新的缓冲区及其变更代。
+///
+/// The path parameter identifies the existing file that becomes the in-memory authority.
+/// path 参数标识将成为内存权威来源的已有文件。
+///
+/// Returns the complete bytes and their observable before/after generation, or an error if the host reports a change during the read.
+/// 返回完整字节及其可观察的前后变更代；若宿主报告读取期间发生变化则返回错误。
+fn read_managed_io_update_buffer(
+    path: &Path,
+) -> std::io::Result<(Vec<u8>, ManagedIoBackingFingerprint)> {
+    // File is retained across reading and both generation captures to prevent path-replacement ambiguity.
+    // File 在读取及两次变更代捕获期间保持打开，避免路径替换歧义。
+    let mut file = File::open(path)?;
+    // BeforeFingerprint captures the generation whose bytes are about to be read.
+    // BeforeFingerprint 捕获即将读取字节所属的变更代。
+    let before_fingerprint = ManagedIoBackingFingerprint::from_file(&file)?;
+    // Buffer receives the complete authoritative starting content.
+    // Buffer 接收完整的初始权威内容。
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+    // AfterFingerprint rejects concurrent in-place changes during the initial read.
+    // AfterFingerprint 拒绝初始读取期间发生的并发原地变更。
+    let after_fingerprint = ManagedIoBackingFingerprint::from_file(&file)?;
+    if before_fingerprint != after_fingerprint {
+        return Err(std::io::Error::other(format!(
+            "managed file changed while opening {}",
+            path.display()
+        )));
+    }
+    Ok((buffer, after_fingerprint))
 }
 
 /// Process close status retained for a managed popen read handle.
@@ -126,28 +338,60 @@ impl ManagedIoFile {
         mode: ManagedIoOpenMode,
         encoding: RuntimeTextEncoding,
     ) -> mlua::Result<Self> {
-        let buffer = match (mode.kind, mode.update) {
-            (ManagedIoModeKind::Read, _) => fs::read(&path)
-                .map_err(|error| mlua::Error::runtime(format!("vulcan.io.open: {error}")))?,
-            (ManagedIoModeKind::Append, true) => match fs::read(&path) {
-                Ok(bytes) => {
-                    // Existing file content that update-capable append mode must preserve before new writes.
-                    // 支持更新的追加模式在新写入前必须保留的已有文件内容。
-                    bytes
+        // Initial buffer, synchronized length, and publication state derived from the exact open mode.
+        // 从精确打开模式派生的初始缓冲区、同步长度和发布状态。
+        let (buffer, flushed_len, flush_initialized, flushed_fingerprint) =
+            match (mode.kind, mode.update) {
+                (ManagedIoModeKind::Read, true) => {
+                    // Existing bytes and observable generation required by read-update mode.
+                    // 读更新模式所需的已有字节与可观察变更代。
+                    let (bytes, fingerprint) =
+                        read_managed_io_update_buffer(&path).map_err(|error| {
+                            mlua::Error::runtime(format!("vulcan.io.open: {error}"))
+                        })?;
+                    // Persisted length matches the complete buffer loaded from the stable handle.
+                    // 已落盘长度与从稳定句柄加载的完整缓冲区一致。
+                    let persisted_len = bytes.len();
+                    (bytes, persisted_len, true, Some(fingerprint))
                 }
-                Err(error) if error.kind() == ErrorKind::NotFound => {
-                    // Missing append-update target starts as an empty new file buffer.
-                    // 缺失的追加更新目标会从空的新文件缓冲区开始。
-                    Vec::new()
+                (ManagedIoModeKind::Read, false) => {
+                    // Existing bytes required by read-only mode.
+                    // 只读模式所需的已有字节。
+                    let bytes = fs::read(&path).map_err(|error| {
+                        mlua::Error::runtime(format!("vulcan.io.open: {error}"))
+                    })?;
+                    // Persisted length matches the complete buffer loaded from disk.
+                    // 已落盘长度与从磁盘加载的完整缓冲区一致。
+                    let persisted_len = bytes.len();
+                    (bytes, persisted_len, true, None)
                 }
-                Err(error) => {
-                    // Non-missing read failures are real open errors and must not become empty content.
-                    // 非缺失类读取失败是真实打开错误，不能变成空内容。
-                    return Err(mlua::Error::runtime(format!("vulcan.io.open: {error}")));
+                (ManagedIoModeKind::Append, true) => match read_managed_io_update_buffer(&path) {
+                    Ok((bytes, fingerprint)) => {
+                        // Persisted length matches the existing content retained by append-update.
+                        // 已落盘长度与追加更新模式保留的已有内容一致。
+                        let persisted_len = bytes.len();
+                        (bytes, persisted_len, true, Some(fingerprint))
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        // Missing append-update target requires initial publication on first flush.
+                        // 缺失的追加更新目标需要在首次刷新时完成初始发布。
+                        (Vec::new(), 0, false, None)
+                    }
+                    Err(error) => {
+                        return Err(mlua::Error::runtime(format!("vulcan.io.open: {error}")));
+                    }
+                },
+                (ManagedIoModeKind::Write, _) => {
+                    // Write modes begin from an empty authoritative buffer and publish by truncation.
+                    // 写入模式从空的权威缓冲区开始，并通过截断完成发布。
+                    (Vec::new(), 0, false, None)
                 }
-            },
-            (ManagedIoModeKind::Write, _) | (ManagedIoModeKind::Append, false) => Vec::new(),
-        };
+                (ManagedIoModeKind::Append, false) => {
+                    // Append-only buffers contain only bytes owned by this handle.
+                    // 纯追加缓冲区只包含当前句柄拥有的字节。
+                    (Vec::new(), 0, true, None)
+                }
+            };
         Ok(Self {
             state: Arc::new(Mutex::new(ManagedIoFileState {
                 path,
@@ -155,7 +399,12 @@ impl ManagedIoFile {
                 encoding,
                 buffer,
                 cursor: 0,
-                flushed_len: 0,
+                flushed_len,
+                flush_initialized,
+                flushed_fingerprint,
+                dirty_range: None,
+                #[cfg(test)]
+                physical_write_bytes: 0,
                 closed: false,
                 delete_on_close: false,
                 close_status: None,
@@ -166,7 +415,14 @@ impl ManagedIoFile {
     /// Create one update-capable temporary file handle that deletes its backing file on close.
     /// 创建一个支持更新读写并在关闭时删除底层文件的临时文件句柄。
     fn tmpfile(encoding: RuntimeTextEncoding) -> mlua::Result<Self> {
+        // Reserved empty file created atomically before the managed handle is published.
+        // 在托管句柄发布前以原子方式创建的已预留空文件。
         let path = reserve_tmpfile_path()?;
+        // FlushedFingerprint identifies the atomically reserved empty backing file.
+        // FlushedFingerprint 标识以原子方式预留的空底层文件。
+        let flushed_fingerprint = File::open(&path)
+            .and_then(|file| ManagedIoBackingFingerprint::from_file(&file))
+            .map_err(|error| mlua::Error::runtime(format!("vulcan.io.tmpfile: {error}")))?;
         Ok(Self {
             state: Arc::new(Mutex::new(ManagedIoFileState {
                 path,
@@ -179,6 +435,11 @@ impl ManagedIoFile {
                 buffer: Vec::new(),
                 cursor: 0,
                 flushed_len: 0,
+                flush_initialized: true,
+                flushed_fingerprint: Some(flushed_fingerprint),
+                dirty_range: None,
+                #[cfg(test)]
+                physical_write_bytes: 0,
                 closed: false,
                 delete_on_close: true,
                 close_status: None,
@@ -195,6 +456,9 @@ impl ManagedIoFile {
         buffer: Vec<u8>,
         close_status: Option<ManagedIoCloseStatus>,
     ) -> Self {
+        // Read buffer length retained only for a complete initialized in-memory source.
+        // 仅为完整初始化的内存读取源保留的读取缓冲区长度。
+        let flushed_len = buffer.len();
         Self {
             state: Arc::new(Mutex::new(ManagedIoFileState {
                 path: PathBuf::from(label),
@@ -202,7 +466,12 @@ impl ManagedIoFile {
                 encoding,
                 buffer,
                 cursor: 0,
-                flushed_len: 0,
+                flushed_len,
+                flush_initialized: true,
+                flushed_fingerprint: None,
+                dirty_range: None,
+                #[cfg(test)]
+                physical_write_bytes: 0,
                 closed: false,
                 delete_on_close: false,
                 close_status,
@@ -318,23 +587,41 @@ impl ManagedIoFile {
     /// Write one or more Lua values into the managed file handle.
     /// 将一个或多个 Lua 值写入托管文件句柄。
     fn write_values(&self, values: MultiValue) -> mlua::Result<bool> {
+        // Mutable handle state covering the complete logical write transaction.
+        // 覆盖完整逻辑写入事务的可变句柄状态。
         let mut state = self.lock_state();
         ensure_file_is_open(&state, "file:write")?;
         ensure_file_is_writable(&state, "file:write")?;
         for value in values {
+            // Encoded bytes for the current Lua value under this handle's mode and encoding.
+            // 当前 Lua 值按本句柄模式和编码生成的字节。
             let bytes = lua_value_to_output_bytes(value, state.mode.binary, state.encoding)?;
             if state.mode.update {
+                // Update write position follows append semantics or the explicit random-access cursor.
+                // 更新写入位置遵循追加语义或显式随机访问游标。
                 let write_position = if matches!(state.mode.kind, ManagedIoModeKind::Append) {
                     state.buffer.len()
                 } else {
                     state.cursor
                 };
+                // Exclusive end of the logical update write.
+                // 逻辑更新写入的排他结束位置。
                 let write_end = write_position.saturating_add(bytes.len());
                 if write_end > state.buffer.len() {
                     state.buffer.resize(write_end, 0);
                 }
                 state.buffer[write_position..write_end].copy_from_slice(&bytes);
                 state.cursor = write_end;
+                if write_position < write_end {
+                    // Union range bounds every unflushed update without storing per-write intervals.
+                    // 并集范围覆盖所有未刷新更新，无需保存逐次写入区间。
+                    state.dirty_range = Some(match state.dirty_range {
+                        Some((dirty_start, dirty_end)) => {
+                            (dirty_start.min(write_position), dirty_end.max(write_end))
+                        }
+                        None => (write_position, write_end),
+                    });
+                }
             } else {
                 state.buffer.extend_from_slice(&bytes);
                 state.cursor = state.buffer.len();
@@ -361,7 +648,15 @@ impl ManagedIoFile {
         }
         flush_state(&mut state)?;
         if state.delete_on_close {
-            let _ = fs::remove_file(&state.path);
+            match fs::remove_file(&state.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(mlua::Error::runtime(format!(
+                        "file:close: failed to remove temporary file: {error}"
+                    )));
+                }
+            }
         }
         state.closed = true;
         Ok(state
@@ -1002,39 +1297,66 @@ fn run_managed_popen_read(
     options: ManagedPopenOptions,
 ) -> mlua::Result<ManagedPopenOutput> {
     let mut command = create_shell_command(command_text);
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| mlua::Error::runtime(format!("vulcan.io.popen: {error}")))?;
+        .stderr(Stdio::null());
+    // Managed one-shot ownership tuple that prevents timeout and direct-exit descendants from escaping.
+    // 防止超时或直接子进程退出后的后代逃逸的受管单次执行所有权元组。
+    let (mut child, process_tree, reaper_permit) =
+        ManagedChildProcessTree::spawn_with_keepalive(&mut command, "vulcan.io.popen", None)
+            .map_err(|error| mlua::Error::runtime(format!("vulcan.io.popen: {error}")))?;
     let stdout_handle = child.stdout.take().map(spawn_popen_pipe_reader);
-    let stderr_handle = child.stderr.take().map(spawn_popen_pipe_reader);
     let deadline = Instant::now() + Duration::from_millis(options.timeout_ms);
     let mut timed_out = false;
+    // Direct-child wait failure retained until unified process-tree cleanup has preserved ownership.
+    // 保留到统一进程树清理完成所有权保护后的直接子进程等待失败。
+    let mut wait_error = None;
 
-    let status = loop {
-        match child
-            .try_wait()
-            .map_err(|error| mlua::Error::runtime(format!("vulcan.io.popen wait: {error}")))?
-        {
-            Some(status) => break status,
-            None if Instant::now() >= deadline => {
+    // Direct-child status observed before remaining descendants are terminated and reaped.
+    // 终止并回收残留后代前观察到的直接子进程状态。
+    let observed_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() >= deadline => {
                 timed_out = true;
-                let _ = child.kill();
-                break crate::runtime::process_session::wait_for_child_exit_until(
-                    &mut child,
-                    Instant::now() + Duration::from_secs(5),
-                    "vulcan.io.popen timed-out direct child",
-                )
-                .map_err(mlua::Error::runtime)?;
+                break None;
             }
-            None => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                wait_error = Some(format!("vulcan.io.popen wait: {error}"));
+                break None;
+            }
+        }
+    };
+
+    // Definitive status available only after the entire one-shot process tree has converged.
+    // 仅在整棵单次执行进程树收敛后可用的确定终态。
+    let status = match finalize_one_shot_process_tree(
+        child,
+        process_tree,
+        reaper_permit,
+        observed_status,
+        "vulcan.io.popen",
+    ) {
+        Ok(status) if wait_error.is_none() => status,
+        Ok(_) => {
+            return Err(mlua::Error::runtime(wait_error.unwrap_or_else(|| {
+                "vulcan.io.popen failed to wait for process".to_string()
+            })));
+        }
+        Err(cleanup_error) => {
+            // Combined error retains the primary wait failure next to the cleanup failure.
+            // 组合错误会把主要等待失败与清理失败并列保留。
+            let error = match wait_error {
+                Some(wait_error) => format!("{wait_error}; cleanup failed: {cleanup_error}"),
+                None => cleanup_error,
+            };
+            return Err(mlua::Error::runtime(error));
         }
     };
 
     let stdout = join_popen_pipe_reader(stdout_handle, "stdout")?;
-    let _stderr = join_popen_pipe_reader(stderr_handle, "stderr")?;
     if timed_out {
         return Err(mlua::Error::runtime(format!(
             "vulcan.io.popen timed out after {} ms",
@@ -1249,27 +1571,209 @@ fn lua_value_to_display_text(value: LuaValue) -> mlua::Result<String> {
 /// 按写入模式刷新一个托管文件状态。
 fn flush_state(state: &mut ManagedIoFileState) -> mlua::Result<()> {
     if state.mode.update {
-        return fs::write(&state.path, &state.buffer)
-            .map_err(|error| mlua::Error::runtime(format!("file:flush: {error}")));
+        return flush_update_state(state);
     }
     match state.mode.kind {
         ManagedIoModeKind::Read => Ok(()),
-        ManagedIoModeKind::Write => fs::write(&state.path, &state.buffer)
-            .map_err(|error| mlua::Error::runtime(format!("file:flush: {error}"))),
+        ManagedIoModeKind::Write => flush_write_state(state),
         ManagedIoModeKind::Append => {
+            // Pending append suffix owned by this handle since the last successful flush.
+            // 当前句柄自上次成功刷新后拥有的待追加后缀。
             let pending = &state.buffer[state.flushed_len..];
+            // Pending byte count retained after the immutable slice borrow ends.
+            // 在不可变切片借用结束后保留的待写字节数。
+            #[cfg(test)]
+            let pending_len = pending.len();
             if !pending.is_empty() {
                 OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(&state.path)
-                    .and_then(|mut file| std::io::Write::write_all(&mut file, pending))
+                    .and_then(|mut file| file.write_all(pending))
                     .map_err(|error| mlua::Error::runtime(format!("file:flush: {error}")))?;
                 state.flushed_len = state.buffer.len();
+                #[cfg(test)]
+                {
+                    state.physical_write_bytes =
+                        state.physical_write_bytes.saturating_add(pending_len);
+                }
             }
             Ok(())
         }
     }
+}
+
+/// Publish the complete authoritative buffer and reset incremental flush bookkeeping.
+/// 发布完整权威缓冲区并重置增量刷新记账。
+fn flush_full_buffer(state: &mut ManagedIoFileState) -> mlua::Result<()> {
+    // Full payload size recorded only after the filesystem write succeeds.
+    // 仅在文件系统写入成功后记录的完整载荷大小。
+    let payload_len = state.buffer.len();
+    // File remains open through publication and generation capture so both describe one exact object.
+    // File 在发布与变更代捕获期间保持打开，确保二者描述同一个精确对象。
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&state.path)
+        .and_then(|mut file| {
+            file.write_all(&state.buffer)?;
+            file.flush()?;
+            Ok(file)
+        })
+        .map_err(|error| mlua::Error::runtime(format!("file:flush: {error}")))?;
+    // FlushedFingerprint is captured only after the complete publication succeeds.
+    // FlushedFingerprint 仅在完整发布成功后获取。
+    let flushed_fingerprint = ManagedIoBackingFingerprint::from_file(&file)
+        .map_err(|error| mlua::Error::runtime(format!("file:flush: {error}")))?;
+    state.flushed_len = payload_len;
+    state.flush_initialized = true;
+    state.flushed_fingerprint = Some(flushed_fingerprint);
+    state.dirty_range = None;
+    #[cfg(test)]
+    {
+        state.physical_write_bytes = state.physical_write_bytes.saturating_add(payload_len);
+    }
+    Ok(())
+}
+
+/// Flush non-update write mode by truncating once and then writing only the new suffix.
+/// 刷新非更新写入模式：首次截断，随后只写入新增后缀。
+fn flush_write_state(state: &mut ManagedIoFileState) -> mlua::Result<()> {
+    if !state.flush_initialized || state.flushed_len > state.buffer.len() {
+        return flush_full_buffer(state);
+    }
+    if !managed_io_backing_file_matches_last_flush(state)? {
+        return flush_full_buffer(state);
+    }
+    // First byte not represented by the last successful flush.
+    // 上次成功刷新尚未表示的第一个字节位置。
+    let pending_start = state.flushed_len;
+    if pending_start == state.buffer.len() {
+        return Ok(());
+    }
+    // Pending suffix byte count used for test-only physical-write accounting.
+    // 用于测试专属物理写入计数的待写后缀字节数。
+    #[cfg(test)]
+    let pending_len = state.buffer.len() - pending_start;
+    // Existing output file used for positioned suffix publication.
+    // 用于定位发布后缀的已有输出文件。
+    let mut file = match OpenOptions::new().write(true).open(&state.path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return flush_full_buffer(state),
+        Err(error) => return Err(mlua::Error::runtime(format!("file:flush: {error}"))),
+    };
+    // Persisted offset expressed in the filesystem seek type.
+    // 以文件系统 seek 类型表示的已落盘偏移。
+    let pending_offset = u64::try_from(pending_start)
+        .map_err(|error| mlua::Error::runtime(format!("file:flush: {error}")))?;
+    // Final authoritative length applied after the suffix write.
+    // 在后缀写入后应用的最终权威长度。
+    let final_len = u64::try_from(state.buffer.len())
+        .map_err(|error| mlua::Error::runtime(format!("file:flush: {error}")))?;
+    file.seek(SeekFrom::Start(pending_offset))
+        .and_then(|_| file.write_all(&state.buffer[pending_start..]))
+        .and_then(|_| file.set_len(final_len))
+        .and_then(|_| file.flush())
+        .map_err(|error| mlua::Error::runtime(format!("file:flush: {error}")))?;
+    // FlushedFingerprint describes the exact file handle after suffix publication.
+    // FlushedFingerprint 描述后缀发布后的精确文件句柄。
+    let flushed_fingerprint = ManagedIoBackingFingerprint::from_file(&file)
+        .map_err(|error| mlua::Error::runtime(format!("file:flush: {error}")))?;
+    state.flushed_len = state.buffer.len();
+    state.flushed_fingerprint = Some(flushed_fingerprint);
+    #[cfg(test)]
+    {
+        state.physical_write_bytes = state.physical_write_bytes.saturating_add(pending_len);
+    }
+    Ok(())
+}
+
+/// Flush the union of update-mode dirty bytes while retaining the in-memory buffer as truth.
+/// 刷新更新模式脏字节并继续以内存缓冲区作为事实源。
+fn flush_update_state(state: &mut ManagedIoFileState) -> mlua::Result<()> {
+    if !state.flush_initialized {
+        return flush_full_buffer(state);
+    }
+    if !managed_io_backing_file_matches_last_flush(state)? {
+        return flush_full_buffer(state);
+    }
+    // Dirty range accumulated from every successful logical write since the last flush.
+    // 自上次刷新后每次成功逻辑写入累计得到的脏范围。
+    let Some((dirty_start, dirty_end)) = state.dirty_range else {
+        return Ok(());
+    };
+    // Dirty bytes validated against the authoritative buffer before any filesystem mutation.
+    // 在任何文件系统变更前相对权威缓冲区验证的脏字节。
+    let dirty_bytes = state.buffer.get(dirty_start..dirty_end).ok_or_else(|| {
+        mlua::Error::runtime("file:flush: managed update dirty range is outside the buffer")
+    })?;
+    // Dirty payload length retained after its immutable buffer borrow ends.
+    // 在不可变缓冲区借用结束后保留的脏载荷长度。
+    #[cfg(test)]
+    let dirty_len = dirty_bytes.len();
+    // Existing update target opened without implicit truncation.
+    // 在不隐式截断情况下打开的已有更新目标。
+    let mut file = match OpenOptions::new().write(true).open(&state.path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return flush_full_buffer(state),
+        Err(error) => return Err(mlua::Error::runtime(format!("file:flush: {error}"))),
+    };
+    // Dirty offset expressed in the filesystem seek type.
+    // 以文件系统 seek 类型表示的脏偏移。
+    let dirty_offset = u64::try_from(dirty_start)
+        .map_err(|error| mlua::Error::runtime(format!("file:flush: {error}")))?;
+    // Final authoritative length used for update-mode extension or truncation.
+    // 用于更新模式扩展或截断的最终权威长度。
+    let final_len = u64::try_from(state.buffer.len())
+        .map_err(|error| mlua::Error::runtime(format!("file:flush: {error}")))?;
+    file.seek(SeekFrom::Start(dirty_offset))
+        .and_then(|_| file.write_all(dirty_bytes))
+        .and_then(|_| file.set_len(final_len))
+        .and_then(|_| file.flush())
+        .map_err(|error| mlua::Error::runtime(format!("file:flush: {error}")))?;
+    // FlushedFingerprint describes the exact file handle after dirty-range publication.
+    // FlushedFingerprint 描述脏区发布后的精确文件句柄。
+    let flushed_fingerprint = ManagedIoBackingFingerprint::from_file(&file)
+        .map_err(|error| mlua::Error::runtime(format!("file:flush: {error}")))?;
+    state.flushed_len = state.buffer.len();
+    state.flushed_fingerprint = Some(flushed_fingerprint);
+    state.dirty_range = None;
+    #[cfg(test)]
+    {
+        state.physical_write_bytes = state.physical_write_bytes.saturating_add(dirty_len);
+    }
+    Ok(())
+}
+
+/// Verify that the current backing file still matches the observable generation published by the last successful flush.
+/// 验证当前底层文件仍与上次成功刷新所发布的可观察代一致。
+///
+/// The state parameter owns the expected metadata generation and backing path for one writable handle.
+/// state 参数持有单个可写句柄的预期元数据代与底层路径。
+///
+/// Returns true only when length and an available timestamp prove the backing generation is unchanged, false for a missing, changed, or unverifiable generation, and an error for inaccessible metadata.
+/// 仅当长度与可用时间戳证明底层代未变化时返回 true；文件缺失、已变化或无法验证时返回 false，元数据不可访问时返回错误。
+fn managed_io_backing_file_matches_last_flush(state: &ManagedIoFileState) -> mlua::Result<bool> {
+    // ExpectedFingerprint is absent before the first successful full publication.
+    // ExpectedFingerprint 在首次完整发布成功前不存在。
+    let Some(expected_fingerprint) = state.flushed_fingerprint.as_ref() else {
+        return Ok(false);
+    };
+    // File is opened read-only so validation cannot mutate the current generation.
+    // File 以只读方式打开，确保验证不会修改当前代。
+    let file = match File::open(&state.path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(mlua::Error::runtime(format!("file:flush: {error}"))),
+    };
+    // ActualFingerprint is compared in constant time; missing platform generations force safe full publication.
+    // ActualFingerprint 以常量时间比较；缺失平台变更代时强制执行安全的完整发布。
+    let actual_fingerprint = ManagedIoBackingFingerprint::from_file(&file)
+        .map_err(|error| mlua::Error::runtime(format!("file:flush: {error}")))?;
+    let has_platform_generation = actual_fingerprint.platform_generation.is_some()
+        && expected_fingerprint.platform_generation.is_some();
+    Ok(has_platform_generation && &actual_fingerprint == expected_fingerprint)
 }
 
 /// Ensure one managed file handle is still open.

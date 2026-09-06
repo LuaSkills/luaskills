@@ -3,7 +3,7 @@ use crate::host::options::{LuaRuntimeHostOptions, LuaRuntimeSpaceControllerProce
 use crate::runtime::path::render_host_visible_path;
 use sha2::{Digest, Sha256};
 use std::future::Future;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Handle, Runtime};
@@ -15,17 +15,15 @@ use vldb_controller_client::{
 /// Shared host-side controller bridge that executes async controller SDK calls from sync runtime code.
 /// 供同步运行时代码调用异步控制器 SDK 的共享宿主桥接。
 pub struct LuaRuntimeSpaceControllerBridge {
+    /// Cloneable SDK client shared by concurrent controller requests.
+    /// 由并发控制器请求共享的可克隆 SDK 客户端。
     client: ControllerClient,
-    runtime: Mutex<Runtime>,
+    /// Multi-thread Tokio runtime that schedules controller futures concurrently.
+    /// 并发调度控制器 future 的多线程 Tokio 运行时。
+    runtime: Runtime,
+    /// Stable controller client-session scope used to isolate binding identifiers.
+    /// 用于隔离绑定标识的稳定控制器客户端会话作用域。
     binding_scope_id: String,
-}
-
-/// Acquire one controller bridge runtime and return its guard, recovering after lock poisoning.
-/// 获取并返回单个控制器桥接运行时保护对象；如果锁已 poison，则恢复继续使用。
-fn lock_controller_runtime(runtime: &Mutex<Runtime>) -> MutexGuard<'_, Runtime> {
-    runtime
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Controller identifiers resolved after one runtime database binding has been attached.
@@ -101,7 +99,7 @@ impl LuaRuntimeSpaceControllerBridge {
             })?;
         Ok(Arc::new(Self {
             client,
-            runtime: Mutex::new(runtime),
+            runtime,
             binding_scope_id,
         }))
     }
@@ -114,8 +112,7 @@ impl LuaRuntimeSpaceControllerBridge {
         Fut: Future<Output = Result<T, BoxError>> + Send + 'static,
         T: Send + 'static,
     {
-        let runtime = lock_controller_runtime(&self.runtime);
-        run_controller_operation_with_client(&runtime, &self.client, operation)
+        run_controller_operation_with_client(&self.runtime, &self.client, operation)
             .map_err(|error| format!("space controller request failed: {}", error))
     }
 
@@ -355,12 +352,19 @@ fn normalize_controller_space_label(space_label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_controller_binding_id, lock_controller_runtime, run_future_on_bridge_runtime,
+        LuaRuntimeSpaceControllerBridge, build_controller_binding_id, run_future_on_bridge_runtime,
         system_time_to_controller_start_unix_millis,
     };
-    use std::panic::{self, AssertUnwindSafe};
-    use std::sync::Mutex;
-    use std::time::{Duration, UNIX_EPOCH};
+    use crate::host::database::{
+        RuntimeDatabaseBindingContext, RuntimeDatabaseBindingContextSpec, RuntimeDatabaseKind,
+    };
+    use crate::host::options::LuaRuntimeHostOptions;
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::thread;
+    use std::time::{Duration, Instant, UNIX_EPOCH};
     use tokio::runtime::{Builder, Runtime};
     use vldb_controller_client::BoxError;
 
@@ -368,6 +372,106 @@ mod tests {
     /// 构建一个供桥接执行测试使用的控制器运行时。
     fn build_bridge_runtime() -> Runtime {
         Runtime::new().expect("bridge runtime should build")
+    }
+
+    /// Return one zero-based nearest-rank percentile from sorted microsecond samples.
+    /// 从已排序的微秒样本中返回一个从零开始的最邻近秩百分位数。
+    ///
+    /// Parameter `sorted_samples` contains ascending latency samples and must not be empty.
+    /// 参数 `sorted_samples` 包含升序延迟样本，且不得为空。
+    ///
+    /// Parameter `percentile` is the inclusive percentile in the range 1 through 100.
+    /// 参数 `percentile` 是 1 到 100 范围内的包含式百分位数。
+    ///
+    /// Returns the selected latency sample in microseconds.
+    /// 返回选中的微秒延迟样本。
+    fn nearest_rank_percentile_micros(sorted_samples: &[u128], percentile: usize) -> u128 {
+        // Rank converts the one-based nearest-rank formula into a zero-based slice index.
+        // Rank 将从一开始的最邻近秩公式转换为从零开始的切片索引。
+        let rank = sorted_samples
+            .len()
+            .saturating_mul(percentile)
+            .div_ceil(100)
+            .saturating_sub(1)
+            .min(sorted_samples.len().saturating_sub(1));
+        sorted_samples[rank]
+    }
+
+    /// Measure real controller status RPC latency for one requested concurrency level.
+    /// 测量指定并发级别下真实控制器状态 RPC 的延迟。
+    ///
+    /// Parameter `bridge` is connected to a real auto-spawned controller process.
+    /// 参数 `bridge` 已连接到一个真实自动唤起的控制器进程。
+    ///
+    /// Parameter `concurrency` defines both synchronous caller threads and simultaneous request capacity.
+    /// 参数 `concurrency` 同时定义同步调用线程数与并发请求容量。
+    ///
+    /// Returns sorted per-request microsecond samples plus the measured wall duration.
+    /// 返回已排序的逐请求微秒样本与测得的墙钟时长。
+    fn measure_real_controller_status_requests(
+        bridge: &Arc<LuaRuntimeSpaceControllerBridge>,
+        concurrency: usize,
+    ) -> (Vec<u128>, Duration) {
+        // RequestsPerCaller balances percentile sample size against one bounded acceptance run.
+        // RequestsPerCaller 在百分位样本规模与有界验收运行之间取得平衡。
+        const REQUESTS_PER_CALLER: usize = 8;
+        // StartBarrier releases every synchronous caller together after all threads are ready.
+        // StartBarrier 在所有线程就绪后同时释放每个同步调用方。
+        let start_barrier = Arc::new(Barrier::new(concurrency + 1));
+        // ResultChannel collects one latency batch from each caller without shared mutable vectors.
+        // ResultChannel 从每个调用方收集一批延迟，避免共享可变向量。
+        let (result_sender, result_receiver) = mpsc::channel();
+        // Threads own the synchronous callers whose bridge requests must overlap safely.
+        // Threads 持有桥接请求必须安全重叠的同步调用方。
+        let mut threads = Vec::with_capacity(concurrency);
+
+        for _ in 0..concurrency {
+            // ThreadBridge shares the production bridge and its real controller client.
+            // ThreadBridge 共享生产桥接及其真实控制器客户端。
+            let thread_bridge = Arc::clone(bridge);
+            // ThreadBarrier synchronizes this caller with the complete batch.
+            // ThreadBarrier 将当前调用方与完整批次同步。
+            let thread_barrier = Arc::clone(&start_barrier);
+            // ThreadSender returns this caller's independent latency batch.
+            // ThreadSender 返回当前调用方的独立延迟批次。
+            let thread_sender = result_sender.clone();
+            threads.push(thread::spawn(move || {
+                thread_barrier.wait();
+                // Latencies stores this caller's bounded real RPC measurements.
+                // Latencies 保存当前调用方的有界真实 RPC 测量值。
+                let mut latencies = Vec::with_capacity(REQUESTS_PER_CALLER);
+                for _ in 0..REQUESTS_PER_CALLER {
+                    // RequestStart bounds one controller get_status round trip.
+                    // RequestStart 界定一次控制器 get_status 往返。
+                    let request_start = Instant::now();
+                    thread_bridge
+                        .run(|client| async move { client.get_status().await })
+                        .expect("real controller status request should succeed");
+                    latencies.push(request_start.elapsed().as_micros());
+                }
+                thread_sender
+                    .send(latencies)
+                    .expect("send real controller latency batch");
+            }));
+        }
+        drop(result_sender);
+        // BatchStart measures all synchronized RPC calls at this concurrency level.
+        // BatchStart 测量当前并发级别下全部同步 RPC 调用。
+        let batch_start = Instant::now();
+        start_barrier.wait();
+        // Samples merges each caller batch after execution without affecting request timing.
+        // Samples 在执行后合并每个调用方批次，不影响请求计时。
+        let mut samples = result_receiver.into_iter().flatten().collect::<Vec<_>>();
+        for thread in threads {
+            thread
+                .join()
+                .expect("real controller request thread should not panic");
+        }
+        // BatchElapsed captures end-to-end synchronized completion time.
+        // BatchElapsed 捕获同步批次的端到端完成时间。
+        let batch_elapsed = batch_start.elapsed();
+        samples.sort_unstable();
+        (samples, batch_elapsed)
     }
 
     /// Verify controller registration timestamps accept normal post-epoch system times.
@@ -444,33 +548,279 @@ mod tests {
         assert_eq!(result, 11);
     }
 
-    /// Verify the controller bridge runtime remains usable after its mutex is poisoned.
-    /// 验证控制器桥接运行时互斥锁 poison 后仍可继续使用。
+    /// Verify two synchronous callers can overlap on the bridge-owned runtime.
+    /// 验证两个同步调用方可以在桥接持有的运行时上重叠执行。
     #[test]
-    fn controller_runtime_lock_recovers_after_poisoned_lock() {
-        // Runtime mutex used to mimic the bridge-owned controller runtime slot.
-        // 用于模拟桥接持有的控制器运行时槽位的运行时互斥锁。
-        let runtime = Mutex::new(build_bridge_runtime());
-        // Captured panic result from a holder that poisons only the runtime mutex.
-        // 单个运行时互斥锁持有者制造 poison 后被捕获的 panic 结果。
-        let poison_result = panic::catch_unwind(AssertUnwindSafe(|| {
-            // Guard used only to poison the controller runtime lock.
-            // 仅用于制造控制器运行时锁 poison 的保护对象。
-            let _guard = runtime.lock().expect("initial controller runtime lock");
-            panic!("poison controller runtime for recovery test");
-        }));
+    fn bridge_runtime_allows_concurrent_block_on_callers() {
+        // runtime is shared directly without a request-wide mutex.
+        // runtime 在没有请求级互斥锁的情况下被直接共享。
+        let runtime = Arc::new(build_bridge_runtime());
+        // start_barrier releases both synchronous callers at the same instant.
+        // start_barrier 在同一时刻释放两个同步调用方。
+        let start_barrier = Arc::new(Barrier::new(3));
+        // active counts controller futures that have entered but not completed.
+        // active 统计已经进入但尚未完成的控制器 future。
+        let active = Arc::new(AtomicUsize::new(0));
+        // entered is a monotonic rendezvous counter that cannot fall before both futures observe it.
+        // entered 是单调汇合计数器，在两个 future 都观察到它之前不会下降。
+        let entered = Arc::new(AtomicUsize::new(0));
+        // maximum_active records the largest observed overlap.
+        // maximum_active 记录观察到的最大重叠数量。
+        let maximum_active = Arc::new(AtomicUsize::new(0));
 
-        assert!(poison_result.is_err());
+        // first_thread runs one future through the shared runtime.
+        // first_thread 通过共享运行时执行一个 future。
+        let first_thread = {
+            // thread_runtime is the first caller's shared runtime handle.
+            // thread_runtime 是第一个调用方的共享运行时句柄。
+            let thread_runtime = runtime.clone();
+            // thread_barrier synchronizes the first caller with the other participants.
+            // thread_barrier 将第一个调用方与其他参与方同步。
+            let thread_barrier = start_barrier.clone();
+            // thread_active shares the live overlap counter.
+            // thread_active 共享活动重叠计数器。
+            let thread_active = active.clone();
+            // thread_entered shares the monotonic rendezvous counter.
+            // thread_entered 共享单调汇合计数器。
+            let thread_entered = entered.clone();
+            // thread_maximum shares the maximum overlap counter.
+            // thread_maximum 共享最大重叠计数器。
+            let thread_maximum = maximum_active.clone();
+            thread::spawn(move || {
+                thread_barrier.wait();
+                run_future_on_bridge_runtime(&thread_runtime, async move {
+                    // active_now includes the current future after entering the runtime.
+                    // active_now 包含当前 future 进入运行时后的活动数量。
+                    let active_now = thread_active.fetch_add(1, Ordering::SeqCst) + 1;
+                    thread_maximum.fetch_max(active_now, Ordering::SeqCst);
+                    thread_entered.fetch_add(1, Ordering::SeqCst);
+                    while thread_entered.load(Ordering::SeqCst) < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                    thread_active.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<_, BoxError>(())
+                })
+            })
+        };
+        // second_thread runs another future through the same shared runtime.
+        // second_thread 通过同一共享运行时执行另一个 future。
+        let second_thread = {
+            // thread_runtime is the second caller's shared runtime handle.
+            // thread_runtime 是第二个调用方的共享运行时句柄。
+            let thread_runtime = runtime.clone();
+            // thread_barrier synchronizes the second caller with the other participants.
+            // thread_barrier 将第二个调用方与其他参与方同步。
+            let thread_barrier = start_barrier.clone();
+            // thread_active shares the live overlap counter.
+            // thread_active 共享活动重叠计数器。
+            let thread_active = active.clone();
+            // thread_entered shares the monotonic rendezvous counter.
+            // thread_entered 共享单调汇合计数器。
+            let thread_entered = entered.clone();
+            // thread_maximum shares the maximum overlap counter.
+            // thread_maximum 共享最大重叠计数器。
+            let thread_maximum = maximum_active.clone();
+            thread::spawn(move || {
+                thread_barrier.wait();
+                run_future_on_bridge_runtime(&thread_runtime, async move {
+                    // active_now includes the current future after entering the runtime.
+                    // active_now 包含当前 future 进入运行时后的活动数量。
+                    let active_now = thread_active.fetch_add(1, Ordering::SeqCst) + 1;
+                    thread_maximum.fetch_max(active_now, Ordering::SeqCst);
+                    thread_entered.fetch_add(1, Ordering::SeqCst);
+                    while thread_entered.load(Ordering::SeqCst) < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                    thread_active.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<_, BoxError>(())
+                })
+            })
+        };
 
-        // Recovered runtime guard used to execute one bridge-owned future.
-        // 用于执行单个桥接 future 的已恢复运行时保护对象。
-        let recovered_runtime = lock_controller_runtime(&runtime);
-        // Future result proving the recovered runtime still executes work.
-        // 用于证明已恢复运行时仍可执行任务的 future 结果。
-        let result =
-            run_future_on_bridge_runtime(&recovered_runtime, async { Ok::<_, BoxError>(13usize) })
-                .expect("recovered controller runtime should execute future");
-        assert_eq!(result, 13);
+        start_barrier.wait();
+        first_thread
+            .join()
+            .expect("first controller caller must not panic")
+            .expect("first controller future must succeed");
+        second_thread
+            .join()
+            .expect("second controller caller must not panic")
+            .expect("second controller future must succeed");
+        assert!(maximum_active.load(Ordering::SeqCst) > 1);
+    }
+
+    /// Verify one slow controller future does not block an independent fast future.
+    /// 验证一个缓慢控制器 future 不会阻塞另一个独立的快速 future。
+    #[test]
+    fn bridge_runtime_slow_future_does_not_block_fast_future() {
+        // runtime is the same bridge-owned scheduler used by both synchronous callers.
+        // runtime 是两个同步调用方共用的同一个桥接调度器。
+        let runtime = Arc::new(build_bridge_runtime());
+        // release_slow controls when the deliberately slow future may complete.
+        // release_slow 控制刻意缓慢的 future 何时可以完成。
+        let release_slow = Arc::new(AtomicBool::new(false));
+        // entered channel confirms the slow future is already running before the fast call starts.
+        // entered 通道确认慢 future 已在运行后才启动快速调用。
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+
+        // slow_thread owns the first synchronous caller and remains pending until released.
+        // slow_thread 持有第一个同步调用方，并在释放前保持等待。
+        let slow_thread = {
+            // thread_runtime is the slow caller's shared runtime handle.
+            // thread_runtime 是慢调用方的共享运行时句柄。
+            let thread_runtime = runtime.clone();
+            // thread_release is the slow future's completion gate.
+            // thread_release 是慢 future 的完成门闩。
+            let thread_release = release_slow.clone();
+            thread::spawn(move || {
+                run_future_on_bridge_runtime(&thread_runtime, async move {
+                    entered_sender
+                        .send(())
+                        .map_err(|error| -> BoxError { error.to_string().into() })?;
+                    while !thread_release.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok::<_, BoxError>("slow")
+                })
+            })
+        };
+
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("slow controller future must enter the runtime");
+        // fast_result channel reports whether the independent fast call completed promptly.
+        // fast_result 通道报告独立快速调用是否及时完成。
+        let (fast_sender, fast_receiver) = mpsc::sync_channel(1);
+        // fast_thread runs the independent call while the slow future remains pending.
+        // fast_thread 在慢 future 仍处于等待时运行独立调用。
+        let fast_thread = {
+            // thread_runtime is the fast caller's handle to the same runtime.
+            // thread_runtime 是快速调用方指向同一运行时的句柄。
+            let thread_runtime = runtime.clone();
+            thread::spawn(move || {
+                // result is the fast controller future outcome sent back to the test thread.
+                // result 是发送回测试线程的快速控制器 future 结果。
+                let result = run_future_on_bridge_runtime(&thread_runtime, async {
+                    Ok::<_, BoxError>("fast")
+                });
+                let _ = fast_sender.send(result);
+            })
+        };
+        // prompt_result distinguishes concurrent completion from request-wide serialization.
+        // prompt_result 用于区分并发完成与请求级串行化。
+        let prompt_result = fast_receiver.recv_timeout(Duration::from_secs(2));
+        release_slow.store(true, Ordering::SeqCst);
+        // slow_result is collected after release so every test thread terminates deterministically.
+        // slow_result 在释放后收集，确保每个测试线程都确定结束。
+        let slow_result = slow_thread
+            .join()
+            .expect("slow controller caller must not panic")
+            .expect("slow controller future must succeed");
+        fast_thread
+            .join()
+            .expect("fast controller caller must not panic");
+        // fast_result is the prompt independent result captured before releasing the slow future.
+        // fast_result 是释放慢 future 前捕获的及时独立结果。
+        let fast_result = prompt_result
+            .expect("fast controller future must finish while slow future is pending")
+            .expect("fast controller future must succeed");
+
+        assert_eq!(slow_result, "slow");
+        assert_eq!(fast_result, "fast");
+    }
+
+    /// Verify a real controller can auto-spawn, attach, serve concurrent RPCs, and close.
+    /// 验证真实控制器能够自动唤起、附加、处理并发 RPC 并关闭。
+    #[test]
+    #[ignore = "requires LUASKILLS_TEST_VLDB_CONTROLLER pointing to a real controller executable"]
+    fn real_controller_grpc_connect_attach_concurrent_and_close() {
+        // ExecutablePath is explicitly supplied by the acceptance environment after digest-verified download.
+        // ExecutablePath 由验收环境在摘要校验下载后显式提供。
+        let executable_path = std::env::var_os("LUASKILLS_TEST_VLDB_CONTROLLER")
+            .map(PathBuf::from)
+            .expect("LUASKILLS_TEST_VLDB_CONTROLLER must point to the real controller executable");
+        assert!(
+            executable_path.is_file(),
+            "real controller executable does not exist: {}",
+            executable_path.display()
+        );
+        // PortReservation obtains an unused loopback address without assuming the default controller is absent.
+        // PortReservation 获取一个未使用的回环地址，不假设默认控制器不存在。
+        let port_reservation = TcpListener::bind("127.0.0.1:0")
+            .expect("reserve isolated real controller validation port");
+        // ControllerAddress is the exact loopback address assigned by the operating system.
+        // ControllerAddress 是操作系统分配的精确回环地址。
+        let controller_address = port_reservation
+            .local_addr()
+            .expect("read reserved controller address");
+        drop(port_reservation);
+        // TempRoot isolates the attached real controller space from repository and user data.
+        // TempRoot 将附加的真实控制器空间与仓库及用户数据隔离。
+        let temp_root = std::env::temp_dir().join(format!(
+            "luaskills_real_controller_validation_{}",
+            std::process::id()
+        ));
+        if temp_root.exists() {
+            // Stale generated fixture cleanup is limited to this process-namespaced temp root.
+            // 陈旧生成夹具清理仅限当前进程命名的临时根目录。
+            let _ = std::fs::remove_dir_all(&temp_root);
+        }
+        std::fs::create_dir_all(&temp_root).expect("create real controller validation root");
+        // HostOptions selects one isolated endpoint and the digest-verified executable.
+        // HostOptions 选择一个隔离端点与经过摘要校验的可执行文件。
+        let mut host_options = LuaRuntimeHostOptions::default();
+        host_options.space_controller.endpoint = Some(format!("http://{controller_address}"));
+        host_options.space_controller.auto_spawn = true;
+        host_options.space_controller.executable_path = Some(executable_path);
+        host_options.space_controller.minimum_uptime_secs = 1;
+        host_options.space_controller.idle_timeout_secs = 1;
+        host_options.space_controller.startup_timeout_secs = 30;
+        // Bridge performs the production connect and client-session registration sequence.
+        // Bridge 执行生产连接与客户端会话注册流程。
+        let bridge = LuaRuntimeSpaceControllerBridge::new(&host_options, "real-acceptance")
+            .expect("connect to auto-spawned real controller");
+        // Binding identifies one real but temporary controller space.
+        // Binding 标识一个真实但临时的控制器空间。
+        let binding = RuntimeDatabaseBindingContext::new(RuntimeDatabaseBindingContextSpec {
+            space_label: "ROOT".to_string(),
+            skill_id: "real-controller-acceptance".to_string(),
+            root_name: "ROOT".to_string(),
+            space_root: temp_root.to_string_lossy().into_owned(),
+            skill_dir: temp_root.join("skill").to_string_lossy().into_owned(),
+            skill_dir_name: "skill".to_string(),
+            database_kind: RuntimeDatabaseKind::Sqlite,
+            default_database_path: temp_root.join("default.db").to_string_lossy().into_owned(),
+        });
+        bridge
+            .attach_binding(&binding)
+            .expect("attach temporary real controller space");
+
+        for concurrency in [1_usize, 8, 32] {
+            // Samples and elapsed are produced by real get_status gRPC round trips.
+            // Samples 与 elapsed 来自真实 get_status gRPC 往返。
+            let (samples, elapsed) = measure_real_controller_status_requests(&bridge, concurrency);
+            // ExpectedSamples proves every synchronized caller completed its fixed request budget.
+            // ExpectedSamples 证明每个同步调用方均完成固定请求预算。
+            let expected_samples = concurrency * 8;
+            assert_eq!(samples.len(), expected_samples);
+            // Throughput is the completed real RPC count divided by batch wall time.
+            // Throughput 是完成的真实 RPC 数除以批次墙钟时长。
+            let throughput = samples.len() as f64 / elapsed.as_secs_f64();
+            // P95 and P99 report nearest-rank per-request microsecond latency.
+            // P95 与 P99 报告最邻近秩的逐请求微秒延迟。
+            let p95 = nearest_rank_percentile_micros(&samples, 95);
+            let p99 = nearest_rank_percentile_micros(&samples, 99);
+            println!(
+                "CONTROLLER_PERF concurrency={concurrency} requests={} elapsed_ms={} throughput_rps={throughput:.2} p95_us={p95} p99_us={p99}",
+                samples.len(),
+                elapsed.as_millis()
+            );
+        }
+
+        drop(bridge);
+        // Generated validation space cleanup is best effort after the bridge closes its client.
+        // 桥接关闭客户端后，按最佳努力原则清理生成的验收空间。
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     /// Verify controller binding ids preserve the stable host tag while adding one client-scoped suffix.

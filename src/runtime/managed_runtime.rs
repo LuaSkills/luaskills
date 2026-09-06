@@ -2928,6 +2928,78 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Build the owner-scoped cache key for one authoritative managed-runtime declaration.
+/// 为一个权威受管运行时声明构建所有者作用域缓存键。
+///
+/// `package` owns the immutable root authority, `runtime` separates Python from Node, and
+/// `spec` is the fully parsed dependency declaration used by the resolver.
+/// `package` 持有不可变根授权，`runtime` 区分 Python 与 Node，`spec` 是解析器使用的完整依赖声明。
+///
+/// Returns a stable process-local key or a serialization error.
+/// 返回稳定的进程内键或序列化错误。
+fn managed_runtime_plan_cache_key<T: Serialize>(
+    package: &ManagedRuntimePackageContext,
+    runtime: ManagedRuntimeKind,
+    spec: &T,
+) -> Result<String, String> {
+    // Canonical serialized declaration whose field order is fixed by the concrete spec type.
+    // 字段顺序由具体声明类型固定的规范序列化声明。
+    let serialized_spec = serde_json::to_vec(spec)
+        .map_err(|error| format!("failed to serialize managed runtime declaration: {error}"))?;
+    Ok(format!(
+        "{}:{}:{}",
+        package.owner_token(),
+        runtime.as_str(),
+        sha256_hex(&serialized_spec)
+    ))
+}
+
+/// Validate every mutable input represented by one cached managed-runtime plan.
+/// 校验一个缓存受管运行时计划所表示的每个可变输入。
+///
+/// `plan` is the previously successful owner-local resolution result.
+/// `plan` 是此前成功的所有者局部解析结果。
+///
+/// Returns success only when roots, runtime assets, lockfile, and optional manifest still match.
+/// 仅当根、运行时资产、锁文件与可选清单仍匹配时返回成功。
+fn validate_cached_managed_runtime_plan(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
+    validate_managed_runtime_plan_assets(plan)?;
+    verify_managed_runtime_build_input_hash(
+        &plan.lockfile_path,
+        &plan.lock_hash,
+        "dependency lockfile",
+    )?;
+    match (&plan.package_manifest_path, &plan.package_manifest_hash) {
+        (Some(path), Some(expected_hash)) => {
+            verify_managed_runtime_build_input_hash(path, expected_hash, "package manifest")
+        }
+        (None, None) => Ok(()),
+        _ => Err("managed runtime plan package manifest identity is inconsistent".to_string()),
+    }
+}
+
+/// Return a live validated cached plan, evicting it when any represented asset has changed.
+/// 返回经过实时校验的缓存计划，并在任一所表示资产变化时将其驱逐。
+///
+/// `package` owns the cache and `key` identifies one exact normalized declaration.
+/// `package` 持有缓存，`key` 标识一个精确规范声明。
+///
+/// Returns `Some` only for a cache hit that passes every current asset check.
+/// 仅在缓存命中且通过全部当前资产检查时返回 `Some`。
+fn validated_cached_managed_runtime_plan(
+    package: &ManagedRuntimePackageContext,
+    key: &str,
+) -> Option<ManagedRuntimeEnvPlan> {
+    // Candidate plan cloned from the only cache owned by this exact package lifetime.
+    // 从当前精确包生命周期持有的唯一缓存中克隆的候选计划。
+    let plan = package.cached_managed_runtime_plan(key)?;
+    if validate_cached_managed_runtime_plan(&plan).is_ok() {
+        return Some(plan);
+    }
+    package.evict_managed_runtime_plan(key);
+    None
+}
+
 /// Resolve one Python managed runtime environment plan from a skill declaration.
 /// 根据 skill 声明解析一个 Python 受管运行时环境计划。
 pub(crate) fn resolve_python_env_plan(
@@ -2936,6 +3008,14 @@ pub(crate) fn resolve_python_env_plan(
 ) -> Result<ManagedRuntimeEnvPlan, String> {
     validate_managed_runtime_resolver_version(&spec.version)?;
     validate_managed_runtime_resolver_version(&spec.package_manager_version)?;
+    package.validate_live_filesystem_identity()?;
+    // Owner-local cache key derived from the authoritative parsed Python declaration.
+    // 从权威已解析 Python 声明派生的所有者局部缓存键。
+    let cache_key = managed_runtime_plan_cache_key(package, ManagedRuntimeKind::Python, spec)?;
+    if let Some(plan) = validated_cached_managed_runtime_plan(package, &cache_key) {
+        return Ok(plan);
+    }
+
     // ManagedRuntimeRoots is the single engine-selected authority for all three root roles.
     // ManagedRuntimeRoots 是三个根角色唯一的引擎选定授权。
     let managed_runtime_roots = package.managed_runtime_roots();
@@ -2995,7 +3075,9 @@ pub(crate) fn resolve_python_env_plan(
         package_manager_install_manifest_hash: package_manager_install.manifest_hash.clone(),
         package_manager_executable_hash: package_manager_install.executable_hash.clone(),
     };
-    build_env_plan(
+    // Successful immutable plan published only after every resolver step has completed.
+    // 仅在全部解析步骤完成后发布的成功不可变计划。
+    let plan = build_env_plan(
         managed_runtime_roots,
         ManagedRuntimeKind::Python,
         runtime_install,
@@ -3003,7 +3085,9 @@ pub(crate) fn resolve_python_env_plan(
         None,
         lockfile_path,
         hash_input,
-    )
+    )?;
+    package.cache_managed_runtime_plan(cache_key, plan.clone());
+    Ok(plan)
 }
 
 /// Validate one declared Node.js version against the supported asynchronous ESM baseline.
@@ -3048,6 +3132,14 @@ pub(crate) fn resolve_node_env_plan(
 ) -> Result<ManagedRuntimeEnvPlan, String> {
     validate_managed_node_runtime_version(&spec.version)?;
     validate_managed_runtime_resolver_version(&spec.package_manager_version)?;
+    package.validate_live_filesystem_identity()?;
+    // Owner-local cache key derived from the authoritative parsed Node declaration.
+    // 从权威已解析 Node 声明派生的所有者局部缓存键。
+    let cache_key = managed_runtime_plan_cache_key(package, ManagedRuntimeKind::Node, spec)?;
+    if let Some(plan) = validated_cached_managed_runtime_plan(package, &cache_key) {
+        return Ok(plan);
+    }
+
     // ManagedRuntimeRoots is the single engine-selected authority for all three root roles.
     // ManagedRuntimeRoots 是三个根角色唯一的引擎选定授权。
     let managed_runtime_roots = package.managed_runtime_roots();
@@ -3118,7 +3210,9 @@ pub(crate) fn resolve_node_env_plan(
         package_manager_install_manifest_hash: package_manager_install.manifest_hash.clone(),
         package_manager_executable_hash: package_manager_install.executable_hash.clone(),
     };
-    build_env_plan(
+    // Successful immutable plan published only after every resolver step has completed.
+    // 仅在全部解析步骤完成后发布的成功不可变计划。
+    let plan = build_env_plan(
         managed_runtime_roots,
         ManagedRuntimeKind::Node,
         runtime_install,
@@ -3126,7 +3220,9 @@ pub(crate) fn resolve_node_env_plan(
         package_manifest_path,
         lockfile_path,
         hash_input,
-    )
+    )?;
+    package.cache_managed_runtime_plan(cache_key, plan.clone());
+    Ok(plan)
 }
 
 /// Read one managed runtime installation manifest from an installation directory.
@@ -3804,18 +3900,17 @@ mod tests {
             platform_executable("uv"),
         );
         let package = make_test_package_context(&package_root, &runtime_root);
-        let plan = resolve_python_env_plan(
-            package.as_ref(),
-            &PythonRuntimeDependencySpec {
-                version: "3.14.4".to_string(),
-                package_manager: PythonRuntimePackageManager::Uv,
-                package_manager_version: "0.11.28".to_string(),
-                lockfile: "python/requirements.lock".to_string(),
-                required: true,
-            },
-        )
-        .expect("python env plan should resolve");
-
+        // Authoritative Python declaration reused to prove package-local cache behavior.
+        // 为证明包局部缓存行为而复用的权威 Python 声明。
+        let spec = PythonRuntimeDependencySpec {
+            version: "3.14.4".to_string(),
+            package_manager: PythonRuntimePackageManager::Uv,
+            package_manager_version: "0.11.28".to_string(),
+            lockfile: "python/requirements.lock".to_string(),
+            required: true,
+        };
+        let plan = resolve_python_env_plan(package.as_ref(), &spec)
+            .expect("python env plan should resolve");
         assert!(!managed_env_is_ready(&plan).expect("ready check should work"));
         fs::create_dir_all(&plan.env_dir).unwrap();
         write_expected_marker(&plan.env_dir, &plan.expected_marker).unwrap();
@@ -4888,25 +4983,64 @@ mod tests {
         );
 
         let package = make_test_package_context(&package_root, &runtime_root);
-        let plan = resolve_python_env_plan(
-            package.as_ref(),
-            &PythonRuntimeDependencySpec {
-                version: "3.14.4".to_string(),
-                package_manager: PythonRuntimePackageManager::Uv,
-                package_manager_version: "0.11.28".to_string(),
-                lockfile: "python/requirements.lock".to_string(),
-                required: true,
-            },
-        )
-        .expect("python env plan should resolve");
+        // Authoritative Python declaration reused to prove package-local cache behavior.
+        // 为证明包局部缓存行为而复用的权威 Python 声明。
+        let spec = PythonRuntimeDependencySpec {
+            version: "3.14.4".to_string(),
+            package_manager: PythonRuntimePackageManager::Uv,
+            package_manager_version: "0.11.28".to_string(),
+            lockfile: "python/requirements.lock".to_string(),
+            required: true,
+        };
+        let plan = resolve_python_env_plan(package.as_ref(), &spec)
+            .expect("python env plan should resolve");
+        // Repeated plan proving that the same owner and declaration hit one cached result.
+        // 证明相同所有者与声明命中同一缓存结果的重复计划。
+        let cached_plan = resolve_python_env_plan(package.as_ref(), &spec)
+            .expect("cached Python env plan should resolve");
 
         assert_eq!(plan.runtime, ManagedRuntimeKind::Python);
         assert_eq!(plan.package_manager, "uv");
         assert_eq!(plan.lock_hash, sha256_hex(b"requests==2.32.3"));
         assert_eq!(plan.expected_marker.env_hash, plan.env_hash);
+        assert_eq!(cached_plan, plan);
+        assert_eq!(package.managed_runtime_plan_cache_hit_count(), 1);
+        assert_eq!(package.managed_runtime_plan_cache_len(), 1);
         assert!(
             plan.env_dir
                 .starts_with(package.runtime_root().join("dependencies/envs/python"))
+        );
+
+        fs::write(
+            package_root.join("python/requirements.lock"),
+            b"requests==2.32.4",
+        )
+        .expect("replace cached Python lockfile input");
+        // Refreshed plan proving live lockfile validation evicts the stale cache entry.
+        // 证明实时锁文件校验会驱逐失效缓存项的刷新计划。
+        let refreshed_plan = resolve_python_env_plan(package.as_ref(), &spec)
+            .expect("Python plan should refresh after lockfile replacement");
+        assert_ne!(refreshed_plan.lock_hash, plan.lock_hash);
+        assert_eq!(refreshed_plan.lock_hash, sha256_hex(b"requests==2.32.4"));
+        assert_eq!(package.managed_runtime_plan_cache_len(), 1);
+
+        // Independent owner over the same authoritative files must build its own cache entry.
+        // 面向相同权威文件的独立所有者必须构建自己的缓存项。
+        let independent_package = make_test_package_context(&package_root, &runtime_root);
+        resolve_python_env_plan(independent_package.as_ref(), &spec)
+            .expect("independent owner Python plan should resolve");
+        assert_eq!(
+            independent_package.managed_runtime_plan_cache_hit_count(),
+            0
+        );
+        assert_eq!(independent_package.managed_runtime_plan_cache_len(), 1);
+        // Weak owner reference proving that the plan cache does not create a lifetime cycle.
+        // 证明计划缓存不会形成生命周期环的所有者弱引用。
+        let package_weak = Arc::downgrade(&package);
+        drop(package);
+        assert!(
+            package_weak.upgrade().is_none(),
+            "dropping the owner should release its complete plan cache"
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -5036,18 +5170,22 @@ mod tests {
         );
 
         let package = make_test_package_context(&package_root, &runtime_root);
-        let plan = resolve_node_env_plan(
-            package.as_ref(),
-            &NodeRuntimeDependencySpec {
-                version: "24.18.0".to_string(),
-                package_manager: NodeRuntimePackageManager::Pnpm,
-                package_manager_version: "11.11.0".to_string(),
-                package_json: "node/package.json".to_string(),
-                lockfile: "node/pnpm-lock.yaml".to_string(),
-                required: true,
-            },
-        )
-        .expect("node env plan should resolve");
+        // Authoritative Node declaration reused to prove runtime-separated cache behavior.
+        // 为证明运行时隔离缓存行为而复用的权威 Node 声明。
+        let spec = NodeRuntimeDependencySpec {
+            version: "24.18.0".to_string(),
+            package_manager: NodeRuntimePackageManager::Pnpm,
+            package_manager_version: "11.11.0".to_string(),
+            package_json: "node/package.json".to_string(),
+            lockfile: "node/pnpm-lock.yaml".to_string(),
+            required: true,
+        };
+        let plan =
+            resolve_node_env_plan(package.as_ref(), &spec).expect("node env plan should resolve");
+        // Repeated plan proving that Node uses the same owner-local cache contract.
+        // 证明 Node 使用相同所有者局部缓存契约的重复计划。
+        let cached_plan = resolve_node_env_plan(package.as_ref(), &spec)
+            .expect("cached Node env plan should resolve");
 
         assert_eq!(plan.runtime, ManagedRuntimeKind::Node);
         assert_eq!(plan.package_manager, "pnpm");
@@ -5056,10 +5194,28 @@ mod tests {
             plan.package_manifest_hash,
             Some(sha256_hex(br#"{"dependencies":{}}"#))
         );
+        assert_eq!(cached_plan, plan);
+        assert_eq!(package.managed_runtime_plan_cache_hit_count(), 1);
+        assert_eq!(package.managed_runtime_plan_cache_len(), 1);
         assert!(
             plan.env_dir
                 .starts_with(package.runtime_root().join("dependencies/envs/node"))
         );
+
+        fs::write(
+            package_root.join("node/package.json"),
+            br#"{"dependencies":{"demo":"1.0.0"}}"#,
+        )
+        .expect("replace cached Node package manifest input");
+        // Refreshed plan proving live package-manifest validation evicts the stale cache entry.
+        // 证明实时包清单校验会驱逐失效缓存项的刷新计划。
+        let refreshed_plan = resolve_node_env_plan(package.as_ref(), &spec)
+            .expect("Node plan should refresh after package manifest replacement");
+        assert_ne!(
+            refreshed_plan.package_manifest_hash,
+            plan.package_manifest_hash
+        );
+        assert_eq!(package.managed_runtime_plan_cache_len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 

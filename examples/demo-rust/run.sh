@@ -14,7 +14,7 @@ TARGET="${1:-none}"
 RUNTIME_ROOT="$PROJECT_ROOT/examples/ffi/standard_runtime/runtime_root"
 
 if [ "$TARGET" != "none" ]; then
-  RUNTIME_ROOT="$RUNTIME_ROOT" bash "$PROJECT_ROOT/scripts/fetch_runtime_deps.sh" "$TARGET"
+  RUNTIME_ROOT="$RUNTIME_ROOT" bash "$PROJECT_ROOT/scripts/deps/fetch_deps.sh" "$TARGET"
 fi
 
 if [ -f "$RUNTIME_ROOT/resources/runtime-env.sh" ]; then

@@ -2070,7 +2070,7 @@ impl LuaEngine {
     /// Returns the decoded UTF-8 path text or a descriptive runtime lease initialization error.
     /// 返回解码后的 UTF-8 路径文本，或描述性的运行时租约初始化错误。
     fn runtime_lease_package_search_path_text(
-        value: &mlua::String,
+        value: &mlua::LuaString,
         field_name: &str,
     ) -> Result<String, String> {
         value
@@ -2093,10 +2093,10 @@ impl LuaEngine {
                 error
             )
         })?;
-        let old_cpath: mlua::String = package.get("cpath").map_err(|error| {
+        let old_cpath: mlua::LuaString = package.get("cpath").map_err(|error| {
             format!("Failed to read package.cpath for runtime lease: {}", error)
         })?;
-        let old_path: mlua::String = package
+        let old_path: mlua::LuaString = package
             .get("path")
             .map_err(|error| format!("Failed to read package.path for runtime lease: {}", error))?;
         let mut cpath_prefix = String::new();

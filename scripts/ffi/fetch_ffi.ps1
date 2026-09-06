@@ -12,6 +12,14 @@
 
 $ErrorActionPreference = "Stop"
 
+# Dedicated failure type emitted only when a resolved GitHub Release lacks the requested asset.
+# 仅在已解析的 GitHub Release 缺少所请求资产时发出的专用失败类型。
+class ReleaseAssetNotFoundException : System.Exception {
+    # Create one classified missing-asset failure with the supplied diagnostic message.
+    # 使用给定诊断消息创建一个已分类的资产缺失失败。
+    ReleaseAssetNotFoundException([string]$Message) : base($Message) {}
+}
+
 function Resolve-ProjectRoot {
     <#
     .SYNOPSIS
@@ -137,7 +145,9 @@ function Get-ReleaseAssetInfo {
     $Asset = $Release.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
     if (-not $Asset) {
         $Available = ($Release.assets | ForEach-Object { $_.name }) -join ", "
-        throw "Asset '$AssetName' not found in $Repo@$Tag. Available: $Available"
+        throw [ReleaseAssetNotFoundException]::new(
+            "Asset '$AssetName' not found in $Repo@$Tag. Available: $Available"
+        )
     }
     return [PSCustomObject]@{
         Url = $Asset.browser_download_url
@@ -321,7 +331,7 @@ function Install-LuaSkillsFfi {
     try {
         try {
             Save-ReleaseAssetWithDigest -Repo $LuaSkillsRepo -Tag $LuaSkillsVersion -AssetName $AssetName -Destination $ArchivePath
-        } catch {
+        } catch [ReleaseAssetNotFoundException] {
             if (Test-ExistingLuaSkillsFfiContent -RuntimeRootPath $RuntimeRootPath) {
                 Write-Warning "LuaSkills FFI SDK asset '$AssetName' was not found in $LuaSkillsRepo@$LuaSkillsVersion. Existing packaged LuaSkills core content will be used."
                 return
@@ -330,30 +340,37 @@ function Install-LuaSkillsFfi {
         }
         Expand-ArchiveSmart -ArchivePath $ArchivePath -Destination $ExtractDir
 
+        # Exact extracted core library required before any SDK content is copied into an existing runtime root.
+        # 在任何 SDK 内容复制到现有运行根之前必须存在的精确解压核心库。
+        $ExtractedLibrary = Get-LuaSkillsLibraryCandidates |
+            ForEach-Object { Join-Path (Join-Path $ExtractDir "lib") $_ } |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            Select-Object -First 1
+        if (-not $ExtractedLibrary) {
+            throw "LuaSkills dynamic library was not found in downloaded $AssetName"
+        }
+
         $IncludeSource = Join-Path $ExtractDir "include"
         if (Test-Path -LiteralPath $IncludeSource) {
             $IncludeDest = Join-Path $RuntimeRootPath "include"
             Ensure-Dir $IncludeDest
-            Copy-Item -Recurse -Force -Path (Join-Path $IncludeSource "*") -Destination $IncludeDest -ErrorAction SilentlyContinue
+            Copy-Item -Recurse -Force -Path (Join-Path $IncludeSource "*") -Destination $IncludeDest -ErrorAction Stop
         }
 
         $LibrarySource = Join-Path $ExtractDir "lib"
         if (Test-Path -LiteralPath $LibrarySource) {
             $LibraryDest = Join-Path $RuntimeRootPath "libs"
             Ensure-Dir $LibraryDest
-            Copy-Item -Recurse -Force -Path (Join-Path $LibrarySource "*") -Destination $LibraryDest -ErrorAction SilentlyContinue
+            Copy-Item -Recurse -Force -Path (Join-Path $LibrarySource "*") -Destination $LibraryDest -ErrorAction Stop
         }
 
         $LicenseSource = Join-Path $ExtractDir "licenses"
         if (Test-Path -LiteralPath $LicenseSource) {
             $LicenseDest = Join-Path $RuntimeRootPath "licenses\luaskills-ffi"
             Ensure-Dir $LicenseDest
-            Copy-Item -Recurse -Force -Path (Join-Path $LicenseSource "*") -Destination $LicenseDest -ErrorAction SilentlyContinue
+            Copy-Item -Recurse -Force -Path (Join-Path $LicenseSource "*") -Destination $LicenseDest -ErrorAction Stop
         }
 
-        if (-not (Test-ExistingLuaSkillsFfiContent -RuntimeRootPath $RuntimeRootPath)) {
-            throw "LuaSkills dynamic library was not found after installing $AssetName"
-        }
     } finally {
         Remove-Item -LiteralPath $TempDir -Recurse -Force -ErrorAction SilentlyContinue
     }

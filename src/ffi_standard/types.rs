@@ -46,11 +46,11 @@ pub struct FfiBorrowedBuffer {
 /// 跨 FFI 边界传递的拥有型字节缓冲容器。
 #[repr(C)]
 pub struct FfiOwnedBuffer {
-    /// Owned heap pointer allocated by `luaskills` helper functions.
-    /// 由 `luaskills` 辅助函数分配的拥有型堆指针。
+    /// Exact-length heap pointer allocated by `luaskills`; null only when `len` is zero.
+    /// 由 `luaskills` 分配的精确长度堆指针；仅当 `len` 为零时允许为空。
     pub ptr: *mut u8,
-    /// Number of owned bytes starting at `ptr`.
-    /// 从 `ptr` 开始拥有的字节数。
+    /// Exact allocation length; the unchanged pair must be freed exactly once by the matching helper.
+    /// 精确分配长度；未经修改的指针长度对必须由匹配辅助函数恰好释放一次。
     pub len: usize,
 }
 

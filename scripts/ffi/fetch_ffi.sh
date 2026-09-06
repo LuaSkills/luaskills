@@ -56,7 +56,8 @@ for asset in data.get("assets", []):
         print(asset.get("browser_download_url", ""))
         print(asset.get("digest", ""))
         raise SystemExit(0)
-raise SystemExit(f"asset not found: {asset_name}")
+print(f"asset not found: {asset_name}", file=sys.stderr)
+raise SystemExit(2)
 ' "$asset_name"
 }
 
@@ -67,8 +68,21 @@ save_release_asset_with_digest() {
   local tag="$2"
   local asset_name="$3"
   local destination="$4"
-  local asset_url asset_digest expected actual
-  mapfile -t asset_info < <(release_asset_info "$repo" "$tag" "$asset_name")
+  # Lookup payload and status kept separately so only an exact missing-asset result may use compatibility fallback.
+  # 分开保存查询载荷与状态，确保只有明确的资产缺失结果可以使用兼容回退。
+  local asset_url asset_digest expected actual asset_info_text lookup_status
+  if asset_info_text="$(release_asset_info "$repo" "$tag" "$asset_name")"; then
+    lookup_status=0
+  else
+    lookup_status=$?
+  fi
+  if [ "$lookup_status" -ne 0 ]; then
+    if [ "$lookup_status" -eq 2 ]; then
+      return 2
+    fi
+    return 1
+  fi
+  mapfile -t asset_info <<< "$asset_info_text"
   asset_url="${asset_info[0]:-}"
   asset_digest="${asset_info[1]:-}"
   if [[ "$asset_digest" != sha256:* ]]; then
@@ -155,14 +169,31 @@ install_luaskills_ffi() {
   local archive="$temp_dir/$asset_name"
   local extract_dir="$temp_dir/extract"
   ensure_dir "$extract_dir"
-  if ! save_release_asset_with_digest "$LUASKILLS_REPO" "$LUASKILLS_VERSION" "$asset_name" "$archive"; then
-    if has_existing_luaskills_ffi_content; then
+  # Classified download result used to separate exact asset absence from integrity or transport failures.
+  # 用于区分明确资产缺失与完整性或传输失败的分类下载结果。
+  local download_status=0
+  save_release_asset_with_digest "$LUASKILLS_REPO" "$LUASKILLS_VERSION" "$asset_name" "$archive" || download_status=$?
+  if [ "$download_status" -ne 0 ]; then
+    if [ "$download_status" -eq 2 ] && has_existing_luaskills_ffi_content; then
       echo "WARNING: LuaSkills FFI SDK asset '$asset_name' was not found in $LUASKILLS_REPO@$LUASKILLS_VERSION. Existing packaged LuaSkills core content will be used." >&2
       return 0
     fi
     return 1
   fi
   tar -xzf "$archive" -C "$extract_dir"
+  # Exact extracted core library required before any SDK content is copied into an existing runtime root.
+  # 在任何 SDK 内容复制到现有运行根之前必须存在的精确解压核心库。
+  local extracted_library="" candidate=""
+  while IFS= read -r candidate; do
+    if [ -f "$extract_dir/lib/$candidate" ]; then
+      extracted_library="$extract_dir/lib/$candidate"
+      break
+    fi
+  done < <(luaskills_library_candidates)
+  if [ -z "$extracted_library" ]; then
+    echo "LuaSkills dynamic library was not found in downloaded $asset_name" >&2
+    return 1
+  fi
   if [ -d "$extract_dir/include" ]; then
     ensure_dir "$RUNTIME_ROOT/include"
     cp -a "$extract_dir/include"/. "$RUNTIME_ROOT/include"/
@@ -175,10 +206,6 @@ install_luaskills_ffi() {
     ensure_dir "$RUNTIME_ROOT/licenses/luaskills-ffi"
     cp -a "$extract_dir/licenses"/. "$RUNTIME_ROOT/licenses/luaskills-ffi"/
   fi
-  has_existing_luaskills_ffi_content || {
-    echo "LuaSkills dynamic library was not found after installing $asset_name" >&2
-    return 1
-  }
 }
 
 cd "$PROJECT_ROOT"

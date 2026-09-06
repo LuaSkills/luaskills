@@ -11,7 +11,7 @@ import {
   StandardFixtureRuntimeClient,
   resolveLibraryPath,
   resolveStandardFixtureRuntimeRoot,
-} from "./json_runtime.js";
+} from "./json_runtime.ts";
 
 /**
 Stable session id reused by the demo lease lifecycle.

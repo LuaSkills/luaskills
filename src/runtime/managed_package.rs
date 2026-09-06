@@ -72,7 +72,7 @@ struct ManagedDependencyManifestContext {
     manifest: PackageDependencyManifest,
 }
 
-use crate::runtime::managed_runtime::ManagedRuntimeRoots;
+use crate::runtime::managed_runtime::{ManagedRuntimeEnvPlan, ManagedRuntimeRoots};
 use crate::runtime::path::{normalize_host_input_path_text, render_host_visible_path};
 use crate::skill::dependencies::PackageDependencyManifest;
 use crate::skill::manifest::validate_luaskills_identifier;
@@ -280,6 +280,13 @@ pub(crate) struct ManagedRuntimePackageContext {
     /// Shared retirement state observed by every in-flight worker request for this exact owner.
     /// 当前精确所有者的每个执行中 Worker 请求共同观察的退役状态。
     owner_state: Arc<ManagedRuntimeOwnerState>,
+    /// Successful managed-runtime plans scoped to this exact immutable package owner.
+    /// 限定在当前精确不可变包所有者内的成功受管运行时计划。
+    managed_runtime_plan_cache: Mutex<HashMap<String, ManagedRuntimeEnvPlan>>,
+    /// Number of successful plan-cache hits observed by tests for this package owner.
+    /// 测试针对当前包所有者观察到的成功计划缓存命中次数。
+    #[cfg(test)]
+    managed_runtime_plan_cache_hits: AtomicU64,
 }
 
 /// Shared lifecycle state for one exact managed package owner token.
@@ -541,6 +548,9 @@ impl ManagedRuntimePackageContext {
             lease_binding,
             owner_token,
             owner_state,
+            managed_runtime_plan_cache: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            managed_runtime_plan_cache_hits: AtomicU64::new(0),
         }))
     }
 
@@ -606,6 +616,78 @@ impl ManagedRuntimePackageContext {
     /// 此函数不接收参数，并返回绑定当前精确所有者令牌的弱句柄。
     pub(crate) fn owner_state(&self) -> Weak<ManagedRuntimeOwnerState> {
         Arc::downgrade(&self.owner_state)
+    }
+
+    /// Return a cloned successful plan cached for one exact normalized declaration key.
+    /// 返回针对一个精确规范声明键缓存的成功计划副本。
+    ///
+    /// `key` includes the owner, runtime kind, dependency declaration, and root authority.
+    /// `key` 包含所有者、运行时类型、依赖声明与根授权。
+    ///
+    /// Returns `None` when this owner has not cached the requested plan.
+    /// 当前所有者尚未缓存所请求计划时返回 `None`。
+    pub(crate) fn cached_managed_runtime_plan(&self, key: &str) -> Option<ManagedRuntimeEnvPlan> {
+        // Cached plan cloned after poison recovery so one failed caller cannot wedge future use.
+        // 在锁中毒恢复后克隆缓存计划，避免单个失败调用永久阻塞后续使用。
+        let cached = self
+            .managed_runtime_plan_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned();
+        #[cfg(test)]
+        if cached.is_some() {
+            self.managed_runtime_plan_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        cached
+    }
+
+    /// Cache one successfully resolved managed-runtime plan for this exact package owner.
+    /// 为当前精确包所有者缓存一个成功解析的受管运行时计划。
+    ///
+    /// `key` is the normalized declaration identity and `plan` is the successful result.
+    /// `key` 是规范声明身份，`plan` 是成功解析结果。
+    ///
+    /// This function replaces an older value for the same key and returns no value.
+    /// 此函数会替换同键旧值且不返回值。
+    pub(crate) fn cache_managed_runtime_plan(&self, key: String, plan: ManagedRuntimeEnvPlan) {
+        self.managed_runtime_plan_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, plan);
+    }
+
+    /// Remove one stale managed-runtime plan after live input validation fails.
+    /// 在实时输入校验失败后移除一个失效的受管运行时计划。
+    ///
+    /// `key` identifies the exact cached declaration to evict.
+    /// `key` 标识要驱逐的精确缓存声明。
+    ///
+    /// This function returns no value and tolerates a missing key.
+    /// 此函数不返回值并允许目标键不存在。
+    pub(crate) fn evict_managed_runtime_plan(&self, key: &str) {
+        self.managed_runtime_plan_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
+    }
+
+    /// Return the package-local managed-runtime plan-cache hit count for deterministic tests.
+    /// 返回包局部受管运行时计划缓存命中次数，供确定性测试使用。
+    #[cfg(test)]
+    pub(crate) fn managed_runtime_plan_cache_hit_count(&self) -> u64 {
+        self.managed_runtime_plan_cache_hits.load(Ordering::Relaxed)
+    }
+
+    /// Return the number of successful plans currently cached by this package owner.
+    /// 返回当前包所有者已经缓存的成功计划数量。
+    #[cfg(test)]
+    pub(crate) fn managed_runtime_plan_cache_len(&self) -> usize {
+        self.managed_runtime_plan_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Revalidate canonical package/runtime roots and the trusted manifest before each lease eval.

@@ -346,6 +346,34 @@ fn buffer_clone_copies_payload_into_owned_storage() {
     unsafe { luaskills_ffi_buffer_free(buffer_out) };
 }
 
+/// Verify the exact-length owned-buffer contract across empty, tiny, Unicode, and large payloads.
+/// 验证精确长度拥有型缓冲契约可覆盖空、小型、Unicode 与大载荷。
+#[test]
+fn owned_buffer_exact_length_contract_round_trips_boundary_payloads() {
+    // Boundary payloads exercising null-zero, one byte, multibyte UTF-8, and one MiB ownership.
+    // 覆盖空指针零长度、单字节、多字节 UTF-8 与一 MiB 所有权的边界载荷。
+    let payloads = vec![
+        Vec::new(),
+        vec![0x7f],
+        "火山缓冲".as_bytes().to_vec(),
+        vec![0xa5; 1024 * 1024],
+    ];
+    for payload in payloads {
+        // FFI allocation transferred directly from one owned vector.
+        // 从一个拥有型向量直接移交的 FFI 分配。
+        let buffer = alloc_owned_buffer_from_vec(payload.clone());
+        assert_eq!(buffer.len, payload.len());
+        if payload.is_empty() {
+            assert!(buffer.ptr.is_null());
+        } else {
+            assert!(!buffer.ptr.is_null());
+            let copied = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len) };
+            assert_eq!(copied, payload.as_slice());
+        }
+        unsafe { luaskills_ffi_buffer_free(buffer) };
+    }
+}
+
 /// Verify JSON provider callback bridge accepts borrowed buffers and owned-buffer responses.
 /// 验证 JSON provider callback 桥接可接受借用缓冲输入并处理拥有型缓冲输出。
 #[test]
@@ -557,13 +585,10 @@ fn entry_list_free_handles_nested_owned_buffers() {
         }),
     };
 
-    let mut items =
+    let items =
         vec![alloc_entry_descriptor(&runtime_entry).expect("entry descriptor should allocate")];
-    let list = FfiRuntimeEntryDescriptorList {
-        items: items.as_mut_ptr(),
-        len: items.len(),
-    };
-    std::mem::forget(items);
+    let (items, len) = alloc_ffi_boxed_slice(items);
+    let list = FfiRuntimeEntryDescriptorList { items, len };
     let list_ptr = Box::into_raw(Box::new(list));
 
     let list_ref = unsafe { &*list_ptr };
@@ -661,12 +686,9 @@ fn help_results_free_handle_nested_owned_buffers() {
         }],
     };
 
-    let mut items = vec![alloc_help_descriptor(&help_descriptor)];
-    let list = FfiRuntimeSkillHelpDescriptorList {
-        items: items.as_mut_ptr(),
-        len: items.len(),
-    };
-    std::mem::forget(items);
+    let items = vec![alloc_help_descriptor(&help_descriptor)];
+    let (items, len) = alloc_ffi_boxed_slice(items);
+    let list = FfiRuntimeSkillHelpDescriptorList { items, len };
     let list_ptr = Box::into_raw(Box::new(list));
 
     let list_ref = unsafe { &*list_ptr };

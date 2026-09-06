@@ -64,7 +64,11 @@ typedef struct FfiBorrowedBuffer {
 } FfiBorrowedBuffer;
 
 typedef struct FfiOwnedBuffer {
+    /* Exact-length luaskills allocation; null only when len is zero. */
+    /* luaskills 精确长度分配；仅当 len 为零时允许为空。 */
     uint8_t *ptr;
+    /* Keep ptr and len unchanged and free the pair exactly once with the matching helper. */
+    /* 保持 ptr 与 len 不变，并使用匹配辅助函数恰好释放一次。 */
     size_t len;
 } FfiOwnedBuffer;
 
@@ -553,13 +557,17 @@ Clone one host-owned byte buffer into one luaskills-owned heap buffer for callba
 */
 uint8_t *luaskills_ffi_bytes_clone(const uint8_t *value, size_t len);
 /*
-Free one luaskills-owned buffer container created by luaskills_ffi_buffer_clone.
-释放由 luaskills_ffi_buffer_clone 创建的 luaskills 自主管理缓冲容器。
+Free one exact-length luaskills-owned buffer returned by any FfiOwnedBuffer-producing API.
+The pointer-length pair must be unchanged and must be freed exactly once.
+释放任意返回 FfiOwnedBuffer 的 API 所创建的精确长度 luaskills 拥有型缓冲。
+指针长度对必须保持不变，并且必须恰好释放一次。
 */
 void luaskills_ffi_buffer_free(FfiOwnedBuffer value);
 /*
-Free one luaskills-owned heap byte buffer created by luaskills_ffi_bytes_clone.
-释放由 luaskills_ffi_bytes_clone 创建的 luaskills 自主管理堆字节缓冲。
+Free one exact-length luaskills-owned heap byte buffer created by luaskills_ffi_bytes_clone.
+The pointer and original length must be passed unchanged exactly once.
+释放由 luaskills_ffi_bytes_clone 创建的精确长度 luaskills 拥有型堆字节缓冲。
+必须恰好一次传入未经修改的指针与原始长度。
 */
 void luaskills_ffi_bytes_free(uint8_t *value, size_t len);
 /*

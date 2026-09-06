@@ -10,9 +10,9 @@ import shutil
 from pathlib import Path
 
 
-DEMO_SKILL_ID = "luaskills-demo-skill"
-DEMO_SKILL_REPO = "LuaSkills/luaskills-demo-skill"
-DEMO_TOOL_NAME = "luaskills-demo-skill-demo-status"
+DEMO_SKILL_ID = "demo-skill"
+DEMO_SKILL_REPO = "LuaSkills/demo-skill"
+DEMO_TOOL_NAME = "demo-skill-demo-status"
 
 
 class FfiLuaVmPoolConfig(ctypes.Structure):
@@ -41,6 +41,9 @@ class FfiLuaRuntimeHostOptions(ctypes.Structure):
         ("host_provided_tool_root", ctypes.c_char_p),
         ("host_provided_lua_root", ctypes.c_char_p),
         ("host_provided_ffi_root", ctypes.c_char_p),
+        # Current V1 layout places the system Lua root before the download cache root.
+        # 当前 V1 布局将系统 Lua 根放在下载缓存根之前。
+        ("system_lua_lib_dir", ctypes.c_char_p),
         ("download_cache_root", ctypes.c_char_p),
         ("dependency_dir_name", ctypes.c_char_p),
         ("state_dir_name", ctypes.c_char_p),
@@ -51,6 +54,12 @@ class FfiLuaRuntimeHostOptions(ctypes.Structure):
         ("allow_network_download", ctypes.c_uint8),
         ("github_base_url", ctypes.c_char_p),
         ("github_api_base_url", ctypes.c_char_p),
+        # Source-policy fields complete the public V1 host-options layout.
+        # 来源策略字段补全公共 V1 宿主选项布局。
+        ("official_skill_hub_base_url", ctypes.c_char_p),
+        ("enable_private_url_skill_install", ctypes.c_uint8),
+        ("private_skill_source_allowlist", ctypes.POINTER(ctypes.c_char_p)),
+        ("private_skill_source_allowlist_len", ctypes.c_size_t),
         ("sqlite_library_path", ctypes.c_char_p),
         ("sqlite_provider_mode", ctypes.c_int32),
         ("sqlite_callback_mode", ctypes.c_int32),
@@ -257,6 +266,9 @@ def build_engine_options(root: Path) -> FfiLuaEngineOptions:
     host.host_provided_tool_root = normalized_path(root / "bin" / "tools").encode("utf-8")
     host.host_provided_lua_root = normalized_path(root / "lua_packages").encode("utf-8")
     host.host_provided_ffi_root = normalized_path(root / "libs").encode("utf-8")
+    # System Lua root occupies its exact public V1 slot even when this demo does not load system packages.
+    # 即使本示例不加载系统包，系统 Lua 根仍占据公共 V1 的精确槽位。
+    host.system_lua_lib_dir = normalized_path(root / "system_lua_lib").encode("utf-8")
     host.download_cache_root = normalized_path(root / "temp" / "downloads").encode("utf-8")
     host.dependency_dir_name = b"dependencies"
     host.state_dir_name = b"state"
@@ -267,6 +279,12 @@ def build_engine_options(root: Path) -> FfiLuaEngineOptions:
     host.allow_network_download = 1
     host.github_base_url = None
     host.github_api_base_url = None
+    # Source-policy defaults keep private URL installation disabled for the demo.
+    # 来源策略默认值使本示例保持禁用私有 URL 安装。
+    host.official_skill_hub_base_url = None
+    host.enable_private_url_skill_install = 0
+    host.private_skill_source_allowlist = None
+    host.private_skill_source_allowlist_len = 0
     host.sqlite_library_path = None
     host.sqlite_provider_mode = 0
     host.sqlite_callback_mode = 0

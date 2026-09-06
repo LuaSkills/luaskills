@@ -133,6 +133,20 @@ copy_native_runtime_libraries() {
   done
 }
 
+canonical_existing_path() {
+  # Print one canonical existing path for dependency-queue deduplication.
+  # 输出一个用于依赖队列去重的规范现有路径。
+  local path="$1"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "$path"
+    return 0
+  fi
+  local directory name
+  directory="$(cd "$(dirname "$path")" && pwd -P)"
+  name="$(basename "$path")"
+  printf '%s/%s\n' "$directory" "$name"
+}
+
 is_bundled_native_dependency() {
   # Check whether one linked native library belongs to the runtime dependency set.
   # 判断一个已链接原生库是否属于需要随 runtime 携带的依赖集合。
@@ -164,37 +178,53 @@ linked_dependency_paths() {
 }
 
 copy_linked_runtime_dependencies() {
-  # Iteratively copy allowlisted linked libraries, including dependencies of newly copied libs.
-  # 迭代复制白名单链接库，包括新复制进 libs 的库的下游依赖。
-  local scan_root="$1"
-  local libs_dir="$2"
-  [ -d "$scan_root" ] || return 0
+  # Copy one complete allowlisted dependency closure from distinct initial scan roots.
+  # 从不同初始扫描根复制一个完整的白名单依赖闭包。
+  local libs_dir="$1"
+  shift
   ensure_dir "$libs_dir"
-  local queue_file seen_file pending_file
+  local queue_file seen_file pending_file roots_file
   queue_file="$(mktemp)"
   seen_file="$(mktemp)"
   pending_file="$(mktemp)"
-  trap 'rm -f "$queue_file" "$seen_file" "$pending_file"' RETURN
-  find "$scan_root" "$libs_dir" -type f \( -name '*.so' -o -name '*.dylib' -o -name '*.dll' \) 2>/dev/null > "$queue_file" || true
+  roots_file="$(mktemp)"
+  trap 'rm -f "$queue_file" "$seen_file" "$pending_file" "$roots_file"' RETURN
+
+  # Canonical initial roots prevent runtime/libs from being enumerated twice through separate calls.
+  # 规范初始根防止 runtime/libs 通过不同调用被重复枚举。
+  local scan_root canonical_root
+  for scan_root in "$@"; do
+    [ -d "$scan_root" ] || continue
+    canonical_root="$(canonical_existing_path "$scan_root")"
+    if grep -Fxq "$canonical_root" "$roots_file" 2>/dev/null; then
+      continue
+    fi
+    printf '%s\n' "$canonical_root" >> "$roots_file"
+    find "$canonical_root" -type f \( -name '*.dll' -o -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \) 2>/dev/null >> "$queue_file" || true
+  done
+
   while [ -s "$queue_file" ]; do
     : > "$pending_file"
     while IFS= read -r binary; do
       [ -f "$binary" ] || continue
-      if grep -Fxq "$binary" "$seen_file" 2>/dev/null; then
+      local canonical_binary
+      canonical_binary="$(canonical_existing_path "$binary")"
+      if grep -Fxq "$canonical_binary" "$seen_file" 2>/dev/null; then
         continue
       fi
-      printf '%s\n' "$binary" >> "$seen_file"
-      linked_dependency_paths "$binary" | while IFS= read -r dependency; do
-      [ -f "$dependency" ] || continue
-      is_bundled_native_dependency "$dependency" || continue
-        local destination="$libs_dir/$(basename "$dependency")"
+      printf '%s\n' "$canonical_binary" >> "$seen_file"
+      linked_dependency_paths "$canonical_binary" | while IFS= read -r dependency; do
+        [ -f "$dependency" ] || continue
+        is_bundled_native_dependency "$dependency" || continue
+        local destination
+        destination="$libs_dir/$(basename "$dependency")"
         if [ ! -f "$destination" ]; then
           cp -f "$dependency" "$destination"
           record_bundled_library "$dependency" "$destination"
           printf '%s\n' "$destination" >> "$pending_file"
         fi
       done
-    done
+    done < "$queue_file"
     mv "$pending_file" "$queue_file"
   done
 }
@@ -319,8 +349,7 @@ ensure_dir "$OUTPUT_DIR"
 copy_lua_package_runtime_dir "$THIRD_PARTY_DIR/lua_packages/lib/lua" "$RUNTIME_ROOT/lua_packages/lib/lua"
 copy_lua_package_runtime_dir "$THIRD_PARTY_DIR/lua_packages/share/lua" "$RUNTIME_ROOT/lua_packages/share/lua"
 copy_native_runtime_libraries "$THIRD_PARTY_DIR/deps" "$RUNTIME_ROOT"
-copy_linked_runtime_dependencies "$RUNTIME_ROOT" "$RUNTIME_ROOT/libs"
-copy_linked_runtime_dependencies "$PROJECT_ROOT/target/release" "$RUNTIME_ROOT/libs"
+copy_linked_runtime_dependencies "$RUNTIME_ROOT/libs" "$RUNTIME_ROOT" "$PROJECT_ROOT/target/release"
 
 write_loader_env_scripts
 copy_license_candidates "$PROJECT_ROOT" "$RUNTIME_ROOT/licenses/luaskills"

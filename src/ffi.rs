@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::ffi_standard::{FfiBorrowedBuffer, FfiOwnedBuffer};
+use crate::ffi_standard::{FfiBorrowedBuffer, FfiOwnedBuffer, alloc_owned_buffer_from_vec};
 use crate::runtime::managed_runtime::resolve_managed_runtime_install;
 use crate::runtime::managed_session_events::ManagedSessionEventCenter;
 use crate::runtime::path::{normalize_host_input_path_text, render_host_visible_path};
@@ -203,30 +203,16 @@ fn lock_engine_handle(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Convert one owned byte slice into one LuaSkills-owned FFI buffer container.
-/// 将一段拥有型字节切片转换为一个由 LuaSkills 管理的 FFI 缓冲容器。
-fn owned_buffer_from_bytes(bytes: &[u8]) -> FfiOwnedBuffer {
-    if bytes.is_empty() {
-        return FfiOwnedBuffer {
-            ptr: std::ptr::null_mut(),
-            len: 0,
-        };
-    }
-    let mut owned = bytes.to_vec();
-    let pointer = owned.as_mut_ptr();
-    let len = owned.len();
-    std::mem::forget(owned);
-    FfiOwnedBuffer { ptr: pointer, len }
-}
-
 /// Convert one Rust value into one LuaSkills-owned UTF-8 JSON response buffer.
 /// 将单个 Rust 值转换为一个由 LuaSkills 管理的 UTF-8 JSON 响应缓冲。
 fn encode_json_buffer<T: Serialize>(value: &T) -> FfiOwnedBuffer {
-    let json_text = match serde_json::to_string(value) {
-        Ok(json_text) => json_text,
-        Err(error) => encode_json_serialization_error_text(error),
+    // Serialized bytes transferred directly into the exact-length FFI allocation without a payload copy.
+    // 直接移交给精确长度 FFI 分配且不复制载荷的序列化字节。
+    let json_bytes = match serde_json::to_vec(value) {
+        Ok(json_bytes) => json_bytes,
+        Err(error) => encode_json_serialization_error_text(error).into_bytes(),
     };
-    owned_buffer_from_bytes(json_text.as_bytes())
+    alloc_owned_buffer_from_vec(json_bytes)
 }
 
 /// Build escaped fallback JSON text for a response serialization failure.
