@@ -1,5 +1,9 @@
 ## LuaSkills core release packages
 
+### LuaSkills 0.5.7
+
+This patch release fixes configuration watcher routing for atomic file replacement and restores package business validators on Linux ARM64 while retaining their 8 MiB Lua memory limit. It also corrects cross-platform test-only lint and timing issues. The public FFI headers and shared contracts are unchanged from `0.5.6`. The main repository publishes the Rust crate, five-platform FFI SDK, demos, and debug tool; the separate TypeScript, Python, and Go SDK packages remain on their `0.5.5` line. The default LuaSkills tag in this repository's runtime asset sync scripts is now `v0.5.7`.
+
 ### LuaSkills 0.5.6
 
 This release adds live host-model availability checks for `vulcan.models.has` and `vulcan.models.status`, owner-aware callback cleanup, and a public runtime-session lease limit constant. It also bounds outbound download requests, hardens Windows descendant-process tests, and includes the repository-wide runtime, dependency, cache, file-watcher, and FFI fixes made since `v0.5.5`. The main repository publishes the Rust crate, FFI SDK, demos, and debug tool; the TypeScript, Python, and Go SDK packages remain on their separately published `0.5.5` line until those repositories are released.
@@ -48,6 +52,10 @@ Unlike FFI demo packages, the debug tool does not bundle the extra FFI fetch scr
 The debug binary accepts explicit managed distribution/environment roots and five resource-policy flags for Worker capacity, Worker idle TTL, persistent-session capacity, default per-stream output buffering, and default invoke timeout. Omitted flags preserve the stable engine defaults.
 
 ## LuaSkills 主仓库发布资产说明
+
+### LuaSkills 0.5.7
+
+本次补丁发布修复原子替换配置文件时的监听路由问题，并在保持 Lua 8 MiB 内存硬上限的前提下恢复 Linux ARM64 的技能包业务校验；同时修正跨平台测试专用代码的 lint 与时序问题。公开 FFI 头文件和共享契约相对 `0.5.6` 未变。主仓库发布 Rust crate、五平台 FFI SDK、demo 和调试工具；独立的 TypeScript、Python、Go SDK 仍保持 `0.5.5` 版本线。本仓库运行时资产同步脚本的默认 LuaSkills 标签更新为 `v0.5.7`。
 
 ### LuaSkills 0.5.6
 
