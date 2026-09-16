@@ -10524,13 +10524,13 @@ fn open_and_capture_managed_session_tree(
         &managed_session_open_lua(layout, global_name, 4096, args),
     );
     assert_eq!(open_response["ok"], true, "open failed: {open_response}");
-    // ReadResponse waits for sidecar initialization and returns the startup JSON line.
-    // ReadResponse 等待 sidecar 初始化并返回启动 JSON 行。
+    // ReadResponse matches the compact stdout JSON field, not the stderr-started diagnostic.
+    // ReadResponse 匹配 stdout 中紧凑 JSON 字段，避免被 stderr-started 诊断提前唤醒。
     let read_response = eval_managed_session_test_lease(
         engine,
         lease,
         &format!(
-            "return {global_name}:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = 'started' }})"
+            "return {global_name}:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = '\"event\":\"started\"' }})"
         ),
     );
     assert_eq!(
@@ -11506,13 +11506,13 @@ fn run_managed_session_isolation_integration(runtime: ManagedSessionTestRuntime)
         &format!("system-managed-isolation-{}", runtime.label()),
         false,
     );
-    // OpenBoth creates two userdata instances and waits for both sidecars before the first write.
-    // OpenBoth 创建两个 userdata 实例，并在首次写入前等待两个 sidecar 就绪。
+    // OpenBoth waits for each compact stdout startup record; stderr also contains "started".
+    // OpenBoth 等待各自 stdout 的紧凑启动记录；stderr 诊断也含有 "started"。
     let open_both = eval_managed_session_test_lease(
         &engine,
         &lease,
         &format!(
-            "session_a = {}({{ file = '{}', cwd = 'runtime', buffer_limit_bytes = 4096 }})\nsession_b = {}({{ file = '{}', cwd = 'runtime', buffer_limit_bytes = 4096 }})\nlocal a = session_a:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = 'started' }})\nif not string.find(a.stderr, 'stderr-started', 1, true) then local extra_a = session_a:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = 'stderr-started' }}); a.stderr = a.stderr .. extra_a.stderr end\nlocal b = session_b:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = 'started' }})\nif not string.find(b.stderr, 'stderr-started', 1, true) then local extra_b = session_b:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = 'stderr-started' }}); b.stderr = b.stderr .. extra_b.stderr end\nreturn {{ a = a, b = b }}",
+            "session_a = {}({{ file = '{}', cwd = 'runtime', buffer_limit_bytes = 4096 }})\nsession_b = {}({{ file = '{}', cwd = 'runtime', buffer_limit_bytes = 4096 }})\nlocal a = session_a:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = '\"event\":\"started\"' }})\nif not string.find(a.stderr, 'stderr-started', 1, true) then local extra_a = session_a:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = 'stderr-started' }}); a.stderr = a.stderr .. extra_a.stderr end\nlocal b = session_b:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = '\"event\":\"started\"' }})\nif not string.find(b.stderr, 'stderr-started', 1, true) then local extra_b = session_b:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = 'stderr-started' }}); b.stderr = b.stderr .. extra_b.stderr end\nreturn {{ a = a, b = b }}",
             layout.lua_open_api(),
             layout.sidecar_file(),
             layout.lua_open_api(),
@@ -11628,13 +11628,13 @@ fn run_managed_session_lifecycle_integration(runtime: ManagedSessionTestRuntime)
         .join(format!("rollback-{}.json", runtime.label()));
     let pid_file_lua = serde_json::to_string(&render_host_visible_path(&pid_file))
         .expect("quote rollback pid file for Lua");
-    // RollbackEval waits for startup, then fails the transaction deliberately.
-    // RollbackEval 等待启动完成，随后有意让事务失败。
+    // RollbackEval waits for the stdout startup JSON before failing the transaction deliberately.
+    // RollbackEval 等待 stdout 启动 JSON 后，再有意让事务失败。
     let rollback_eval = eval_managed_session_test_lease(
         &engine,
         &rollback_lease,
         &format!(
-            "rollback_session = {}({{ file = '{}', args = {{{pid_file_lua}}}, cwd = 'runtime', buffer_limit_bytes = 4096 }})\nlocal ready = rollback_session:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = 'started' }})\nerror('forced managed session rollback after ' .. ready.stdout)",
+            "rollback_session = {}({{ file = '{}', args = {{{pid_file_lua}}}, cwd = 'runtime', buffer_limit_bytes = 4096 }})\nlocal ready = rollback_session:read({{ timeout_ms = 5000, max_bytes = 4096, until_text = '\"event\":\"started\"' }})\nerror('forced managed session rollback after ' .. ready.stdout)",
             layout.lua_open_api(),
             layout.sidecar_file(),
         ),

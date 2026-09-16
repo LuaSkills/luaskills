@@ -2,7 +2,7 @@
 
 ### LuaSkills 0.5.7
 
-This patch release fixes configuration watcher routing for atomic file replacement and restores package business validators on Linux ARM64 while retaining their 8 MiB Lua memory limit. It also corrects cross-platform test-only lint and timing issues. The public FFI headers and shared contracts are unchanged from `0.5.6`. The main repository publishes the Rust crate, five-platform FFI SDK, demos, and debug tool; the separate TypeScript, Python, and Go SDK packages remain on their `0.5.5` line. The default LuaSkills tag in this repository's runtime asset sync scripts is now `v0.5.7`.
+This patch release fixes configuration watcher routing for atomic file replacement and restores package business validators on Linux ARM64 while retaining their 8 MiB Lua memory limit. It also corrects cross-platform test-only lint and timing issues, including a managed-session acceptance race between stdout and stderr readiness. The public FFI headers and shared contracts are unchanged from `0.5.6`. The main repository publishes the Rust crate, five-platform FFI SDK, demos, and debug tool; the separate TypeScript, Python, and Go SDK packages remain on their `0.5.5` line. The default LuaSkills tag in this repository's runtime asset sync scripts is now `v0.5.7`.
 
 ### LuaSkills 0.5.6
 
@@ -55,7 +55,7 @@ The debug binary accepts explicit managed distribution/environment roots and fiv
 
 ### LuaSkills 0.5.7
 
-本次补丁发布修复原子替换配置文件时的监听路由问题，并在保持 Lua 8 MiB 内存硬上限的前提下恢复 Linux ARM64 的技能包业务校验；同时修正跨平台测试专用代码的 lint 与时序问题。公开 FFI 头文件和共享契约相对 `0.5.6` 未变。主仓库发布 Rust crate、五平台 FFI SDK、demo 和调试工具；独立的 TypeScript、Python、Go SDK 仍保持 `0.5.5` 版本线。本仓库运行时资产同步脚本的默认 LuaSkills 标签更新为 `v0.5.7`。
+本次补丁发布修复原子替换配置文件时的监听路由问题，并在保持 Lua 8 MiB 内存硬上限的前提下恢复 Linux ARM64 的技能包业务校验；同时修正跨平台测试专用代码的 lint 与时序问题，包括受管会话验收中 stdout 与 stderr 就绪顺序的竞态。公开 FFI 头文件和共享契约相对 `0.5.6` 未变。主仓库发布 Rust crate、五平台 FFI SDK、demo 和调试工具；独立的 TypeScript、Python、Go SDK 仍保持 `0.5.5` 版本线。本仓库运行时资产同步脚本的默认 LuaSkills 标签更新为 `v0.5.7`。
 
 ### LuaSkills 0.5.6
 
