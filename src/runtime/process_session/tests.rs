@@ -24,6 +24,14 @@ const WINDOWS_SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 /// 全量测试进程压力下后代探针允许的最大启动时长。
 const DESCENDANT_PROBE_START_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Root lifetime that keeps explicit-kill fixtures alive beyond the descendant probe budget.
+/// 让显式终止夹具根进程存活时间超过后代探针预算的时长。
+const DESCENDANT_KILL_FIXTURE_ROOT_LIFETIME: Duration = Duration::from_secs(65);
+
+/// Root lifetime that lets root-exit fixtures complete promptly.
+/// 让根进程退出夹具及时完成的存活时长。
+const DESCENDANT_EXIT_FIXTURE_ROOT_LIFETIME: Duration = Duration::from_millis(300);
+
 /// Descendant fixture lifetime long enough to survive full-suite scheduler pressure before cleanup.
 /// 足以承受全量套件调度压力并等待清理的后代夹具存活秒数。
 const DESCENDANT_FIXTURE_LIFETIME_SECONDS: u64 = 120;
@@ -32,6 +40,15 @@ const DESCENDANT_FIXTURE_LIFETIME_SECONDS: u64 = 120;
 /// 用作受控 Windows 后代夹具根进程的完整测试名称。
 const WINDOWS_DESCENDANT_FIXTURE_ROOT_TEST: &str =
     "runtime::process_session::tests::vulcan_process_session_descendant_fixture_root";
+
+/// Fully-qualified test name used as the long-lived Windows descendant-fixture root.
+/// 用作长生命周期 Windows 后代夹具根进程的完整测试名称。
+const WINDOWS_LONG_LIVED_DESCENDANT_FIXTURE_ROOT_TEST: &str =
+    "runtime::process_session::tests::vulcan_process_session_long_lived_descendant_fixture_root";
+
+/// Environment key that gives the controlled descendant its exact readiness publication path.
+/// 向受控后代传递精确定绪发布路径的环境变量键。
+const WINDOWS_DESCENDANT_PID_PATH_ENV: &str = "LUASKILLS_TEST_DESCENDANT_PID_PATH";
 
 /// Fully-qualified test name used as the controlled Windows inherited-pipe fixture root.
 /// 用作受控 Windows 继承管道夹具根进程的完整测试名称。
@@ -81,17 +98,23 @@ fn windows_descendant_fixture_pid_path(root_pid: u32) -> PathBuf {
 ///
 /// `inherit_output` keeps the descendant attached to the root output handles when true.
 /// `inherit_output` 为 true 时会让后代继续继承根进程的输出句柄。
+/// `root_lifetime` controls how long the root remains alive after publishing the pid.
+/// `root_lifetime` 控制根进程在发布 pid 后继续存活的时长。
 ///
-/// Returns after the descendant identity is published and the root-exit ordering is stabilized.
-/// 在后代身份发布且根进程退出顺序稳定后返回。
+/// Returns after the configured lifetime elapses or process-tree cleanup terminates the root.
+/// 在配置时长结束或进程树清理终止根进程后返回。
 #[cfg(windows)]
-fn run_windows_descendant_fixture_root(inherit_output: bool) {
+fn run_windows_descendant_fixture_root(inherit_output: bool, root_lifetime: Duration) {
     // TestExecutable is the exact current test binary, avoiding PATH and external Python discovery.
     // TestExecutable 是当前测试二进制的精确路径，避免 PATH 与外部 Python 发现过程。
     let test_executable = std::env::current_exe().expect("resolve descendant fixture test binary");
     // DescendantCommand targets one exact sleeper test and never performs executable discovery.
     // DescendantCommand 指向一个精确休眠测试，且绝不执行可执行文件发现。
     let mut descendant_command = Command::new(&test_executable);
+    // PidPath lets the descendant itself prove that its exact test body reached the sleep phase.
+    // PidPath 让后代进程自行证明其精确测试体已经进入休眠阶段。
+    let pid_path = windows_descendant_fixture_pid_path(std::process::id());
+    let _ = fs::remove_file(&pid_path);
     descendant_command
         .args([
             WINDOWS_DESCENDANT_FIXTURE_SLEEP_TEST,
@@ -99,6 +122,7 @@ fn run_windows_descendant_fixture_root(inherit_output: bool) {
             "--nocapture",
             "--test-threads=1",
         ])
+        .env(WINDOWS_DESCENDANT_PID_PATH_ENV, &pid_path)
         .stdin(Stdio::null());
     if inherit_output {
         descendant_command
@@ -122,14 +146,10 @@ fn run_windows_descendant_fixture_root(inherit_output: bool) {
     let _descendant_reaper = thread::spawn(move || {
         let _ = descendant.wait();
     });
-    // PidPath bypasses libtest output capture and is keyed by this exact managed root pid.
-    // PidPath 绕过 libtest 输出捕获，并以当前精确受管根进程 pid 为键。
-    let pid_path = windows_descendant_fixture_pid_path(std::process::id());
-    fs::write(&pid_path, descendant_pid.to_string()).expect("publish controlled descendant pid");
     if inherit_output {
         println!("{descendant_pid}");
     }
-    thread::sleep(Duration::from_millis(300));
+    thread::sleep(root_lifetime);
 }
 
 /// Run the controlled Windows fixture root with isolated descendant output handles.
@@ -140,7 +160,18 @@ fn vulcan_process_session_descendant_fixture_root() {
     if !is_exact_descendant_fixture_invocation(WINDOWS_DESCENDANT_FIXTURE_ROOT_TEST) {
         return;
     }
-    run_windows_descendant_fixture_root(false);
+    run_windows_descendant_fixture_root(false, DESCENDANT_EXIT_FIXTURE_ROOT_LIFETIME);
+}
+
+/// Run the controlled long-lived Windows fixture root for explicit tree-termination tests.
+/// 为显式进程树终止测试运行受控的长生命周期 Windows 夹具根进程。
+#[cfg(windows)]
+#[test]
+fn vulcan_process_session_long_lived_descendant_fixture_root() {
+    if !is_exact_descendant_fixture_invocation(WINDOWS_LONG_LIVED_DESCENDANT_FIXTURE_ROOT_TEST) {
+        return;
+    }
+    run_windows_descendant_fixture_root(false, DESCENDANT_KILL_FIXTURE_ROOT_LIFETIME);
 }
 
 /// Run the controlled Windows fixture root whose descendant retains inherited output handles.
@@ -151,7 +182,7 @@ fn vulcan_process_session_inherited_pipe_fixture_root() {
     if !is_exact_descendant_fixture_invocation(WINDOWS_INHERITED_PIPE_FIXTURE_ROOT_TEST) {
         return;
     }
-    run_windows_descendant_fixture_root(true);
+    run_windows_descendant_fixture_root(true, DESCENDANT_EXIT_FIXTURE_ROOT_LIFETIME);
 }
 
 /// Keep the controlled Windows descendant alive until process-tree cleanup terminates it.
@@ -162,6 +193,13 @@ fn vulcan_process_session_descendant_fixture_sleep() {
     if !is_exact_descendant_fixture_invocation(WINDOWS_DESCENDANT_FIXTURE_SLEEP_TEST) {
         return;
     }
+    // PidPath is supplied only by the controlled fixture root and proves this exact body started.
+    // PidPath 仅由受控夹具根进程提供，并证明当前精确测试体已经启动。
+    let pid_path = std::env::var_os(WINDOWS_DESCENDANT_PID_PATH_ENV)
+        .map(PathBuf::from)
+        .expect("controlled descendant pid publication path");
+    fs::write(&pid_path, std::process::id().to_string())
+        .expect("publish ready controlled descendant pid");
     thread::sleep(Duration::from_secs(DESCENDANT_FIXTURE_LIFETIME_SECONDS));
 }
 
@@ -425,9 +463,16 @@ fn make_drop_cleanup_request() -> ProcessSessionOpenRequest {
     }
 }
 
-/// Build one process request whose direct child exits after spawning one descendant.
-/// 构建一个直接子进程在拉起后代后立即退出的进程请求。
-fn make_descendant_cleanup_request() -> (ProcessSessionOpenRequest, Option<PathBuf>) {
+/// Build one process request whose direct child spawns one controlled descendant.
+/// 构建一个直接子进程会派生受控后代的进程请求。
+///
+/// `keep_windows_root_alive` selects the long-lived Windows root required by explicit-kill tests.
+/// `keep_windows_root_alive` 为显式终止测试选择所需的长生命周期 Windows 根进程。
+/// Returns the open request and the optional POSIX pid publication path.
+/// 返回打开请求以及可选的 POSIX pid 发布路径。
+fn make_descendant_cleanup_request(
+    keep_windows_root_alive: bool,
+) -> (ProcessSessionOpenRequest, Option<PathBuf>) {
     let encoding = default_runtime_text_encoding();
     if cfg!(windows) {
         // TestExecutable is an absolute controlled fixture path independent of PATH and Python startup.
@@ -436,11 +481,18 @@ fn make_descendant_cleanup_request() -> (ProcessSessionOpenRequest, Option<PathB
             .expect("resolve process descendant fixture test binary")
             .to_string_lossy()
             .into_owned();
+        // RootTest selects an exit-driven or explicit-kill fixture without changing libtest arguments.
+        // RootTest 在不改变 libtest 参数的情况下选择退出驱动或显式终止夹具。
+        let root_test = if keep_windows_root_alive {
+            WINDOWS_LONG_LIVED_DESCENDANT_FIXTURE_ROOT_TEST
+        } else {
+            WINDOWS_DESCENDANT_FIXTURE_ROOT_TEST
+        };
         (
             ProcessSessionOpenRequest {
                 program: test_executable,
                 args: vec![
-                    WINDOWS_DESCENDANT_FIXTURE_ROOT_TEST.to_string(),
+                    root_test.to_string(),
                     "--exact".to_string(),
                     "--nocapture".to_string(),
                     "--test-threads=1".to_string(),
@@ -974,7 +1026,7 @@ fn dropping_process_session_kills_child_process() {
 /// 验证显式清理会杀掉派生后代，并及时释放 reader 线程。
 #[test]
 fn killing_process_session_terminates_descendants_and_releases_readers() {
-    let (request, pid_path) = make_descendant_cleanup_request();
+    let (request, pid_path) = make_descendant_cleanup_request(true);
     let session = ManagedProcessSession::open(request).expect("open descendant cleanup session");
     let descendant_pid = wait_for_descendant_pid(
         &session,
@@ -1089,7 +1141,7 @@ fn one_shot_finalization_terminates_inherited_pipe_descendant_after_root_exit() 
 /// 验证挂起根进程只在归属 Job 后恢复，且根进程与后续后代共同继承同一 Job。
 #[test]
 fn windows_suspended_root_and_descendant_share_managed_job() {
-    let (request, pid_path) = make_descendant_cleanup_request();
+    let (request, pid_path) = make_descendant_cleanup_request(true);
     let session =
         ManagedProcessSession::open(request).expect("open Windows Job containment session");
     // Descendant output proves the CREATE_SUSPENDED root was resumed successfully.
@@ -2115,7 +2167,7 @@ fn process_session_child_lock_recovers_after_poisoned_lock() {
 #[test]
 fn closing_process_session_after_child_exit_still_cleans_descendants() {
     let lua = Lua::new();
-    let (request, pid_path) = make_descendant_cleanup_request();
+    let (request, pid_path) = make_descendant_cleanup_request(false);
     let session =
         ManagedProcessSession::open(request).expect("open close descendant cleanup session");
     let descendant_pid = wait_for_descendant_pid(

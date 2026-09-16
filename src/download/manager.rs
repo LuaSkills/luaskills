@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,14 @@ const DOWNLOAD_HTTP_WORKER_COUNT: usize = 4;
 /// Maximum number of pending HTTP tasks retained before synchronous callers apply backpressure.
 /// 同步调用方开始施加背压前允许保留的最大待处理 HTTP 任务数。
 const DOWNLOAD_HTTP_QUEUE_CAPACITY: usize = 64;
+
+/// Maximum time allowed to establish one outbound download connection.
+/// 建立单个外部下载连接允许等待的最长时间。
+const DOWNLOAD_HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Maximum total time allowed for one metadata or payload HTTP request.
+/// 单次元数据或载荷 HTTP 请求允许占用的最长总时间。
+const DOWNLOAD_HTTP_REQUEST_TIMEOUT_SECS: u64 = 5 * 60;
 
 /// Maximum collision retries while creating one same-directory unique download temp file.
 /// 创建同目录唯一下载临时文件时允许的最大冲突重试次数。
@@ -882,14 +891,37 @@ impl DownloadManager {
     /// Build one blocking HTTP client only when a network operation is actually needed.
     /// 仅在真正需要网络操作时构建一个阻塞式 HTTP 客户端。
     fn build_http_client() -> Result<reqwest::blocking::Client, String> {
+        let client = Self::build_http_client_with_timeouts(
+            Duration::from_secs(DOWNLOAD_HTTP_CONNECT_TIMEOUT_SECS),
+            Duration::from_secs(DOWNLOAD_HTTP_REQUEST_TIMEOUT_SECS),
+        )?;
+        #[cfg(test)]
+        DOWNLOAD_HTTP_CLIENT_BUILDS.fetch_add(1, Ordering::SeqCst);
+        Ok(client)
+    }
+
+    /// Build one blocking HTTP client with explicit connection and whole-request bounds.
+    /// 使用明确的连接与整次请求边界构建一个阻塞式 HTTP 客户端。
+    ///
+    /// `connect_timeout` bounds connection establishment while `request_timeout` bounds metadata
+    /// lookup or complete payload transfer, including body streaming.
+    /// `connect_timeout` 约束建连，`request_timeout` 约束元数据查询或完整载荷传输，
+    /// 其中包含响应正文的流式读取。
+    ///
+    /// Returns one reusable client or its construction error.
+    /// 返回一个可复用客户端或其构造错误。
+    fn build_http_client_with_timeouts(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<reqwest::blocking::Client, String> {
         // Client is constructed once and cloned by workers while preserving one connection pool.
         // Client 仅构造一次并由工作线程克隆，同时保留同一个连接池。
         let client = reqwest::blocking::Client::builder()
-            .user_agent("luaskills/0.1.0")
+            .user_agent(concat!("luaskills/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout)
             .build()
             .map_err(|error| format!("Failed to build HTTP client: {}", error))?;
-        #[cfg(test)]
-        DOWNLOAD_HTTP_CLIENT_BUILDS.fetch_add(1, Ordering::SeqCst);
         Ok(client)
     }
 }
@@ -1892,6 +1924,47 @@ mod tests {
             }
         }
 
+        /// Start one server that accepts a request and then emits no response bytes.
+        /// 启动一个接受请求后不再发送任何响应字节的服务。
+        ///
+        /// `stall` is the bounded interval retained by the server before closing the socket.
+        /// `stall` 是服务关闭套接字前保持停滞的有界时长。
+        ///
+        /// Returns a finite one-request fixture for client read-timeout verification.
+        /// 返回一个用于验证客户端读超时的有限单请求夹具。
+        fn start_stalled(stall: Duration) -> Self {
+            // Listener binds an isolated ephemeral loopback endpoint.
+            // Listener 绑定隔离的临时回环端点。
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled HTTP listener");
+            listener
+                .set_nonblocking(true)
+                .expect("set stalled HTTP listener nonblocking");
+            // Address becomes the stalled request URL.
+            // Address 成为停滞请求 URL。
+            let address = listener.local_addr().expect("read stalled HTTP address");
+            // RequestCount records the accepted request before the stall starts.
+            // RequestCount 在停滞开始前记录已接受请求。
+            let request_count = Arc::new(AtomicUsize::new(0));
+            // ServerRequestCount transfers counting into the stalled server thread.
+            // ServerRequestCount 将计数能力转移到停滞服务线程。
+            let server_request_count = request_count.clone();
+            // Handle owns the finite stall and socket lifetime.
+            // Handle 拥有有限停滞与套接字生命周期。
+            let handle = thread::spawn(move || {
+                // Stream remains open without response bytes until the bounded stall ends.
+                // Stream 在有界停滞结束前保持打开且不发送响应字节。
+                let mut stream = accept_test_http_connection(&listener);
+                read_test_http_request(&mut stream);
+                server_request_count.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(stall);
+            });
+            Self {
+                url: format!("http://{address}/stalled.bin"),
+                request_count,
+                handle: Some(handle),
+            }
+        }
+
         /// Join the finite server and return its delivered response count.
         /// 等待有限服务结束并返回其已投递响应数量。
         ///
@@ -1980,6 +2053,32 @@ mod tests {
             github_base_url: None,
             github_api_base_url: None,
         })
+    }
+
+    /// Verify the production client builder bounds a response that never starts.
+    /// 验证生产客户端构建器会约束始终不开始响应的请求。
+    #[test]
+    fn blocking_http_client_bounds_stalled_requests() {
+        // Server holds the accepted socket longer than the configured test request timeout.
+        // Server 持有已接受套接字的时间长于测试配置的请求超时。
+        let server = TestHttpServer::start_stalled(Duration::from_millis(250));
+        // Client uses the same builder as production with shorter deterministic test bounds.
+        // Client 使用与生产相同的构建器，但采用更短且确定的测试边界。
+        let client = DownloadManager::build_http_client_with_timeouts(
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+        )
+        .expect("build bounded test HTTP client");
+        // StartedAt proves failure occurs before the server's own bounded close.
+        // StartedAt 证明失败发生在服务自身有界关闭之前。
+        let started_at = Instant::now();
+        let error = client
+            .get(&server.url)
+            .send()
+            .expect_err("stalled response must hit the request timeout");
+        assert!(error.is_timeout(), "expected timeout error, got {error}");
+        assert!(started_at.elapsed() < Duration::from_millis(200));
+        assert_eq!(server.finish(), 1);
     }
 
     /// Assert that no armed download temp files remain below one cache root.

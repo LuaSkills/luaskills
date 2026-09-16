@@ -47,6 +47,10 @@ pub type RuntimeModelLlmCallback = Arc<
         + Sync,
 >;
 
+/// Callback type used by hosts to report whether one registered model capability is usable now.
+/// 宿主用于报告某项已注册模型能力当前是否可用的回调类型。
+pub type RuntimeModelAvailabilityCallback = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// Structured host-tool bridge actions that Lua may request through `vulcan.host.*`.
 /// Lua 可以通过 `vulcan.host.*` 请求的结构化宿主工具桥接动作集合。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -568,6 +572,28 @@ fn clone_callback_registry_value<T: Clone>(registry: &'static Mutex<Option<T>>) 
     lock_callback_registry(registry).clone()
 }
 
+/// Clear one Arc-backed callback only when the registry still contains that exact instance.
+/// 仅当注册表仍保存同一个 Arc 回调实例时才清除它。
+/// `registry` selects the process-wide callback storage, and `expected` identifies its owner.
+/// `registry` 选择进程级回调存储，`expected` 标识它的所有者。
+/// Returns true only when the expected callback was removed.
+/// 仅在预期回调确实被移除时返回 true。
+fn clear_arc_callback_registry_value_if<T: ?Sized>(
+    registry: &'static Mutex<Option<Arc<T>>>,
+    expected: &Arc<T>,
+) -> bool {
+    let mut guard = lock_callback_registry(registry);
+    if guard
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, expected))
+    {
+        *guard = None;
+        true
+    } else {
+        false
+    }
+}
+
 /// Install or clear the process-wide skill-lifecycle callback used by the host.
 /// 安装或清理供宿主使用的进程级技能生命周期回调。
 pub fn set_skill_lifecycle_callback(callback: Option<RuntimeSkillLifecycleCallback>) {
@@ -580,6 +606,18 @@ pub fn set_skill_operation_progress_callback(
     callback: Option<RuntimeSkillOperationProgressCallback>,
 ) {
     set_callback_registry_value(skill_operation_progress_callback_registry(), callback);
+}
+
+/// Clear the skill-operation progress callback only when it is still the caller-owned instance.
+/// 仅当技能操作进度回调仍是调用方持有的实例时才清除它。
+/// `callback` is the exact Arc previously installed by this owner.
+/// `callback` 是该所有者先前安装的精确 Arc。
+/// Returns true when the callback was removed and false after another owner replaced it.
+/// 回调被移除时返回 true；已被其他所有者替换时返回 false。
+pub fn clear_skill_operation_progress_callback_if(
+    callback: &RuntimeSkillOperationProgressCallback,
+) -> bool {
+    clear_arc_callback_registry_value_if(skill_operation_progress_callback_registry(), callback)
 }
 
 /// Install or clear the process-wide entry-registry callback used by the host.
@@ -606,10 +644,72 @@ pub fn set_model_embed_callback(callback: Option<RuntimeModelEmbedCallback>) {
     set_callback_registry_value(model_embed_callback_registry(), callback);
 }
 
+/// Clear the embedding dispatch callback only when it is still the caller-owned instance.
+/// 仅当向量派发回调仍是调用方持有的实例时才清除它。
+/// `callback` is the exact Arc previously installed by this owner.
+/// `callback` 是该所有者先前安装的精确 Arc。
+/// Returns true when the callback was removed and false after replacement.
+/// 回调被移除时返回 true；已被替换时返回 false。
+pub fn clear_model_embed_callback_if(callback: &RuntimeModelEmbedCallback) -> bool {
+    clear_arc_callback_registry_value_if(model_embed_callback_registry(), callback)
+}
+
 /// Install or clear the process-wide standard non-streaming LLM callback used by the host.
 /// 安装或清理由宿主使用的进程级标准非流式 LLM 回调。
 pub fn set_model_llm_callback(callback: Option<RuntimeModelLlmCallback>) {
     set_callback_registry_value(model_llm_callback_registry(), callback);
+}
+
+/// Clear the LLM dispatch callback only when it is still the caller-owned instance.
+/// 仅当 LLM 派发回调仍是调用方持有的实例时才清除它。
+/// `callback` is the exact Arc previously installed by this owner.
+/// `callback` 是该所有者先前安装的精确 Arc。
+/// Returns true when the callback was removed and false after replacement.
+/// 回调被移除时返回 true；已被替换时返回 false。
+pub fn clear_model_llm_callback_if(callback: &RuntimeModelLlmCallback) -> bool {
+    clear_arc_callback_registry_value_if(model_llm_callback_registry(), callback)
+}
+
+/// Install or clear the process-wide embedding availability probe used by `has` and `status`.
+/// 安装或清理供 `has` 与 `status` 使用的进程级向量可用性探针。
+/// `callback` is queried after the registry lock is released; absence preserves the legacy
+/// dispatch-slot-presence behavior.
+/// `callback` 会在注册表锁释放后被查询；缺失时保留旧有的派发槽存在性行为。
+pub fn set_model_embed_availability_callback(callback: Option<RuntimeModelAvailabilityCallback>) {
+    set_callback_registry_value(model_embed_availability_callback_registry(), callback);
+}
+
+/// Clear the embedding availability probe only when it is still the caller-owned instance.
+/// 仅当向量可用性探针仍是调用方持有的实例时才清除它。
+/// `callback` is the exact Arc previously installed by this owner.
+/// `callback` 是该所有者先前安装的精确 Arc。
+/// Returns true when the callback was removed and false after replacement.
+/// 探针被移除时返回 true；已被替换时返回 false。
+pub fn clear_model_embed_availability_callback_if(
+    callback: &RuntimeModelAvailabilityCallback,
+) -> bool {
+    clear_arc_callback_registry_value_if(model_embed_availability_callback_registry(), callback)
+}
+
+/// Install or clear the process-wide LLM availability probe used by `has` and `status`.
+/// 安装或清理供 `has` 与 `status` 使用的进程级 LLM 可用性探针。
+/// `callback` is queried after the registry lock is released; absence preserves the legacy
+/// dispatch-slot-presence behavior.
+/// `callback` 会在注册表锁释放后被查询；缺失时保留旧有的派发槽存在性行为。
+pub fn set_model_llm_availability_callback(callback: Option<RuntimeModelAvailabilityCallback>) {
+    set_callback_registry_value(model_llm_availability_callback_registry(), callback);
+}
+
+/// Clear the LLM availability probe only when it is still the caller-owned instance.
+/// 仅当 LLM 可用性探针仍是调用方持有的实例时才清除它。
+/// `callback` is the exact Arc previously installed by this owner.
+/// `callback` 是该所有者先前安装的精确 Arc。
+/// Returns true when the callback was removed and false after replacement.
+/// 探针被移除时返回 true；已被替换时返回 false。
+pub fn clear_model_llm_availability_callback_if(
+    callback: &RuntimeModelAvailabilityCallback,
+) -> bool {
+    clear_arc_callback_registry_value_if(model_llm_availability_callback_registry(), callback)
 }
 
 /// Guard one process-wide model callback test and clear global callback state on drop.
@@ -628,6 +728,8 @@ impl Drop for RuntimeModelCallbackTestGuard {
     fn drop(&mut self) {
         set_model_embed_callback(None);
         set_model_llm_callback(None);
+        set_model_embed_availability_callback(None);
+        set_model_llm_availability_callback(None);
     }
 }
 
@@ -642,6 +744,8 @@ pub(crate) fn runtime_model_callback_test_guard() -> RuntimeModelCallbackTestGua
         .expect("lock model callback test guard");
     set_model_embed_callback(None);
     set_model_llm_callback(None);
+    set_model_embed_availability_callback(None);
+    set_model_llm_availability_callback(None);
     RuntimeModelCallbackTestGuard { _guard: guard }
 }
 
@@ -745,12 +849,24 @@ pub(crate) fn try_has_host_tool_callback() -> bool {
 /// Return whether one host callback is currently registered for standard embedding dispatch.
 /// 返回当前是否已为标准 embedding 分发注册宿主回调。
 pub(crate) fn try_has_model_embed_callback() -> bool {
+    let available = clone_callback_registry_value(model_embed_availability_callback_registry())
+        .map(|callback| callback())
+        .unwrap_or(true);
+    if !available {
+        return false;
+    }
     clone_callback_registry_value(model_embed_callback_registry()).is_some()
 }
 
 /// Return whether one host callback is currently registered for standard LLM dispatch.
 /// 返回当前是否已为标准 LLM 分发注册宿主回调。
 pub(crate) fn try_has_model_llm_callback() -> bool {
+    let available = clone_callback_registry_value(model_llm_availability_callback_registry())
+        .map(|callback| callback())
+        .unwrap_or(true);
+    if !available {
+        return false;
+    }
     clone_callback_registry_value(model_llm_callback_registry()).is_some()
 }
 
@@ -884,17 +1000,39 @@ fn model_llm_callback_registry() -> &'static Mutex<Option<RuntimeModelLlmCallbac
     REGISTRY.get_or_init(|| Mutex::new(None))
 }
 
+/// Return the process-wide embedding availability probe storage.
+/// 返回进程级向量可用性探针存储。
+fn model_embed_availability_callback_registry()
+-> &'static Mutex<Option<RuntimeModelAvailabilityCallback>> {
+    static REGISTRY: OnceLock<Mutex<Option<RuntimeModelAvailabilityCallback>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(None))
+}
+
+/// Return the process-wide LLM availability probe storage.
+/// 返回进程级 LLM 可用性探针存储。
+fn model_llm_availability_callback_registry()
+-> &'static Mutex<Option<RuntimeModelAvailabilityCallback>> {
+    static REGISTRY: OnceLock<Mutex<Option<RuntimeModelAvailabilityCallback>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(None))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
+        RuntimeModelAvailabilityCallback, RuntimeModelLlmCallback,
         RuntimeSkillOperationProgressCallback, RuntimeSkillOperationProgressDetail,
         RuntimeSkillOperationProgressEmitter, RuntimeSkillOperationProgressEvent,
-        set_skill_operation_progress_callback, skill_operation_progress_callback_registry,
-        system_time_to_skill_operation_unix_millis,
+        clear_model_llm_callback_if, clear_skill_operation_progress_callback_if,
+        clone_callback_registry_value, model_llm_callback_registry,
+        runtime_model_callback_test_guard, set_model_llm_availability_callback,
+        set_model_llm_callback, set_skill_operation_progress_callback,
+        skill_operation_progress_callback_registry, system_time_to_skill_operation_unix_millis,
+        try_has_model_llm_callback,
     };
     use crate::skill::manager::{SkillLifecycleAction, SkillOperationPlane};
     use crate::skill::source::SkillInstallSourceType;
     use std::panic::{self, AssertUnwindSafe};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -1073,5 +1211,105 @@ mod tests {
         assert_eq!(events[0].phase, "registry_recovered");
         assert_eq!(events[0].status, "completed");
         assert_eq!(events[0].skill_id.as_deref(), Some("demo-skill"));
+    }
+
+    /// Verify a live availability probe controls Lua discovery while preserving legacy hosts.
+    /// 验证实时可用性探针会控制 Lua 能力发现，同时保留旧宿主行为。
+    #[test]
+    fn model_availability_probe_overrides_dispatch_slot_presence() {
+        let _guard = runtime_model_callback_test_guard();
+        // Dispatch callback whose body is intentionally unreachable in this discovery-only test.
+        // 此发现能力测试中函数体刻意不可达的派发回调。
+        let dispatch: RuntimeModelLlmCallback =
+            Arc::new(|_| panic!("discovery must not invoke the dispatch callback"));
+        set_model_llm_callback(Some(dispatch));
+        assert!(try_has_model_llm_callback());
+
+        // Mutable capability fact returned by the host-owned live probe.
+        // 宿主持有的实时探针所返回的可变能力事实。
+        let available = Arc::new(AtomicBool::new(false));
+        // Probe closure that reads the current host capability fact after registry unlock.
+        // 在注册表解锁后读取当前宿主能力事实的探针闭包。
+        let probe_fact = Arc::clone(&available);
+        let probe: RuntimeModelAvailabilityCallback =
+            Arc::new(move || probe_fact.load(Ordering::SeqCst));
+        set_model_llm_availability_callback(Some(probe));
+
+        assert!(!try_has_model_llm_callback());
+        available.store(true, Ordering::SeqCst);
+        assert!(try_has_model_llm_callback());
+
+        // Removing the optional probe restores callback-presence compatibility for existing hosts.
+        // 移除可选探针后，为既有宿主恢复按回调存在性判断的兼容行为。
+        set_model_llm_availability_callback(None);
+        assert!(try_has_model_llm_callback());
+    }
+
+    /// Verify discovery cannot report available after its probe removes the dispatch callback.
+    /// 验证可用性探针移除派发回调后，能力发现不能继续报告可用。
+    #[test]
+    fn model_availability_rechecks_dispatch_after_probe() {
+        let _guard = runtime_model_callback_test_guard();
+        // Installed dispatch slot that the availability probe invalidates during this observation.
+        // 本次观察期间由可用性探针使其失效的已安装派发槽。
+        let dispatch: RuntimeModelLlmCallback =
+            Arc::new(|_| panic!("discovery must not invoke the dispatch callback"));
+        set_model_llm_callback(Some(dispatch));
+        // Probe that models a concurrent shutdown between availability evaluation and dispatch use.
+        // 模拟在可用性求值与派发使用之间发生并发关闭的探针。
+        let probe: RuntimeModelAvailabilityCallback = Arc::new(|| {
+            set_model_llm_callback(None);
+            true
+        });
+        set_model_llm_availability_callback(Some(probe));
+
+        assert!(!try_has_model_llm_callback());
+    }
+
+    /// Verify an obsolete model owner cannot clear a callback installed by its replacement.
+    /// 验证过期模型所有者无法清除其替代者安装的回调。
+    #[test]
+    fn conditional_model_clear_preserves_replacement_callback() {
+        let _guard = runtime_model_callback_test_guard();
+        // First owner callback retained after a replacement has already been installed.
+        // 替代者已经安装后仍由首个所有者保留的回调。
+        let first: RuntimeModelLlmCallback = Arc::new(|_| panic!("first callback is not invoked"));
+        // Replacement callback that must survive cleanup attempted by the first owner.
+        // 必须在首个所有者尝试清理后继续保留的替代回调。
+        let second: RuntimeModelLlmCallback =
+            Arc::new(|_| panic!("second callback is not invoked"));
+        set_model_llm_callback(Some(Arc::clone(&first)));
+        set_model_llm_callback(Some(Arc::clone(&second)));
+
+        assert!(!clear_model_llm_callback_if(&first));
+        let installed = clone_callback_registry_value(model_llm_callback_registry())
+            .expect("replacement callback must remain installed");
+        assert!(Arc::ptr_eq(&installed, &second));
+        assert!(clear_model_llm_callback_if(&second));
+        assert!(!try_has_model_llm_callback());
+    }
+
+    /// Verify an obsolete progress owner cannot clear a callback installed by its replacement.
+    /// 验证过期进度所有者无法清除其替代者安装的回调。
+    #[test]
+    fn conditional_progress_clear_preserves_replacement_callback() {
+        let _guard = progress_callback_test_guard();
+        // First progress callback retained by the owner being replaced.
+        // 被替换所有者仍保留的首个进度回调。
+        let first: RuntimeSkillOperationProgressCallback = Arc::new(|_| {});
+        // Replacement progress callback that must remain authoritative.
+        // 必须继续保持权威的替代进度回调。
+        let second: RuntimeSkillOperationProgressCallback = Arc::new(|_| {});
+        set_skill_operation_progress_callback(Some(Arc::clone(&first)));
+        set_skill_operation_progress_callback(Some(Arc::clone(&second)));
+
+        assert!(!clear_skill_operation_progress_callback_if(&first));
+        let installed = clone_callback_registry_value(skill_operation_progress_callback_registry())
+            .expect("replacement progress callback must remain installed");
+        assert!(Arc::ptr_eq(&installed, &second));
+        assert!(clear_skill_operation_progress_callback_if(&second));
+        assert!(
+            clone_callback_registry_value(skill_operation_progress_callback_registry()).is_none()
+        );
     }
 }

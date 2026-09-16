@@ -467,6 +467,10 @@ pub struct LuaVmPoolConfig {
     pub idle_ttl_secs: u64,
 }
 
+/// Maximum leases retained by each public or System runtime-session manager.
+/// 每个公开或 System 运行时会话管理器允许保留的租约数量上限。
+pub const MAX_RUNTIME_SESSION_LEASES_PER_MANAGER: usize = 8;
+
 impl LuaVmPoolConfig {
     /// Return a normalized pool config with safe bounds.
     /// 返回经过安全边界归一化后的池配置。

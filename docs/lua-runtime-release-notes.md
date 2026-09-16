@@ -1,5 +1,11 @@
 ## LuaSkills core release packages
 
+### LuaSkills 0.5.6
+
+This release adds live host-model availability checks for `vulcan.models.has` and `vulcan.models.status`, owner-aware callback cleanup, and a public runtime-session lease limit constant. It also bounds outbound download requests, hardens Windows descendant-process tests, and includes the repository-wide runtime, dependency, cache, file-watcher, and FFI fixes made since `v0.5.5`. The main repository publishes the Rust crate, FFI SDK, demos, and debug tool; the TypeScript, Python, and Go SDK packages remain on their separately published `0.5.5` line until those repositories are released.
+
+Rust source compatibility note: transaction-internal fields of `PreparedSkillInstall`, `PreparedSkillUpdate`, and `PreparedSkillUninstall` are now crate-private. External Rust callers that accessed or constructed those fields must use supported manager operations and the public `result` field instead. The global Tool Cache configuration entrypoint now reports conflicting registration instead of silently keeping an older configuration.
+
 This Release now publishes only the main-repo artifacts that still belong to `luaskills`: the FFI SDK and the runnable demo packages. Lua runtime packages and native dependency bundles are published separately by [`LuaSkills/luaskills-packages`](https://github.com/LuaSkills/luaskills-packages).
 
 ### Assets
@@ -9,7 +15,7 @@ This Release now publishes only the main-repo artifacts that still belong to `lu
 - `luaskills-demo-rust-{platform}.tar.gz`: Runnable non-FFI Rust demo package that shows a Rust host using the `luaskills` crate. It includes platform-matching runner scripts and dependency fetch scripts.
 - `luaskills-debug-tool-{platform}.tar.gz`: Standalone skill-debug workspace. It includes the release-mode `luaskills-debug` binary, a package-local `runtime/`, a `skills/` drop-in directory, and scripts that fetch Lua runtime packages on demand.
 
-Every archive above has a same-name `.sha256` sidecar. LuaSkills `0.5.5` introduces the strict package-level configuration contract, versioned user-level stores, cross-process transactions, cached file-watch reloads, business validators, host events, and matching TypeScript, Python, and Go SDK APIs. This unreleased configuration surface intentionally does not retain its earlier draft format or symbols.
+Every archive above has a same-name `.sha256` sidecar. LuaSkills `0.5.5` introduced the strict package-level configuration contract, versioned user-level stores, cross-process transactions, cached file-watch reloads, business validators, host events, and matching TypeScript, Python, and Go SDK APIs. That configuration surface intentionally did not retain its earlier draft format or symbols.
 
 ### Runtime dependencies
 
@@ -24,7 +30,7 @@ Demo and debug-tool packages no longer bundle `lua-runtime-{platform}.tar.gz` or
 
 Demo packages provide standalone dependency upgrade scripts with four targets. The `run` script only runs the demo and does not download dependencies automatically. Windows packages include `upgrade_deps.bat`, `scripts/deps/fetch_deps.ps1`, and `run.ps1`; FFI packages also include `scripts/ffi/fetch_ffi.ps1`. Linux/macOS packages include the matching `.sh` scripts.
 
-SDK repositories additionally publish `scripts/deps/sync_runtime_assets.ps1` and `scripts/deps/sync_runtime_assets.sh` as one direct entrypoint for LuaSkills FFI, Lua runtime packages, and VLDB. Use target `all`, `luaskills`, `lua`, or `vldb`; select `none`, `vldb-controller`, `vldb-direct`, or `host-callback` as the database preset. The default LuaSkills tag is `v0.5.5`, and release tags can be overridden explicitly for controlled validation.
+SDK repositories additionally publish `scripts/deps/sync_runtime_assets.ps1` and `scripts/deps/sync_runtime_assets.sh` as one direct entrypoint for LuaSkills FFI, Lua runtime packages, and VLDB. Use target `all`, `luaskills`, `lua`, or `vldb`; select `none`, `vldb-controller`, `vldb-direct`, or `host-callback` as the database preset. This repository's default LuaSkills tag is `v0.5.6`; release tags can be overridden explicitly for controlled validation.
 
 - `all`: Fetch `lua-runtime-packages-{platform}.tar.gz`, optional vldb-controller, and the FFI SDK when the package contains `scripts/ffi`.
 - `lua`: Fetch `lua-runtime-packages-{platform}.tar.gz` and install it into the demo `runtime/` directory.
@@ -43,6 +49,12 @@ The debug binary accepts explicit managed distribution/environment roots and fiv
 
 ## LuaSkills 主仓库发布资产说明
 
+### LuaSkills 0.5.6
+
+本次发布新增 `vulcan.models.has` 与 `vulcan.models.status` 的宿主模型实时可用性检查、按所有者清理回调的接口，以及公开的运行时会话租约上限常量；同时为下载请求设置时限，增强 Windows 后代进程测试，并包含 `v0.5.5` 以来运行时、依赖、缓存、文件监听及 FFI 的仓库级修复。主仓库发布 Rust crate、FFI SDK、demo 与调试工具；TypeScript、Python、Go SDK 在各自仓库另行发布前仍保持已发布的 `0.5.5` 版本线。
+
+Rust 源码兼容提醒：`PreparedSkillInstall`、`PreparedSkillUpdate`、`PreparedSkillUninstall` 的事务内部字段现为 crate 私有。外部 Rust 调用方若曾直接读取或构造这些字段，需改用受支持的管理操作与公开的 `result` 字段。全局 Tool Cache 配置入口遇到冲突注册时也不再静默保留旧配置，而会报告冲突。
+
 本 Release 现在只发布仍然属于 `luaskills` 主仓库的核心资产：FFI SDK 与可运行 demo 包。Lua runtime 包和原生依赖包已经拆分到 [`LuaSkills/luaskills-packages`](https://github.com/LuaSkills/luaskills-packages) 独立发布。
 
 ### 资产用途
@@ -52,7 +64,7 @@ The debug binary accepts explicit managed distribution/environment roots and fiv
 - `luaskills-demo-rust-{platform}.tar.gz`：面向非 FFI / Rust 直连模式的可运行 demo 包，演示 Rust 宿主通过 `luaskills` crate 使用运行时，并携带平台匹配的运行脚本与依赖拉取脚本。
 - `luaskills-debug-tool-{platform}.tar.gz`：独立 skill 调试工作台，包含 release 模式的 `luaskills-debug` 二进制、包内 `runtime/`、可直接放 skill 的 `skills/` 目录，以及按需拉取 Lua runtime packages 的脚本。
 
-以上每个归档都有同名 `.sha256` sidecar。LuaSkills `0.5.5` 引入严格的技能包级配置契约、版本化用户级存储、跨进程事务、缓存与文件监听重载、业务校验器、宿主事件，以及匹配的 TypeScript、Python、Go SDK API。此前未发布的配置草案格式与符号有意不保留。
+以上每个归档都有同名 `.sha256` sidecar。LuaSkills `0.5.5` 引入严格的技能包级配置契约、版本化用户级存储、跨进程事务、缓存与文件监听重载、业务校验器、宿主事件，以及匹配的 TypeScript、Python、Go SDK API。该版本有意不保留此前配置草案的格式与符号。
 
 ### Runtime 依赖来源
 
@@ -67,7 +79,7 @@ demo 包与 debug-tool 包不再从本仓库发布 `lua-runtime-{platform}.tar.g
 
 demo 包内的独立依赖升级脚本支持四个目标。`run` 脚本只负责运行 demo，不会自动下载依赖。Windows 包携带 `upgrade_deps.bat`、`scripts/deps/fetch_deps.ps1` 和 `run.ps1`；FFI 包额外携带 `scripts/ffi/fetch_ffi.ps1`。Linux/macOS 包携带对应的 `.sh` 脚本。
 
-三个 SDK 仓库还会发布 `scripts/deps/sync_runtime_assets.ps1` 与 `scripts/deps/sync_runtime_assets.sh`，作为 LuaSkills FFI、Lua runtime packages 与 VLDB 的统一直接同步入口。目标支持 `all`、`luaskills`、`lua`、`vldb`；数据库预设支持 `none`、`vldb-controller`、`vldb-direct`、`host-callback`。默认 LuaSkills 标签固定为 `v0.5.5`，受控验证时可显式覆盖发布标签。
+三个 SDK 仓库还会发布 `scripts/deps/sync_runtime_assets.ps1` 与 `scripts/deps/sync_runtime_assets.sh`，作为 LuaSkills FFI、Lua runtime packages 与 VLDB 的统一直接同步入口。目标支持 `all`、`luaskills`、`lua`、`vldb`；数据库预设支持 `none`、`vldb-controller`、`vldb-direct`、`host-callback`。本仓库的默认 LuaSkills 标签为 `v0.5.6`，受控验证时可显式覆盖发布标签。
 
 - `all`：拉取 `lua-runtime-packages-{platform}.tar.gz`、可选 vldb-controller，并在包内存在 `scripts/ffi` 时额外拉取 FFI SDK。
 - `lua`：只拉取并安装 `lua-runtime-packages-{platform}.tar.gz` 到 demo 的 `runtime/` 目录。

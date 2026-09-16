@@ -575,7 +575,9 @@ impl RuntimeSessionManager {
                     state.sid_index.remove(&sid);
                 }
             }
-            if state.leases.len() >= 8 && replacement_lease_id.is_none() {
+            if state.leases.len() >= MAX_RUNTIME_SESSION_LEASES_PER_MANAGER
+                && replacement_lease_id.is_none()
+            {
                 return Err(RuntimeSessionError {
                     code: "lease_limit_exceeded",
                     message: "runtime session lease limit exceeded".to_string(),

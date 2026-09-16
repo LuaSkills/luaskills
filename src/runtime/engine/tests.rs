@@ -14,10 +14,10 @@ use super::vulcan_process_candidate_paths;
 use super::windows_wide_null_path;
 use super::{
     LoadedSkill, LuaEngine, LuaVm, LuaVmPool, LuaVmPoolConfig, LuaVmPoolState,
-    LuaVmRequestScopeGuard, ManagedRuntimeServices, ManagedRuntimeWorkerKey,
-    ManagedRuntimeWorkerService, NativeLibrarySearchGuard, ResolvedEntryTarget,
-    RunLuaVmBuildContext, SkillApplyLifecycleAction, SkillPackageConfigService,
-    VulcanInternalExecutionContext, build_lua_call_dispatch_entries,
+    LuaVmRequestScopeGuard, MAX_RUNTIME_SESSION_LEASES_PER_MANAGER, ManagedRuntimeServices,
+    ManagedRuntimeWorkerKey, ManagedRuntimeWorkerService, NativeLibrarySearchGuard,
+    ResolvedEntryTarget, RunLuaVmBuildContext, SkillApplyLifecycleAction,
+    SkillPackageConfigService, VulcanInternalExecutionContext, build_lua_call_dispatch_entries,
     copy_managed_node_package_import_root, default_runlua_vm_pool_config,
     find_vulcan_process_candidate, format_lifecycle_recovery_error, get_vulcan_context_table,
     get_vulcan_deps_table, get_vulcan_runtime_internal_table, get_vulcan_table,
@@ -61,7 +61,7 @@ use crate::{
     RuntimeModelLlmRequest, RuntimeModelLlmResponse, RuntimeModelUsage, RuntimeRequestContext,
     RuntimeSkillRoot, SkillInstallRequest, SkillInstallSourceType, SkillManagementAuthority,
     SkillUninstallOptions, set_host_tool_callback, set_model_embed_callback,
-    set_model_llm_callback,
+    set_model_llm_availability_callback, set_model_llm_callback,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -83,7 +83,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Barrier, Condvar, Mutex, MutexGuard, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -4751,6 +4751,50 @@ return {
     assert_eq!(result["llm_code"], "model_unavailable");
 }
 
+/// Verify one already-created Lua engine observes live host availability changes.
+/// 验证一个已经创建的 Lua 引擎会观察到宿主实时可用性变化。
+#[test]
+fn vulcan_models_discovery_uses_live_availability_probe() {
+    let _guard = runtime_model_callback_test_guard();
+    // Dispatch callback kept installed while only the host capability fact changes.
+    // 仅宿主能力事实变化期间保持安装的派发回调。
+    set_model_llm_callback(Some(Arc::new(|_| {
+        Ok(RuntimeModelLlmResponse {
+            assistant: "unused".to_string(),
+            usage: None,
+        })
+    })));
+    // Mutable availability fact queried on each Lua discovery call.
+    // 每次 Lua 能力发现调用都会查询的可变可用性事实。
+    let available = Arc::new(AtomicBool::new(false));
+    // Host probe reading the exact current fact without replacing the dispatch callback.
+    // 在不替换派发回调的情况下读取精确当前事实的宿主探针。
+    let probe_fact = Arc::clone(&available);
+    set_model_llm_availability_callback(Some(Arc::new(move || {
+        probe_fact.load(AtomicOrdering::SeqCst)
+    })));
+
+    let engine = make_runtime_test_engine();
+    let unavailable = engine
+        .run_lua(
+            "return { has = vulcan.models.has('llm'), status = vulcan.models.status().capabilities.llm }",
+            &json!({}),
+            None,
+        )
+        .expect("run unavailable model discovery");
+    assert_eq!(unavailable, json!({"has": false, "status": false}));
+
+    available.store(true, AtomicOrdering::SeqCst);
+    let usable = engine
+        .run_lua(
+            "return { has = vulcan.models.has('llm'), status = vulcan.models.status().capabilities.llm }",
+            &json!({}),
+            None,
+        )
+        .expect("run available model discovery");
+    assert_eq!(usable, json!({"has": true, "status": true}));
+}
+
 /// Verify model APIs return structured invalid-argument errors instead of throwing to Lua.
 /// 验证模型 API 会返回结构化非法参数错误，而不是向 Lua 抛出异常。
 #[test]
@@ -4763,6 +4807,7 @@ fn vulcan_models_validate_arguments() {
 local embed_empty = vulcan.models.embed("")
 local embed_table = vulcan.models.embed({ "a", "b" })
 local embed_extra = vulcan.models.embed("x", "extra")
+local status_extra = vulcan.models.status("extra")
 local llm_empty_system = vulcan.models.llm("", "u")
 local llm_empty_user = vulcan.models.llm("s", "")
 local llm_extra = vulcan.models.llm("s", "u", "extra")
@@ -4770,6 +4815,7 @@ return {
   embed_empty = embed_empty.error.code,
   embed_table = embed_table.error.code,
   embed_extra = embed_extra.error.code,
+  status_extra = status_extra.error.code,
   llm_empty_system = llm_empty_system.error.code,
   llm_empty_user = llm_empty_user.error.code,
   llm_extra = llm_extra.error.code,
@@ -4783,6 +4829,7 @@ return {
     assert_eq!(result["embed_empty"], "invalid_argument");
     assert_eq!(result["embed_table"], "invalid_argument");
     assert_eq!(result["embed_extra"], "invalid_argument");
+    assert_eq!(result["status_extra"], "invalid_argument");
     assert_eq!(result["llm_empty_system"], "invalid_argument");
     assert_eq!(result["llm_empty_user"], "invalid_argument");
     assert_eq!(result["llm_extra"], "invalid_argument");
@@ -11964,6 +12011,52 @@ fn runtime_session_status_reports_closed_lease() {
     .expect("status response json");
     assert_eq!(status["ok"], false);
     assert_eq!(status["error_code"], "lease_closed");
+}
+
+/// Verify the exported runtime-session capacity is the manager's exact enforced boundary.
+/// 验证公开的运行时会话容量就是管理器实际执行的精确边界。
+#[test]
+fn runtime_session_manager_limit_matches_exported_capacity() {
+    let engine = make_runtime_test_engine();
+    // created_lease_ids retain every accepted lease so the test proves distinct live capacity.
+    // created_lease_ids 保留全部已接受租约，以证明互不相同的活动容量。
+    let mut created_lease_ids = Vec::new();
+    for index in 0..MAX_RUNTIME_SESSION_LEASES_PER_MANAGER {
+        // request uses a distinct SID because replacement must not consume additional capacity.
+        // request 使用不同 SID，因为替换操作不得消耗额外容量。
+        let request = json!({
+            "sid": format!("capacity-{index}"),
+            "ttl_sec": 60,
+        });
+        let created: Value = serde_json::from_str(
+            &engine
+                .create_runtime_lease_json(&request.to_string())
+                .expect("create runtime session within exported capacity"),
+        )
+        .expect("decode runtime-session create response");
+        assert_eq!(created["ok"], true);
+        created_lease_ids.push(
+            created["lease_id"]
+                .as_str()
+                .expect("accepted lease id")
+                .to_string(),
+        );
+    }
+    assert_eq!(
+        created_lease_ids.len(),
+        MAX_RUNTIME_SESSION_LEASES_PER_MANAGER
+    );
+
+    // overflow is the first request beyond the exported public-manager capacity.
+    // overflow 是超过公开会话管理器容量后的第一条请求。
+    let overflow: Value = serde_json::from_str(
+        &engine
+            .create_runtime_lease_json(r#"{"sid":"capacity-overflow","ttl_sec":60}"#)
+            .expect("encode runtime-session capacity failure"),
+    )
+    .expect("decode runtime-session capacity failure");
+    assert_eq!(overflow["ok"], false);
+    assert_eq!(overflow["error_code"], "lease_limit_exceeded");
 }
 
 /// Verify replaced runtime sessions keep a stable lease_replaced terminal error.

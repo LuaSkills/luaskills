@@ -147,7 +147,7 @@ Rust hosts can depend on the crate directly:
 
 ```toml
 [dependencies]
-luaskills = "0.5.5"
+luaskills = "0.5.6"
 ```
 
 Repository development uses the normal Rust workflow:
@@ -265,7 +265,8 @@ This order keeps every installer and examples workflow pointed at already-publis
 
 | Component | Current version |
 | --- | --- |
-| LuaSkills core, FFI SDK, and language SDK line | `0.5.5` |
+| LuaSkills core and FFI SDK | `0.5.6` |
+| TypeScript, Python, and Go SDK line | `0.5.5` |
 | Lua runtime packages compatible series | `0.1` |
 | Managed Python / uv | `3.14.6` / `0.11.28` |
 | Managed Node.js / pnpm | `24.18.0` / `11.11.0` |

@@ -373,14 +373,23 @@ fn current_runtime_model_caller(lua: &Lua) -> Result<RuntimeModelCaller, String>
 /// Create the Lua-facing `vulcan.models.status` function.
 /// 创建面向 Lua 的 `vulcan.models.status` 函数。
 pub(super) fn create_model_status_fn(lua: &Lua) -> mlua::Result<Function> {
-    lua.create_function(move |lua, _: MultiValue| {
-        let result = json!({
-            "ok": true,
-            "capabilities": {
-                "embed": try_has_model_embed_callback(),
-                "llm": try_has_model_llm_callback(),
-            },
-        });
+    lua.create_function(move |lua, args: MultiValue| {
+        // Exact positional arguments supplied by Lua; status accepts none.
+        // Lua 传入的精确位置参数；status 不接受任何参数。
+        let values = args.into_vec();
+        // Stable envelope that reports either the current capabilities or one argument error.
+        // 稳定包络：返回当前能力，或返回一条参数错误。
+        let result = match validate_runtime_model_arg_count(values.len(), 0, "vulcan.models.status")
+        {
+            Ok(()) => json!({
+                "ok": true,
+                "capabilities": {
+                    "embed": try_has_model_embed_callback(),
+                    "llm": try_has_model_llm_callback(),
+                },
+            }),
+            Err(error) => runtime_model_error_value(error),
+        };
         json_value_to_lua(lua, &result)
     })
 }

@@ -9,15 +9,19 @@ pub mod skill;
 
 pub use host::callbacks::{
     RuntimeEntryRegistryCallback, RuntimeEntryRegistryDelta, RuntimeHostToolAction,
-    RuntimeHostToolCallback, RuntimeHostToolRequest, RuntimeModelCaller, RuntimeModelEmbedCallback,
-    RuntimeModelEmbedRequest, RuntimeModelEmbedResponse, RuntimeModelError, RuntimeModelErrorCode,
-    RuntimeModelLlmCallback, RuntimeModelLlmRequest, RuntimeModelLlmResponse, RuntimeModelUsage,
+    RuntimeHostToolCallback, RuntimeHostToolRequest, RuntimeModelAvailabilityCallback,
+    RuntimeModelCaller, RuntimeModelEmbedCallback, RuntimeModelEmbedRequest,
+    RuntimeModelEmbedResponse, RuntimeModelError, RuntimeModelErrorCode, RuntimeModelLlmCallback,
+    RuntimeModelLlmRequest, RuntimeModelLlmResponse, RuntimeModelUsage,
     RuntimeSkillLifecycleCallback, RuntimeSkillLifecycleEvent, RuntimeSkillManagementAction,
     RuntimeSkillManagementCallback, RuntimeSkillManagementRequest,
     RuntimeSkillOperationProgressCallback, RuntimeSkillOperationProgressEvent,
-    set_entry_registry_callback, set_host_tool_callback, set_model_embed_callback,
-    set_model_llm_callback, set_skill_lifecycle_callback, set_skill_management_callback,
-    set_skill_operation_progress_callback,
+    clear_model_embed_availability_callback_if, clear_model_embed_callback_if,
+    clear_model_llm_availability_callback_if, clear_model_llm_callback_if,
+    clear_skill_operation_progress_callback_if, set_entry_registry_callback,
+    set_host_tool_callback, set_model_embed_availability_callback, set_model_embed_callback,
+    set_model_llm_availability_callback, set_model_llm_callback, set_skill_lifecycle_callback,
+    set_skill_management_callback, set_skill_operation_progress_callback,
 };
 pub use host::database::{
     LuaRuntimeDatabaseCallbackMode, LuaRuntimeDatabaseProviderMode, RuntimeDatabaseBindingContext,
@@ -62,7 +66,9 @@ pub use runtime::config_tool::{
     RuntimeSkillConfigToolResponse,
 };
 pub use runtime::context::{RuntimeClientInfo, RuntimeRequestContext};
-pub use runtime::engine::{LuaEngine, LuaEngineOptions, LuaVmPoolConfig};
+pub use runtime::engine::{
+    LuaEngine, LuaEngineOptions, LuaVmPoolConfig, MAX_RUNTIME_SESSION_LEASES_PER_MANAGER,
+};
 pub use runtime::entry::{RuntimeEntryDescriptor, RuntimeEntryParameterDescriptor};
 pub use runtime::help::{RuntimeHelpDetail, RuntimeHelpNodeDescriptor, RuntimeSkillHelpDescriptor};
 pub use runtime::logging::{
