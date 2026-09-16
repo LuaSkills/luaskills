@@ -393,11 +393,11 @@ pub(crate) struct SkillConfigReloadWatcher {
 /// One exact configuration target routed through the shared watcher.
 /// 通过共享监听器路由的单个精确配置目标。
 pub(crate) struct SkillConfigReloadTarget {
-    /// Store refreshed after an accepted native event batch.
-    /// 接受原生事件批次后刷新的存储。
+    /// Store checked after a native directory event batch.
+    /// 原生目录事件批次之后接受核对的存储。
     store: Arc<SkillConfigStore>,
-    /// Ordered callback receiving refresh results or backend failures.
-    /// 接收刷新结果或后端失败的有序回调。
+    /// Ordered callback receiving changed snapshots or explicit failures.
+    /// 接收已变化快照或明确失败的有序回调。
     callback: Arc<dyn Fn(Result<SkillConfigRefreshResult, String>) + Send + Sync>,
 }
 
@@ -412,17 +412,17 @@ impl SkillConfigReloadTarget {
     }
 }
 
-/// Worker-owned target state with an absolute exact file path.
-/// 工作线程拥有的目标状态及其绝对精确文件路径。
+/// Worker-owned target state with the canonical watched directory.
+/// 工作线程拥有的目标状态及其规范化监听目录。
 struct SkillConfigReloadWorkerTarget {
     /// Store refreshed after the debounce window closes.
     /// 防抖窗口关闭后刷新的存储。
     store: Arc<SkillConfigStore>,
-    /// Absolute file path used for exact event filtering.
-    /// 用于精确事件过滤的绝对文件路径。
-    file_path: PathBuf,
-    /// Ordered callback receiving one completed batch result.
-    /// 接收单个已完成批次结果的有序回调。
+    /// Canonical parent directory used to route native event hints.
+    /// 用于路由原生事件提示的规范化父目录。
+    watch_directory: PathBuf,
+    /// Ordered callback receiving changed snapshots or explicit watcher failures.
+    /// 接收已变化快照或明确监听失败的有序回调。
     callback: Arc<dyn Fn(Result<SkillConfigRefreshResult, String>) + Send + Sync>,
     /// Current trailing-debounce state when a batch is pending.
     /// 批次待处理时的当前尾随防抖状态。
@@ -500,13 +500,22 @@ impl SkillConfigReloadWatcher {
                     error
                 )
             })?;
+            // Canonical directory identity matches the path registered by the native backend.
+            // 规范化目录身份与原生后端注册的路径保持一致。
+            let watch_directory = parent.canonicalize().map_err(|error| {
+                format!(
+                    "CONFIG_WATCHER_FAILED: failed to canonicalize configuration watch directory '{}': {}",
+                    render_skill_config_path(parent),
+                    error
+                )
+            })?;
             // RAII parent registration sharing the single notify backend.
             // 共享单个 notify 后端的 RAII 父目录注册。
             let registration = watcher.register_path(parent.to_path_buf(), false)?;
             registrations.push(registration);
             worker_targets.push(SkillConfigReloadWorkerTarget {
                 store: target.store,
-                file_path,
+                watch_directory,
                 callback: target.callback,
                 pending: None,
             });
@@ -536,7 +545,10 @@ impl SkillConfigReloadWatcher {
                                 record_shared_config_watch_error(&mut worker_targets, error);
                             } else {
                                 for target in &mut worker_targets {
-                                    if config_event_targets_file(&event, &target.file_path) {
+                                    if config_event_targets_directory(
+                                        &event,
+                                        &target.watch_directory,
+                                    ) {
                                         record_skill_config_watch_event(target, debounce);
                                     }
                                 }
@@ -664,18 +676,32 @@ fn flush_due_skill_config_watch_targets(targets: &mut [SkillConfigReloadWorkerTa
         if let Some(error) = pending.backend_error {
             (target.callback)(Err(error));
         } else {
-            (target.callback)(target.store.refresh());
+            // Native events are hints: temporary-file and repeated rename events may describe
+            // one persisted revision, so only a changed snapshot is published.
+            // 原生事件只是提示：临时文件与重复重命名事件可能对应同一持久化修订号，
+            // 因此只发布确实变化的快照。
+            match target.store.refresh() {
+                Ok(refresh) if refresh.changed => (target.callback)(Ok(refresh)),
+                Ok(_) => {}
+                Err(error) => (target.callback)(Err(error)),
+            }
         }
     }
 }
 
-/// Return whether one native event references the exact watched configuration file.
-/// 返回单个原生事件是否引用精确的被监听配置文件。
-fn config_event_targets_file(event: &Event, file_path: &Path) -> bool {
-    event
-        .paths
-        .iter()
-        .any(|path| skill_config_paths_match(path, file_path))
+/// Return whether one native event can affect the watched configuration directory.
+/// 返回单个原生事件是否可能影响被监听的配置目录。
+fn config_event_targets_directory(event: &Event, watch_directory: &Path) -> bool {
+    // A pathless native event cannot be routed more narrowly; the snapshot check prevents
+    // an unchanged file from producing a user-visible notification.
+    // 无路径的原生事件无法进一步精确路由；快照检查会阻止未变化的文件产生用户可见通知。
+    event.paths.is_empty()
+        || event.paths.iter().any(|path| {
+            skill_config_paths_match(path, watch_directory)
+                || path
+                    .parent()
+                    .is_some_and(|parent| skill_config_paths_match(parent, watch_directory))
+        })
 }
 
 /// Compare one watcher path with the absolute target using host filesystem semantics.
@@ -1742,12 +1768,13 @@ mod tests {
     use super::{
         SKILL_CONFIG_FORMAT_VERSION, SkillConfigDocument, SkillConfigEntry,
         SkillConfigReloadTarget, SkillConfigReloadWatcher, SkillConfigSnapshot, SkillConfigStore,
-        cleanup_skill_config_temp_after_failure, lock_skill_config_lock_registry,
-        record_skill_config_watch_event, shared_skill_config_path_lock,
-        skill_config_companion_lock_path, skill_config_lock_key, skill_config_lock_registry,
-        skill_config_lock_retry_delay,
+        cleanup_skill_config_temp_after_failure, config_event_targets_directory,
+        lock_skill_config_lock_registry, record_skill_config_watch_event,
+        shared_skill_config_path_lock, skill_config_companion_lock_path, skill_config_lock_key,
+        skill_config_lock_registry, skill_config_lock_retry_delay,
     };
     use crate::runtime::path::render_host_visible_path;
+    use notify::{Event, EventKind};
     use std::collections::BTreeMap;
     use std::fs::{self, OpenOptions};
     use std::panic::{self, AssertUnwindSafe};
@@ -2534,6 +2561,43 @@ mod tests {
         let _cleanup_result = fs::remove_dir_all(runtime_root);
     }
 
+    /// Verify temporary-file hints route to the canonical directory without routing other domains.
+    /// 验证临时文件提示路由到规范化目录，同时不路由到其他配置域。
+    #[test]
+    fn watcher_routes_temporary_file_hints_by_canonical_directory() {
+        // Existing directories let the test compare the same identities registered by notify.
+        // 现有目录使测试能够比较 notify 注册的相同目录身份。
+        let runtime_root = unique_temp_runtime_root("watcher_temp_hint");
+        let watched_directory = runtime_root.join("watched");
+        let other_directory = runtime_root.join("other");
+        fs::create_dir_all(&watched_directory).expect("create watched directory");
+        fs::create_dir_all(&other_directory).expect("create other directory");
+        let canonical_directory = watched_directory
+            .canonicalize()
+            .expect("canonical watched directory");
+        // Native atomic replacement may report only the temporary sibling path.
+        // 原生原子替换可能仅报告临时同级文件路径。
+        let temporary_event = Event::new(EventKind::Any)
+            .add_path(canonical_directory.join("skill_config.json.123.tmp"));
+        assert!(config_event_targets_directory(
+            &temporary_event,
+            &canonical_directory
+        ));
+        assert!(!config_event_targets_directory(
+            &temporary_event,
+            &other_directory
+                .canonicalize()
+                .expect("canonical other directory")
+        ));
+        // A pathless native event requires a snapshot check for every registered target.
+        // 无路径原生事件需要检查每个已注册目标的快照。
+        assert!(config_event_targets_directory(
+            &Event::new(EventKind::Any),
+            &canonical_directory
+        ));
+        let _cleanup_result = fs::remove_dir_all(runtime_root);
+    }
+
     /// Verify repeated events extend only the quiet deadline, not the maximum window.
     /// 验证重复事件只延长静默截止时间，不延长最大等待窗口。
     #[test]
@@ -2551,7 +2615,7 @@ mod tests {
         // 接收两次合成已接受事件的可变工作线程目标。
         let mut target = super::SkillConfigReloadWorkerTarget {
             store,
-            file_path,
+            watch_directory: file_path.parent().expect("target parent").to_path_buf(),
             callback,
             pending: None,
         };
