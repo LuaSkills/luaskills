@@ -1868,6 +1868,7 @@ mod tests {
         ///
         /// Returns a finite one-request fixture without allocating payload-sized server memory.
         /// 返回一个有限单请求夹具，且不会在服务端分配载荷大小级内存。
+        #[cfg(windows)]
         fn start_streaming_body(total_bytes: usize) -> Self {
             // Listener binds an isolated ephemeral loopback endpoint.
             // Listener 绑定隔离的临时回环端点。

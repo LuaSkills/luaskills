@@ -26,10 +26,12 @@ const DESCENDANT_PROBE_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Root lifetime that keeps explicit-kill fixtures alive beyond the descendant probe budget.
 /// 让显式终止夹具根进程存活时间超过后代探针预算的时长。
+#[cfg(windows)]
 const DESCENDANT_KILL_FIXTURE_ROOT_LIFETIME: Duration = Duration::from_secs(65);
 
 /// Root lifetime that lets root-exit fixtures complete promptly.
 /// 让根进程退出夹具及时完成的存活时长。
+#[cfg(windows)]
 const DESCENDANT_EXIT_FIXTURE_ROOT_LIFETIME: Duration = Duration::from_millis(300);
 
 /// Descendant fixture lifetime long enough to survive full-suite scheduler pressure before cleanup.
@@ -48,6 +50,7 @@ const WINDOWS_LONG_LIVED_DESCENDANT_FIXTURE_ROOT_TEST: &str =
 
 /// Environment key that gives the controlled descendant its exact readiness publication path.
 /// 向受控后代传递精确定绪发布路径的环境变量键。
+#[cfg(windows)]
 const WINDOWS_DESCENDANT_PID_PATH_ENV: &str = "LUASKILLS_TEST_DESCENDANT_PID_PATH";
 
 /// Fully-qualified test name used as the controlled Windows inherited-pipe fixture root.
@@ -57,6 +60,7 @@ const WINDOWS_INHERITED_PIPE_FIXTURE_ROOT_TEST: &str =
 
 /// Fully-qualified test name used as the controlled long-lived Windows descendant.
 /// 用作受控长生命周期 Windows 后代进程的完整测试名称。
+#[cfg(windows)]
 const WINDOWS_DESCENDANT_FIXTURE_SLEEP_TEST: &str =
     "runtime::process_session::tests::vulcan_process_session_descendant_fixture_sleep";
 
