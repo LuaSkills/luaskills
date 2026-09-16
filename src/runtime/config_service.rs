@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::c_void;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -12,7 +13,7 @@ use std::time::Instant;
 
 use mlua::{
     Function as LuaFunction, HookTriggers, Lua, LuaOptions, StdLib, Table as LuaTable,
-    Value as LuaValue, VmState,
+    Value as LuaValue, VmState, ffi,
 };
 
 use crate::host::options::RuntimeSkillRoot;
@@ -1763,6 +1764,116 @@ const SKILL_CONFIG_VALIDATOR_TIMEOUT: Duration = Duration::from_millis(100);
 /// 单个校验器允许返回的结构化问题最大数量。
 const SKILL_CONFIG_VALIDATOR_MAX_ISSUES: usize = 1_024;
 
+/// Track validator allocations when LuaJIT rejects mlua's initial allocator.
+/// 当 LuaJIT 拒绝 mlua 的初始分配器时跟踪校验器分配。
+struct ValidatorAllocatorBudget {
+    /// Original allocator retained for low-address LuaJIT allocations.
+    /// 保留用于 LuaJIT 低地址分配的原始分配器。
+    original: ffi::lua_Alloc,
+    /// Opaque userdata paired with the original allocator.
+    /// 与原始分配器配对的不透明用户数据。
+    original_userdata: *mut c_void,
+    /// Current bytes, initialized from the Lua state before interception.
+    /// 当前字节数，从拦截前的 Lua 状态初始化。
+    used: usize,
+    /// Maximum bytes allowed in the validator state.
+    /// 校验器状态允许使用的最大字节数。
+    limit: usize,
+}
+
+/// Forward LuaJIT allocations through its original allocator with a hard budget.
+/// 经由 LuaJIT 原始分配器转发分配并实施硬预算。
+unsafe extern "C" fn validator_budget_allocator(
+    userdata: *mut c_void,
+    ptr: *mut c_void,
+    old_size: usize,
+    new_size: usize,
+) -> *mut c_void {
+    let budget = unsafe { &mut *userdata.cast::<ValidatorAllocatorBudget>() };
+    let accounted_old_size = if ptr.is_null() { 0 } else { old_size };
+    let next_used = budget
+        .used
+        .checked_sub(accounted_old_size)
+        .unwrap_or(budget.used)
+        .checked_add(new_size);
+    // Lua requires a shrinking reallocation to remain infallible.
+    // Lua 要求缩小重分配始终不可失败。
+    if new_size > accounted_old_size && next_used.is_none_or(|used| used > budget.limit) {
+        return std::ptr::null_mut();
+    }
+    let result = unsafe { (budget.original)(budget.original_userdata, ptr, old_size, new_size) };
+    if new_size == 0 || !result.is_null() {
+        budget.used = next_used.unwrap_or(0);
+    }
+    result
+}
+
+/// Restore the original allocator before mlua closes its LuaJIT state.
+/// 在 mlua 关闭 LuaJIT 状态前恢复原始分配器。
+struct ValidatorAllocatorGuard<'lua> {
+    /// Lua state that owns the allocator being intercepted.
+    /// 被拦截分配器所属的 Lua 状态。
+    lua: &'lua Lua,
+    /// Owned budget passed as userdata to the allocator callback.
+    /// 作为用户数据传给分配器回调的预算所有权。
+    budget: *mut ValidatorAllocatorBudget,
+}
+
+impl ValidatorAllocatorGuard<'_> {
+    /// Install the budget only after mlua reports its allocator unavailable.
+    /// 仅在 mlua 报告自身分配器不可用后安装预算。
+    fn install(lua: &Lua, limit: usize) -> ValidatorAllocatorGuard<'_> {
+        let mut original_userdata = std::ptr::null_mut();
+        let original = lua
+            .exec_raw_lua(|raw| unsafe { ffi::lua_getallocf(raw.state(), &mut original_userdata) });
+        let budget = Box::into_raw(Box::new(ValidatorAllocatorBudget {
+            original,
+            original_userdata,
+            used: lua.used_memory(),
+            limit,
+        }));
+        lua.exec_raw_lua(|raw| unsafe {
+            ffi::lua_setallocf(raw.state(), validator_budget_allocator, budget.cast());
+        });
+        ValidatorAllocatorGuard { lua, budget }
+    }
+}
+
+impl Drop for ValidatorAllocatorGuard<'_> {
+    /// Remove interception before LuaJIT destroys its built-in allocator.
+    /// 在 LuaJIT 销毁内置分配器之前移除拦截。
+    fn drop(&mut self) {
+        let budget = unsafe { &*self.budget };
+        self.lua.exec_raw_lua(|raw| unsafe {
+            ffi::lua_setallocf(raw.state(), budget.original, budget.original_userdata);
+        });
+        unsafe { drop(Box::from_raw(self.budget)) };
+    }
+}
+
+/// Enforce the validator memory ceiling with the available allocator strategy.
+/// 使用可用的分配器策略强制执行校验器内存上限。
+fn install_validator_memory_limit(
+    lua: &Lua,
+) -> Result<Option<ValidatorAllocatorGuard<'_>>, String> {
+    match lua.set_memory_limit(SKILL_CONFIG_VALIDATOR_MAX_MEMORY_BYTES) {
+        Ok(_) => Ok(None),
+        Err(mlua::Error::MemoryControlNotAvailable)
+            if cfg!(all(target_os = "linux", target_arch = "aarch64")) =>
+        {
+            // LuaJIT may reject Rust's high-address allocator on Linux ARM64.
+            // Linux ARM64 上 LuaJIT 可能拒绝 Rust 的高地址分配器。
+            Ok(Some(ValidatorAllocatorGuard::install(
+                lua,
+                SKILL_CONFIG_VALIDATOR_MAX_MEMORY_BYTES,
+            )))
+        }
+        Err(error) => Err(format!(
+            "CONFIG_VALIDATOR_UNAVAILABLE: memory limit cannot be enforced: {error}"
+        )),
+    }
+}
+
 /// Execute one optional package business validator in an isolated capability-free Lua state.
 /// 在隔离且无能力的 Lua 状态中执行一个可选技能包业务校验器。
 fn run_business_validator(
@@ -1804,8 +1915,7 @@ fn run_business_validator(
         LuaOptions::default(),
     )
     .map_err(|error| format!("CONFIG_VALIDATOR_UNAVAILABLE: {error}"))?;
-    lua.set_memory_limit(SKILL_CONFIG_VALIDATOR_MAX_MEMORY_BYTES)
-        .map_err(|error| format!("CONFIG_VALIDATOR_LIMIT_EXCEEDED: {error}"))?;
+    let _allocator_guard = install_validator_memory_limit(&lua)?;
     let globals = lua.globals();
     for forbidden in [
         "dofile", "loadfile", "load", "require", "package", "io", "os", "debug", "ffi", "jit",
@@ -2101,6 +2211,60 @@ fn public_value_error_code(code: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verify the fallback allocator rejects a large Lua allocation and restores the original allocator.
+    /// 验证后备分配器拒绝大型 Lua 分配并恢复原始分配器。
+    #[test]
+    fn validator_fallback_allocator_enforces_hard_limit_and_restores() {
+        let lua = Lua::new_with(
+            StdLib::TABLE | StdLib::STRING | StdLib::MATH,
+            LuaOptions::default(),
+        )
+        .expect("create isolated validator state");
+        let baseline = lua.used_memory();
+        let guard = ValidatorAllocatorGuard::install(&lua, baseline + 64 * 1_024);
+        let error = lua
+            .load("return string.rep('x', 512 * 1024)")
+            .eval::<String>()
+            .expect_err("allocator must reject an allocation above its limit");
+        assert!(error.to_string().contains("memory"), "{error}");
+        drop(guard);
+        assert_eq!(lua.load("return 42").eval::<i32>().unwrap(), 42);
+    }
+
+    /// Verify interception also works with LuaJIT's built-in low-address allocator.
+    /// 验证拦截同样适用于 LuaJIT 内置的低地址分配器。
+    #[test]
+    fn validator_fallback_allocator_wraps_luajit_builtin_allocator() {
+        let result = unsafe {
+            let state = ffi::luaL_newstate();
+            assert!(!state.is_null(), "create a LuaJIT built-in allocator state");
+            ffi::luaL_openlibs(state);
+            let baseline = (ffi::lua_gc(state, ffi::LUA_GCCOUNT, 0) as usize) * 1_024
+                + ffi::lua_gc(state, ffi::LUA_GCCOUNTB, 0) as usize;
+            let mut original_userdata = std::ptr::null_mut();
+            let original = ffi::lua_getallocf(state, &mut original_userdata);
+            let budget = Box::into_raw(Box::new(ValidatorAllocatorBudget {
+                original,
+                original_userdata,
+                used: baseline,
+                limit: baseline + 64 * 1_024,
+            }));
+            ffi::lua_setallocf(state, validator_budget_allocator, budget.cast());
+            let source = c"return string.rep('x', 512 * 1024)";
+            let load_status = ffi::luaL_loadstring(state, source.as_ptr());
+            let call_status = if load_status == 0 {
+                ffi::lua_pcall(state, 0, 1, 0)
+            } else {
+                load_status
+            };
+            ffi::lua_setallocf(state, original, original_userdata);
+            drop(Box::from_raw(budget));
+            ffi::lua_close(state);
+            call_status
+        };
+        assert_ne!(result, 0, "a large allocation must be rejected");
+    }
 
     /// Verify detailed value failures map onto stable public error codes.
     /// 验证详细值失败会映射到稳定公共错误码。

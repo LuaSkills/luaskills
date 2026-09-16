@@ -11153,9 +11153,13 @@ fn run_managed_session_persistence_integration(
     // WakeCount 证明真实后台输出会唤醒宿主边沿回调。
     let wake_count = Arc::new(AtomicUsize::new(0));
     let wake_count_for_callback = Arc::clone(&wake_count);
+    // WakeChannel separates asynchronous callback delivery from destructive event draining.
+    // 唤醒通道将异步回调交付与破坏性事件取出分开。
+    let (wake_tx, wake_rx) = mpsc::channel();
     event_center
         .set_wake_callback(Some(Arc::new(move || {
             wake_count_for_callback.fetch_add(1, AtomicOrdering::AcqRel);
+            let _send_result = wake_tx.send(());
         })))
         .expect("install managed session wake callback");
     // Lease uses the required infinite System profile lifetime.
@@ -11265,6 +11269,13 @@ fn run_managed_session_persistence_integration(
             .expect("probe persistent sidecar descendant")
     );
 
+    // An event waiter drains the nonempty queue epoch and may cancel a callback that has not
+    // run yet; observe the asynchronous wake before consuming the events it announces.
+    // 事件等待者会取空非空队列纪元，也可能取消尚未执行的回调；因此先观察异步唤醒，
+    // 再消费它所通知的事件。
+    wake_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("managed session output should invoke the wake callback");
     // InitialEvents must include both readable streams from real background readers.
     // InitialEvents 必须包含真实后台读取器产生的两个可读流事件。
     let initial_events = wait_for_managed_session_event_kinds(
@@ -13132,10 +13143,16 @@ fn managed_runtime_worker_pool_reuses_warm_worker() {
         .acquire(key.clone(), &mut factory)
         .expect("first worker should spawn");
     assert!(!reused);
+    // Allow cold worker startup headroom while testing reuse; timeout has its own test.
+    // 测试复用时给冷启动工作进程留余量；超时另有独立测试。
     let (worker, first) =
-        invoke_managed_runtime_worker(worker, &json!({"value": 1}), Some(3_000), reused);
+        invoke_managed_runtime_worker(worker, &json!({"value": 1}), Some(10_000), reused);
     assert!(!first.worker_reused);
-    assert_eq!(first.envelope["ok"], true);
+    assert_eq!(
+        first.envelope["ok"], true,
+        "first worker: {}",
+        first.envelope
+    );
     assert_eq!(first.envelope["value"], 1);
     assert!(!first.discard_worker);
     service.release(key.clone(), worker);
@@ -13145,9 +13162,13 @@ fn managed_runtime_worker_pool_reuses_warm_worker() {
         .expect("second worker should reuse");
     assert!(reused);
     let (worker, second) =
-        invoke_managed_runtime_worker(worker, &json!({"value": 2}), Some(3_000), reused);
+        invoke_managed_runtime_worker(worker, &json!({"value": 2}), Some(10_000), reused);
     assert!(second.worker_reused);
-    assert_eq!(second.envelope["ok"], true);
+    assert_eq!(
+        second.envelope["ok"], true,
+        "reused worker: {}",
+        second.envelope
+    );
     assert_eq!(second.envelope["value"], 2);
     assert!(!second.discard_worker);
     service.release(key, worker);
