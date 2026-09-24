@@ -1202,12 +1202,19 @@ fn popen_from_args(
         }
     };
     let mode = parse_popen_mode(mode_text.as_deref().unwrap_or("r"))?;
-    let options = parse_popen_options(
+    let mut options = parse_popen_options(
         options_value,
         "vulcan.io.popen",
         io_options.default_encoding,
     )?;
-    let output = run_managed_popen_read(&command, options)?;
+    if let Some(remaining) = crate::runtime::engine::logical_cwd::remaining_timeout_ms(lua)? {
+        options.timeout_ms = options.timeout_ms.min(remaining);
+    }
+    let output = run_managed_popen_read(
+        &command,
+        options,
+        crate::runtime::engine::logical_cwd::directory(lua).as_deref(),
+    )?;
     let file = ManagedIoFile::from_read_buffer(
         format!("<popen:{command}>"),
         mode,
@@ -1295,8 +1302,26 @@ fn parse_timeout_ms_option(
 fn run_managed_popen_read(
     command_text: &str,
     options: ManagedPopenOptions,
+    cwd: Option<&Path>,
 ) -> mlua::Result<ManagedPopenOutput> {
     let mut command = create_shell_command(command_text);
+    // Logical System cwd applies to the child only; select an absolute shell executable as well.
+    // 系统逻辑目录仅应用于子进程；同时选用绝对 shell 程序路径。
+    if let Some(cwd) = cwd {
+        let shell = command
+            .get_program()
+            .to_str()
+            .ok_or_else(|| mlua::Error::runtime("popen shell is not UTF-8"))?;
+        let program = crate::runtime::engine::resolve_vulcan_process_which_in_directory(shell, cwd)
+            .map_err(mlua::Error::runtime)?
+            .ok_or_else(|| mlua::Error::runtime("System popen shell was not found."))?;
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_owned())
+            .collect::<Vec<_>>();
+        command = Command::new(program);
+        command.args(args).current_dir(cwd);
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

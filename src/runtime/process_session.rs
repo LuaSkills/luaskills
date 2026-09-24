@@ -2123,7 +2123,25 @@ pub(crate) fn create_process_session_table(
     table.set(
         "open",
         lua.create_function(move |lua, spec: LuaValue| {
-            let request = parse_session_open_request(spec, default_encoding)?;
+            let mut request = parse_session_open_request(spec, default_encoding)?;
+            // System process creation owns explicit absolute paths independently of host chdir.
+            // 系统进程创建持有明确绝对路径，不依赖宿主目录切换。
+            if let Some(base) = crate::runtime::engine::logical_cwd::directory(lua) {
+                let cwd = crate::runtime::engine::logical_cwd::resolve(
+                    &base,
+                    request.cwd.as_deref().unwrap_or("."),
+                )?;
+                let program = crate::runtime::engine::resolve_vulcan_process_which_in_directory(
+                    &request.program,
+                    std::path::Path::new(&cwd),
+                )
+                .map_err(mlua::Error::runtime)?
+                .ok_or_else(|| {
+                    mlua::Error::runtime("System process session executable was not found.")
+                })?;
+                request.program = crate::runtime::path::render_host_visible_path(&program);
+                request.cwd = Some(cwd);
+            }
             // Core is wrapped by the same userdata factory used by managed runtime sessions.
             // Core 由受管运行时会话共同使用的同一个 userdata 工厂包装。
             let core = ManagedProcessSession::launch_core(request)?;

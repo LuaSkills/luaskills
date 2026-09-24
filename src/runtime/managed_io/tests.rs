@@ -93,6 +93,7 @@ fn managed_popen_discards_large_stderr_without_blocking_stdout() {
             encoding: RuntimeTextEncoding::Utf8,
             timeout_ms: 30_000,
         },
+        None,
     )
     .expect("large stderr command must complete");
 
@@ -115,6 +116,7 @@ fn managed_popen_discards_stderr_only_output() {
             encoding: RuntimeTextEncoding::Utf8,
             timeout_ms: 30_000,
         },
+        None,
     )
     .expect("stderr-only command must complete");
 
@@ -148,6 +150,7 @@ fn large_ignored_stderr_has_bounded_parent_peak_working_set() {
             encoding: RuntimeTextEncoding::Utf8,
             timeout_ms: 120_000,
         },
+        None,
     )
     .expect("100 MiB ignored stderr command should complete");
     // Elapsed records the end-to-end measured duration.

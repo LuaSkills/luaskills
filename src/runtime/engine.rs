@@ -105,6 +105,7 @@ use crate::tool_cache::{global_tool_cache, try_configure_global_tool_cache};
 mod bridge;
 mod host_result;
 mod lease;
+pub(crate) mod logical_cwd;
 mod runlua;
 
 use self::bridge::{
@@ -967,10 +968,10 @@ fn parse_vulcan_fs_overwrite_option(value: LuaValue, fn_name: &str) -> mlua::Res
 /// Resolve one `vulcan.fs.copy` path into a normalized absolute path for relationship checks.
 /// 将单个 `vulcan.fs.copy` 路径解析为归一化绝对路径，以便做关系校验。
 fn resolve_vulcan_fs_copy_absolute_path(path: &Path) -> Result<PathBuf, String> {
-    let cwd = std::env::current_dir().map_err(|error| format!("fs.copy: {}", error))?;
     Ok(if path.is_absolute() {
         normalize_runtime_root_path(path)
     } else {
+        let cwd = std::env::current_dir().map_err(|error| format!("fs.copy: {}", error))?;
         normalize_runtime_root_path(&cwd.join(path))
     })
 }
@@ -1652,13 +1653,24 @@ fn find_vulcan_process_candidate(base: &Path) -> Result<Option<PathBuf>, String>
 /// Returns an error when the current directory or executable lookup environment cannot be read.
 /// 当当前目录或可执行查找环境无法读取时返回错误。
 fn resolve_vulcan_process_which(program: &str) -> Result<Option<PathBuf>, String> {
+    let cwd = std::env::current_dir().map_err(|error| format!("process.which: {}", error))?;
+    resolve_vulcan_process_which_in_directory(program, &cwd)
+}
+
+/// Resolves a program using the supplied directory without reading the process cwd.
+/// 使用传入目录解析程序，不读取进程工作目录。
+/// Returns the first executable or an explicit lookup error.
+/// 返回首个可执行文件或明确查找错误。
+pub(crate) fn resolve_vulcan_process_which_in_directory(
+    program: &str,
+    cwd: &Path,
+) -> Result<Option<PathBuf>, String> {
     // Program spelling normalized before explicit path detection or PATH candidate construction.
     // 在显式路径检测或 PATH 候选构造前归一化程序路径写法。
     let program = normalize_host_input_path_text(program)
         .map_err(|error| format!("process.which: program: {error}"))?;
     // Current working directory used to resolve relative explicit paths and relative PATH entries.
     // 用于解析相对显式路径与相对 PATH 条目的当前工作目录。
-    let cwd = std::env::current_dir().map_err(|error| format!("process.which: {}", error))?;
     if is_vulcan_process_explicit_path(&program) {
         // Explicit program path resolved against the current working directory when needed.
         // 必要时基于当前工作目录解析得到的显式程序路径。
@@ -11272,8 +11284,11 @@ impl LuaEngine {
         path.set("is_abs", path_is_abs_fn)?;
 
         let cwd_fn = lua.create_function(|lua, ()| {
-            let current_dir = std::env::current_dir()
-                .map_err(|error| mlua::Error::runtime(format!("runtime.cwd: {}", error)))?;
+            let current_dir = match logical_cwd::directory(lua) {
+                Some(directory) => directory,
+                None => std::env::current_dir()
+                    .map_err(|error| mlua::Error::runtime(format!("runtime.cwd: {}", error)))?,
+            };
             let current_dir_text = render_host_visible_path(&current_dir);
             lua.create_string(&current_dir_text)
         })?;
@@ -11321,7 +11336,11 @@ impl LuaEngine {
         let launchers_fn = lua.create_function(|lua, ()| {
             let info = lua.create_table()?;
             let shells = lua.create_table()?;
-            for (index, shell_name) in supported_exec_shell_names().into_iter().enumerate() {
+            for (index, shell_name) in
+                supported_exec_shell_names(logical_cwd::directory(lua).as_deref())
+                    .into_iter()
+                    .enumerate()
+            {
                 shells.set(index + 1, shell_name)?;
             }
             info.set("default", default_exec_shell_name())?;
@@ -11330,14 +11349,30 @@ impl LuaEngine {
         })?;
         process.set("launchers", launchers_fn)?;
         let exec_fn = lua.create_function(move |lua, spec: LuaValue| {
-            let request = parse_exec_request(spec, "process.exec", exec_default_encoding)?;
+            let directory = logical_cwd::directory(lua);
+            let mut request = parse_exec_request(
+                spec,
+                "process.exec",
+                exec_default_encoding,
+                directory.as_deref(),
+            )?;
+            if let Some(directory) = directory {
+                request.bind_logical_cwd(&directory)?;
+            }
+            if let Some(remaining) = logical_cwd::remaining_timeout_ms(lua)? {
+                request.cap_timeout(remaining);
+            }
             let result = execute_exec_request(request);
             exec_result_to_lua_table(lua, result)
         })?;
         process.set("exec", exec_fn)?;
         let which_fn = lua.create_function(|lua, program: LuaValue| {
             let program = require_string_arg(program, "process.which", "program", false)?;
-            match resolve_vulcan_process_which(&program) {
+            let found = match logical_cwd::directory(lua) {
+                Some(directory) => resolve_vulcan_process_which_in_directory(&program, &directory),
+                None => resolve_vulcan_process_which(&program),
+            };
+            match found {
                 Ok(Some(found)) => {
                     let rendered = render_host_visible_path(&found);
                     Ok(LuaValue::String(lua.create_string(&rendered)?))

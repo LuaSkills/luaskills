@@ -5138,6 +5138,9 @@ return {
     assert_eq!(result["call_code"], "host_tool_callback_missing");
 }
 
+#[path = "tests/system_concurrency.rs"]
+mod system_concurrency;
+
 /// Verify `vulcan.host.*` dispatches list, has, and call requests through the host callback.
 /// 验证 `vulcan.host.*` 会通过宿主回调分发 list、has 与 call 请求。
 #[test]

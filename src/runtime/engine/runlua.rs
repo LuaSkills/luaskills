@@ -412,6 +412,44 @@ pub(super) struct ExecRequest {
     stdin_encoding: RuntimeTextEncoding,
 }
 
+impl ExecRequest {
+    /// Caps the child timeout by the enclosing evaluation's remaining budget.
+    /// 以外层执行剩余预算限制子进程超时。
+    /// A smaller caller limit remains authoritative; an absent limit becomes bounded.
+    /// 调用方更小的上限保持有效；未设上限时也受到约束。
+    pub(super) fn cap_timeout(&mut self, remaining: u64) {
+        self.timeout_ms = Some(
+            self.timeout_ms
+                .map_or(remaining, |limit| limit.min(remaining)),
+        );
+    }
+    /// Binds child cwd and executable to one System lease before the host cwd can affect spawning.
+    /// 在宿主工作目录影响启动前，将子进程目录及程序绑定到系统租约。
+    /// Returns a path or executable lookup error before creating any process.
+    /// 创建任何进程之前返回路径或程序查找错误。
+    pub(super) fn bind_logical_cwd(&mut self, base: &Path) -> mlua::Result<()> {
+        let cwd = logical_cwd::resolve(base, self.cwd.as_deref().unwrap_or("."))?;
+        self.cwd = Some(cwd.clone());
+        let (program, args) = match &self.mode {
+            ExecMode::Shell { command, launcher } => (
+                launcher.program().to_owned(),
+                launcher.command_args(command),
+            ),
+            ExecMode::Program { program, args } => (program.clone(), args.clone()),
+        };
+        let program = resolve_vulcan_process_which_in_directory(&program, Path::new(&cwd))
+            .map_err(mlua::Error::runtime)?
+            .ok_or_else(|| {
+                mlua::Error::runtime(format!("System lease executable was not found: {program}"))
+            })?;
+        self.mode = ExecMode::Program {
+            program: render_host_visible_path(&program),
+            args,
+        };
+        Ok(())
+    }
+}
+
 /// Process execution result returned back to Lua.
 /// 返回给 Lua 的进程执行结果。
 pub(super) struct ExecResult {
@@ -571,14 +609,17 @@ fn candidate_exec_shell_launchers() -> &'static [ExecShellLauncher] {
 
 /// Check whether one shell launcher should be advertised as available on the current host.
 /// 检查单个 shell 启动器是否应被标记为当前宿主可用。
-fn is_exec_shell_launcher_available(launcher: ExecShellLauncher) -> bool {
+fn is_exec_shell_launcher_available(launcher: ExecShellLauncher, directory: Option<&Path>) -> bool {
     if launcher == default_exec_shell_launcher() {
         return true;
     }
-    resolve_vulcan_process_which(launcher.program())
-        .ok()
-        .flatten()
-        .is_some()
+    match directory {
+        Some(directory) => resolve_vulcan_process_which_in_directory(launcher.program(), directory),
+        None => resolve_vulcan_process_which(launcher.program()),
+    }
+    .ok()
+    .flatten()
+    .is_some()
 }
 
 /// Resolve the concrete executable path used to spawn one shell launcher.
@@ -604,10 +645,12 @@ fn resolve_exec_shell_launcher_program(
 
 /// Return the ordered shell parameter names supported by the current runtime host.
 /// 返回当前运行时宿主支持的有序 shell 参数名列表。
-pub(super) fn supported_exec_shell_names() -> Vec<&'static str> {
+pub(super) fn supported_exec_shell_names(directory: Option<&Path>) -> Vec<&'static str> {
     let mut supported = Vec::new();
     for launcher in candidate_exec_shell_launchers().iter().copied() {
-        if is_exec_shell_launcher_available(launcher) && !supported.contains(&launcher.id()) {
+        if is_exec_shell_launcher_available(launcher, directory)
+            && !supported.contains(&launcher.id())
+        {
             supported.push(launcher.id());
         }
     }
@@ -616,8 +659,8 @@ pub(super) fn supported_exec_shell_names() -> Vec<&'static str> {
 
 /// Render the currently supported shell parameter names into one stable comma-separated string.
 /// 将当前支持的 shell 参数名渲染为稳定的逗号分隔字符串。
-fn render_supported_exec_shell_names() -> String {
-    supported_exec_shell_names().join(", ")
+fn render_supported_exec_shell_names(directory: Option<&Path>) -> String {
+    supported_exec_shell_names(directory).join(", ")
 }
 
 /// Parse one normalized shell parameter value into its launcher descriptor.
@@ -639,19 +682,20 @@ fn parse_exec_shell_launcher_id(value: &str) -> Option<ExecShellLauncher> {
 fn resolve_exec_shell_launcher_from_label(
     label: &str,
     fn_name: &str,
+    directory: Option<&Path>,
 ) -> mlua::Result<ExecShellLauncher> {
     let normalized = label.trim().to_ascii_lowercase();
     let Some(launcher) = parse_exec_shell_launcher_id(&normalized) else {
         return Err(mlua::Error::runtime(format!(
             "{fn_name}: shell must be one of: {}",
-            render_supported_exec_shell_names()
+            render_supported_exec_shell_names(directory)
         )));
     };
-    if !supported_exec_shell_names().contains(&launcher.id()) {
+    if !supported_exec_shell_names(directory).contains(&launcher.id()) {
         return Err(mlua::Error::runtime(format!(
             "{fn_name}: shell `{}` is not available in the current host; available shell values: {}",
             launcher.id(),
-            render_supported_exec_shell_names()
+            render_supported_exec_shell_names(directory)
         )));
     }
     Ok(launcher)
@@ -663,6 +707,7 @@ fn table_get_optional_shell_field(
     table: &Table,
     fn_name: &str,
     field_name: &str,
+    directory: Option<&Path>,
 ) -> mlua::Result<Option<ExecShellSetting>> {
     let value: LuaValue = table.get(field_name)?;
     match value {
@@ -676,7 +721,7 @@ fn table_get_optional_shell_field(
                 ))
             })?;
             Ok(Some(ExecShellSetting::Selected(
-                resolve_exec_shell_launcher_from_label(shell_label.as_ref(), fn_name)?,
+                resolve_exec_shell_launcher_from_label(shell_label.as_ref(), fn_name, directory)?,
             )))
         }
         other => Err(mlua::Error::runtime(format!(
@@ -805,6 +850,7 @@ pub(super) fn parse_exec_request(
     value: LuaValue,
     fn_name: &str,
     default_encoding: RuntimeTextEncoding,
+    directory: Option<&Path>,
 ) -> mlua::Result<ExecRequest> {
     match value {
         LuaValue::String(command_text) => Ok(ExecRequest {
@@ -841,7 +887,7 @@ pub(super) fn parse_exec_request(
             let env = table_get_string_map_field(&spec, fn_name, "env")?;
             let stdin = table_get_optional_string_field(&spec, fn_name, "stdin", true)?;
             let timeout_ms = table_get_optional_timeout_field(&spec, fn_name, "timeout_ms")?;
-            let shell_setting = table_get_optional_shell_field(&spec, fn_name, "shell")?;
+            let shell_setting = table_get_optional_shell_field(&spec, fn_name, "shell", directory)?;
             let encoding = table_get_optional_encoding_field(&spec, fn_name, "encoding")?
                 .unwrap_or(default_encoding);
             let stdout_encoding =
@@ -1676,6 +1722,9 @@ end
     /// 为隔离 luaexec 虚拟机安装硬超时保护。
     pub(super) fn install_runlua_timeout_guard(lua: &Lua, timeout_ms: u64) -> mlua::Result<()> {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        if logical_cwd::directory(lua).is_some() {
+            lua.set_app_data(logical_cwd::EvaluationDeadline(deadline));
+        }
         let timeout_text = format!("luaexec execution timed out after {} ms", timeout_ms);
 
         lua.set_hook(
@@ -1693,6 +1742,7 @@ end
     /// 移除隔离 luaexec 虚拟机上已安装的超时保护。
     pub(super) fn remove_runlua_timeout_guard(lua: &Lua) {
         lua.remove_hook();
+        lua.remove_app_data::<logical_cwd::EvaluationDeadline>();
     }
 
     /// Collect packed Lua return values from the isolated runlua wrapper.

@@ -1,0 +1,24 @@
+name: System lease concurrency
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - src/runtime/**
+      - .github/workflows/system-lease-concurrency.yml
+permissions:
+  contents: read
+jobs:
+  system-paths:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System paths and deterministic concurrency
+        run: cargo test -j 4 --lib system_runtime_lease -- --test-threads=1
+      - name: Managed IO regression
+        run: cargo test -j 4 --lib managed_io::tests -- --test-threads=1

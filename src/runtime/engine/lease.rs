@@ -2445,7 +2445,15 @@ impl LuaEngine {
         // 不会跨重载保留普通 Skill 分发状态的专用 VM。
         let vm = self.create_system_runtime_vm()?;
         Self::configure_runtime_lease_vm(&vm.lua, &path_context)?;
-        Self::install_managed_io_compat_for_runtime(&vm.lua, self.host_options.as_ref())?;
+        logical_cwd::install(
+            &vm.lua,
+            path_context
+                .cwd
+                .as_deref()
+                .ok_or("System lease requires a logical cwd")?,
+            resolve_host_default_text_encoding(self.host_options.as_ref())?,
+        )
+        .map_err(|error| error.to_string())?;
         // System manager insertion binds lease identity before publishing the session.
         // System 管理器插入会在发布会话前绑定租约身份。
         // Dedicated System manager whose replacement and prune retirements are drained together.
@@ -2609,11 +2617,17 @@ impl LuaEngine {
         );
         Self::install_runlua_timeout_guard(&session.vm.lua, request.timeout_ms)
             .map_err(|error| error.to_string())?;
-        let eval_result = Self::eval_lua_value_with_optional_cwd(
-            &session.vm.lua,
-            &wrapper,
-            session.path_context.cwd.as_deref(),
-        );
+        // System paths are VM-local and absolute; ordinary file sessions retain serialized chdir.
+        // 系统路径属于虚拟机且已绝对化；普通文件会话保留串行目录切换。
+        let eval_result = if session.profile == RuntimeLeaseProfile::SystemLuaLib {
+            session.vm.lua.load(&wrapper).eval::<LuaValue>()
+        } else {
+            Self::eval_lua_value_with_optional_cwd(
+                &session.vm.lua,
+                &wrapper,
+                session.path_context.cwd.as_deref(),
+            )
+        };
         Self::remove_runlua_timeout_guard(&session.vm.lua);
         let result = eval_result.map_err(|error| {
             let msg = format!("Runtime session eval error: {}", error);
