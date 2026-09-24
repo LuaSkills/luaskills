@@ -132,8 +132,8 @@ fn load_script(
     let mut chunk = lua.load(bytes).set_name(format!("@{path}"));
     match mode.as_deref().unwrap_or("bt") {
         "bt" | "tb" => {}
-        "b" => chunk = chunk.set_mode(mlua::ChunkMode::Binary),
-        "t" => chunk = chunk.set_mode(mlua::ChunkMode::Text),
+        "b" => chunk = chunk.set_mode(mlua::chunk::ChunkMode::Binary),
+        "t" => chunk = chunk.set_mode(mlua::chunk::ChunkMode::Text),
         _ => return Err(mlua::Error::runtime("Invalid script load mode.")),
     }
     if let Some(env) = env {
