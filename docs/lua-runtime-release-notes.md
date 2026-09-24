@@ -1,5 +1,11 @@
 ## LuaSkills core release packages
 
+### LuaSkills 0.5.9
+
+System runtime leases now resolve managed file, module and process paths against their own logical working directory without holding the process-wide current-directory lock throughout execution. Independent plugins can progress concurrently while each Lua VM remains serialized. Ordinary file-backed `runLua` retains its existing directory behavior. This release also fixes the public script-loading type path for stable mlua. Version 0.5.8 was yanked from crates.io after its dependency compatibility issue was found.
+
+GitHub assets include two redundant-borrow lint corrections made after the immutable crates.io 0.5.9 upload; these do not change runtime behavior or the public ABI. GitHub native acceptance and release assets are verified separately from crate publication. Runtime asset synchronization defaults to `v0.5.9`; the independent Lua runtime package repository retains its own version line.
+
 ### LuaSkills 0.5.7
 
 This patch release fixes configuration watcher routing for atomic file replacement and restores package business validators on Linux ARM64 while retaining their 8 MiB Lua memory limit. It also corrects cross-platform test-only lint and timing issues, including a managed-session acceptance race between stdout and stderr readiness. The public FFI headers and shared contracts are unchanged from `0.5.6`. The main repository publishes the Rust crate, five-platform FFI SDK, demos, and debug tool; the separate TypeScript, Python, and Go SDK packages remain on their `0.5.5` line. The default LuaSkills tag in this repository's runtime asset sync scripts is now `v0.5.7`.
@@ -52,6 +58,12 @@ Unlike FFI demo packages, the debug tool does not bundle the extra FFI fetch scr
 The debug binary accepts explicit managed distribution/environment roots and five resource-policy flags for Worker capacity, Worker idle TTL, persistent-session capacity, default per-stream output buffering, and default invoke timeout. Omitted flags preserve the stable engine defaults.
 
 ## LuaSkills 主仓库发布资产说明
+
+### LuaSkills 0.5.9
+
+System 运行时租约改为按照自身逻辑工作目录解析受管文件、模块及进程路径，执行期间不再持有进程级工作目录锁。不同插件可以并发推进，同一 Lua VM 仍保持串行。普通文件型 `runLua` 保留原有目录行为。同时修复正式 mlua 版本下的脚本加载公开类型路径；存在依赖兼容问题的 0.5.8 已从 crates.io 撤回。
+
+GitHub 资产包含 crates.io 0.5.9 不可变上传之后的两处多余借用修正，运行行为与公开 ABI 不变。GitHub 原生验收及发布资产与 crate 发布分别验证。运行时资产同步默认标签为 `v0.5.9`；独立 Lua runtime 包仓库保持自身版本线。
 
 ### LuaSkills 0.5.7
 

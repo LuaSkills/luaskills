@@ -1674,7 +1674,7 @@ pub(crate) fn resolve_vulcan_process_which_in_directory(
     if is_vulcan_process_explicit_path(&program) {
         // Explicit program path resolved against the current working directory when needed.
         // 必要时基于当前工作目录解析得到的显式程序路径。
-        let explicit_path = resolve_vulcan_process_search_path(Path::new(&program), &cwd);
+        let explicit_path = resolve_vulcan_process_search_path(Path::new(&program), cwd);
         return find_vulcan_process_candidate(&explicit_path);
     }
     // Host PATH environment used for command-name lookup.
@@ -1687,7 +1687,7 @@ pub(crate) fn resolve_vulcan_process_which_in_directory(
     for search_dir in std::env::split_paths(&path_env) {
         // Search directory resolved against the current working directory when the PATH entry is relative.
         // 当 PATH 条目为相对路径时，基于当前工作目录解析得到的搜索目录。
-        let resolved_dir = resolve_vulcan_process_search_path(&search_dir, &cwd);
+        let resolved_dir = resolve_vulcan_process_search_path(&search_dir, cwd);
         // Candidate base path before platform-specific executable suffix expansion.
         // 执行平台相关可执行后缀扩展之前的候选基础路径。
         let base = resolved_dir.join(&program);
