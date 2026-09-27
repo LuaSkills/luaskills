@@ -225,6 +225,23 @@ impl RuntimeSlot {
         })
     }
 
+    /// Retain the actual core for one command; `admission` rejects new work after the slot closes.
+    /// 为一个命令保留实际核心；`admission` 在槽关闭后拒绝新工作。
+    /// Control commands remain available for cancellation, host acknowledgements and drainage.
+    /// 控制命令仍可用于取消、宿主确认及排空。
+    pub(super) fn acquire(self: &Arc<Self>, admission: bool) -> EmbeddedResult<RuntimeLease> {
+        let mut state = self.lock()?;
+        if admission && state.closing {
+            return Err(closed());
+        }
+        self.lease(&mut state).ok_or_else(|| {
+            EmbeddedError::new(
+                EmbeddedErrorCode::Busy,
+                "FFI runtime has no initialized core; query runtime_status",
+            )
+        })
+    }
+
     /// Permanently close this exact slot, including a future core still under construction.
     /// 永久关闭此精确槽，包含仍在构造中的未来核心。
     pub(super) fn request_close(self: &Arc<Self>) -> EmbeddedResult<()> {
@@ -302,7 +319,7 @@ impl RuntimeSlot {
 impl RuntimeLease {
     /// Borrow the actual core for this live lease; the private constructor always installs its owner.
     /// 为此活动租借借用实际核心；私有构造器始终安装其所有者。
-    fn runtime(&self) -> &EmbeddedRuntime {
+    pub(super) fn runtime(&self) -> &EmbeddedRuntime {
         self.runtime
             .as_deref()
             .expect("live runtime lease owns its core")

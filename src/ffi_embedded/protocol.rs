@@ -1,3 +1,4 @@
+use super::commands::{RUNTIME_COMMAND_NAMES, RuntimeCommand};
 use super::runtime::RuntimeSlot;
 use super::{EMBEDDED_FFI_PROTOCOL_VERSION, EmbeddedFfiStatus, transport::Transport};
 use crate::{
@@ -25,6 +26,16 @@ pub(super) struct Request {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Command {
+    /// Execute one typed operation on an exact initialized runtime.
+    /// 在精确已初始化运行时上执行一个类型化操作。
+    Runtime {
+        /// Exact transport-local runtime identity.
+        /// 精确传输局部运行时身份。
+        runtime_id: String,
+        /// Typed core operation with no legacy command aliases.
+        /// 不含旧命令别名的类型化核心操作。
+        operation: Box<RuntimeCommand>,
+    },
     /// Inspect effective transport limits and implemented protocol commands.
     /// 查看有效传输限制与已实现协议命令。
     Describe {},
@@ -130,7 +141,8 @@ pub(super) fn execute(
                 "core_version": env!("CARGO_PKG_VERSION"),
                 "protocol_version": EMBEDDED_FFI_PROTOCOL_VERSION,
                 "abi_structure_version": EMBEDDED_FFI_PROTOCOL_VERSION,
-                "commands": ["describe", "runtime_reserve", "runtime_initialize", "runtime_status", "runtime_close", "runtime_free"],
+                "commands": ["describe", "runtime_reserve", "runtime_initialize", "runtime_status", "runtime_close", "runtime_free", "runtime"],
+                "runtime_commands": RUNTIME_COMMAND_NAMES,
                 "limits": transport.config,
             })),
             limit,
@@ -182,6 +194,13 @@ pub(super) fn execute(
                 Err(error) => respond::<()>(Err(error), limit),
             }
         }
+        Command::Runtime {
+            runtime_id,
+            operation,
+        } => match transport.runtime(&runtime_id) {
+            Ok(slot) => super::control::execute(&slot, *operation, limit),
+            Err(error) => respond::<()>(Err(error), limit),
+        },
     }
 }
 
@@ -193,15 +212,17 @@ fn receipt(id: &str, limit: usize) -> Result<Vec<u8>, EmbeddedFfiStatus> {
 
 /// Encode the core `result` as an explicit success or structured failure within `limit`.
 /// 在 `limit` 内将核心 `result` 编码为明确成功或结构化失败。
-fn respond<T: Serialize>(
+pub(super) fn respond<T: Serialize>(
     result: EmbeddedResult<T>,
     limit: usize,
 ) -> Result<Vec<u8>, EmbeddedFfiStatus> {
     match result {
         Ok(result) => encode(
-            &serde_json::json!({
-                "protocol_version": EMBEDDED_FFI_PROTOCOL_VERSION, "status": "ok", "result": result,
-            }),
+            &SuccessEnvelope {
+                protocol_version: EMBEDDED_FFI_PROTOCOL_VERSION,
+                status: "ok",
+                result: &result,
+            },
             limit,
         ),
         Err(error) => encode(
@@ -210,6 +231,67 @@ fn respond<T: Serialize>(
             }),
             limit,
         ),
+    }
+}
+
+/// Borrowed success envelope avoids cloning application output during native response publication.
+/// 借用成功信封，避免原生响应发布期间克隆应用输出。
+#[derive(Serialize)]
+struct SuccessEnvelope<'a, T: Serialize> {
+    /// Single protocol version authority.
+    /// 唯一协议版本权威。
+    protocol_version: u32,
+    /// Exact success discriminator.
+    /// 精确成功判别。
+    status: &'static str,
+    /// Borrowed result whose owner lives through serialization.
+    /// 借用结果，其所有者跨序列化存活。
+    result: &'a T,
+}
+
+/// Owned response allocation proved large enough before a command can mutate core state.
+/// 在命令能够变更核心状态前，已证明足够大的拥有型响应分配。
+pub(super) struct PreparedSuccess {
+    /// The same allocation is reused for the actual success response after mutation.
+    /// 变更后实际成功响应复用同一分配。
+    writer: ResponseWriter,
+}
+
+impl PreparedSuccess {
+    /// Encode worst-case `sample` within `limit` and retain its allocation for later publication.
+    /// 在 `limit` 内编码最坏情况 `sample`，并保留其分配供稍后发布。
+    pub(super) fn new(sample: &impl Serialize, limit: usize) -> Result<Self, EmbeddedFfiStatus> {
+        let bytes = encode(
+            &SuccessEnvelope {
+                protocol_version: EMBEDDED_FFI_PROTOCOL_VERSION,
+                status: "ok",
+                result: sample,
+            },
+            limit,
+        )?;
+        Ok(Self {
+            writer: ResponseWriter {
+                limit: bytes.len(),
+                bytes,
+                failure: None,
+            },
+        })
+    }
+
+    /// Serialize actual `result` into the retained allocation; exceeding the proven sample is an internal contract failure.
+    /// 将实际 `result` 序列化到保留分配；超过已证明样本属于内部契约失败。
+    pub(super) fn finish(mut self, result: &impl Serialize) -> Result<Vec<u8>, EmbeddedFfiStatus> {
+        self.writer.bytes.clear();
+        serde_json::to_writer(
+            &mut self.writer,
+            &SuccessEnvelope {
+                protocol_version: EMBEDDED_FFI_PROTOCOL_VERSION,
+                status: "ok",
+                result,
+            },
+        )
+        .map_err(|_| EmbeddedFfiStatus::Internal)?;
+        Ok(self.writer.bytes)
     }
 }
 

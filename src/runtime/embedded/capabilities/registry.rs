@@ -496,7 +496,8 @@ impl CapabilityRegistry {
             state.sequence += 1;
             // String identities preserve their exact value across JavaScript and every FFI.
             // 字符串身份在 JavaScript 与全部 FFI 中保留精确值。
-            let id = format!("{}:cap:{}", self.runtime_id, state.sequence);
+            let id = crate::runtime::embedded::IdentityKind::Capability
+                .render(&self.runtime_id, state.sequence);
             state
                 .active
                 .insert(request.descriptor.name.clone(), id.clone());

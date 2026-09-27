@@ -1,6 +1,7 @@
 use super::*;
 use std::sync::{Arc, Barrier};
 
+mod commands;
 pub(super) mod runtimes;
 
 /// Build explicit small budgets for native transport ownership tests.

@@ -374,6 +374,18 @@ pub struct ModulePool {
 }
 
 impl ModulePool {
+    /// Revoke live `permission` from this exact module binding without replacing its capability snapshot.
+    /// 从此精确模块绑定撤销实时 `permission`，不替换能力快照。
+    pub(super) fn revoke_capability_permission(&self, permission: &str) -> EmbeddedResult<bool> {
+        let binding = self.capabilities.as_ref().ok_or_else(|| {
+            EmbeddedError::new(
+                EmbeddedErrorCode::Unsupported,
+                "pool has no capability binding",
+            )
+        })?;
+        binding.permissions.revoke(permission)
+    }
+
     /// Reserve ordinary call ownership using `control`, without constructing a VM or executing Lua.
     /// 使用 `control` 预留普通调用所有权，不构造 VM 或执行 Lua。
     /// Return a prepared lease for one worker, or a capacity error safe to keep queued.

@@ -367,7 +367,7 @@ impl EmbeddedRuntime {
             .sequence
             .checked_add(1)
             .ok_or_else(|| internal("pool identity exhausted"))?;
-        let id = format!("{}:pool:{sequence}", self.id());
+        let id = IdentityKind::Pool.render(self.id(), sequence);
         let plugin_id = definition.plugin_id.clone();
         let pool = self.center.pools.create_pool_with_capabilities(
             id.clone(),
@@ -519,6 +519,20 @@ impl EmbeddedRuntime {
                 .pool,
         );
         pool.usage()
+    }
+
+    /// Revoke exact `permission` for `pool_id` using its existing live authority; return whether a grant changed.
+    /// 使用既有实时权威为 `pool_id` 撤销精确 `permission`；返回授权是否发生变化。
+    pub fn revoke_pool_permission(&self, pool_id: &str, permission: &str) -> EmbeddedResult<bool> {
+        let pool = self
+            .center
+            .lock()?
+            .pools
+            .get(pool_id)
+            .ok_or_else(not_found)?
+            .pool
+            .clone();
+        pool.revoke_capability_permission(permission)
     }
 
     /// Reject new work and request cancellation without blocking on a VM or language callback.

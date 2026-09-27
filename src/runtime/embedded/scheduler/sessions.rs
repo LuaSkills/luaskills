@@ -239,7 +239,7 @@ impl EmbeddedRuntime {
             .sequence
             .checked_add(1)
             .ok_or_else(|| internal("session identity exhausted"))?;
-        let session_id = format!("{}:session:{}", self.id(), state.sequence);
+        let session_id = IdentityKind::Session.render(self.id(), state.sequence);
         let request = ScheduledRequest::OpenSession {
             pool_id: pool_id.to_owned(),
             session_id: session_id.clone(),
@@ -435,7 +435,7 @@ impl SchedulerCenter {
             ));
         }
         let (handle, owner) = self.operations.admit(Arc::clone(&control))?;
-        let id = handle.snapshot()?.operation_id;
+        let id = handle.id().to_owned();
         let plugin_state = state
             .plugins
             .get_mut(&plugin)

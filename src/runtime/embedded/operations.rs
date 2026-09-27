@@ -102,6 +102,9 @@ pub struct OperationSnapshot {
 /// State shared by one read/cancel handle and its sole execution owner.
 /// 单个读取与取消句柄和其唯一执行所有者共享的状态。
 struct Operation {
+    /// Immutable identity remains available even if mutable lifecycle observations fail.
+    /// 即使可变生命周期观测失败，不可变身份仍可取得。
+    id: String,
     /// Bounded evidence shared with the original execution control.
     /// 与原始执行控制共享的有界证据。
     effects: Arc<EffectLedger>,
@@ -163,6 +166,12 @@ pub struct OperationHandle {
 }
 
 impl OperationHandle {
+    /// Borrow the exact immutable identity without querying execution or effect state.
+    /// 借用精确不可变身份，不查询执行或副作用状态。
+    pub fn id(&self) -> &str {
+        &self.operation.id
+    }
+
     /// Return a fresh snapshot with the actual cooperative cancellation request flag.
     /// 返回包含真实协作取消请求标记的最新快照。
     pub fn snapshot(&self) -> EmbeddedResult<OperationSnapshot> {
@@ -418,7 +427,7 @@ impl OperationRegistry {
         })?;
         // Opaque strings preserve the full identity in every supported SDK.
         // 不透明字符串在所有受支持 SDK 中保留完整身份。
-        let id = format!("{}:op:{sequence}", self.runtime_id);
+        let id = super::IdentityKind::Operation.render(&self.runtime_id, sequence);
         // The original control can belong to exactly one registered operation for its whole lifetime.
         // 原始控制对象在整个生命周期内只能归属于一个注册操作。
         let effects = EffectLedger::new(
@@ -431,6 +440,7 @@ impl OperationRegistry {
         // Prepare the complete record before making it discoverable.
         // 在记录可被发现前完整构造记录。
         let operation = Arc::new(Operation {
+            id: id.clone(),
             effects,
             control,
             snapshot: Mutex::new(OperationSnapshot {

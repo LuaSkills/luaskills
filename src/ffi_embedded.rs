@@ -1,6 +1,8 @@
 //! Versioned, bounded transports independent of legacy engine-wide execution locks.
 //! 独立于旧引擎级执行锁的版本化有界传输。
 
+mod commands;
+mod control;
 mod protocol;
 mod runtime;
 mod transport;
