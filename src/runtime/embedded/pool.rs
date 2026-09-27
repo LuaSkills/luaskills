@@ -1,3 +1,4 @@
+use super::capabilities::ModuleCapabilities;
 use super::retirement::RetirementService;
 use super::{
     CallControl, EmbeddedError, EmbeddedErrorCode, EmbeddedModule, EmbeddedResult,
@@ -62,15 +63,43 @@ impl EmbeddedPoolManager {
         }))
     }
 
-    /// Register immutable `definition` and `policy` under exact host `group` identity.
-    /// 将不可变 `definition` 与 `policy` 注册到精确宿主 `group` 身份。
-    /// Each pool has one complete generation and security domain; capacity is shared by the parent.
-    /// 每个池具有一个完整代次与安全域；容量由父级共享。
+    /// Register an unbound module pool under explicit `group`, `definition` and `policy`.
+    /// 根据显式 `group`、`definition` 与 `policy` 注册未绑定模块池。
+    /// Unbound modules cannot reach legacy process-global host callbacks.
+    /// 未绑定模块无法访问旧进程全局宿主回调。
     pub fn create_pool(
         self: &Arc<Self>,
         group: String,
         definition: ModuleDefinition,
         policy: PluginPoolConfig,
+    ) -> EmbeddedResult<Arc<ModulePool>> {
+        self.create_pool_internal(group, definition, policy, None)
+    }
+
+    /// Register a pool with immutable `capabilities` in the same generation and security domain.
+    /// 在相同代次与安全域中注册具有不可变 `capabilities` 的池。
+    /// Every resident VM inherits this exact snapshot and configuration revision.
+    /// 每个常驻 VM 继承此精确快照与配置修订。
+    pub fn create_pool_with_capabilities(
+        self: &Arc<Self>,
+        group: String,
+        definition: ModuleDefinition,
+        policy: PluginPoolConfig,
+        capabilities: ModuleCapabilities,
+    ) -> EmbeddedResult<Arc<ModulePool>> {
+        self.create_pool_internal(group, definition, policy, Some(capabilities))
+    }
+
+    /// Register immutable `definition` and `policy` under exact host `group` identity.
+    /// 将不可变 `definition` 与 `policy` 注册到精确宿主 `group` 身份。
+    /// Each pool has one complete generation and security domain; capacity is shared by the parent.
+    /// 每个池具有一个完整代次与安全域；容量由父级共享。
+    fn create_pool_internal(
+        self: &Arc<Self>,
+        group: String,
+        definition: ModuleDefinition,
+        policy: PluginPoolConfig,
+        capabilities: Option<ModuleCapabilities>,
     ) -> EmbeddedResult<Arc<ModulePool>> {
         definition.validate()?;
         for export in &definition.exports {
@@ -88,6 +117,7 @@ impl EmbeddedPoolManager {
         // The unique registration outlives all modules even after this public owner disappears.
         // 即使此公开所有者消失，唯一注册仍比全部模块存活更久。
         let pool = Arc::new(ModulePool {
+            capabilities,
             manager: Arc::clone(self),
             registration: Arc::new(PoolRegistration {
                 group,
@@ -318,6 +348,9 @@ struct ModulePoolState {
 /// Reusable pool bound to one immutable plugin generation and complete security context.
 /// 绑定单个不可变插件代次与完整安全上下文的可复用池。
 pub struct ModulePool {
+    /// Frozen capability membership and configuration revision for every resident instance.
+    /// 每个常驻实例使用的冻结能力成员与配置修订。
+    capabilities: Option<ModuleCapabilities>,
     /// Parent capacity and shared cleanup services.
     /// 父级容量与共享清理服务。
     manager: Arc<EmbeddedPoolManager>,
@@ -463,6 +496,9 @@ impl ModulePool {
                 // Initialization itself consumes the same parent and group running budgets.
                 // 初始化本身消耗相同的父级与分组运行预算。
                 let _permit = resident.reservation.begin_execution()?;
+                if let Some(capabilities) = &self.capabilities {
+                    resident.module.bind_capabilities(capabilities.clone())?;
+                }
                 resident.module.initialize(control)
             };
             initialization?;

@@ -7,6 +7,7 @@ use crate::runtime::embedded::{
     CallControl, EmbeddedErrorCode, ModuleDefinition, ModuleExport, ModuleInvocation,
 };
 
+mod capabilities;
 mod pools;
 
 /// Build a declaration using the established System fixture and exact `source`.
@@ -70,6 +71,8 @@ fn embedded_module_invokes_captured_functions_without_reloading_source() {
         // 直接调用结果必须同时保留持久状态与结构化输入。
         let result = module
             .invoke(ModuleInvocation {
+                operation_id: "test-operation",
+                session_id: None,
                 export: "call",
                 arguments: &arguments,
                 context: &context,
@@ -142,6 +145,8 @@ fn embedded_cancellation_prevents_execution_and_reuse() {
     // Exact invocation result, with no string parsing of the failure.
     // 精确调用结果，不对错误进行字符串解析。
     let result = module.invoke(ModuleInvocation {
+        operation_id: "test-operation",
+        session_id: None,
         export: "call",
         arguments: &json!({}),
         context: &LuaInvocationContext::default(),
@@ -183,6 +188,8 @@ fn embedded_module_revalidates_package_identity() {
     assert!(
         module
             .invoke(ModuleInvocation {
+                operation_id: "test-operation",
+                session_id: None,
                 export: "call",
                 arguments: &json!({}),
                 context: &LuaInvocationContext::default(),
@@ -245,6 +252,8 @@ fn embedded_module_enforces_input_and_output_contracts() {
     assert!(
         module
             .invoke(ModuleInvocation {
+                operation_id: "test-operation",
+                session_id: None,
                 export: "call",
                 arguments: &json!("rejected-secret"),
                 context: &LuaInvocationContext::default(),
@@ -257,6 +266,8 @@ fn embedded_module_enforces_input_and_output_contracts() {
     assert!(
         module
             .invoke(ModuleInvocation {
+                operation_id: "test-operation",
+                session_id: None,
                 export: "call",
                 arguments: &json!(1),
                 context: &LuaInvocationContext::default(),

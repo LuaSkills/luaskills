@@ -1,12 +1,21 @@
 use super::*;
+use crate::runtime::embedded::capabilities::ModuleCapabilities;
 use crate::runtime::embedded::{
     CallControl, EmbeddedError, EmbeddedErrorCode, EmbeddedResult, JsonContract, ModuleDefinition,
     ModuleInvocation,
 };
 
+mod capabilities;
+
 /// One exclusively borrowed VM with immutable, validated function exports.
 /// 单个被独占借用且具有不可变已校验函数导出的 VM。
 pub struct EmbeddedModule {
+    /// Immutable per-module registry snapshot and live permission authority.
+    /// 不可变逐模块注册表快照与实时权限权威。
+    capabilities: Option<ModuleCapabilities>,
+    /// Unique lifecycle operation identity used only during this instance's initialization.
+    /// 仅在此实例初始化期间使用的唯一生命周期操作身份。
+    initialization_id: String,
     /// Package and directory identities shared with the proven System loader.
     /// 与已验证 System 加载器共享的包和目录身份。
     paths: RuntimeLeasePathContext,
@@ -86,6 +95,8 @@ impl Drop for ModuleBudgetGuard<'_> {
         self.lua
             .remove_app_data::<logical_cwd::EvaluationDeadline>();
         self.lua.remove_app_data::<Arc<CallControl>>();
+        self.lua
+            .remove_app_data::<capabilities::CapabilityCallContext>();
     }
 }
 
@@ -96,6 +107,26 @@ fn execution_error(error: impl Display) -> EmbeddedError {
 }
 
 impl LuaEngine {
+    /// Create a module with immutable `capabilities` installed before source initialization.
+    /// 在源码初始化前安装不可变 `capabilities` 并创建模块。
+    /// `definition`, `instance_id` and `control` retain the same path and deadline contracts as direct creation.
+    /// `definition`、`instance_id` 与 `control` 保持与直接创建相同的路径及截止契约。
+    pub fn create_embedded_module_with_capabilities(
+        self: &Arc<Self>,
+        definition: ModuleDefinition,
+        instance_id: &str,
+        control: Arc<CallControl>,
+        capabilities: ModuleCapabilities,
+    ) -> EmbeddedResult<EmbeddedModule> {
+        control.check()?;
+        // Ownership is established before binding and source execution can fail.
+        // 在绑定与源码执行可能失败前建立所有权。
+        let mut module = self.allocate_embedded_module(definition, instance_id)?;
+        module.bind_capabilities(capabilities)?;
+        module.initialize(control)?;
+        Ok(module)
+    }
+
     /// Create and initialize `definition` with trusted `instance_id` and original `control`.
     /// 使用可信 `instance_id` 与原始 `control` 创建并初始化 `definition`。
     /// Return a standalone module; governed pools retain failed instances separately.
@@ -194,7 +225,10 @@ impl LuaEngine {
         .map_err(execution_error)?;
         // Construct the owner before running source so every failure retires created resources.
         // 在运行源码前构造所有者，确保所有失败路径退役已创建资源。
+        capabilities::install(&vm.lua, None).map_err(execution_error)?;
         Ok(EmbeddedModule {
+            capabilities: None,
+            initialization_id: format!("{instance_id}:initialize"),
             engine: Arc::clone(self),
             paths,
             vm,
@@ -208,6 +242,23 @@ impl LuaEngine {
 }
 
 impl EmbeddedModule {
+    /// Bind `capabilities` exactly once before initialization; reject replacing a live VM's authority.
+    /// 在初始化前精确绑定一次 `capabilities`；拒绝替换活动 VM 权威。
+    pub(crate) fn bind_capabilities(
+        &mut self,
+        capabilities: ModuleCapabilities,
+    ) -> EmbeddedResult<()> {
+        if self.pending_contracts.is_none() || self.capabilities.is_some() {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::Closed,
+                "module capability binding is already frozen",
+            ));
+        }
+        capabilities::install(&self.vm.lua, Some(capabilities.clone())).map_err(execution_error)?;
+        self.capabilities = Some(capabilities);
+        Ok(())
+    }
+
     /// Execute source with `control` and consume the already-compiled contracts once.
     /// 使用 `control` 执行源码，并且仅消费一次已编译契约。
     /// Return only after initialization resources have committed successfully.
@@ -229,7 +280,8 @@ impl EmbeddedModule {
         let source = self.definition.source.clone();
         // Resolve exact functions only after every value contract has compiled successfully.
         // 仅在全部值契约编译成功后解析精确函数。
-        let exports = self.run(&context, control, |lua| {
+        let initialization_id = self.initialization_id.clone();
+        let exports = self.run(&context, control, &initialization_id, None, |lua| {
             // The module return shape is fixed by the declared runtime protocol.
             // 模块返回形状由声明的运行时协议固定。
             let table: Table = lua.load(&source).set_name("embedded_module").eval()?;
@@ -274,22 +326,28 @@ impl EmbeddedModule {
                 EmbeddedError::new(EmbeddedErrorCode::NotFound, "module export is not declared")
             })?;
         export.input.validate(invocation.arguments)?;
-        self.run(invocation.context, invocation.control, |lua| {
-            // JSON conversion preserves the canonical null and empty-container representation.
-            // JSON 转换保留规范空值与空容器表示。
-            let argument = lua.to_value(invocation.arguments)?;
-            // Direct function calls do not compile a new wrapper for every request.
-            // 直接函数调用不为每次请求编译新包装。
-            let result = export.function.call::<LuaValue>(argument)?;
-            // Output contract validation happens before request-owned resources commit.
-            // 输出契约在请求所属资源提交前校验。
-            let value = lua.from_value(result)?;
-            export
-                .output
-                .validate(&value)
-                .map_err(mlua::Error::external)?;
-            Ok(value)
-        })
+        self.run(
+            invocation.context,
+            invocation.control,
+            invocation.operation_id,
+            invocation.session_id,
+            |lua| {
+                // JSON conversion preserves the canonical null and empty-container representation.
+                // JSON 转换保留规范空值与空容器表示。
+                let argument = lua.to_value(invocation.arguments)?;
+                // Direct function calls do not compile a new wrapper for every request.
+                // 直接函数调用不为每次请求编译新包装。
+                let result = export.function.call::<LuaValue>(argument)?;
+                // Output contract validation happens before request-owned resources commit.
+                // 输出契约在请求所属资源提交前校验。
+                let value = lua.from_value(result)?;
+                export
+                    .output
+                    .validate(&value)
+                    .map_err(mlua::Error::external)?;
+                Ok(value)
+            },
+        )
     }
 
     /// Run `execute` under trusted `context` and the original `control` budget.
@@ -300,6 +358,8 @@ impl EmbeddedModule {
         &mut self,
         context: &LuaInvocationContext,
         control: Arc<CallControl>,
+        operation_id: &str,
+        session_id: Option<&str>,
         execute: impl FnOnce(&Lua) -> mlua::Result<T>,
     ) -> EmbeddedResult<T> {
         self.reusable = false;
@@ -351,6 +411,25 @@ impl EmbeddedModule {
         // One guard protects initialization, execution, and JSON result conversion alike.
         // 同一保护对象覆盖初始化、执行与 JSON 结果转换。
         let guard = ModuleBudgetGuard::install(&self.vm.lua, Arc::clone(&control))?;
+        // Derive caller authority only from frozen host declarations and explicit call identifiers.
+        // 仅从冻结宿主声明与显式调用标识派生调用方权威。
+        let caller = self
+            .capabilities
+            .as_ref()
+            .map(|binding| {
+                binding.caller(
+                    &self.definition,
+                    operation_id.to_owned(),
+                    session_id.map(str::to_owned),
+                )
+            })
+            .transpose()?;
+        self.vm
+            .lua
+            .set_app_data(capabilities::CapabilityCallContext {
+                caller,
+                control: Arc::clone(&control),
+            });
         // Save the result before unconditional request-context cleanup.
         // 在无条件清理请求上下文前保存执行结果。
         let result = execute(&self.vm.lua);

@@ -208,7 +208,7 @@ impl CapabilityCaller {
             || self
                 .session_id
                 .as_ref()
-                .is_some_and(|value| value.trim().is_empty())
+                .is_some_and(|value| value.trim().is_empty() || value.contains('\0'))
         {
             return Err(EmbeddedError::invalid(
                 "capability caller identity is invalid",
@@ -331,4 +331,17 @@ pub struct CapabilityOutcome {
     /// Host-confirmed effect status, independent from cancellation and schema validation.
     /// 宿主确认的副作用状态，独立于取消与 Schema 校验。
     pub effects: EffectState,
+}
+
+impl CapabilityOutcome {
+    /// Return the explicit success/error envelope shared by Lua and the versioned SDK protocol.
+    /// 返回由 Lua 与版本化 SDK 协议共享的显式成功或错误信封。
+    /// Successful null values remain present; failures carry no fabricated application value.
+    /// 成功的空值保持存在；失败不携带虚构应用值。
+    pub fn to_json(&self) -> Value {
+        match &self.result {
+            Ok(value) => serde_json::json!({"ok":true,"value":value,"effects":self.effects}),
+            Err(error) => serde_json::json!({"ok":false,"error":error,"effects":self.effects}),
+        }
+    }
 }

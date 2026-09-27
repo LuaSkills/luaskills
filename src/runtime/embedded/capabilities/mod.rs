@@ -1,6 +1,7 @@
 //! Instance-scoped host capabilities with explicit authorization and callback ownership.
 //! 具有显式授权与回调所有权的实例级宿主能力。
 
+mod binding;
 mod broker;
 mod registry;
 mod types;
@@ -8,6 +9,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+pub use binding::ModuleCapabilities;
 pub use broker::{
     HostRequest, HostRequestBroker, HostRequestHandle, HostRequestPhase, HostRequestStatus,
 };

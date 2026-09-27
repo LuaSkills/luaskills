@@ -5,64 +5,67 @@ use crate::runtime::embedded::EmbeddedResult;
 /// 同一引擎上的独立 VM 必须在真实宿主等待中重叠，同时保持两个许可记账。
 #[test]
 fn embedded_pool_parallel_host_wait_keeps_actual_capacity() {
-    // The legacy bridge is used only as a deterministic blocking probe for the new VM pool.
-    // 旧桥接仅用作新 VM 池的确定性阻塞探针。
-    let _guard = host_tool_callback_test_guard();
-    // One channel observes both callback arrivals without relying on elapsed-time speedups.
-    // 单个通道观察两个回调到达，不依赖耗时加速比。
+    use crate::runtime::embedded::EffectState;
+    use crate::runtime::embedded::capabilities::{
+        CapabilityExecution, CapabilityOutcome, CapabilityRegistrationRequest, CapabilityRegistry,
+    };
+    // Channels prove both actual native handlers overlap while the parent counts both VMs.
+    // 通道证明两个真实原生处理器重叠，同时父级统计两个 VM。
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    // Separate releases let both callbacks remain blocked at once.
-    // 独立释放使两个回调能同时保持阻塞。
     let (first_tx, first_rx) = std::sync::mpsc::channel();
-    // The second callback receives a different synchronization slot.
-    // 第二个回调接收不同同步槽。
     let (second_tx, second_rx) = std::sync::mpsc::channel();
-    // Callbacks select an exact declared probe slot rather than sharing one receiver.
-    // 回调选择精确声明的探针槽，而非共用一个接收器。
+    // Each callback has an independent release barrier.
+    // 每个回调具有独立释放屏障。
     let releases = [Mutex::new(first_rx), Mutex::new(second_rx)];
-    set_host_tool_callback(Some(Arc::new(move |request| {
-        if request.action != RuntimeHostToolAction::Call {
-            return Err("unexpected probe action".into());
-        }
-        // Test-owned numeric arguments are validated before selecting a barrier.
-        // 选择屏障前校验测试拥有的数值参数。
-        let index = request.args["index"]
-            .as_u64()
-            .filter(|index| *index < 2)
-            .ok_or("invalid probe slot")? as usize;
-        entered_tx.send(index).map_err(|error| error.to_string())?;
-        releases[index]
-            .lock()
-            .unwrap()
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|error| error.to_string())?;
-        Ok(json!({"ok":true,"value":index}))
-    })));
-    // Real module calls the existing native host bridge while the runtime permit remains held.
-    // 真实模块调用既有原生宿主桥接，同时运行许可仍被持有。
     let layout = SystemRuntimeTestLayout::new("embedded concurrent pool");
-    // Both VMs deliberately belong to one engine and one execution group.
-    // 两个 VM 刻意属于同一个引擎与执行分组。
     let manager = pool_manager(&layout);
-    // Callback envelopes are validated in Lua before returning the structured result.
-    // 回调信封在 Lua 中经过校验后返回结构化结果。
-    let pool = manager.create_pool("parallel".into(), definition(&layout,
+    // The instance registry replaces the previous process-global probe.
+    // 实例注册表替代此前的进程全局探针。
+    let registry =
+        CapabilityRegistry::new("parallel-runtime".into(), manager.config().clone()).unwrap();
+    registry
+        .register(vec![CapabilityRegistrationRequest {
+            descriptor: super::capabilities::descriptor("pool.probe", CapabilityExecution::Native),
+            native: Some(Arc::new(move |request| {
+                // Fixture input is validated before selecting an exact synchronization slot.
+                // 选择精确同步槽前校验夹具输入。
+                let index = request.arguments["index"]
+                    .as_u64()
+                    .filter(|index| *index < 2)
+                    .unwrap() as usize;
+                entered_tx.send(index).unwrap();
+                releases[index]
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                CapabilityOutcome {
+                    result: Ok(json!(index)),
+                    effects: EffectState::NotApplicable,
+                }
+            })),
+        }])
+        .unwrap();
+    // Every VM binds the same immutable snapshot while retaining independent Lua state.
+    // 每个 VM 绑定同一个不可变快照，同时保留独立 Lua 状态。
+    let (_, capabilities) = super::capabilities::binding(&registry);
+    let pool = manager.create_pool_with_capabilities("parallel".into(), definition(&layout,
         "return {call=function(a) local r=vulcan.host.call('pool.probe',a); if not r.ok then error(r.error.message) end; return r.value end}"),
-        pool_policy(InstanceReuse::Reusable)).unwrap();
-    // Prepare both instances before blocking either worker on its host callback.
-    // 在任何工作线程阻塞于宿主回调前准备两个实例。
+        pool_policy(InstanceReuse::Reusable), capabilities).unwrap();
+    // Prepare both instances before either worker blocks inside a real host callback.
+    // 在任一工作线程阻塞于真实宿主回调前准备两个实例。
     let leases = [
         pool.acquire(control()).unwrap(),
         pool.acquire(control()).unwrap(),
     ];
-    // Each thread owns a different Lua VM, so no VM mutex is shared across the blocking calls.
-    // 每个线程拥有不同 Lua VM，因此阻塞调用不共用 VM 互斥锁。
     let workers = leases
         .into_iter()
         .enumerate()
         .map(|(index, mut lease)| {
             std::thread::spawn(move || {
                 lease.invoke(ModuleInvocation {
+                    operation_id: "parallel-operation",
+                    session_id: None,
                     export: "call",
                     arguments: &json!({"index":index}),
                     context: &LuaInvocationContext::default(),
@@ -96,7 +99,7 @@ use crate::runtime::embedded::{
 
 /// Small explicit limits expose parent capacity, reservation and retirement behavior.
 /// 小规模显式上限暴露父级容量、预留与退役行为。
-fn pool_manager(layout: &SystemRuntimeTestLayout) -> Arc<EmbeddedPoolManager> {
+pub(super) fn pool_manager(layout: &SystemRuntimeTestLayout) -> Arc<EmbeddedPoolManager> {
     // One engine is deliberately shared by every independently allocated VM.
     // 所有独立分配的 VM 刻意共享同一个引擎。
     let engine = Arc::new(make_runtime_test_engine_with_host_options(
@@ -122,7 +125,7 @@ fn pool_manager(layout: &SystemRuntimeTestLayout) -> Arc<EmbeddedPoolManager> {
 
 /// Return explicit `reuse` policy without implicit reuse or unbounded options.
 /// 返回显式 `reuse` 策略，不隐式复用或使用无界选项。
-fn pool_policy(reuse: InstanceReuse) -> PluginPoolConfig {
+pub(super) fn pool_policy(reuse: InstanceReuse) -> PluginPoolConfig {
     PluginPoolConfig {
         kind: PoolKind::Shared,
         min_resident_vms: 0,
@@ -141,6 +144,8 @@ fn pool_policy(reuse: InstanceReuse) -> PluginPoolConfig {
 /// 调用 `lease` 中精确计数导出并返回 JSON 值。
 fn count(lease: &mut ModuleLease) -> EmbeddedResult<Value> {
     lease.invoke(ModuleInvocation {
+        operation_id: "test-operation",
+        session_id: None,
         export: "call",
         arguments: &Value::Null,
         context: &LuaInvocationContext::default(),
@@ -150,7 +155,7 @@ fn count(lease: &mut ModuleLease) -> EmbeddedResult<Value> {
 
 /// Wait for true resident destruction without treating an empty retirement queue as completion.
 /// 等待真实常驻实例销毁，不将空退役队列视为完成。
-fn drained(pool: &ModulePool) {
+pub(super) fn drained(pool: &ModulePool) {
     // Bounded deadline detects ownership leaks without requiring exact worker scheduling.
     // 有界截止时间检测所有权泄漏，不要求精确工作线程调度。
     let deadline = Instant::now() + Duration::from_secs(3);

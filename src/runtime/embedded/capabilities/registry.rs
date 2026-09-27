@@ -672,6 +672,63 @@ impl Drop for CallbackScope {
 }
 
 impl CapabilitySnapshot {
+    /// Check whether exact `name` is active and authorized by current `permissions`.
+    /// 检查精确 `name` 是否活动且被当前 `permissions` 授权。
+    /// Missing or denied declarations are hidden; internal failures remain explicit.
+    /// 隐藏缺失或拒绝的声明；内部失败仍显式报告。
+    pub fn has(&self, name: &str, permissions: &CapabilityPermissions) -> EmbeddedResult<bool> {
+        let Some(entry) = self.entries.get(name) else {
+            return Ok(false);
+        };
+        match permissions.require(&entry.descriptor.permissions) {
+            Ok(()) => Ok(entry.status()?.accepting),
+            Err(error) if error.code == EmbeddedErrorCode::PermissionDenied => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Return the trusted runtime namespace captured with this immutable snapshot.
+    /// 返回与此不可变快照一同捕获的可信运行时命名空间。
+    pub fn runtime_id(&self) -> &str {
+        &self.runtime_id
+    }
+
+    /// Invoke exact `name` through its declared transport using host-authenticated context.
+    /// 使用宿主认证上下文，通过声明的传输调用精确 `name`。
+    /// Queued work waits on its existing VM worker until the actual host handler acknowledges completion.
+    /// 队列任务在已有 VM 工作线程等待，直到真实宿主处理器确认完成。
+    pub fn invoke(
+        &self,
+        name: &str,
+        caller: CapabilityCaller,
+        permissions: Arc<CapabilityPermissions>,
+        arguments: Value,
+        control: Arc<CallControl>,
+    ) -> EmbeddedResult<CapabilityOutcome> {
+        // Resolve the transport from this precise registration, never by trying another callback path.
+        // 从此精确注册解析传输，绝不尝试其他回调路径。
+        let execution = self
+            .entries
+            .get(name)
+            .ok_or_else(not_found)?
+            .descriptor
+            .execution;
+        match execution {
+            CapabilityExecution::Native => {
+                self.invoke_native(name, caller, permissions, arguments, control)
+            }
+            CapabilityExecution::Queued => {
+                // Submission failure proves no handler was dispatched; a later control failure does not.
+                // 提交失败证明未分发处理器；后续控制失败则不能证明。
+                let handle = self.submit_queued(name, caller, permissions, arguments, control)?;
+                Ok(handle.wait().unwrap_or_else(|error| CapabilityOutcome {
+                    result: Err(error),
+                    effects: EffectState::Unknown,
+                }))
+            }
+        }
+    }
+
     /// Prepare exact `name` for declared `execution` using authenticated context and original budget.
     /// 使用已认证上下文与原始预算，为声明的 `execution` 准备精确 `name`。
     /// Return unique ownership before any host implementation can execute.

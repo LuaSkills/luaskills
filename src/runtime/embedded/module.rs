@@ -113,6 +113,12 @@ impl ModuleDefinition {
 /// Host-owned invocation values; Lua receives no writable identity authority.
 /// 宿主拥有的调用值；Lua 不会获得可写的身份权威。
 pub struct ModuleInvocation<'a> {
+    /// Host-generated operation identity, separate from plugin-controlled arguments.
+    /// 宿主生成的操作身份，独立于插件可控参数。
+    pub operation_id: &'a str,
+    /// Trusted session identity for this invocation, absent for ordinary calls.
+    /// 此次调用的可信会话身份，普通调用省略。
+    pub session_id: Option<&'a str>,
     /// Exact export name selected from the validated module declaration.
     /// 从已校验模块声明中选定的精确导出名称。
     pub export: &'a str,
