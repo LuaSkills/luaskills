@@ -3,6 +3,9 @@ pub(crate) mod config;
 pub(crate) mod config_service;
 pub mod config_tool;
 pub mod context;
+/// Independent host-owned plugin execution contracts and runtime.
+/// 独立且由宿主拥有的插件执行契约与运行时。
+pub mod embedded;
 pub mod encoding;
 pub mod engine;
 pub mod entry;

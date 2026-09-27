@@ -120,6 +120,9 @@ struct ManagedRuntimeServicesState {
     /// All live or launching sessions keyed by engine-local identifier.
     /// 按引擎内部标识索引的全部活动或启动中会话。
     sessions: HashMap<u64, ManagedRuntimeSessionRecord>,
+    /// Detached sessions remain charged and owner-visible until teardown actually finishes.
+    /// 摘除的会话在清理实际结束前仍计入容量并对所有者可见。
+    retiring_sessions: HashMap<u64, u64>,
     /// Open evaluation transactions keyed by transaction identifier.
     /// 按事务标识索引的开放执行事务。
     transactions: HashMap<u64, ManagedRuntimeTransactionRecord>,
@@ -151,6 +154,21 @@ struct ManagedRuntimeTransactionRecord {
     /// Sessions requiring rollback if evaluation fails.
     /// 执行失败时需要回滚的会话。
     session_ids: Vec<u64>,
+}
+
+impl ManagedRuntimeServicesState {
+    /// Detach exact `session_id` while retaining its capacity and owner identity.
+    /// 摘除精确 `session_id`，同时保留其容量与所有者身份。
+    /// Return the exclusive teardown record, or none if another path already owns it.
+    /// 返回独占清理记录；若其他路径已拥有它则返回空。
+    fn detach_session(&mut self, session_id: u64) -> Option<(u64, ManagedRuntimeSessionRecord)> {
+        // Transfer accounting under the same lock as every admission and owner query.
+        // 在与全部入场及所有者查询相同的锁下转移记账。
+        let record = self.sessions.remove(&session_id)?;
+        self.retiring_sessions
+            .insert(session_id, record.owner_token);
+        Some((session_id, record))
+    }
 }
 
 /// RAII evaluation transaction that rolls back newly created sessions unless committed.
@@ -228,6 +246,7 @@ impl ManagedRuntimeServices {
                 next_session_id: 0,
                 next_transaction_id: 0,
                 sessions: HashMap::new(),
+                retiring_sessions: HashMap::new(),
                 transactions: HashMap::new(),
             }),
             event_center,
@@ -314,7 +333,9 @@ impl ManagedRuntimeServices {
         // 在注册表锁内分配并验证事务所有权的会话 id。
         let session_id = {
             let mut state = self.lock_state();
-            if state.sessions.len() >= self.config.persistent_session_limit_per_engine {
+            if state.sessions.len() + state.retiring_sessions.len()
+                >= self.config.persistent_session_limit_per_engine
+            {
                 return Err(format!(
                     "managed runtime session limit exceeded: {}",
                     self.config.persistent_session_limit_per_engine
@@ -398,8 +419,8 @@ impl ManagedRuntimeServices {
         })
     }
 
-    /// Build userdata cleanup that unregisters the session before running language-specific cleanup.
-    /// 构造 userdata 清理逻辑，先注销会话，再运行语言专属清理。
+    /// Build userdata cleanup that unregisters only after language-specific cleanup finishes.
+    /// 构造 userdata 清理逻辑，仅在语言专属清理结束后注销会话。
     pub(crate) fn session_cleanup(
         self: &Arc<Self>,
         session_id: u64,
@@ -413,11 +434,11 @@ impl ManagedRuntimeServices {
         let retry_services = Arc::downgrade(self);
         ManagedProcessSessionCleanupHandle::new_with_retry(
             Box::new(move || {
-                if let Some(services) = services.upgrade() {
-                    services.unregister_session(session_id);
-                }
                 if let Some(next) = next {
                     next();
+                }
+                if let Some(services) = services.upgrade() {
+                    services.unregister_session(session_id);
                 }
             }),
             Box::new(move || {
@@ -443,33 +464,45 @@ impl ManagedRuntimeServices {
     /// Retry teardown for every record still owned by one retired package lifetime.
     /// 重试清理由一个已退役包生命周期仍然拥有的全部记录。
     fn retry_retired_owner(&self, owner_token: u64) -> Result<(), String> {
-        // Session records detached under lock and torn down after releasing it.
-        // 在锁内摘除并在释放锁后清理的会话记录。
+        // Detachment preserves owner visibility while blocking teardown runs outside the lock.
+        // 摘除操作保留所有者可见性，阻塞清理在锁外执行。
         let records = {
+            // One metadata guard protects record transfer and transaction references.
+            // 同一元数据保护锁保护记录转移与事务引用。
             let mut state = self.lock_state();
+            // Exact owner records only; unrelated plugins remain runnable.
+            // 仅处理精确所有者记录；无关插件仍可运行。
             let session_ids = state
                 .sessions
                 .iter()
-                .filter_map(|(session_id, record)| {
-                    (record.owner_token == owner_token).then_some(*session_id)
-                })
+                .filter_map(|(id, record)| (record.owner_token == owner_token).then_some(*id))
                 .collect::<Vec<_>>();
             for transaction in state.transactions.values_mut() {
                 transaction
                     .session_ids
-                    .retain(|session_id| !session_ids.contains(session_id));
+                    .retain(|id| !session_ids.contains(id));
             }
             session_ids
                 .into_iter()
-                .filter_map(|session_id| {
-                    state
-                        .sessions
-                        .remove(&session_id)
-                        .map(|record| (session_id, record))
-                })
-                .collect::<Vec<_>>()
+                .filter_map(|id| state.detach_session(id))
+                .collect()
         };
-        self.teardown_records(records)
+        self.teardown_records(records)?;
+        // A concurrent attempt may have republished failure just before this completion check.
+        // 并发尝试可能恰好在完成检查前重新发布失败记录。
+        let state = self.lock_state();
+        if state
+            .retiring_sessions
+            .values()
+            .any(|owner| *owner == owner_token)
+            || state
+                .sessions
+                .values()
+                .any(|record| record.owner_token == owner_token)
+        {
+            return Err("managed runtime owner teardown is still in progress".to_string());
+        }
+        Ok(())
     }
 
     /// Retry teardown for one exact failed session without touching other owner sessions.
@@ -479,9 +512,19 @@ impl ManagedRuntimeServices {
     /// are already complete and therefore succeed idempotently.
     /// `session_id` 标识上一次清理失败后重新发布的记录。记录缺失表示已完成，因此幂等成功。
     fn retry_session(&self, session_id: u64) -> Result<(), String> {
-        let record = self.lock_state().sessions.remove(&session_id);
+        // Keep the detached record charged until its exclusive cleanup path confirms completion.
+        // 在独占清理路径确认完成前，保留摘除记录的容量记账。
+        let record = {
+            // Check and transfer must be atomic with owner retirement.
+            // 检查与转移相对所有者退役必须为原子操作。
+            let mut state = self.lock_state();
+            if state.retiring_sessions.contains_key(&session_id) {
+                return Err("managed runtime session teardown is still in progress".to_string());
+            }
+            state.detach_session(session_id)
+        };
         match record {
-            Some(record) => self.teardown_records(vec![(session_id, record)]),
+            Some(record) => self.teardown_records(vec![record]),
             None => Ok(()),
         }
     }
@@ -552,26 +595,29 @@ impl ManagedRuntimeServices {
         &self,
         context: ManagedRuntimeTransactionContext,
     ) -> Result<(), String> {
-        // Transaction sessions detached atomically from the live registry.
-        // 从活动注册表原子摘除的事务会话。
+        // Validate ownership before consuming the exact transaction.
+        // 消费精确事务前校验所有权。
         let records = {
+            // Transfer all rollback records without an uncharged teardown gap.
+            // 转移全部回滚记录，避免清理期间出现未记账的空档。
             let mut state = self.lock_state();
-            let Some(transaction) = state.transactions.remove(&context.transaction_id) else {
+            let Some(transaction) = state.transactions.get(&context.transaction_id) else {
                 return Ok(());
             };
             if transaction.owner_token != context.owner_token {
                 return Err("managed runtime resource transaction owner mismatch".to_string());
             }
+            // The checked transaction remains present under this same guard.
+            // 在同一个保护锁下，已校验事务仍存在。
+            let transaction = state
+                .transactions
+                .remove(&context.transaction_id)
+                .expect("validated transaction remains present");
             transaction
                 .session_ids
                 .into_iter()
-                .filter_map(|session_id| {
-                    state
-                        .sessions
-                        .remove(&session_id)
-                        .map(|record| (session_id, record))
-                })
-                .collect::<Vec<_>>()
+                .filter_map(|id| state.detach_session(id))
+                .collect()
         };
         self.teardown_records(records)
     }
@@ -582,70 +628,68 @@ impl ManagedRuntimeServices {
         &self,
         records: Vec<(u64, ManagedRuntimeSessionRecord)>,
     ) -> Result<(), String> {
-        // First lifecycle error retained while every remaining resource still receives cleanup.
-        // 在仍清理全部剩余资源时保留的首个生命周期错误。
+        // Preserve the first diagnostic while attempting every independent record.
+        // 尝试全部独立记录，同时保留首个诊断。
         let mut first_error = None;
-        // Failed live records retained so explicit retry or later owner retirement remains possible.
-        // 保留清理失败的活动记录，使显式重试或后续所有者退役仍然可行。
-        let mut retry_records = Vec::new();
         for (session_id, mut record) in records {
-            if let Some(token) = record.event_token.as_ref() {
-                self.event_center.unregister_session(token);
+            if let Some(token) = record.event_token.take() {
+                self.event_center.unregister_session(&token);
             }
-            // Event identity is retired even when process teardown must be retried later.
-            // 即使之后必须重试进程清理，也会立即退役事件身份。
-            record.event_token = None;
+            // Teardown may block; no resource-registry lock is held here.
+            // 清理可能阻塞；此处不持有资源注册表锁。
             #[cfg(test)]
             let process_result = if self.consume_forced_teardown_failure() {
                 Err("forced managed runtime teardown failure".to_string())
             } else {
-                match record.process.as_ref() {
-                    Some(process) => process.kill().map(|_| ()),
-                    None => Ok(()),
-                }
+                record
+                    .process
+                    .as_ref()
+                    .map_or(Ok(()), |process| process.kill().map(|_| ()))
             };
+            // Production kill follows the same resource ownership as deterministic tests.
+            // 生产终止路径与确定性测试遵循相同资源归属。
             #[cfg(not(test))]
-            let process_result = match record.process.as_ref() {
-                Some(process) => process.kill().map(|_| ()),
-                None => Ok(()),
-            };
-            if let Err(error) = process_result {
-                first_error.get_or_insert(error);
-                // A concurrent successful userdata close consumes cleanup and makes reinsertion stale.
-                // 并发成功的 userdata close 会消费 cleanup，此时重新插入记录已经过时。
-                if record
+            let process_result = record
+                .process
+                .as_ref()
+                .map_or(Ok(()), |process| process.kill().map(|_| ()));
+            // A consumed callback can still be executing on another teardown thread.
+            // 已被取走的回调可能仍在另一个清理线程上执行。
+            let result = process_result.and_then(|()| {
+                if let Some(cleanup) = record.cleanup.as_ref() {
+                    cleanup.run_once();
+                    if !cleanup.is_finished() {
+                        return Err(
+                            "managed runtime cleanup callback is still incomplete".to_string()
+                        );
+                    }
+                }
+                Ok(())
+            });
+            // Successful concurrent cleanup makes a failed kill record obsolete.
+            // 并发清理成功后，终止失败记录已过时。
+            let retry = result.is_err()
+                && !record
                     .cleanup
                     .as_ref()
-                    .is_some_and(|cleanup| cleanup.is_pending())
-                {
-                    retry_records.push((session_id, record));
+                    .is_some_and(|cleanup| cleanup.is_finished());
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+            {
+                // Republish failure and release detached accounting in one transaction.
+                // 在同一事务中重新发布失败记录并释放摘除记账。
+                let mut state = self.lock_state();
+                if retry {
+                    state.sessions.insert(session_id, record);
                 }
-                continue;
+                state.retiring_sessions.remove(&session_id);
             }
-            if let Some(cleanup) = record.cleanup {
-                cleanup.run_once();
-            }
-        }
-        if !retry_records.is_empty() {
-            // Failed records republished only after all blocking teardown attempts have released their locks.
-            // 仅在全部阻塞清理尝试释放锁之后重新发布失败记录。
-            let retry_session_ids = retry_records
-                .iter()
-                .map(|(session_id, _record)| *session_id)
-                .collect::<Vec<_>>();
-            let mut state = self.lock_state();
-            for (session_id, record) in retry_records {
-                state.sessions.entry(session_id).or_insert(record);
-            }
-            drop(state);
-            for session_id in retry_session_ids {
+            if retry {
                 self.retirement_retry_center.enqueue_session(session_id);
             }
         }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Tear down final service records with bounded retries and fail-safe resource retention.
@@ -968,6 +1012,122 @@ impl Drop for ManagedRuntimeServices {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// Detached blocking cleanup must remain visible to owner retirement and capacity admission.
+    /// 摘除后阻塞的清理必须对所有者退役与容量入场保持可见。
+    #[test]
+    fn concurrent_retirement_retains_inflight_session_capacity() {
+        // One resident child slot makes premature capacity release observable.
+        // 单个常驻子进程槽使过早释放容量可被观察。
+        let config = LuaRuntimeManagedRuntimeConfig {
+            persistent_session_limit_per_engine: 1,
+            ..LuaRuntimeManagedRuntimeConfig::default()
+        };
+        // Production services provide the actual detached registry path.
+        // 生产服务提供真实的摘除注册表路径。
+        let services = ManagedRuntimeServices::new_with_config(config).unwrap();
+        // Channels stop cleanup at an exact point without timing assumptions.
+        // 通道使清理停在精确位置，不依赖时间猜测。
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        // Release is bounded so a failed assertion cannot strand the worker forever.
+        // 释放等待有界，避免断言失败后工作线程永久滞留。
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        // Cleanup callbacks require Sync even though the receiver has one consumer.
+        // 清理回调要求 Sync，尽管接收器只有一个消费者。
+        let release_rx = Mutex::new(release_rx);
+        // The callback represents language-specific filesystem and registry cleanup.
+        // 回调代表语言专属文件系统与注册表清理。
+        let cleanup = ManagedProcessSessionCleanupHandle::new(Box::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }));
+        services.lock_state().sessions.insert(
+            1,
+            ManagedRuntimeSessionRecord {
+                owner_token: 51,
+                process: None,
+                cleanup: Some(cleanup),
+                event_token: None,
+            },
+        );
+        // An independent teardown owns the detached record until callback completion.
+        // 独立清理在回调完成前拥有摘除记录。
+        let worker_services = Arc::clone(&services);
+        // Joining verifies teardown really ended before reclaiming the slot.
+        // 等待退出验证回收槽位前清理确实结束。
+        let worker = std::thread::spawn(move || worker_services.retry_retired_owner(51));
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            services
+                .retry_retired_owner(51)
+                .unwrap_err()
+                .contains("still in progress")
+        );
+        assert!(
+            services
+                .retry_session(1)
+                .unwrap_err()
+                .contains("still in progress")
+        );
+        assert!(services.reserve_session(52, None, None).is_err());
+        release_tx.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        services.retry_retired_owner(51).unwrap();
+        assert!(services.reserve_session(52, None, None).is_ok());
+    }
+
+    /// A callback consumed by userdata must not appear complete to concurrent owner teardown.
+    /// 被 userdata 取走的回调不能被并发所有者清理视为已经完成。
+    #[test]
+    fn userdata_cleanup_remains_registered_until_callback_completion() {
+        // Real service-generated cleanup includes the registry-unregister ordering.
+        // 服务实际生成的清理包含注册表注销顺序。
+        let services = ManagedRuntimeServices::new().unwrap();
+        // Deterministic barriers establish the concurrent callback window.
+        // 确定性屏障建立并发回调窗口。
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        // A bounded release prevents a test failure from leaving a permanent waiter.
+        // 有界释放防止测试失败后留下永久等待者。
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        // Keep the callback's synchronization contract without sharing receiver ownership.
+        // 保持回调同步契约，且不共享接收器所有权。
+        let release_rx = Mutex::new(release_rx);
+        // The downstream cleanup must finish before registry ownership disappears.
+        // 下游清理必须在注册表所有权消失前完成。
+        let cleanup = services.session_cleanup(
+            1,
+            Some(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            })),
+        );
+        services.lock_state().sessions.insert(
+            1,
+            ManagedRuntimeSessionRecord {
+                owner_token: 61,
+                process: None,
+                cleanup: Some(Arc::clone(&cleanup)),
+                event_token: None,
+            },
+        );
+        // Userdata consumes the one-shot callback before engine retirement begins.
+        // userdata 在引擎退役开始前取走单次回调。
+        let worker = std::thread::spawn(move || cleanup.run_once());
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(services.lock_state().sessions.contains_key(&1));
+        assert!(services.retry_retired_owner(61).is_err());
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        services.retry_retired_owner(61).unwrap();
+    }
 
     /// Verify the host-selected per-engine persistent-session limit applies before process launch.
     /// 验证宿主选择的单引擎持久会话上限会在进程启动前生效。

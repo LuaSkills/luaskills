@@ -1926,11 +1926,14 @@ fn run_business_validator(
     }
     let instruction_count = Arc::new(AtomicU64::new(0));
     let hook_count = Arc::clone(&instruction_count);
+    // Derive counting increments from the same authoritative hook interval.
+    // 从同一权威钩子间隔派生计数增量。
+    let hook_interval = u64::from(crate::runtime::engine::LUA_BUDGET_HOOK_INTERVAL);
     let deadline = Instant::now() + SKILL_CONFIG_VALIDATOR_TIMEOUT;
     lua.set_hook(
-        HookTriggers::new().every_nth_instruction(1_000),
+        HookTriggers::new().every_nth_instruction(crate::runtime::engine::LUA_BUDGET_HOOK_INTERVAL),
         move |_, _| {
-            let executed = hook_count.fetch_add(1_000, Ordering::AcqRel) + 1_000;
+            let executed = hook_count.fetch_add(hook_interval, Ordering::AcqRel) + hook_interval;
             if executed > SKILL_CONFIG_VALIDATOR_MAX_INSTRUCTIONS {
                 return Err(mlua::Error::runtime(
                     "CONFIG_VALIDATOR_LIMIT_EXCEEDED: instruction limit exceeded",

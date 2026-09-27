@@ -12,6 +12,10 @@ use crate::runtime::managed_package::{
 use crate::runtime::path::{host_process_path_argument, normalize_host_input_path_text};
 use mlua::{MetaMethod, UserData, UserDataMethods};
 
+/// Typed module execution sharing the existing trusted System package boundary.
+/// 与既有可信 System 包边界共享的类型化模块执行。
+pub(super) mod embedded;
+
 /// Runtime session creation request accepted by the host-facing JSON API.
 /// 面向宿主 JSON API 的运行时会话创建请求。
 #[derive(Debug, Deserialize)]

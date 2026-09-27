@@ -1,3 +1,5 @@
+mod embedded;
+
 #[cfg(windows)]
 use super::configured_package_search_directory_exists;
 #[cfg(windows)]

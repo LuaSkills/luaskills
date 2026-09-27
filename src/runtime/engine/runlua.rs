@@ -1728,7 +1728,7 @@ end
         let timeout_text = format!("luaexec execution timed out after {} ms", timeout_ms);
 
         lua.set_hook(
-            HookTriggers::new().every_nth_instruction(1_000),
+            HookTriggers::new().every_nth_instruction(LUA_BUDGET_HOOK_INTERVAL),
             move |_, _| {
                 if Instant::now() >= deadline {
                     return Err(mlua::Error::runtime(timeout_text.clone()));

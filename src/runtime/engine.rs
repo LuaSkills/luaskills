@@ -117,6 +117,7 @@ use self::host_result::{
     host_result_capability_to_json_value, parse_tool_call_output, resolve_host_result_capability,
 };
 use self::lease::RuntimeSessionManager;
+pub use self::lease::embedded::EmbeddedModule;
 use self::runlua::{
     RunLuaRuntimeContext, default_exec_shell_name, exec_result_to_lua_table, execute_exec_request,
     optional_u64_arg, parse_exec_request, require_path_arg, require_string_arg, require_table_arg,
@@ -471,6 +472,10 @@ pub struct LuaVmPoolConfig {
 /// Maximum leases retained by each public or System runtime-session manager.
 /// 每个公开或 System 运行时会话管理器允许保留的租约数量上限。
 pub const MAX_RUNTIME_SESSION_LEASES_PER_MANAGER: usize = 8;
+
+/// Shared instruction interval for cooperative Lua execution-budget checks.
+/// Lua 执行预算协作检查共享的指令间隔。
+pub(crate) const LUA_BUDGET_HOOK_INTERVAL: u32 = 1_000;
 
 impl LuaVmPoolConfig {
     /// Return a normalized pool config with safe bounds.

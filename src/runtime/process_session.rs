@@ -863,6 +863,9 @@ pub(crate) struct ManagedProcessSessionCleanupHandle {
     /// Callback removed before invocation so every competing lifecycle path remains idempotent.
     /// 在调用前取出的回调，使每条竞争生命周期路径都保持幂等。
     cleanup: Mutex<Option<ManagedProcessSessionCleanup>>,
+    /// Completion differs from callback consumption while another thread executes cleanup.
+    /// 当其他线程执行清理时，完成状态不同于回调已被取走。
+    finished: std::sync::atomic::AtomicBool,
     /// Optional service callback that persistently retries teardown after userdata Drop failure.
     /// userdata 析构清理失败后持久重试清理的可选服务回调。
     retry_teardown: Option<ManagedProcessSessionCleanupRetry>,
@@ -881,6 +884,7 @@ impl ManagedProcessSessionCleanupHandle {
     pub(crate) fn new(cleanup: ManagedProcessSessionCleanup) -> Arc<Self> {
         Arc::new(Self {
             cleanup: Mutex::new(Some(cleanup)),
+            finished: std::sync::atomic::AtomicBool::new(false),
             retry_teardown: None,
         })
     }
@@ -902,6 +906,7 @@ impl ManagedProcessSessionCleanupHandle {
     ) -> Arc<Self> {
         Arc::new(Self {
             cleanup: Mutex::new(Some(cleanup)),
+            finished: std::sync::atomic::AtomicBool::new(false),
             retry_teardown: Some(retry_teardown),
         })
     }
@@ -918,7 +923,16 @@ impl ManagedProcessSessionCleanupHandle {
             .take();
         if let Some(cleanup) = cleanup {
             cleanup();
+            self.finished.store(true, Ordering::Release);
         }
+    }
+
+    /// Report successful callback completion, including concurrent one-shot execution.
+    /// 报告回调成功完成状态，包含并发的单次执行。
+    /// A consumed callback that is still running or unwound is not complete.
+    /// 已取走但仍在运行或发生栈展开的回调不算完成。
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
     }
 
     /// Return whether the one-shot callback is still available for a future lifecycle retry.
