@@ -181,6 +181,18 @@ pub struct JournalWriteReceipt {
 }
 
 impl JournalWriteReceipt {
+    /// Wait for actual storage completion on an execution thread; no control-thread caller may use this.
+    /// 在执行线程等待真实存储完成；控制线程调用方不得使用此方法。
+    pub(crate) fn wait_until_completed(&self) -> EmbeddedResult<JournalWriteSnapshot> {
+        // This local mutex is released while waiting and is never held by SQLite execution.
+        // 等待时释放此本地互斥锁，SQLite 执行绝不持有它。
+        let mut snapshot = self.state.snapshot.lock().map_err(|_| poisoned())?;
+        while snapshot.phase != JournalWritePhase::Completed {
+            snapshot = self.state.changed.wait(snapshot).map_err(|_| poisoned())?;
+        }
+        Ok(snapshot.clone())
+    }
+
     /// Borrow the original runtime identity without reading disk or parsing opaque identifiers.
     /// 借用原始运行时身份，不读取磁盘或解析不透明标识符。
     pub fn runtime_id(&self) -> &str {

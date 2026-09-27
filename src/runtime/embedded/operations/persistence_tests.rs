@@ -414,3 +414,4 @@ fn embedded_operation_history_rejects_reused_namespace_identity() {
     assert_eq!(previous.snapshot.phase, OperationPhase::Running);
     assert_eq!(previous.snapshot.effects, EffectState::Unknown);
 }
+mod queued;

@@ -11,6 +11,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+mod checkpoint;
+use checkpoint::{HistoryBackend, PendingCheckpoint};
+
 #[cfg(test)]
 mod persistence_tests;
 
@@ -159,6 +162,9 @@ fn advance_snapshot(snapshot: &mut OperationSnapshot, phase: OperationPhase) -> 
 /// State shared by one read/cancel handle and its sole execution owner.
 /// 单个读取与取消句柄和其唯一执行所有者共享的状态。
 struct Operation {
+    /// Serializes phase checkpoint ownership separately from client observation and cancellation.
+    /// 将阶段检查点所有权与客户端观测、取消分开串行化。
+    transition: Mutex<Option<PendingCheckpoint>>,
     /// Explicit durable checkpoints for this operation; absence preserves the existing memory-only API.
     /// 此操作的显式持久检查点；省略时保留既有仅内存 API。
     history: Option<OperationHistory>,
@@ -187,7 +193,7 @@ struct Operation {
 struct OperationHistory {
     /// Host-owned storage, shared across operation namespaces without becoming a live registry.
     /// 宿主拥有的存储，可跨操作命名空间共享，但不成为活动注册表。
-    journal: Arc<OperationJournal>,
+    backend: HistoryBackend,
     /// Original namespace supplied by the registry, never taken from application arguments.
     /// 注册表提供的原始命名空间，绝不从应用参数取得。
     runtime_id: String,
@@ -212,11 +218,10 @@ impl OperationHistory {
         })?;
         // The first acknowledged checkpoint creates history; later ones compare the exact prior receipt.
         // 首个确认检查点创建历史；后续检查点比较精确的前次回执。
-        let retained = match *revision {
-            None => self.journal.insert(&self.runtime_id, snapshot)?,
-            Some(previous) => self.journal.replace(&self.runtime_id, previous, snapshot)?,
-        };
-        *revision = Some(retained.revision);
+        *revision = Some(
+            self.backend
+                .checkpoint(&self.runtime_id, *revision, snapshot)?,
+        );
         Ok(())
     }
 }
@@ -348,19 +353,19 @@ pub struct OperationOwner {
     /// Exact state shared with client views and the bounded registry.
     /// 与客户端视图及有界注册表共享的精确状态。
     operation: Arc<Operation>,
-    /// Serializes concurrent shared-reference phase transitions without blocking client observations.
-    /// 串行化共享引用上的并发阶段变更，不阻塞客户端观测。
-    transition: Mutex<()>,
     /// The original bounded terminal outcome survives a failed checkpoint and can only be retried explicitly.
     /// 原始有界终态结果在检查点失败后存活，且只能显式重试。
-    pending_completion: Option<OperationSnapshot>,
+    pending_completion: Option<Arc<OperationSnapshot>>,
+    /// Queued terminal write retained across observation and explicit retry, never reconstructed by polling.
+    /// 跨观测及显式重试保留的排队终态写入，绝不由轮询重新构造。
+    completion_checkpoint: Option<PendingCheckpoint>,
 }
 
 impl OperationOwner {
-    /// Borrow the original unpublished terminal outcome after checkpoint failure, without claiming completion.
-    /// 检查点失败后借用原始未发布终态结果，不声称已经完成。
+    /// Borrow the original prepared terminal outcome before acknowledgement, without claiming completion.
+    /// 确认前借用原始已准备终态结果，不声称已经完成。
     pub fn pending_completion(&self) -> Option<&OperationSnapshot> {
-        self.pending_completion.as_ref()
+        self.pending_completion.as_deref()
     }
 
     /// Retry only the retained terminal checkpoint; never execute plugin code or accept a replacement outcome.
@@ -368,29 +373,39 @@ impl OperationOwner {
     /// A journal with uncertain commit evidence rejects this retry until explicit storage recovery.
     /// 日志的提交证据不确定时，在显式存储恢复前拒绝此重试。
     pub fn retry_completion(&mut self) -> EmbeddedResult<()> {
+        if self
+            .operation
+            .history
+            .as_ref()
+            .is_some_and(OperationHistory::is_queued)
+        {
+            self.drive_completion(true, true)?;
+            return Ok(());
+        }
         if self.operation.lock()?.phase != OperationPhase::Cleaning {
             return Err(EmbeddedError::new(
                 EmbeddedErrorCode::Busy,
                 "operation completion requires finished execution and cleanup",
             ));
         }
-        // Keep the prepared business outcome owned across disk errors; cancellation remains an observation.
-        // 跨磁盘错误保留已准备的业务结果所有权；取消仍为独立观测。
+        // Direct persistence may refresh cancellation only before a new explicit attempt.
+        // 直接持久化只在新的显式尝试之前刷新取消观测。
         let snapshot = self.pending_completion.as_mut().ok_or_else(|| {
             EmbeddedError::new(
                 EmbeddedErrorCode::Busy,
                 "operation has no retained terminal checkpoint",
             )
         })?;
-        snapshot.cancellation_requested = self.operation.control.is_cancelled();
+        Arc::make_mut(snapshot).cancellation_requested = self.operation.control.is_cancelled();
         self.operation.checkpoint(snapshot)?;
         // Publication follows the durable receipt and never exposes an unacknowledged terminal result.
         // 发布跟随持久回执，绝不暴露尚未确认的终态结果。
         let mut current = self.operation.lock()?;
-        *current = self
-            .pending_completion
-            .take()
-            .expect("owned completion retained through checkpoint");
+        *current = Arc::unwrap_or_clone(
+            self.pending_completion
+                .take()
+                .expect("owned completion retained through checkpoint"),
+        );
         self.operation.changed.notify_all();
         Ok(())
     }
@@ -410,26 +425,30 @@ impl OperationOwner {
                 "operation has a retained terminal checkpoint",
             ));
         }
-        // Serialize only competing owner transitions; client reads and cancellation remain independent.
-        // 仅串行化竞争的所有者阶段变更；客户端读取与取消保持独立。
-        let _transition = self.transition.lock().map_err(|_| {
-            EmbeddedError::new(
-                EmbeddedErrorCode::Internal,
-                "operation transition lock is poisoned",
-            )
-        })?;
+        // Queue-backed execution waits only on its original write; control-thread users call poll_advance.
+        // 队列后端的执行仅等待原写入；控制线程用户调用 poll_advance。
+        let mut transition = self
+            .operation
+            .transition
+            .lock()
+            .map_err(|_| checkpoint::poisoned())?;
+        if self
+            .operation
+            .history
+            .as_ref()
+            .is_some_and(OperationHistory::is_queued)
+        {
+            self.drive_advance(&mut transition, phase, true, true)?;
+            return Ok(());
+        }
         if self.operation.history.is_none() {
-            // Existing memory-only runtimes do not copy their entire effect ledger for a phase transition.
-            // 既有仅内存运行时不会为一次阶段变更复制整个副作用账本。
             return advance_snapshot(&mut *self.operation.lock()?, phase);
         }
-        // Prepare the next observation without holding its public lock during filesystem work.
-        // 准备下一观测，文件系统工作期间不持有其公开锁。
+        // The public lock is released before any synchronous storage work starts.
+        // 任何同步存储开始前均释放公开锁。
         let mut snapshot = self.operation.lock()?.clone();
         advance_snapshot(&mut snapshot, phase)?;
         snapshot = self.operation.project(snapshot)?;
-        // Owner transitions keep their declared phase; public observation independently projects host waiting.
-        // 所有者变更保留其声明阶段；公开观测独立投影宿主等待。
         snapshot.phase = phase;
         self.operation.checkpoint(&snapshot)?;
         *self.operation.lock()? = snapshot;
@@ -445,59 +464,7 @@ impl OperationOwner {
         result: EmbeddedResult<Value>,
         effects: EffectState,
     ) -> EmbeddedResult<()> {
-        if self.pending_completion.is_some() {
-            return Err(EmbeddedError::new(
-                EmbeddedErrorCode::Busy,
-                "retry the original retained terminal checkpoint before supplying another outcome",
-            ));
-        }
-        // Bound retained application evidence before constructing the immutable completion attempt.
-        // 构造不可变完成尝试前限制保留的应用证据。
-        let encoded = match &result {
-            Ok(value) => json_size(value, self.operation.max_value_bytes),
-            Err(error) => json_size(error, self.operation.max_value_bytes),
-        };
-        // Keep fixed diagnostics instead of retaining oversized or unencodable business values.
-        // 保留固定诊断，不保留超大或无法编码的业务值。
-        let result = match encoded {
-            Ok(_) => result,
-            Err(error) if error.code == EmbeddedErrorCode::CapacityExceeded => {
-                Err(EmbeddedError::new(
-                    EmbeddedErrorCode::CapacityExceeded,
-                    "operation result exceeds the configured byte limit",
-                ))
-            }
-            Err(_) => Err(EmbeddedError::new(
-                EmbeddedErrorCode::Internal,
-                "operation result serialization failed",
-            )),
-        };
-        // The live snapshot remains Cleaning until the exact terminal checkpoint is acknowledged.
-        // 精确终态检查点被确认之前，实时快照保持 Cleaning。
-        let mut snapshot = self.operation.lock()?.clone();
-        if snapshot.phase != OperationPhase::Cleaning {
-            return Err(EmbeddedError::new(
-                EmbeddedErrorCode::Busy,
-                "operation completion requires finished execution and cleanup",
-            ));
-        }
-        snapshot.host_effects = self.operation.effects.seal()?;
-        snapshot.effects = merge_effects(effects, &snapshot.host_effects);
-        match result {
-            Ok(value) => {
-                snapshot.phase = OperationPhase::Succeeded;
-                snapshot.value = Some(value);
-            }
-            Err(error) => {
-                snapshot.phase = if error.code == EmbeddedErrorCode::Cancelled {
-                    OperationPhase::Cancelled
-                } else {
-                    OperationPhase::Failed
-                };
-                snapshot.error = Some(error);
-            }
-        }
-        self.pending_completion = Some(snapshot);
+        self.prepare_completion(result, effects)?;
         self.retry_completion()
     }
 }
@@ -518,7 +485,7 @@ struct OperationRegistryState {
 pub struct OperationRegistry {
     /// Optional explicit history; admission itself performs no disk I/O while holding registry metadata.
     /// 可选显式历史；入场本身持有注册表元数据时不执行磁盘 I/O。
-    journal: Option<Arc<OperationJournal>>,
+    journal: Option<HistoryBackend>,
     /// Retained host effect count per operation, copied from the authoritative configuration.
     /// 从权威配置复制的逐操作宿主副作用保留数量。
     max_effect_records: usize,
@@ -577,7 +544,7 @@ impl OperationRegistry {
         // Reuse the sole validation and budget authority before enabling explicit durable checkpoints.
         // 启用显式持久检查点前复用唯一校验与预算权威。
         let mut registry = Self::new(runtime_id, config)?;
-        registry.journal = Some(journal);
+        registry.journal = Some(HistoryBackend::Direct(journal));
         Ok(registry)
     }
 
@@ -619,8 +586,9 @@ impl OperationRegistry {
         // Prepare the complete record before making it discoverable.
         // 在记录可被发现前完整构造记录。
         let operation = Arc::new(Operation {
+            transition: Mutex::new(None),
             history: self.journal.as_ref().map(|journal| OperationHistory {
-                journal: Arc::clone(journal),
+                backend: journal.clone(),
                 runtime_id: self.runtime_id.clone(),
                 revision: Mutex::new(None),
             }),
@@ -647,8 +615,8 @@ impl OperationRegistry {
             },
             OperationOwner {
                 operation,
-                transition: Mutex::new(()),
                 pending_completion: None,
+                completion_checkpoint: None,
             },
         ))
     }
