@@ -157,6 +157,9 @@ fn poisoned() -> EmbeddedError {
 /// Explicit ownership disposition after an ordinary call or session lease is released.
 /// 普通调用或会话租借释放后的显式所有权去向。
 pub enum ModuleRelease {
+    /// Preparation reserved capacity but no actual VM was allocated; the reservation is released.
+    /// 准备阶段预留了容量，但未分配真实 VM；预留已释放。
+    NoInstance,
     /// Safe state has been returned to the pool; this request owns no pending retirement.
     /// 安全状态已归还池；此请求不再拥有待完成退役。
     ReturnedToPool,

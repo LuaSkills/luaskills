@@ -374,6 +374,72 @@ pub struct ModulePool {
 }
 
 impl ModulePool {
+    /// Reserve ordinary call ownership using `control`, without constructing a VM or executing Lua.
+    /// 使用 `control` 预留普通调用所有权，不构造 VM 或执行 Lua。
+    /// Return a prepared lease for one worker, or a capacity error safe to keep queued.
+    /// 返回供单个工作线程使用的已准备租借，或可安全保持排队的容量错误。
+    pub(crate) fn prepare(self: &Arc<Self>, control: &CallControl) -> EmbeddedResult<ModuleLease> {
+        if self.policy.reuse == InstanceReuse::Session {
+            return Err(EmbeddedError::invalid(
+                "session pools require explicit session ownership",
+            ));
+        }
+        self.prepare_owned(control, false)
+    }
+
+    /// Reserve exact ownership under `control`; `pinned` selects session-only state.
+    /// 在 `control` 下预留精确所有权；`pinned` 选择仅会话使用的状态。
+    /// This metadata-only step cannot execute initialization or host capabilities.
+    /// 此元数据步骤不能执行初始化或宿主能力。
+    fn prepare_owned(
+        self: &Arc<Self>,
+        control: &CallControl,
+        pinned: bool,
+    ) -> EmbeddedResult<ModuleLease> {
+        control.check()?;
+        self.retire_expired()?;
+        // Pool closure, idle selection and parent reservation share one admission transaction.
+        // 池关闭、空闲选择与父级预留共享一次入场事务。
+        let mut state = self.lock()?;
+        if state.closed {
+            return Err(closed());
+        }
+        let (resident, pending) = if !pinned && let Some(resident) = state.idle.pop() {
+            (Some(resident), None)
+        } else {
+            // Opaque instance identities never repeat, including abandoned preparations.
+            // 不透明实例身份绝不重复，包含已放弃的准备。
+            let sequence = NEXT_INSTANCE_ID
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .map_err(|_| {
+                    EmbeddedError::new(
+                        EmbeddedErrorCode::Internal,
+                        "pool instance identity exhausted",
+                    )
+                })?;
+            let reservation = self.manager.governor.reserve(&self.registration.group)?;
+            (
+                None,
+                Some(PendingAllocation {
+                    reservation,
+                    instance_id: format!("embedded-vm:{sequence}"),
+                }),
+            )
+        };
+        Ok(ModuleLease {
+            ready: resident.is_some(),
+            initialization_attempted: false,
+            retirement: resident
+                .as_ref()
+                .map(|resident| resident.retirement.clone()),
+            pending,
+            pool: Arc::clone(self),
+            resident,
+            pinned,
+            invocation_attempted: false,
+        })
+    }
+
     /// Acquire with `control`, retaining exact cleanup evidence if initialization fails.
     /// 使用 `control` 获取实例，初始化失败时保留精确清理证据。
     /// Return the lease or the original failure plus any actual allocated lifetime.
@@ -471,93 +537,14 @@ impl ModulePool {
         pinned: bool,
         retirement: &mut Option<ModuleRetirement>,
     ) -> EmbeddedResult<ModuleLease> {
-        control.check()?;
-        self.retire_expired()?;
-        // Selection and capacity reservation serialize with permanent admission closure.
-        // 选择与容量预留相对永久关闭入场保持串行。
-        let (idle, reserved) = {
-            // No VM constructor, callback or destructor runs while this guard is held.
-            // 持有此保护锁时不运行 VM 构造器、回调或析构器。
-            let mut state = self.lock()?;
-            if state.closed {
-                return Err(closed());
-            }
-            if !pinned && let Some(module) = state.idle.pop() {
-                (Some(module), None)
-            } else {
-                // Sequence allocation happens before any plugin source can execute.
-                // 在任何插件源码可以执行前分配序号。
-                let sequence = NEXT_INSTANCE_ID
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-                    .map_err(|_| {
-                        EmbeddedError::new(
-                            EmbeddedErrorCode::Internal,
-                            "pool instance identity exhausted",
-                        )
-                    })?;
-                // Parent and group budgets are reserved together by the shared governor.
-                // 共享治理器同时预留父级与分组预算。
-                let reservation = self.manager.governor.reserve(&self.registration.group)?;
-                (None, Some((reservation, format!("embedded-vm:{sequence}"))))
-            }
-        };
-        // A lease exists before initialization so unwinding cannot discard failed VM ownership.
-        // 在初始化前建立租借对象，使栈展开不会丢弃失败 VM 所有权。
-        let mut lease = ModuleLease {
-            retirement: idle.as_ref().map(|module| module.retirement.clone()),
-            pool: Arc::clone(self),
-            resident: idle,
-            pinned,
-            invocation_attempted: false,
-        };
+        // Reservation happens separately so the scheduler can dispatch without running plugin code.
+        // 单独进行预留，使调度器可以分发而不运行插件代码。
+        let mut lease = self.prepare_owned(control.as_ref(), pinned)?;
+        let initialized = lease.initialize(control);
         *retirement = lease.retirement.clone();
-        if let Some((mut reservation, instance_id)) = reserved {
-            // Refuse initialization before allocating a VM when execution capacity is occupied.
-            // 执行容量占满时，在分配 VM 前拒绝初始化。
-            let permit = reservation.begin_execution()?;
-            // Allocation executes no plugin source and cannot create plugin-owned child resources.
-            // 分配不执行插件源码，因此不能创建插件拥有的子资源。
-            let module = self
-                .manager
-                .engine
-                .allocate_embedded_module(self.definition.clone(), &instance_id)?;
-            drop(permit);
-            // Publish evidence before initialization can create native resources or fail.
-            // 在初始化可能创建原生资源或失败前发布证据。
-            let receipt = ModuleRetirement::new(instance_id.clone());
-            *retirement = Some(receipt.clone());
-            lease.retirement = Some(receipt.clone());
-            lease.resident = Some(ResidentModule {
-                retirement: receipt,
-                module,
-                reservation,
-                uses: 0,
-                idle_since: Instant::now(),
-                instance_id,
-                _registration: ResidentRegistration {
-                    registration: Arc::clone(&self.registration),
-                },
-            });
-            // Keep the initialization permit and VM under separate exclusive field borrows.
-            // 通过不同字段的独占借用保留初始化许可与 VM。
-            let resident = lease
-                .resident
-                .as_mut()
-                .expect("new resident is installed before initialization");
-            let initialization = {
-                // Initialization itself consumes the same parent and group running budgets.
-                // 初始化本身消耗相同的父级与分组运行预算。
-                let _permit = resident.reservation.begin_execution()?;
-                if let Some(capabilities) = &self.capabilities {
-                    resident.module.bind_capabilities(capabilities.clone())?;
-                }
-                resident.module.initialize(control)
-            };
-            initialization?;
-            resident.reservation.mark_ready()?;
-        }
-        if self.lock()?.closed {
-            return Err(closed());
+        if let Err(error) = initialized {
+            lease.close();
+            return Err(error);
         }
         Ok(lease)
     }
@@ -617,6 +604,26 @@ impl ModulePool {
             self.manager.retirement.enqueue(module);
         }
         Ok(count)
+    }
+
+    /// Retire at most one idle instance under parent pressure, preserving the declared dedicated minimum.
+    /// 在父级压力下最多退役一个空闲实例，保留声明的专用最小值。
+    /// Return whether ownership moved to retirement; never run VM destructors on the dispatcher.
+    /// 返回所有权是否转移至退役；绝不在分发器上运行 VM 析构器。
+    pub(crate) fn retire_idle_for_pressure(&self) -> EmbeddedResult<bool> {
+        let resident = {
+            let mut state = self.lock()?;
+            if state.idle.len() <= self.policy.min_resident_vms {
+                return Ok(false);
+            }
+            state.idle.pop()
+        };
+        if let Some(resident) = resident {
+            self.manager.retirement.enqueue(resident);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Return exact group resource accounting including pinned and retiring instances.
@@ -691,9 +698,29 @@ impl Drop for ModulePool {
     }
 }
 
+/// Reserved identity and capacity before any actual VM allocation or initialization.
+/// 在任何真实 VM 分配或初始化前预留的身份与容量。
+struct PendingAllocation {
+    /// Parent and group capacity charged through allocation or explicit abandonment.
+    /// 计入父级与分组账本的容量，持续到分配或显式放弃。
+    reservation: VmReservation,
+    /// Immutable instance identity selected during fair scheduler dispatch.
+    /// 公平调度分发期间选定的不可变实例身份。
+    instance_id: String,
+}
+
 /// Exclusive invocation or pinned-session ownership; concurrent calls require different leases.
 /// 独占调用或固定会话所有权；并发调用需要不同租借。
 pub struct ModuleLease {
+    /// Reserved capacity before construction; never executes code when abandoned.
+    /// 构造前的预留容量；放弃时绝不执行代码。
+    pending: Option<PendingAllocation>,
+    /// True only after successful initialization or a validated reusable checkout.
+    /// 仅在初始化成功或已校验可复用借用后为真。
+    ready: bool,
+    /// Initialization is attempted once; failure cannot replay source-side effects.
+    /// 初始化仅尝试一次；失败不能重放源码副作用。
+    initialization_attempted: bool,
     /// Receipt remains queryable after explicit close consumes resident ownership.
     /// 显式关闭消费常驻所有权后，回执仍可查询。
     retirement: Option<ModuleRetirement>,
@@ -712,6 +739,69 @@ pub struct ModuleLease {
 }
 
 impl ModuleLease {
+    /// Construct and initialize prepared ownership under original `control`, without renewing its budget.
+    /// 在原始 `control` 下构造并初始化已准备所有权，不续期预算。
+    /// The caller retains this lease across errors and panic recovery so cleanup remains observable.
+    /// 调用方跨错误及 panic 恢复保留此租借，使清理持续可观察。
+    pub(crate) fn initialize(&mut self, control: Arc<CallControl>) -> EmbeddedResult<()> {
+        control.check()?;
+        if self.pool.lock()?.closed {
+            return Err(closed());
+        }
+        if self.ready {
+            return Ok(());
+        }
+        if self.initialization_attempted {
+            return Err(closed());
+        }
+        self.initialization_attempted = true;
+        // Capacity was committed before dispatch; abandoning before construction releases only that reservation.
+        // 容量在分发前已提交；构造前放弃仅释放该预留。
+        let PendingAllocation {
+            mut reservation,
+            instance_id,
+        } = self.pending.take().ok_or_else(closed)?;
+        let permit = reservation.begin_execution()?;
+        let module = self
+            .pool
+            .manager
+            .engine
+            .allocate_embedded_module(self.pool.definition.clone(), &instance_id)?;
+        drop(permit);
+        let receipt = ModuleRetirement::new(instance_id.clone());
+        self.retirement = Some(receipt.clone());
+        self.resident = Some(ResidentModule {
+            retirement: receipt,
+            module,
+            reservation,
+            uses: 0,
+            idle_since: Instant::now(),
+            instance_id,
+            _registration: ResidentRegistration {
+                registration: Arc::clone(&self.pool.registration),
+            },
+        });
+        // Install actual ownership before initialization can invoke host code or unwind.
+        // 在初始化可能调用宿主代码或栈展开前安装实际所有权。
+        let resident = self
+            .resident
+            .as_mut()
+            .expect("allocated ownership is installed");
+        {
+            let _permit = resident.reservation.begin_execution()?;
+            if let Some(capabilities) = &self.pool.capabilities {
+                resident.module.bind_capabilities(capabilities.clone())?;
+            }
+            resident.module.initialize(control)?;
+        }
+        resident.reservation.mark_ready()?;
+        if self.pool.lock()?.closed {
+            return Err(closed());
+        }
+        self.ready = true;
+        Ok(())
+    }
+
     /// Return this exact instance's receipt, including after explicit asynchronous close.
     /// 返回此精确实例的回执，包含显式异步关闭之后。
     /// This observes lifetime only and cannot initiate or cancel retirement.
@@ -725,9 +815,13 @@ impl ModuleLease {
     /// A previously closed lease returns the same retirement evidence, never false reuse.
     /// 已关闭租借返回同一退役证据，绝不误报复用。
     pub fn finish(mut self) -> EmbeddedResult<ModuleRelease> {
+        self.pending.take();
         match self.resident.take() {
             Some(resident) => Ok(self.pool.release(resident, self.pinned)),
-            None => self.retirement_handle().map(ModuleRelease::Retiring),
+            None => Ok(match self.retirement.clone() {
+                Some(receipt) => ModuleRelease::Retiring(receipt),
+                None => ModuleRelease::NoInstance,
+            }),
         }
     }
 
@@ -735,6 +829,9 @@ impl ModuleLease {
     /// 在精确父级与分组许可下执行 `invocation`；不持有整个引擎锁。
     pub fn invoke(&mut self, invocation: ModuleInvocation<'_>) -> EmbeddedResult<Value> {
         invocation.control.check()?;
+        if !self.ready {
+            return Err(closed());
+        }
         if self.pool.policy.reuse == InstanceReuse::SingleCall && self.invocation_attempted {
             return Err(closed());
         }
@@ -784,6 +881,8 @@ impl ModuleLease {
     /// Retire this exact instance asynchronously; repeated close is harmless.
     /// 异步退役此精确实例；重复关闭无副作用。
     pub fn close(&mut self) {
+        self.ready = false;
+        self.pending.take();
         if let Some(resident) = self.resident.take() {
             self.pool.manager.retirement.enqueue(resident);
         }
@@ -794,6 +893,7 @@ impl Drop for ModuleLease {
     /// Return safe reusable state or retain failed/session ownership for real retirement.
     /// 归还安全可复用状态，或保留失败与会话所有权以执行真实退役。
     fn drop(&mut self) {
+        self.pending.take();
         if let Some(resident) = self.resident.take() {
             self.pool.release(resident, self.pinned);
         }

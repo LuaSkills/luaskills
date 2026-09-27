@@ -12,6 +12,7 @@ mod module;
 mod operations;
 mod pool;
 mod retirement;
+mod scheduler;
 mod schema;
 mod value_size;
 
@@ -36,4 +37,5 @@ pub use operations::{
     OperationSnapshot,
 };
 pub use pool::{EmbeddedPoolManager, ModuleLease, ModulePool};
+pub use scheduler::{EmbeddedCall, EmbeddedRuntime, EmbeddedRuntimeUsage};
 pub use schema::{EMBEDDED_SCHEMA_DIALECT, JsonContract};

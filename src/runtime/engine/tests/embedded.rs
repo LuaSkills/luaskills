@@ -9,6 +9,7 @@ use crate::runtime::embedded::{
 
 mod capabilities;
 mod pools;
+mod scheduler;
 
 /// Build a declaration using the established System fixture and exact `source`.
 /// 使用既有 System 测试夹具与精确 `source` 构造声明。

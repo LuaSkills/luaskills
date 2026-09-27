@@ -352,6 +352,9 @@ pub(super) struct PreparedCapability {
 /// Registry metadata contains active names plus bounded historical registrations awaiting explicit forget.
 /// 注册表元数据包含活动名称及等待显式遗忘的有界历史注册。
 struct RegistryState {
+    /// Permanent instance shutdown rejects new publication and snapshots.
+    /// 永久实例关闭拒绝新发布与快照。
+    closing: bool,
     /// Monotonic identity and snapshot revision, never reused after unregistering.
     /// 注销后绝不复用的单调身份与快照修订。
     sequence: u64,
@@ -400,6 +403,7 @@ impl CapabilityRegistry {
             }),
             config,
             state: Mutex::new(RegistryState {
+                closing: false,
                 sequence: 0,
                 active: BTreeMap::new(),
                 entries: BTreeMap::new(),
@@ -448,6 +452,12 @@ impl CapabilityRegistry {
             .state
             .lock()
             .map_err(|_| internal("capability registry is poisoned"))?;
+        if state.closing {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::Closed,
+                "capability registry is closed",
+            ));
+        }
         if prepared.len()
             > self
                 .config
@@ -520,6 +530,12 @@ impl CapabilityRegistry {
             .state
             .lock()
             .map_err(|_| internal("capability registry is poisoned"))?;
+        if state.closing {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::Closed,
+                "capability registry is closed",
+            ));
+        }
         Ok(CapabilitySnapshot {
             broker: Arc::clone(&self.broker),
             runtime_id: self.runtime_id.clone(),
@@ -593,6 +609,68 @@ impl CapabilityRegistry {
     /// 返回此运行时的 SDK 请求队列；它绝不消耗 VM 执行许可。
     pub fn host_requests(&self) -> Arc<HostRequestBroker> {
         Arc::clone(&self.broker)
+    }
+
+    /// Reject scheduler submission from a synchronous native callback in this runtime.
+    /// 拒绝此运行时同步原生回调中的调度提交。
+    /// Return success only when the caller cannot synchronously wait on its own execution slots.
+    /// 仅在调用方不会同步等待自身执行槽时返回成功。
+    pub(crate) fn check_submission(&self) -> EmbeddedResult<()> {
+        if ACTIVE_CALLBACK_RUNTIMES.with(|active| active.borrow().contains(&self.runtime_id)) {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::Busy,
+                "synchronous runtime reentry is forbidden",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Close publication and exact dispatch gates without dropping native closures on the control thread.
+    /// 关闭发布及精确分发门，不在控制线程释放原生闭包。
+    /// Already executing handlers retain ownership and receive normal cooperative cancellation.
+    /// 已执行处理器保留所有权，并接收正常协作取消。
+    pub(crate) fn begin_shutdown(&self) -> EmbeddedResult<()> {
+        let entries = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| internal("capability registry is poisoned"))?;
+            state.closing = true;
+            state.active.clear();
+            state.entries.values().cloned().collect::<Vec<_>>()
+        };
+        for entry in entries {
+            entry
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .accepting = false;
+        }
+        self.broker.close();
+        Ok(())
+    }
+
+    /// Close publication, request cancellation and retire every exact callback outside registry locks.
+    /// 关闭发布、请求取消并在注册锁外退役每个精确回调。
+    /// Return true only after all actual callback ownership drains; closure destructors may block.
+    /// 仅在全部真实回调所有权排空后返回 true；闭包析构器可能阻塞。
+    pub(crate) fn close_and_poll(&self) -> EmbeddedResult<bool> {
+        let entries = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| internal("capability registry is poisoned"))?;
+            state.closing = true;
+            state.active.clear();
+            state.entries.values().cloned().collect::<Vec<_>>()
+        };
+        self.broker.close();
+        let mut drained = true;
+        for entry in entries {
+            entry.close();
+            drained &= entry.status()?.drained;
+        }
+        Ok(drained)
     }
 
     /// Forget only drained `id`; reject discarding evidence of a still-running callback.

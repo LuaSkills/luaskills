@@ -31,6 +31,9 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 base64 = "0.22"
 encoding_rs = "0.8"
 flate2 = "1"
+# Use operating-system randomness for fresh runtime namespaces without clock or PID reuse.
+# 使用操作系统随机源生成新运行时命名空间，避免时钟或进程号复用。
+getrandom = "=0.3.4"
 libc = "0.2"
 # Match the consuming host's schema engine and disable ambient network/file retrieval.
 # 对齐消费宿主的 Schema 引擎，并禁用环境网络及文件检索。

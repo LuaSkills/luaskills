@@ -107,24 +107,26 @@ pub(super) fn pool_manager(layout: &SystemRuntimeTestLayout) -> Arc<EmbeddedPool
     let engine = Arc::new(make_runtime_test_engine_with_host_options(
         layout.host_options(),
     ));
-    EmbeddedPoolManager::new(
-        engine,
-        EmbeddedRuntimeConfig {
-            max_registered_pools: 8,
-            max_registered_capabilities: 8,
-            max_resident_vms: 3,
-            max_running_calls: 2,
-            max_queued_calls: 8,
-            max_queued_bytes: 4096,
-            max_operations: 16,
-            max_effect_records_per_operation: 16,
-            max_effect_bytes_per_operation: 8192,
-            max_host_requests: 4,
-            max_host_request_bytes: 4096,
-            max_value_bytes: 1024,
-        },
-    )
-    .unwrap()
+    EmbeddedPoolManager::new(engine, pool_config()).unwrap()
+}
+
+/// Return the shared explicit fixture budgets used by both low-level pools and the formal runtime.
+/// 返回低层池与正式运行时共同使用的共享显式夹具预算。
+pub(super) fn pool_config() -> EmbeddedRuntimeConfig {
+    EmbeddedRuntimeConfig {
+        max_registered_pools: 8,
+        max_registered_capabilities: 8,
+        max_resident_vms: 3,
+        max_running_calls: 2,
+        max_queued_calls: 8,
+        max_queued_bytes: 4096,
+        max_operations: 16,
+        max_effect_records_per_operation: 16,
+        max_effect_bytes_per_operation: 8192,
+        max_host_requests: 4,
+        max_host_request_bytes: 4096,
+        max_value_bytes: 1024,
+    }
 }
 
 /// Return explicit `reuse` policy without implicit reuse or unbounded options.

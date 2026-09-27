@@ -120,6 +120,27 @@ struct Operation {
 }
 
 impl Operation {
+    /// Project live cancellation and host waiting onto owned `snapshot` without changing execution authority.
+    /// 将实时取消与宿主等待投影到拥有所有权的 `snapshot`，不改变执行权威。
+    /// Preserve terminal phases; only in-progress host records refine initializing or running observations.
+    /// 保留终态；仅进行中的宿主记录细化初始化或运行观测。
+    fn project(&self, mut snapshot: OperationSnapshot) -> EmbeddedResult<OperationSnapshot> {
+        snapshot.cancellation_requested = self.control.is_cancelled();
+        snapshot.host_effects = self.effects.snapshot()?;
+        snapshot.effects = merge_effects(snapshot.effects, &snapshot.host_effects);
+        if matches!(
+            snapshot.phase,
+            OperationPhase::Initializing | OperationPhase::Running
+        ) && snapshot
+            .host_effects
+            .iter()
+            .any(|effect| effect.phase != super::HostEffectPhase::Completed)
+        {
+            snapshot.phase = OperationPhase::WaitingForHost;
+        }
+        Ok(snapshot)
+    }
+
     /// Acquire current state, rejecting poisoning rather than returning invented status.
     /// 获取当前状态；中毒时报错，不返回编造状态。
     fn lock(&self) -> EmbeddedResult<MutexGuard<'_, OperationSnapshot>> {
@@ -145,13 +166,10 @@ impl OperationHandle {
     /// Return a fresh snapshot with the actual cooperative cancellation request flag.
     /// 返回包含真实协作取消请求标记的最新快照。
     pub fn snapshot(&self) -> EmbeddedResult<OperationSnapshot> {
-        // Snapshot data is cloned while a single short metadata lock is held.
-        // 在持有单个短时元数据锁时克隆快照数据。
-        let mut snapshot = self.operation.lock()?.clone();
-        snapshot.cancellation_requested = self.operation.control.is_cancelled();
-        snapshot.host_effects = self.operation.effects.snapshot()?;
-        snapshot.effects = merge_effects(snapshot.effects, &snapshot.host_effects);
-        Ok(snapshot)
+        // Clone phase ownership before reading independent live host evidence.
+        // 在读取独立实时宿主证据前克隆阶段所有权。
+        let snapshot = self.operation.lock()?.clone();
+        self.operation.project(snapshot)
     }
 
     /// Request cancellation if still active; return whether this request changed intent.
@@ -202,11 +220,9 @@ impl OperationHandle {
         }
         // Cancellation intent may change independently of the phase snapshot.
         // 取消意图可能独立于阶段快照变化。
-        let mut result = snapshot.clone();
-        result.cancellation_requested = self.operation.control.is_cancelled();
-        result.host_effects = self.operation.effects.snapshot()?;
-        result.effects = merge_effects(result.effects, &result.host_effects);
-        Ok(result)
+        let result = snapshot.clone();
+        drop(snapshot);
+        self.operation.project(result)
     }
 }
 
