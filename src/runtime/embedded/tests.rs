@@ -7,6 +7,7 @@ mod operations;
 /// 返回确定性资源压力测试使用的显式小规模父级预算。
 pub(super) fn config() -> EmbeddedRuntimeConfig {
     EmbeddedRuntimeConfig {
+        max_registered_plugins: 8,
         max_registered_pools: 8,
         max_sessions: 8,
         max_registered_capabilities: 8,

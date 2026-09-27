@@ -11,9 +11,12 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+mod plugins;
 mod sessions;
 mod workers;
 
+pub use plugins::EmbeddedPluginSnapshot;
+use plugins::ScheduledPlugin;
 pub use sessions::{EmbeddedSessionOpening, EmbeddedSessionPhase, EmbeddedSessionSnapshot};
 use sessions::{ScheduledRequest, ScheduledSession};
 
@@ -144,6 +147,12 @@ struct SchedulerState {
     /// Exact domain registrations, never resolved by mutable plugin name at execution time.
     /// 精确域注册，执行时绝不通过可变插件名重新解析。
     pools: BTreeMap<String, ScheduledPool>,
+    /// Immutable plugin-wide admission authority spans all of its pool generations.
+    /// 不可变插件级入场权威覆盖其全部池代次。
+    plugins: BTreeMap<String, ScheduledPlugin>,
+    /// Retained operation ownership survives pool removal and is released only by explicit forgetting.
+    /// 保留操作归属在池移除后仍存在，仅通过显式遗忘释放。
+    operation_plugins: BTreeMap<String, String>,
     /// Bounded exact session identities; closed entries remain queryable until explicitly forgotten.
     /// 有界精确会话身份；关闭条目在显式遗忘前仍可查询。
     sessions: BTreeMap<String, ScheduledSession>,
@@ -257,6 +266,8 @@ impl EmbeddedRuntime {
                 failure: None,
                 sequence: 0,
                 pools: BTreeMap::new(),
+                plugins: BTreeMap::new(),
+                operation_plugins: BTreeMap::new(),
                 sessions: BTreeMap::new(),
                 queues: BTreeMap::new(),
                 rotation: VecDeque::new(),
@@ -330,6 +341,7 @@ impl EmbeddedRuntime {
         permissions: Arc<CapabilityPermissions>,
         revision: String,
     ) -> EmbeddedResult<String> {
+        policy.validate(self.center.pools.config())?;
         let binding =
             ModuleCapabilities::new(self.center.capabilities.snapshot()?, permissions, revision)?;
         let inputs = definition
@@ -344,6 +356,7 @@ impl EmbeddedRuntime {
         if state.closing {
             return Err(closed());
         }
+        state.validate_plugin_pool(&definition.plugin_id, &policy)?;
         if state.pools.len() >= self.center.pools.config().max_registered_pools {
             return Err(EmbeddedError::new(
                 EmbeddedErrorCode::CapacityExceeded,
@@ -415,7 +428,25 @@ impl EmbeddedRuntime {
     /// Explicitly forget terminal `id`, leaving active execution evidence intact.
     /// 显式遗忘终态 `id`，保留活跃执行证据。
     pub fn forget_operation(&self, id: &str) -> EmbeddedResult<()> {
-        self.center.operations.forget(id)
+        let mut state = self.center.lock()?;
+        let plugin_id = state
+            .operation_plugins
+            .get(id)
+            .ok_or_else(|| {
+                EmbeddedError::new(
+                    EmbeddedErrorCode::NotFound,
+                    "embedded operation is not retained",
+                )
+            })?
+            .clone();
+        self.center.operations.forget(id)?;
+        state.operation_plugins.remove(id);
+        state
+            .plugins
+            .get_mut(&plugin_id)
+            .expect("retained operation owns a registered plugin")
+            .operations -= 1;
+        Ok(())
     }
 
     /// Close exact `id` admission; queued work fails on this generation instead of retargeting.

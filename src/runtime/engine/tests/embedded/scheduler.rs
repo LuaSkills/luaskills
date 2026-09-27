@@ -4,18 +4,48 @@ use crate::runtime::embedded::capabilities::*;
 use crate::runtime::embedded::*;
 use std::collections::BTreeSet;
 
+mod plugins;
 mod sessions;
 
 /// Build the real formal runtime with explicit fixture `config` and package trust roots.
 /// 使用显式夹具 `config` 与包信任根构造真实正式运行时。
 fn runtime(layout: &SystemRuntimeTestLayout, config: EmbeddedRuntimeConfig) -> EmbeddedRuntime {
-    EmbeddedRuntime::new(
+    let plugin = plugin_policy(&config);
+    runtime_with_plugin(layout, config, plugin)
+}
+
+/// Construct a real runtime with explicit parent `config` and aggregate `plugin` policy for the fixture package.
+/// 使用显式父级 `config` 和聚合 `plugin` 策略，为夹具包构造真实运行时。
+fn runtime_with_plugin(
+    layout: &SystemRuntimeTestLayout,
+    config: EmbeddedRuntimeConfig,
+    plugin: EmbeddedPluginConfig,
+) -> EmbeddedRuntime {
+    let runtime = EmbeddedRuntime::new(
         Arc::new(make_runtime_test_engine_with_host_options(
             layout.host_options(),
         )),
         config,
     )
-    .unwrap()
+    .unwrap();
+    runtime
+        .register_plugin(layout.package_id.clone(), plugin)
+        .unwrap();
+    runtime
+}
+
+/// Resolve explicit fixture plugin budgets from this test's parent policy, without production defaults.
+/// 从本测试的父策略解析显式夹具插件预算，不定义生产默认值。
+fn plugin_policy(config: &EmbeddedRuntimeConfig) -> EmbeddedPluginConfig {
+    EmbeddedPluginConfig {
+        max_registered_pools: config.max_registered_pools,
+        max_sessions: config.max_sessions,
+        max_resident_vms: config.max_resident_vms,
+        max_running_calls: config.max_running_calls,
+        max_queued_calls: config.max_queued_calls,
+        max_queued_bytes: config.max_queued_bytes,
+        max_operations: config.max_operations,
+    }
 }
 
 /// Return live fixture permission authority for explicitly registered host probes.
@@ -339,6 +369,12 @@ fn embedded_scheduler_rotates_plugins_and_reclaims_shared_idle_capacity() {
     second_definition.plugin_id = "fair-second".into();
     second_definition.package_root =
         render_host_visible_path(&fs::canonicalize(second_root).unwrap());
+    runtime
+        .register_plugin(
+            second_definition.plugin_id.clone(),
+            runtime.plugin(&layout.package_id).unwrap().config,
+        )
+        .unwrap();
     let second = runtime
         .register_pool(second_definition, policy, permissions(), "r1".into())
         .unwrap();

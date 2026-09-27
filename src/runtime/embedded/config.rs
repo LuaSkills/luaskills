@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddedRuntimeConfig {
+    /// Maximum retained plugin registrations, including closed entries awaiting explicit removal.
+    /// 保留插件注册的数量上限，包含等待显式移除的已关闭条目。
+    pub max_registered_plugins: usize,
     /// Maximum concurrently registered pool declarations, including draining generations.
     /// 同时注册的池声明数量上限，包含正在排空的代次。
     pub max_registered_pools: usize,
@@ -60,7 +63,8 @@ impl EmbeddedRuntimeConfig {
                 "effect retention limits must be positive",
             ));
         }
-        if self.max_registered_pools == 0
+        if self.max_registered_plugins == 0
+            || self.max_registered_pools == 0
             || self.max_registered_capabilities == 0
             || self.max_sessions == 0
         {
@@ -162,8 +166,8 @@ pub struct PluginPoolConfig {
     /// Non-lendable reservation; only dedicated groups may reserve capacity.
     /// 不可出借的预留；仅专用分组可以预留容量。
     pub min_resident_vms: usize,
-    /// Maximum resident instances in this group, across its security partitions.
-    /// 当前分组跨安全分区的最大常驻实例数。
+    /// Maximum resident instances in this exact immutable execution domain.
+    /// 此精确不可变执行域的最大常驻实例数。
     pub max_resident_vms: usize,
     /// Maximum simultaneously executing calls in this group.
     /// 当前分组同时执行的调用数上限。

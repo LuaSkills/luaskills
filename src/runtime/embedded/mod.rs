@@ -10,6 +10,7 @@ mod error;
 mod governor;
 mod module;
 mod operations;
+mod plugin_config;
 mod pool;
 mod retirement;
 mod scheduler;
@@ -36,9 +37,10 @@ pub use operations::{
     EffectState, OperationHandle, OperationOwner, OperationPhase, OperationRegistry,
     OperationSnapshot,
 };
+pub use plugin_config::EmbeddedPluginConfig;
 pub use pool::{EmbeddedPoolManager, ModuleLease, ModulePool};
 pub use scheduler::{
-    EmbeddedCall, EmbeddedRuntime, EmbeddedRuntimeUsage, EmbeddedSessionOpening,
-    EmbeddedSessionPhase, EmbeddedSessionSnapshot,
+    EmbeddedCall, EmbeddedPluginSnapshot, EmbeddedRuntime, EmbeddedRuntimeUsage,
+    EmbeddedSessionOpening, EmbeddedSessionPhase, EmbeddedSessionSnapshot,
 };
 pub use schema::{EMBEDDED_SCHEMA_DIALECT, JsonContract};

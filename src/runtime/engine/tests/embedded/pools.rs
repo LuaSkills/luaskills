@@ -114,6 +114,7 @@ pub(super) fn pool_manager(layout: &SystemRuntimeTestLayout) -> Arc<EmbeddedPool
 /// 返回低层池与正式运行时共同使用的共享显式夹具预算。
 pub(super) fn pool_config() -> EmbeddedRuntimeConfig {
     EmbeddedRuntimeConfig {
+        max_registered_plugins: 8,
         max_registered_pools: 8,
         max_sessions: 8,
         max_registered_capabilities: 8,

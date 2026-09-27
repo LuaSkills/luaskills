@@ -217,7 +217,24 @@ impl EmbeddedRuntime {
                 "pool does not declare session reuse",
             ));
         }
-        let lease = pool.pool.prepare_owned(&control, true)?;
+        let plugin = state
+            .plugins
+            .get(&pool.plugin_id)
+            .expect("registered pool owns plugin policy");
+        if plugin.closing {
+            return Err(closed());
+        }
+        if state.plugin_sessions(&pool.plugin_id) >= plugin.config.max_sessions {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::CapacityExceeded,
+                "plugin retained session capacity reached",
+            ));
+        }
+        let lease = pool.pool.prepare_with_budget(
+            &control,
+            true,
+            state.plugin_allows_allocation(pool_id)?,
+        )?;
         state.sequence = state
             .sequence
             .checked_add(1)
@@ -397,8 +414,36 @@ impl SchedulerCenter {
             ));
         }
         let plugin = pool.plugin_id.clone();
+        let plugin_state = state
+            .plugins
+            .get(&plugin)
+            .expect("registered pool owns plugin policy");
+        if plugin_state.closing {
+            return Err(closed());
+        }
+        if plugin_state.queued >= plugin_state.config.max_queued_calls
+            || bytes
+                > plugin_state
+                    .config
+                    .max_queued_bytes
+                    .saturating_sub(plugin_state.bytes)
+            || plugin_state.operations >= plugin_state.config.max_operations
+        {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::CapacityExceeded,
+                "plugin queue or retained operation capacity reached",
+            ));
+        }
         let (handle, owner) = self.operations.admit(Arc::clone(&control))?;
         let id = handle.snapshot()?.operation_id;
+        let plugin_state = state
+            .plugins
+            .get_mut(&plugin)
+            .expect("validated plugin exists");
+        plugin_state.queued += 1;
+        plugin_state.bytes += bytes;
+        plugin_state.operations += 1;
+        state.operation_plugins.insert(id.clone(), plugin.clone());
         state
             .pools
             .get_mut(request.pool_id())

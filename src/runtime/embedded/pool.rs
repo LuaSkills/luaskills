@@ -396,6 +396,19 @@ impl ModulePool {
         control: &CallControl,
         pinned: bool,
     ) -> EmbeddedResult<ModuleLease> {
+        self.prepare_with_budget(control, pinned, true)
+    }
+
+    /// Prepare exact ownership under `control`; `allow_new` gates allocation, never existing idle reuse.
+    /// 在 `control` 下准备精确所有权；`allow_new` 约束新分配，不约束既有空闲复用。
+    /// `pinned` creates a fresh fixed-session instance; return a lease or an explicit capacity error.
+    /// `pinned` 创建新的固定会话实例；返回租借或明确容量错误。
+    pub(super) fn prepare_with_budget(
+        self: &Arc<Self>,
+        control: &CallControl,
+        pinned: bool,
+        allow_new: bool,
+    ) -> EmbeddedResult<ModuleLease> {
         control.check()?;
         self.retire_expired()?;
         // Pool closure, idle selection and parent reservation share one admission transaction.
@@ -407,6 +420,12 @@ impl ModulePool {
         let (resident, pending) = if !pinned && let Some(resident) = state.idle.pop() {
             (Some(resident), None)
         } else {
+            if !allow_new {
+                return Err(EmbeddedError::new(
+                    EmbeddedErrorCode::CapacityExceeded,
+                    "plugin resident capacity is occupied or reserved",
+                ));
+            }
             // Opaque instance identities never repeat, including abandoned preparations.
             // 不透明实例身份绝不重复，包含已放弃的准备。
             let sequence = NEXT_INSTANCE_ID
@@ -539,7 +558,11 @@ impl ModulePool {
     ) -> EmbeddedResult<ModuleLease> {
         // Reservation happens separately so the scheduler can dispatch without running plugin code.
         // 单独进行预留，使调度器可以分发而不运行插件代码。
-        let mut lease = self.prepare_owned(control.as_ref(), pinned)?;
+        let mut lease = if pinned {
+            self.prepare_owned(control.as_ref(), true)?
+        } else {
+            self.prepare(control.as_ref())?
+        };
         let initialized = lease.initialize(control);
         *retirement = lease.retirement.clone();
         if let Err(error) = initialized {
@@ -630,6 +653,28 @@ impl ModulePool {
     /// 返回包含固定与退役实例的精确分组资源记账。
     pub fn usage(&self) -> EmbeddedResult<PoolUsage> {
         self.registration.usage()
+    }
+
+    /// Return actual counters and the still-registered dedicated commitment as one identity-safe observation.
+    /// 以一次身份安全观测返回实际计数与仍已注册的专用承诺。
+    /// A released old registration contributes zero, even while the host retains its pool handle.
+    /// 已释放旧注册贡献零，即使宿主仍保留池句柄。
+    pub(super) fn accounting(&self) -> EmbeddedResult<(PoolUsage, usize)> {
+        let lifecycle = self.registration.lifecycle.lock().map_err(|_| {
+            EmbeddedError::new(
+                EmbeddedErrorCode::Internal,
+                "pool registration lock is poisoned",
+            )
+        })?;
+        if lifecycle.released {
+            return Ok((PoolUsage::default(), 0));
+        }
+        let usage = self
+            .registration
+            .governor
+            .usage(Some(&self.registration.group))?;
+        let committed = usage.resident.max(self.policy.min_resident_vms);
+        Ok((usage, committed))
     }
 
     /// Return the immutable host-approved pool declaration.

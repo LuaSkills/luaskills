@@ -26,6 +26,12 @@ fn take_call(state: &mut SchedulerState, plugin: &str, index: usize) -> Schedule
     }
     state.queued -= 1;
     state.bytes -= call.bytes;
+    let plugin_state = state
+        .plugins
+        .get_mut(plugin)
+        .expect("queued plugin remains registered");
+    plugin_state.queued -= 1;
+    plugin_state.bytes -= call.bytes;
     state
         .pools
         .get_mut(call.request.pool_id())
@@ -49,6 +55,13 @@ fn select(state: &mut SchedulerState) -> EmbeddedResult<Option<Dispatch>> {
     let plugins = state.rotation.iter().cloned().collect::<Vec<_>>();
     let mut reclaimed = false;
     for (rotation_index, plugin) in plugins.iter().enumerate() {
+        let policy = state
+            .plugins
+            .get(plugin)
+            .expect("queued plugin remains registered");
+        if policy.closing || state.plugin_active(plugin) >= policy.config.max_running_calls {
+            continue;
+        }
         let mut visited = BTreeSet::new();
         let queue = state
             .queues
@@ -82,11 +95,24 @@ fn select(state: &mut SchedulerState) -> EmbeddedResult<Option<Dispatch>> {
                 // 会话容量已在创建时预留；仅在移除队列后转移其精确租借。
                 None
             } else {
-                let prepared = pool.pool.prepare(&call.control);
+                let allow_new = state.plugin_allows_allocation(call.request.pool_id())?;
+                let prepared = pool
+                    .pool
+                    .prepare_with_budget(&call.control, false, allow_new);
                 if matches!(&prepared, Err(error) if error.code == EmbeddedErrorCode::CapacityExceeded)
                 {
+                    // A full target domain cannot benefit from evicting any other domain's cache.
+                    // 目标域自身已满时，驱逐其他域的缓存不能帮助它。
+                    if pool.pool.usage()?.resident >= pool.pool.policy().max_resident_vms {
+                        continue;
+                    }
                     if !reclaimed {
                         for candidate in state.pools.values() {
+                            // Plugin-local exhaustion can only be relieved by retiring that plugin's own idle state.
+                            // 插件局部耗尽只能通过退役该插件自身的空闲状态缓解。
+                            if !allow_new && candidate.plugin_id != *plugin {
+                                continue;
+                            }
                             if candidate.pool.retire_idle_for_pressure()? {
                                 reclaimed = true;
                                 break;
