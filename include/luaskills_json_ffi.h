@@ -134,14 +134,16 @@ On failure a valid output is empty; the return code is one EmbeddedFfiStatus val
 Request bytes must remain readable and immutable until return. The writable output must be
 exclusively borrowed and disjoint from those bytes. Unknown fields and commands are rejected.
 The describe command is {"protocol_version":1,"command":{"type":"describe"}}.
-Discover implemented commands from its result before requiring additional capabilities.
+Before creating a transport, use luaskills_ffi_embedded_describe_v1 from luaskills_ffi.h
+to check the compiled contract, platform and required capabilities without cleanup ownership.
 通过独立 transport_id 分发显式版本一 JSON 请求。
 成功时 result_out 拥有一个仅由 luaskills_ffi_embedded_result_free_v1 释放的缓冲。
 失败时有效输出为空；返回码为一个 EmbeddedFfiStatus 值。
 请求字节必须在返回前保持可读且不可变。可写输出必须独占借用，且与这些字节不重叠。
 未知字段与命令被拒绝。
 描述命令为 {"protocol_version":1,"command":{"type":"describe"}}。
-要求额外能力前，先从其结果发现已实现命令。
+创建传输前，使用 luaskills_ffi.h 中的 luaskills_ffi_embedded_describe_v1，
+在不产生清理所有权的情况下校验编译契约、平台及必需能力。
 */
 int32_t luaskills_ffi_embedded_request_v1(
     uint64_t transport_id, FfiBorrowedBuffer request_json, FfiEmbeddedResultV1 *result_out

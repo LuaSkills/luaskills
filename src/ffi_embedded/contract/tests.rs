@@ -25,6 +25,7 @@ fn validators() -> &'static BTreeMap<String, jsonschema::Validator> {
         for (name, schema) in [
             ("request", &document["request"]),
             ("error_response", &document["error_response"]),
+            ("core_description", &document["core_description"]),
         ]
         .into_iter()
         .chain(

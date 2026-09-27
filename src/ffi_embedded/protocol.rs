@@ -1,4 +1,4 @@
-use super::commands::{RUNTIME_COMMAND_NAMES, RuntimeCommand};
+use super::commands::RuntimeCommand;
 use super::runtime::RuntimeSlot;
 use super::wire::{
     ErrorEnvelope, ErrorStatus, RuntimeReceipt, SuccessStatus, TransportDescription,
@@ -156,11 +156,11 @@ pub(super) fn execute(
     match request.command {
         Command::Describe {} => respond(
             Ok(TransportDescription {
-                core_version: env!("CARGO_PKG_VERSION"),
-                protocol_version: EMBEDDED_FFI_PROTOCOL_VERSION,
-                abi_structure_version: EMBEDDED_FFI_PROTOCOL_VERSION,
-                commands: ROOT_COMMAND_NAMES,
-                runtime_commands: RUNTIME_COMMAND_NAMES,
+                core_version: super::embedded_core_description().core_version,
+                protocol_version: super::embedded_core_description().protocol_version,
+                abi_structure_version: super::embedded_core_description().abi_structure_version,
+                commands: super::embedded_core_description().commands,
+                runtime_commands: super::embedded_core_description().runtime_commands,
                 limits: &transport.config,
             }),
             limit,

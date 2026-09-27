@@ -132,6 +132,16 @@ typedef enum EmbeddedFfiStatus {
     LUASKILLS_EMBEDDED_UNSUPPORTED = 7
 } EmbeddedFfiStatus;
 
+/* Read core compatibility before creating transport ownership; write immutable JSON bytes to description_out. */
+/* 在创建传输所有权前读取核心兼容信息；将不可变 JSON 字节写入 description_out。 */
+/* Return an EmbeddedFfiStatus; failure clears a valid writable output. The output must be exclusively borrowed. */
+/* 返回 EmbeddedFfiStatus；失败清空有效可写输出。输出必须被独占借用。 */
+/* Bytes remain valid until library unload, are not NUL-terminated, and must never be passed to a free function. */
+/* 字节在动态库卸载前有效，不以空字符结尾，绝不能传给释放函数。 */
+/* Retain the library while copying and validate the generated descriptor byte ceiling before reading. */
+/* 复制时保持动态库存活，并在读取前校验生成契约中的描述字节上限。 */
+int32_t luaskills_ffi_embedded_describe_v1(FfiBorrowedBuffer *description_out);
+
 /*
 Create from config and write one exact identity to transport_out; failures zero the output.
 Config must expose its size prefix and the entire structure when that prefix matches sizeof.

@@ -2,6 +2,7 @@
 //! 独立于旧引擎级执行锁的版本化有界传输。
 
 mod commands;
+mod compatibility;
 mod control;
 mod json;
 mod protocol;
@@ -17,6 +18,10 @@ pub mod contract;
 #[cfg(test)]
 mod tests;
 
+pub use compatibility::{
+    EMBEDDED_CAPABILITIES, EMBEDDED_DESCRIPTION_MAX_BYTES, EMBEDDED_DESCRIPTION_VERSION,
+    EmbeddedBuildIdentity, EmbeddedCoreDescription, embedded_core_description,
+};
 pub use types::{
     EMBEDDED_FFI_PROTOCOL_VERSION, EmbeddedFfiStatus, FfiEmbeddedResultV1,
     FfiEmbeddedTransportConfigV1,
@@ -33,6 +38,40 @@ fn boundary(action: impl FnOnce() -> Result<(), EmbeddedFfiStatus>) -> i32 {
         Ok(Err(status)) => status as i32,
         Err(_) => EmbeddedFfiStatus::Internal as i32,
     }
+}
+
+/// Write the independent read-only core descriptor into `description_out`; return a stable native status.
+/// 将独立只读核心描述写入 `description_out`；返回稳定原生状态。
+/// Success borrows immutable bytes until library unload; never pass them to any buffer-free function.
+/// 成功时借用直到动态库卸载前有效的不可变字节；绝不传给任何缓冲释放函数。
+/// # Safety
+/// `description_out` must be writable and exclusively borrowed for one complete FfiBorrowedBuffer until return.
+/// `description_out` 必须在返回前对一个完整 FfiBorrowedBuffer 可写并被独占借用。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_embedded_describe_v1(
+    description_out: *mut FfiBorrowedBuffer,
+) -> i32 {
+    boundary(|| {
+        if description_out.is_null() {
+            return Err(EmbeddedFfiStatus::InvalidArgument);
+        }
+        // Clear valid output before any fallible serialization; failure never creates cleanup ownership.
+        // 在可能失败的序列化前清空有效输出；失败绝不创建清理所有权。
+        unsafe {
+            description_out.write_unaligned(FfiBorrowedBuffer {
+                ptr: std::ptr::null(),
+                len: 0,
+            })
+        };
+        let bytes = compatibility::description_bytes()?;
+        unsafe {
+            description_out.write_unaligned(FfiBorrowedBuffer {
+                ptr: bytes.as_ptr(),
+                len: bytes.len(),
+            })
+        };
+        Ok(())
+    })
 }
 
 /// Create an independent transport from `config`; write its exact identity to `transport_out` on success.

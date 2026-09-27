@@ -2,6 +2,10 @@
 //! 从实际嵌入式请求和响应类型派生的可复现离线 Schema。
 
 use super::commands::RUNTIME_COMMAND_NAMES;
+use super::compatibility::{
+    EMBEDDED_CAPABILITIES, EMBEDDED_DESCRIPTION_MAX_BYTES, EMBEDDED_DESCRIPTION_VERSION,
+    EmbeddedCoreDescription,
+};
 use super::protocol::{ROOT_COMMAND_NAMES, Request, SuccessEnvelope};
 use super::runtime::RuntimeSnapshot;
 use super::wire::{ErrorEnvelope, RuntimeReceipt, TransportDescription};
@@ -72,6 +76,13 @@ pub fn document() -> Value {
         "runtime_commands": RUNTIME_COMMAND_NAMES,
         "json_vectors": serde_json::from_str::<Value>(include_str!("../../contracts/embedded/v1/json-vectors.json"))
             .expect("checked-in JSON vectors must be valid JSON"),
+        "compatibility": {
+            "description_version": EMBEDDED_DESCRIPTION_VERSION,
+            "max_description_bytes": EMBEDDED_DESCRIPTION_MAX_BYTES,
+            "required_capabilities": EMBEDDED_CAPABILITIES,
+        },
+        "core_description": SchemaSettings::draft2020_12().for_serialize().into_generator()
+            .into_root_schema_for::<EmbeddedCoreDescription>(),
         "native_status": {
             "ok": EmbeddedFfiStatus::Ok as i32,
             "invalid_argument": EmbeddedFfiStatus::InvalidArgument as i32,

@@ -415,6 +415,7 @@ pub(crate) fn exported_ffi_function_names() -> Vec<String> {
         "luaskills_ffi_string_clone",
         "luaskills_ffi_version_json",
         "luaskills_ffi_describe_json",
+        "luaskills_ffi_embedded_describe_v1",
         "luaskills_ffi_embedded_transport_new_v1",
         "luaskills_ffi_embedded_transport_close_v1",
         "luaskills_ffi_embedded_transport_free_v1",

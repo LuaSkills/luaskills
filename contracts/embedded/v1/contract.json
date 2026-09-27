@@ -8,7 +8,187 @@
     "runtime_free",
     "runtime"
   ],
+  "compatibility": {
+    "description_version": 1,
+    "max_description_bytes": 16384,
+    "required_capabilities": [
+      "bounded_transports_v1",
+      "plugin_budgets_v1",
+      "shared_pools_v1",
+      "dedicated_pools_v1",
+      "fixed_sessions_v1",
+      "host_request_queue_v1",
+      "in_memory_effect_evidence_v1",
+      "strict_json_v1"
+    ]
+  },
   "contract_version": 1,
+  "core_description": {
+    "$defs": {
+      "EmbeddedBuildIdentity": {
+        "description": "Selected package and compiler input identities; binary authentication remains the release artifact's job.\n选定包及编译器输入身份；二进制认证仍由发布产物负责。",
+        "properties": {
+          "cargo_features": {
+            "description": "Sorted Cargo feature environment suffixes; they are not reverse-mapped into guessed feature names.\n排序后 Cargo 功能环境后缀；不反向映射为猜测功能名。",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "contract_sha256": {
+            "description": "Exact bundled embedded contract identity, independently checked by SDKs.\n精确包内嵌入式契约身份，由 SDK 独立检查。",
+            "type": "string"
+          },
+          "debug_info": {
+            "description": "Cargo's debug-information setting, independent of optimization.\nCargo 调试信息设置，独立于优化。",
+            "type": "string"
+          },
+          "inputs_sha256": {
+            "description": "SHA-256 of the exact machine-readable selected-input report emitted by build.rs.\nbuild.rs 输出的精确机器可读选定输入报告的 SHA-256。",
+            "type": "string"
+          },
+          "opt_level": {
+            "description": "Actual Cargo optimization setting, not an inferred profile label.\n实际 Cargo 优化设置，不推断配置名称。",
+            "type": "string"
+          },
+          "package_lock_sha256": {
+            "description": "Bundled package lockfile identity; a consuming Rust workspace may resolve a different dependency graph.\n包内锁文件身份；消费它的 Rust 工作区可能解析出不同依赖图。",
+            "type": "string"
+          },
+          "pointer_width": {
+            "description": "Cargo's target pointer width, preserved as its exact textual value.\nCargo 目标指针位宽，保留其精确文本值。",
+            "type": "string"
+          },
+          "rustc": {
+            "description": "The selected rustc executable's verbose version output.\n所选 rustc 可执行文件的详细版本输出。",
+            "type": "string"
+          },
+          "rustflags_sha256": {
+            "description": "SHA-256 of Cargo's exact encoded additional compiler flags.\nCargo 精确编码额外编译参数的 SHA-256。",
+            "type": "string"
+          },
+          "source_sha256": {
+            "description": "SHA-256 of sorted package-relative input paths and their exact content hashes.\n排序后包相对输入路径及其精确内容摘要的 SHA-256。",
+            "type": "string"
+          },
+          "target": {
+            "description": "Cargo's target triple for this build.\n此构建的 Cargo 目标三元组。",
+            "type": "string"
+          },
+          "target_arch": {
+            "description": "Cargo's target architecture identity.\nCargo 目标架构身份。",
+            "type": "string"
+          },
+          "target_os": {
+            "description": "Cargo's target operating-system identity.\nCargo 目标操作系统身份。",
+            "type": "string"
+          }
+        },
+        "required": [
+          "inputs_sha256",
+          "source_sha256",
+          "contract_sha256",
+          "package_lock_sha256",
+          "target",
+          "target_os",
+          "target_arch",
+          "pointer_width",
+          "opt_level",
+          "debug_info",
+          "rustflags_sha256",
+          "rustc",
+          "cargo_features"
+        ],
+        "type": "object"
+      },
+      "ExecutionBackend": {
+        "description": "Declared backend; unavailable variants are rejected instead of downgraded.\n声明的执行后端；不可用的取值直接拒绝，不降级。",
+        "oneOf": [
+          {
+            "const": "in_process",
+            "description": "Execute in owned Lua VMs inside the current host process.\n在当前宿主进程内的受管 Lua VM 中执行。",
+            "type": "string"
+          },
+          {
+            "const": "worker_process",
+            "description": "Reserved protocol identity; no worker backend is advertised yet.\n预留的协议身份；目前尚未声明工作进程后端可用。",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Immutable description of the exact linked core, usable without a transport or runtime.\n精确链接核心的不可变描述，无需传输或运行时即可使用。",
+    "properties": {
+      "abi_structure_version": {
+        "description": "Exact independent embedded ABI structure version.\n精确独立嵌入式 ABI 结构版本。",
+        "format": "uint32",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "build": {
+        "$ref": "#/$defs/EmbeddedBuildIdentity",
+        "description": "Build input evidence; release manifests bind it to commits and signed artifact checksums separately.\n构建输入证据；发布清单另将其关联到提交及签名产物摘要。"
+      },
+      "capabilities": {
+        "description": "Implemented semantic features; a name does not grant host permissions.\n已实现语义功能；名称不授予宿主权限。",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "commands": {
+        "description": "Root command names shared with the exhaustive dispatcher.\n与穷尽分发器共享的根命令名称。",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "core_version": {
+        "description": "Cargo package version of this exact core.\n此精确核心的 Cargo 包版本。",
+        "type": "string"
+      },
+      "description_version": {
+        "description": "Version of this independent descriptor format.\n此独立描述格式的版本。",
+        "format": "uint32",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "execution_backends": {
+        "description": "Actually implemented execution backends, excluding reserved unsupported variants.\n实际已实现执行后端，不包含预留且不支持的取值。",
+        "items": {
+          "$ref": "#/$defs/ExecutionBackend"
+        },
+        "type": "array"
+      },
+      "protocol_version": {
+        "description": "Exact embedded JSON protocol version.\n精确嵌入式 JSON 协议版本。",
+        "format": "uint32",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "runtime_commands": {
+        "description": "Nested command names shared with the exhaustive dispatcher.\n与穷尽分发器共享的嵌套命令名称。",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "description_version",
+      "core_version",
+      "protocol_version",
+      "abi_structure_version",
+      "commands",
+      "runtime_commands",
+      "capabilities",
+      "execution_backends",
+      "build"
+    ],
+    "title": "EmbeddedCoreDescription",
+    "type": "object"
+  },
   "core_version": "0.5.9",
   "error_response": {
     "$defs": {
@@ -147,7 +327,7 @@
     "cargo_lock_sha256": "a611f2757f089f32f6934c885e6214a69abfcdfb1a01a0cc9423ae58d21c886b",
     "name": "luaskills/generate_embedded_contract",
     "schema_draft": "2020-12",
-    "source_sha256": "75ecbbaeb7cc3cfb6207cdbc8e00fc2f30d6c1715d92f943ef4dfeadf596a725",
+    "source_sha256": "f31dc521eeff41b774bddf11408f2a8dd2c1d6bb77c8650bfc3bfb7fa5e621d1",
     "source_version": "0.5.9"
   },
   "json_vectors": {

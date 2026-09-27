@@ -3,6 +3,7 @@ mod json_vectors;
 use std::sync::{Arc, Barrier};
 
 mod commands;
+mod compatibility;
 pub(super) mod runtimes;
 
 /// Build explicit small budgets for native transport ownership tests.
