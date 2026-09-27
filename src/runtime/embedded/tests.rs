@@ -5,15 +5,17 @@ mod operations;
 
 /// Return explicit small parent budgets for deterministic resource-pressure tests.
 /// 返回确定性资源压力测试使用的显式小规模父级预算。
-fn config() -> EmbeddedRuntimeConfig {
+pub(super) fn config() -> EmbeddedRuntimeConfig {
     EmbeddedRuntimeConfig {
         max_registered_pools: 8,
+        max_registered_capabilities: 8,
         max_resident_vms: 3,
         max_running_calls: 2,
         max_queued_calls: 8,
         max_queued_bytes: 4096,
         max_operations: 16,
         max_host_requests: 4,
+        max_host_request_bytes: 4096,
         max_value_bytes: 1024,
     }
 }

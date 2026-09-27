@@ -21,6 +21,9 @@ pub enum EmbeddedErrorCode {
     /// The requested state transition conflicts with live work.
     /// 请求的状态变更与仍在运行的工作冲突。
     Busy,
+    /// This exact request already has a completion owner or retained terminal result.
+    /// 此精确请求已具有完成所有者或保留的终态结果。
+    AlreadyCompleted,
     /// The runtime or registration no longer accepts work.
     /// 运行时或注册项已停止接纳工作。
     Closed,

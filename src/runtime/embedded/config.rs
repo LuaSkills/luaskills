@@ -9,6 +9,9 @@ pub struct EmbeddedRuntimeConfig {
     /// Maximum concurrently registered pool declarations, including draining generations.
     /// 同时注册的池声明数量上限，包含正在排空的代次。
     pub max_registered_pools: usize,
+    /// Maximum retained capability registrations, including draining or unforgotten retired entries.
+    /// 能力注册保留上限，包含正在排空或尚未遗忘的已退役条目。
+    pub max_registered_capabilities: usize,
     /// Maximum resident VMs, including creation and pending teardown.
     /// 最大常驻 VM 数，包含创建中与等待清理的实例。
     pub max_resident_vms: usize,
@@ -27,6 +30,11 @@ pub struct EmbeddedRuntimeConfig {
     /// Maximum pending host requests across all plugin instances.
     /// 所有插件实例待完成宿主请求的数量上限。
     pub max_host_requests: usize,
+    /// Maximum request bytes and reserved application output bytes, including dispatched calls.
+    /// 请求字节与预留应用输出字节上限，包含已分发调用。
+    /// Fixed protocol error metadata is separately bounded by the retained request count.
+    /// 固定协议错误元数据由保留请求数量独立约束。
+    pub max_host_request_bytes: usize,
     /// Maximum serialized application value bytes; fixed protocol error metadata is separate.
     /// 应用值的最大序列化字节数；固定协议错误元数据独立计算。
     pub max_value_bytes: usize,
@@ -38,9 +46,9 @@ impl EmbeddedRuntimeConfig {
     /// Return an error before allocating threads, VMs, or queue storage.
     /// 在分配线程、VM 或队列存储前返回错误。
     pub fn validate(&self) -> EmbeddedResult<()> {
-        if self.max_registered_pools == 0 {
+        if self.max_registered_pools == 0 || self.max_registered_capabilities == 0 {
             return Err(EmbeddedError::invalid(
-                "registered pool limit must be positive",
+                "registration limits must be positive",
             ));
         }
         if self.max_resident_vms == 0 || self.max_running_calls == 0 {
@@ -73,6 +81,11 @@ impl EmbeddedRuntimeConfig {
         if self.max_value_bytes > self.max_queued_bytes {
             return Err(EmbeddedError::invalid(
                 "value byte limit exceeds queue byte limit",
+            ));
+        }
+        if self.max_value_bytes > self.max_host_request_bytes {
+            return Err(EmbeddedError::invalid(
+                "value byte limit exceeds host request byte limit",
             ));
         }
         Ok(())

@@ -6,8 +6,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// Shared maintenance cadence for bounded retirement retries.
-/// 有界退役重试共享的维护间隔。
+/// Shared maintenance cadence for bounded retirement retries and live control refresh.
+/// 有界退役重试与实时控制刷新共享的维护间隔。
 pub(super) const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Retirement metadata; resident tokens bound all retained entries.

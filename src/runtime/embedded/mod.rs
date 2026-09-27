@@ -1,6 +1,7 @@
 //! Host-owned plugin execution, independent of the public lease manager.
 //! 由宿主拥有的插件执行机制，与公开租约管理器独立。
 
+pub mod capabilities;
 mod config;
 mod control;
 mod error;
@@ -10,6 +11,7 @@ mod operations;
 mod pool;
 mod retirement;
 mod schema;
+mod value_size;
 
 #[cfg(test)]
 mod tests;

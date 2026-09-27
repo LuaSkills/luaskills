@@ -106,12 +106,14 @@ fn pool_manager(layout: &SystemRuntimeTestLayout) -> Arc<EmbeddedPoolManager> {
         engine,
         EmbeddedRuntimeConfig {
             max_registered_pools: 8,
+            max_registered_capabilities: 8,
             max_resident_vms: 3,
             max_running_calls: 2,
             max_queued_calls: 8,
             max_queued_bytes: 4096,
             max_operations: 16,
             max_host_requests: 4,
+            max_host_request_bytes: 4096,
             max_value_bytes: 1024,
         },
     )
