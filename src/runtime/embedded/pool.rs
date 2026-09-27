@@ -2,8 +2,8 @@ use super::capabilities::ModuleCapabilities;
 use super::retirement::RetirementService;
 use super::{
     CallControl, EmbeddedError, EmbeddedErrorCode, EmbeddedModule, EmbeddedResult,
-    EmbeddedRuntimeConfig, InstanceReuse, ModuleDefinition, ModuleInvocation, PluginPoolConfig,
-    PoolGovernor, PoolUsage, VmReservation,
+    EmbeddedRuntimeConfig, InstanceReuse, ModuleAcquireFailure, ModuleDefinition, ModuleInvocation,
+    ModuleRelease, ModuleRetirement, PluginPoolConfig, PoolGovernor, PoolUsage, VmReservation,
 };
 use crate::runtime::engine::LuaEngine;
 use serde_json::Value;
@@ -201,8 +201,10 @@ impl EmbeddedPoolManager {
                 EmbeddedError::new(EmbeddedErrorCode::Internal, "pool manager lock is poisoned")
             })?
             .closing
-            || self.usage()?.resident != 0
         {
+            return Ok(false);
+        }
+        if self.usage()?.resident != 0 {
             return Ok(false);
         }
         self.retirement.try_shutdown()
@@ -332,6 +334,9 @@ pub(super) struct ResidentModule {
     /// Registration drops after the VM and its reservation.
     /// 注册在 VM 及其预留之后释放。
     _registration: ResidentRegistration,
+    /// Read-only evidence does not retain this VM after destruction.
+    /// 只读证据不会在销毁后保留此 VM。
+    pub(super) retirement: ModuleRetirement,
 }
 
 /// Short-lock metadata with no execution or teardown inside the lock.
@@ -369,6 +374,48 @@ pub struct ModulePool {
 }
 
 impl ModulePool {
+    /// Acquire with `control`, retaining exact cleanup evidence if initialization fails.
+    /// 使用 `control` 获取实例，初始化失败时保留精确清理证据。
+    /// Return the lease or the original failure plus any actual allocated lifetime.
+    /// 返回租借，或原始错误及实际已分配生命周期。
+    pub fn acquire_tracked(
+        self: &Arc<Self>,
+        control: Arc<CallControl>,
+    ) -> Result<ModuleLease, ModuleAcquireFailure> {
+        if self.policy.reuse == InstanceReuse::Session {
+            return Err(ModuleAcquireFailure {
+                error: EmbeddedError::invalid("session pools require open_session"),
+                retirement: None,
+            });
+        }
+        // Allocation installs this evidence before any plugin source can execute.
+        // 分配在任何插件源码可以执行前安装此证据。
+        let mut retirement = None;
+        self.acquire_owned(control, false, &mut retirement)
+            .map_err(|error| ModuleAcquireFailure { error, retirement })
+    }
+
+    /// Open a pinned session with `control`, retaining cleanup evidence on failure.
+    /// 使用 `control` 打开固定会话，失败时保留清理证据。
+    /// Return exclusive session ownership or its original initialization failure.
+    /// 返回独占会话所有权，或其原始初始化错误。
+    pub fn open_session_tracked(
+        self: &Arc<Self>,
+        control: Arc<CallControl>,
+    ) -> Result<ModuleLease, ModuleAcquireFailure> {
+        if self.policy.reuse != InstanceReuse::Session {
+            return Err(ModuleAcquireFailure {
+                error: EmbeddedError::invalid("pool does not declare session reuse"),
+                retirement: None,
+            });
+        }
+        // A failed session never returns mutable state to ordinary reuse.
+        // 失败会话绝不把可变状态归还普通复用路径。
+        let mut retirement = None;
+        self.acquire_owned(control, true, &mut retirement)
+            .map_err(|error| ModuleAcquireFailure { error, retirement })
+    }
+
     /// Prepare `count` warm instances under original `control`, returning actual idle ownership.
     /// 在原始 `control` 下准备 `count` 个预热实例，并归还真实空闲所有权。
     /// Failure preserves successfully initialized instances and reports the original error.
@@ -398,10 +445,8 @@ impl ModulePool {
     /// Capacity errors leave the request unexecuted; only declared reusable instances return to idle.
     /// 容量错误使请求保持未执行；仅声明为可复用的实例归还空闲池。
     pub fn acquire(self: &Arc<Self>, control: Arc<CallControl>) -> EmbeddedResult<ModuleLease> {
-        if self.policy.reuse == InstanceReuse::Session {
-            return Err(EmbeddedError::invalid("session pools require open_session"));
-        }
-        self.acquire_owned(control, false)
+        self.acquire_tracked(control)
+            .map_err(|failure| failure.error)
     }
 
     /// Pin one instance for an explicit session under original `control` initialization budget.
@@ -412,20 +457,19 @@ impl ModulePool {
         self: &Arc<Self>,
         control: Arc<CallControl>,
     ) -> EmbeddedResult<ModuleLease> {
-        if self.policy.reuse != InstanceReuse::Session {
-            return Err(EmbeddedError::invalid(
-                "pool does not declare session reuse",
-            ));
-        }
-        self.acquire_owned(control, true)
+        self.open_session_tracked(control)
+            .map_err(|failure| failure.error)
     }
 
-    /// Acquire exclusive ownership; `pinned` prevents returning session state to general reuse.
-    /// 获取独占所有权；`pinned` 防止会话状态回到普通复用路径。
+    /// Acquire under `control`; `pinned` prevents ordinary reuse and `retirement` retains failed ownership evidence.
+    /// 在 `control` 下获取；`pinned` 阻止普通复用，`retirement` 保留失败所有权证据。
+    /// Return exclusive ownership or the original failure, with allocated lifetime evidence populated first.
+    /// 返回独占所有权或原始错误，已分配生命周期证据会先行填入。
     fn acquire_owned(
         self: &Arc<Self>,
         control: Arc<CallControl>,
         pinned: bool,
+        retirement: &mut Option<ModuleRetirement>,
     ) -> EmbeddedResult<ModuleLease> {
         control.check()?;
         self.retire_expired()?;
@@ -460,11 +504,13 @@ impl ModulePool {
         // A lease exists before initialization so unwinding cannot discard failed VM ownership.
         // 在初始化前建立租借对象，使栈展开不会丢弃失败 VM 所有权。
         let mut lease = ModuleLease {
+            retirement: idle.as_ref().map(|module| module.retirement.clone()),
             pool: Arc::clone(self),
             resident: idle,
             pinned,
             invocation_attempted: false,
         };
+        *retirement = lease.retirement.clone();
         if let Some((mut reservation, instance_id)) = reserved {
             // Refuse initialization before allocating a VM when execution capacity is occupied.
             // 执行容量占满时，在分配 VM 前拒绝初始化。
@@ -476,7 +522,13 @@ impl ModulePool {
                 .engine
                 .allocate_embedded_module(self.definition.clone(), &instance_id)?;
             drop(permit);
+            // Publish evidence before initialization can create native resources or fail.
+            // 在初始化可能创建原生资源或失败前发布证据。
+            let receipt = ModuleRetirement::new(instance_id.clone());
+            *retirement = Some(receipt.clone());
+            lease.retirement = Some(receipt.clone());
             lease.resident = Some(ResidentModule {
+                retirement: receipt,
                 module,
                 reservation,
                 uses: 0,
@@ -589,7 +641,7 @@ impl ModulePool {
 
     /// Return `resident` after exclusive use; `pinned` session state always retires.
     /// 独占使用后归还 `resident`；`pinned` 会话状态始终退役。
-    fn release(&self, mut resident: ResidentModule, pinned: bool) {
+    fn release(&self, mut resident: ResidentModule, pinned: bool) -> ModuleRelease {
         // A panic during Lua execution leaves the module non-reusable before unwinding.
         // Lua 执行期间发生 panic 时，模块在栈展开前已不可复用。
         let reusable = !pinned
@@ -600,8 +652,8 @@ impl ModulePool {
                 .max_uses
                 .is_none_or(|limit| resident.uses < limit);
         if reusable {
-            // No user code runs while idle ownership is republished.
-            // 重新发布空闲所有权时不运行用户代码。
+            // Returning ownership and reporting disposition share the same closure boundary.
+            // 归还所有权与报告去向共享同一个关闭边界。
             let mut state = self
                 .state
                 .lock()
@@ -609,10 +661,14 @@ impl ModulePool {
             if !state.closed && !self.state.is_poisoned() {
                 resident.idle_since = Instant::now();
                 state.idle.push(resident);
-                return;
+                return ModuleRelease::ReturnedToPool;
             }
         }
+        // The receipt tracks this instance even if another resident remains active forever.
+        // 即使其他常驻实例一直活跃，此回执也只跟踪当前实例。
+        let retirement = resident.retirement.clone();
         self.manager.retirement.enqueue(resident);
+        ModuleRelease::Retiring(retirement)
     }
 }
 
@@ -638,6 +694,9 @@ impl Drop for ModulePool {
 /// Exclusive invocation or pinned-session ownership; concurrent calls require different leases.
 /// 独占调用或固定会话所有权；并发调用需要不同租借。
 pub struct ModuleLease {
+    /// Receipt remains queryable after explicit close consumes resident ownership.
+    /// 显式关闭消费常驻所有权后，回执仍可查询。
+    retirement: Option<ModuleRetirement>,
     /// Strong reference preserves pool registration and cleanup scheduling.
     /// 强引用保留池注册与清理调度。
     pool: Arc<ModulePool>,
@@ -653,6 +712,25 @@ pub struct ModuleLease {
 }
 
 impl ModuleLease {
+    /// Return this exact instance's receipt, including after explicit asynchronous close.
+    /// 返回此精确实例的回执，包含显式异步关闭之后。
+    /// This observes lifetime only and cannot initiate or cancel retirement.
+    /// 此操作仅观察生命周期，不能发起或取消退役。
+    pub fn retirement_handle(&self) -> EmbeddedResult<ModuleRetirement> {
+        self.retirement.clone().ok_or_else(closed)
+    }
+
+    /// Consume the lease and report whether request ownership returned or still needs retirement.
+    /// 消费租借，并报告请求所有权已归还还是仍需退役。
+    /// A previously closed lease returns the same retirement evidence, never false reuse.
+    /// 已关闭租借返回同一退役证据，绝不误报复用。
+    pub fn finish(mut self) -> EmbeddedResult<ModuleRelease> {
+        match self.resident.take() {
+            Some(resident) => Ok(self.pool.release(resident, self.pinned)),
+            None => self.retirement_handle().map(ModuleRelease::Retiring),
+        }
+    }
+
     /// Invoke `invocation` under exact parent and group permits; no whole-engine lock is held.
     /// 在精确父级与分组许可下执行 `invocation`；不持有整个引擎锁。
     pub fn invoke(&mut self, invocation: ModuleInvocation<'_>) -> EmbeddedResult<Value> {

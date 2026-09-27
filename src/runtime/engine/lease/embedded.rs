@@ -19,12 +19,12 @@ pub struct EmbeddedModule {
     /// Package and directory identities shared with the proven System loader.
     /// 与已验证 System 加载器共享的包和目录身份。
     paths: RuntimeLeasePathContext,
-    /// Independently allocated Lua state, never registered in the legacy lease pool.
-    /// 独立分配且从不注册到旧租约池的 Lua 状态。
-    vm: LuaVm,
-    /// Captured functions cannot be redirected by later table-field mutation.
-    /// 捕获的函数不能被后续表字段修改重定向。
+    /// Drop captured roots before the primary Lua owner runs its final live garbage collection.
+    /// 在主 Lua 所有者执行最后一次存活垃圾回收前释放捕获根。
     exports: BTreeMap<String, CompiledModuleExport>,
+    /// Independently allocated Lua state; destruction follows release of captured export roots.
+    /// 独立分配的 Lua 状态；销毁发生在捕获导出根释放之后。
+    vm: LuaVm,
     /// Validated contracts consumed by exactly one initialization attempt.
     /// 仅由一次初始化尝试消费的已校验契约。
     pending_contracts: Option<BTreeMap<String, (JsonContract, JsonContract)>>,

@@ -1,5 +1,5 @@
 use super::pool::ResidentModule;
-use super::{EmbeddedError, EmbeddedErrorCode, EmbeddedResult};
+use super::{EmbeddedError, EmbeddedErrorCode, EmbeddedResult, ModuleRetirementPhase};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -90,6 +90,9 @@ impl RetirementService {
         if let Err(error) = module.reservation.mark_retiring() {
             crate::runtime_logging::error(format!("pool retirement accounting failed: {error}"));
         }
+        module
+            .retirement
+            .publish(ModuleRetirementPhase::Queued, None);
         self.center
             .state
             .lock()
@@ -209,18 +212,35 @@ fn run_retirement(center: Arc<RetirementCenter>) {
         };
         // A panic cannot release the resident token or silently terminate the sole cleanup worker.
         // panic 不能释放常驻令牌，也不能静默终止唯一清理线程。
+        module
+            .retirement
+            .publish(ModuleRetirementPhase::Running, None);
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| module.module.close()));
         match result {
             Ok(Ok(())) => {
+                // Completion must follow actual VM destruction, not only resource close.
+                // 完成必须晚于真实 VM 销毁，而不只是资源关闭。
+                let retirement = module.retirement.clone();
                 drop(module);
+                retirement.publish(ModuleRetirementPhase::Completed, None);
                 center
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .running = false;
             }
-            _ => {
+            failure => {
+                // Preserve a bounded diagnostic while retaining failed resource ownership.
+                // 保留有界诊断，同时保留失败资源所有权。
+                let code = match failure {
+                    Ok(Err(error)) => error.code,
+                    Err(_) => EmbeddedErrorCode::Internal,
+                    Ok(Ok(())) => unreachable!("successful retirement is handled above"),
+                };
+                module
+                    .retirement
+                    .publish(ModuleRetirementPhase::Retrying, Some(code));
                 // Round-robin reinsertion lets independent failed owners make progress.
                 // 轮转重新入队，使独立的失败所有者仍能推进。
                 let mut state = center

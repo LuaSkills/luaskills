@@ -2,6 +2,7 @@
 //! 由宿主拥有的插件执行机制，与公开租约管理器独立。
 
 pub mod capabilities;
+mod cleanup;
 mod config;
 mod control;
 mod effects;
@@ -18,6 +19,10 @@ mod value_size;
 mod tests;
 
 pub use crate::runtime::engine::EmbeddedModule;
+pub use cleanup::{
+    ModuleAcquireFailure, ModuleRelease, ModuleRetirement, ModuleRetirementPhase,
+    ModuleRetirementSnapshot,
+};
 pub use config::{
     EmbeddedRuntimeConfig, ExecutionBackend, InstanceReuse, PluginPoolConfig, PoolKind,
 };
