@@ -15,6 +15,9 @@ use std::sync::{Arc, Condvar, Mutex};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostRequest {
+    /// Original operation effect record, absent only for untracked low-level calls.
+    /// 原始操作副作用记录，仅未跟踪低层调用省略。
+    pub effect_id: Option<String>,
     /// Never-reused identity used for completion and host-side deduplication.
     /// 用于完成与宿主侧去重、绝不复用的身份。
     pub request_id: String,
@@ -178,6 +181,7 @@ impl HostRequestBroker {
         let sequence = state.sequence.checked_add(1).ok_or_else(capacity)?;
         let id = format!("{}:host:{sequence}", self.runtime_id);
         let request = HostRequest {
+            effect_id: prepared.invocation.effect_id.clone(),
             request_id: id.clone(),
             registration_id: prepared.entry.id.clone(),
             name: prepared.entry.descriptor.name.clone(),
@@ -194,11 +198,14 @@ impl HostRequestBroker {
             .checked_add(bytes)
             .filter(|total| *total <= self.max_bytes)
             .ok_or_else(capacity)?;
+        // Evidence observers can see the request identity before queue publication; burn it even on later failure.
+        // 证据观察者可在队列发布前看到请求身份；即使随后失败也消耗此身份。
+        state.sequence = sequence;
+        prepared.effect.bind_request(&id)?;
         // Publish under the exact entry gate so unregister cannot miss a previously admitted request.
         // 在精确条目门内发布，使注销不能遗漏此前已入场请求。
         let entry = Arc::clone(&prepared.entry);
         entry.with_dispatch_gate(|| {
-            state.sequence = sequence;
             state.bytes = total;
             state.ready.push_back(id.clone());
             state.records.insert(
@@ -271,13 +278,14 @@ impl HostRequestBroker {
             // 在进入门前立即重新检查授权与原始截止时间。
             let delivery = prepared.invocation.authorize().and_then(|()| {
                 entry.with_dispatch_gate(|| {
+                    prepared.effect.begin()?;
                     // Returning a copied request transfers only execution authority, not core ownership.
                     // 返回复制请求仅转交执行权，不转交核心所有权。
                     let mut request = record.request.clone();
                     request.remaining_ms = prepared.invocation.budget.remaining_ms();
                     record.phase = HostRequestPhase::Dispatched;
-                    request
-                })
+                    Ok(request)
+                })?
             });
             match delivery {
                 Ok(request) => {
@@ -331,6 +339,7 @@ impl HostRequestBroker {
             record.phase = HostRequestPhase::Completing;
             record.prepared.take().ok_or_else(poisoned)?
         };
+        prepared.effect.observe(outcome.effects);
         let mut outcome = prepared.entry.validate_outcome(outcome);
         if let Err(error) = prepared.invocation.authorize() {
             outcome.result = Err(error);

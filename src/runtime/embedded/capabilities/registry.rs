@@ -5,11 +5,15 @@ use super::super::{
 };
 use super::broker::{HostRequestBroker, HostRequestHandle};
 use super::types::*;
+use crate::runtime::embedded::effects::EffectAttempt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+mod tests;
 
 /// Native callback receives only trusted context and validated business arguments.
 /// 原生回调仅接收可信上下文及已校验业务参数。
@@ -18,6 +22,9 @@ pub type NativeCapability = Arc<dyn Fn(&CapabilityInvocation) -> CapabilityOutco
 /// Immutable validated invocation context, constructed outside Lua-controlled data.
 /// 在 Lua 可控数据之外构造的不可变已校验调用上下文。
 pub struct CapabilityInvocation {
+    /// Registered operation evidence identity, absent only for explicit low-level untracked calls.
+    /// 注册操作证据身份，仅显式低层未跟踪调用省略。
+    pub effect_id: Option<String>,
     /// Host-authenticated identity including the owning operation.
     /// 包含所属操作的宿主认证身份。
     pub caller: CapabilityCaller,
@@ -337,6 +344,9 @@ pub(super) struct PreparedCapability {
     /// Admission and callback ownership until real completion.
     /// 保留到真实完成的入场与回调所有权。
     pub(super) admitted: AdmittedCapability,
+    /// Evidence finalization follows actual callback and admission release by field destruction order.
+    /// 通过字段析构顺序，使证据完成晚于真实回调与入场释放。
+    pub(super) effect: EffectAttempt,
 }
 
 /// Registry metadata contains active names plus bounded historical registrations awaiting explicit forget.
@@ -764,9 +774,19 @@ impl CapabilitySnapshot {
         // Admission retains capacity across every dispatched native or SDK handler.
         // 入场在全部已分发原生或 SDK 处理器期间保留容量。
         let admitted = entry.admit()?;
+        // Retention failure is detected before native execution or SDK publication can produce effects.
+        // 在原生执行或 SDK 发布可能产生副作用前检测保留失败。
+        let effect = control.reserve_effect(
+            &caller.runtime_id,
+            &caller.operation_id,
+            &entry.id,
+            &entry.descriptor.name,
+            &entry.descriptor.version,
+        )?;
         // Child duration cannot extend the original operation deadline.
         // 子时长不能延长原始操作截止时间。
         let invocation = CapabilityInvocation {
+            effect_id: effect.id().map(str::to_owned),
             caller,
             arguments,
             budget: CapabilityBudget::new(control, entry.descriptor.max_call_ms)?,
@@ -778,6 +798,7 @@ impl CapabilitySnapshot {
             entry,
             invocation,
             admitted,
+            effect,
         })
     }
 
@@ -866,6 +887,7 @@ impl CapabilitySnapshot {
             entry,
             invocation,
             admitted,
+            effect,
         } = self.prepare(
             name,
             caller,
@@ -880,6 +902,7 @@ impl CapabilitySnapshot {
             .native
             .as_ref()
             .expect("native registration owns its validated callback");
+        effect.begin()?;
         // Fixed panic diagnostics do not expose private callback values.
         // 固定 panic 诊断不暴露私有回调值。
         let outcome =
@@ -897,11 +920,13 @@ impl CapabilitySnapshot {
                 });
         // Cancellation or invalid output must preserve actual commit evidence.
         // 取消或无效输出必须保留真实提交证据。
+        effect.observe(outcome.effects);
         let mut outcome = entry.validate_outcome(outcome);
         if let Err(error) = invocation.authorize() {
             outcome.result = Err(error);
         }
         drop(admitted);
+        drop(effect);
         Ok(outcome)
     }
 }

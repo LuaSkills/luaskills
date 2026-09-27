@@ -4,6 +4,7 @@
 pub mod capabilities;
 mod config;
 mod control;
+mod effects;
 mod error;
 mod governor;
 mod module;
@@ -21,6 +22,7 @@ pub use config::{
     EmbeddedRuntimeConfig, ExecutionBackend, InstanceReuse, PluginPoolConfig, PoolKind,
 };
 pub use control::CallControl;
+pub use effects::{HostEffectPhase, HostEffectRecord};
 pub use error::{EmbeddedError, EmbeddedErrorCode, EmbeddedResult};
 pub use governor::{ExecutionPermit, PoolGovernor, PoolUsage, VmAllocationState, VmReservation};
 pub use module::{ModuleDefinition, ModuleExport, ModuleInvocation};

@@ -27,6 +27,12 @@ pub struct EmbeddedRuntimeConfig {
     /// Maximum operation records retained, including unfinished operations.
     /// 操作记录保留数量上限，包含未完成操作。
     pub max_operations: usize,
+    /// Maximum host effect records retained by one operation, including completed callbacks.
+    /// 单次操作保留的宿主副作用记录上限，包含已完成回调。
+    pub max_effect_records_per_operation: usize,
+    /// Maximum serialized effect metadata bytes retained by one operation.
+    /// 单次操作保留的副作用元数据序列化字节上限。
+    pub max_effect_bytes_per_operation: usize,
     /// Maximum pending host requests across all plugin instances.
     /// 所有插件实例待完成宿主请求的数量上限。
     pub max_host_requests: usize,
@@ -46,6 +52,11 @@ impl EmbeddedRuntimeConfig {
     /// Return an error before allocating threads, VMs, or queue storage.
     /// 在分配线程、VM 或队列存储前返回错误。
     pub fn validate(&self) -> EmbeddedResult<()> {
+        if self.max_effect_records_per_operation == 0 || self.max_effect_bytes_per_operation == 0 {
+            return Err(EmbeddedError::invalid(
+                "effect retention limits must be positive",
+            ));
+        }
         if self.max_registered_pools == 0 || self.max_registered_capabilities == 0 {
             return Err(EmbeddedError::invalid(
                 "registration limits must be positive",

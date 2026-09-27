@@ -115,6 +115,8 @@ pub(super) fn pool_manager(layout: &SystemRuntimeTestLayout) -> Arc<EmbeddedPool
             max_queued_calls: 8,
             max_queued_bytes: 4096,
             max_operations: 16,
+            max_effect_records_per_operation: 16,
+            max_effect_bytes_per_operation: 8192,
             max_host_requests: 4,
             max_host_request_bytes: 4096,
             max_value_bytes: 1024,

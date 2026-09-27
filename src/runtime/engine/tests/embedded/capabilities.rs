@@ -4,6 +4,8 @@ use crate::runtime::embedded::capabilities::*;
 use crate::runtime::embedded::{EffectState, InstanceReuse};
 use std::collections::BTreeSet;
 
+mod effects;
+
 /// Return a complete capability contract for actual Lua-to-host integration tests.
 /// 返回真实 Lua 到宿主集成测试所用的完整能力契约。
 pub(super) fn descriptor(name: &str, execution: CapabilityExecution) -> CapabilityDescriptor {

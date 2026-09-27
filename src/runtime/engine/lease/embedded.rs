@@ -280,7 +280,10 @@ impl EmbeddedModule {
         let source = self.definition.source.clone();
         // Resolve exact functions only after every value contract has compiled successfully.
         // 仅在全部值契约编译成功后解析精确函数。
-        let initialization_id = self.initialization_id.clone();
+        let initialization_id = match control.operation_id()? {
+            Some(operation_id) => operation_id,
+            None => self.initialization_id.clone(),
+        };
         let exports = self.run(&context, control, &initialization_id, None, |lua| {
             // The module return shape is fixed by the declared runtime protocol.
             // 模块返回形状由声明的运行时协议固定。

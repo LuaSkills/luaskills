@@ -1,3 +1,6 @@
+use super::HostEffectRecord;
+use super::effects::{EffectLedger, merge_effects};
+use super::value_size::json_size;
 use super::{CallControl, EmbeddedError, EmbeddedErrorCode, EmbeddedResult, EmbeddedRuntimeConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -71,6 +74,9 @@ pub enum EffectState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationSnapshot {
+    /// Exact host callback evidence retained even after Lua failure, cancellation or output rejection.
+    /// 即使 Lua 失败、取消或输出被拒绝也保留的精确宿主回调证据。
+    pub host_effects: Vec<HostEffectRecord>,
     /// Opaque identifier, never a JavaScript floating-point integer.
     /// 不透明标识符，绝不使用 JavaScript 浮点整数。
     pub operation_id: String,
@@ -96,6 +102,9 @@ pub struct OperationSnapshot {
 /// State shared by one read/cancel handle and its sole execution owner.
 /// 单个读取与取消句柄和其唯一执行所有者共享的状态。
 struct Operation {
+    /// Bounded evidence shared with the original execution control.
+    /// 与原始执行控制共享的有界证据。
+    effects: Arc<EffectLedger>,
     /// Stable original deadline and cooperative cancellation flag.
     /// 稳定的原始截止时间与协作取消标记。
     control: Arc<CallControl>,
@@ -140,6 +149,8 @@ impl OperationHandle {
         // 在持有单个短时元数据锁时克隆快照数据。
         let mut snapshot = self.operation.lock()?.clone();
         snapshot.cancellation_requested = self.operation.control.is_cancelled();
+        snapshot.host_effects = self.operation.effects.snapshot()?;
+        snapshot.effects = merge_effects(snapshot.effects, &snapshot.host_effects);
         Ok(snapshot)
     }
 
@@ -193,6 +204,8 @@ impl OperationHandle {
         // 取消意图可能独立于阶段快照变化。
         let mut result = snapshot.clone();
         result.cancellation_requested = self.operation.control.is_cancelled();
+        result.host_effects = self.operation.effects.snapshot()?;
+        result.effects = merge_effects(result.effects, &result.host_effects);
         Ok(result)
     }
 }
@@ -261,17 +274,19 @@ impl OperationOwner {
         // Enforce the configured retained-result bound before mutating terminal state.
         // 在变更终态前执行配置的保留结果上限。
         let encoded = match &result {
-            Ok(value) => serde_json::to_vec(value),
-            Err(error) => serde_json::to_vec(error),
+            Ok(value) => json_size(value, self.operation.max_value_bytes),
+            Err(error) => json_size(error, self.operation.max_value_bytes),
         };
         // Protocol-limit diagnostics use fixed metadata, never echo an oversized application value.
         // 协议上限诊断使用固定元数据，绝不回显超大的应用值。
         let result = match encoded {
-            Ok(bytes) if bytes.len() <= self.operation.max_value_bytes => result,
-            Ok(_) => Err(EmbeddedError::new(
-                EmbeddedErrorCode::CapacityExceeded,
-                "operation result exceeds the configured byte limit",
-            )),
+            Ok(_) => result,
+            Err(error) if error.code == EmbeddedErrorCode::CapacityExceeded => {
+                Err(EmbeddedError::new(
+                    EmbeddedErrorCode::CapacityExceeded,
+                    "operation result exceeds the configured byte limit",
+                ))
+            }
             Err(_) => Err(EmbeddedError::new(
                 EmbeddedErrorCode::Internal,
                 "operation result serialization failed",
@@ -286,7 +301,8 @@ impl OperationOwner {
                 "operation completion requires finished execution and cleanup",
             ));
         }
-        snapshot.effects = effects;
+        snapshot.host_effects = self.operation.effects.seal()?;
+        snapshot.effects = merge_effects(effects, &snapshot.host_effects);
         match result {
             Ok(value) => {
                 snapshot.phase = OperationPhase::Succeeded;
@@ -320,6 +336,12 @@ struct OperationRegistryState {
 /// In-memory operation journal; missing records never imply that effects did not occur.
 /// 内存操作日志；记录缺失绝不表示副作用未发生。
 pub struct OperationRegistry {
+    /// Retained host effect count per operation, copied from the authoritative configuration.
+    /// 从权威配置复制的逐操作宿主副作用保留数量。
+    max_effect_records: usize,
+    /// Retained host effect metadata bytes per operation.
+    /// 逐操作宿主副作用元数据保留字节数。
+    max_effect_bytes: usize,
     /// Trusted runtime namespace used only to format opaque operation IDs.
     /// 仅用于生成不透明操作 ID 的可信运行时命名空间。
     runtime_id: String,
@@ -343,6 +365,8 @@ impl OperationRegistry {
             return Err(EmbeddedError::invalid("runtime identity must be nonempty"));
         }
         Ok(Self {
+            max_effect_records: config.max_effect_records_per_operation,
+            max_effect_bytes: config.max_effect_bytes_per_operation,
             runtime_id,
             max_operations: config.max_operations,
             max_value_bytes: config.max_value_bytes,
@@ -379,11 +403,22 @@ impl OperationRegistry {
         // Opaque strings preserve the full identity in every supported SDK.
         // 不透明字符串在所有受支持 SDK 中保留完整身份。
         let id = format!("{}:op:{sequence}", self.runtime_id);
+        // The original control can belong to exactly one registered operation for its whole lifetime.
+        // 原始控制对象在整个生命周期内只能归属于一个注册操作。
+        let effects = EffectLedger::new(
+            self.runtime_id.clone(),
+            id.clone(),
+            self.max_effect_records,
+            self.max_effect_bytes,
+        );
+        control.attach_effects(Arc::clone(&effects))?;
         // Prepare the complete record before making it discoverable.
         // 在记录可被发现前完整构造记录。
         let operation = Arc::new(Operation {
+            effects,
             control,
             snapshot: Mutex::new(OperationSnapshot {
+                host_effects: Vec::new(),
                 operation_id: id.clone(),
                 phase: OperationPhase::Queued,
                 cancellation_requested: false,
