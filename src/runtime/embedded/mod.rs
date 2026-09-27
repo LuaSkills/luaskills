@@ -9,6 +9,7 @@ mod effects;
 mod error;
 mod governor;
 mod identity;
+mod journal;
 mod module;
 mod operations;
 mod plugin_config;
@@ -34,6 +35,7 @@ pub use effects::{HostEffectPhase, HostEffectRecord};
 pub use error::{EmbeddedError, EmbeddedErrorCode, EmbeddedResult};
 pub use governor::{ExecutionPermit, PoolGovernor, PoolUsage, VmAllocationState, VmReservation};
 pub(crate) use identity::IdentityKind;
+pub use journal::{JournalOperation, OperationJournal, OperationJournalConfig};
 pub use module::{ModuleDefinition, ModuleExport, ModuleInvocation};
 pub use operations::{
     EffectState, OperationHandle, OperationOwner, OperationPhase, OperationRegistry,

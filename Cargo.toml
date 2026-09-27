@@ -58,6 +58,9 @@ libloading = "0.8"
 mlua = { version = "0.12.0-rc.1", features = ["luajit52", "vendored", "serialize", "send"] }
 notify = "8.2.0"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# Match the host's SQLite binding and bundle the engine for portable durable operation journals.
+# 对齐宿主的 SQLite 绑定并捆绑引擎，用于可移植的持久操作日志。
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "limits"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

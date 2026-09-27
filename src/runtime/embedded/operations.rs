@@ -94,12 +94,24 @@ pub struct OperationSnapshot {
     pub effects: EffectState,
     /// Successful value; absent before completion or on failure, distinct from JSON null.
     /// 成功值；完成前或失败时省略，与 JSON 空值不同。
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub value: Option<Value>,
     /// Structured terminal error; absent while execution is still in progress.
     /// 结构化终态错误；执行仍在进行时省略。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<EmbeddedError>,
+}
+
+/// Preserve an explicitly present JSON null as a successful value; missing fields use the serde default.
+/// 将显式出现的 JSON 空值保留为成功值；缺失字段使用 serde 默认值。
+fn present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
 }
 
 /// State shared by one read/cancel handle and its sole execution owner.

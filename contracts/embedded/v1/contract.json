@@ -324,7 +324,7 @@
     "type": "object"
   },
   "generator": {
-    "cargo_lock_sha256": "a611f2757f089f32f6934c885e6214a69abfcdfb1a01a0cc9423ae58d21c886b",
+    "cargo_lock_sha256": "d1828517fc69f74266263c5c66147329b4e615c417cc5a77394b4f99e9013c9c",
     "name": "luaskills/generate_embedded_contract",
     "schema_draft": "2020-12",
     "source_sha256": "f31dc521eeff41b774bddf11408f2a8dd2c1d6bb77c8650bfc3bfb7fa5e621d1",
