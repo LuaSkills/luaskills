@@ -264,6 +264,16 @@ impl EmbeddedModule {
     /// Return only after initialization resources have committed successfully.
     /// 仅在初始化资源成功提交后返回。
     pub(crate) fn initialize(&mut self, control: Arc<CallControl>) -> EmbeddedResult<()> {
+        self.initialize_for_session(control, None)
+    }
+
+    /// Initialize under `control` with an optional trusted session identity; return success after capturing exports or an error.
+    /// 在 `control` 下使用可选可信会话身份初始化；捕获导出后返回成功，否则返回错误。
+    pub(crate) fn initialize_for_session(
+        &mut self,
+        control: Arc<CallControl>,
+        session_id: Option<&str>,
+    ) -> EmbeddedResult<()> {
         // Consume contracts before execution to prevent replay after partial effects.
         // 在执行前消费契约，防止部分副作用后重放初始化。
         let contracts = self.pending_contracts.take().ok_or_else(|| {
@@ -284,7 +294,7 @@ impl EmbeddedModule {
             Some(operation_id) => operation_id,
             None => self.initialization_id.clone(),
         };
-        let exports = self.run(&context, control, &initialization_id, None, |lua| {
+        let exports = self.run(&context, control, &initialization_id, session_id, |lua| {
             // The module return shape is fixed by the declared runtime protocol.
             // 模块返回形状由声明的运行时协议固定。
             let table: Table = lua.load(&source).set_name("embedded_module").eval()?;

@@ -391,7 +391,7 @@ impl ModulePool {
     /// 在 `control` 下预留精确所有权；`pinned` 选择仅会话使用的状态。
     /// This metadata-only step cannot execute initialization or host capabilities.
     /// 此元数据步骤不能执行初始化或宿主能力。
-    fn prepare_owned(
+    pub(super) fn prepare_owned(
         self: &Arc<Self>,
         control: &CallControl,
         pinned: bool,
@@ -744,6 +744,18 @@ impl ModuleLease {
     /// The caller retains this lease across errors and panic recovery so cleanup remains observable.
     /// 调用方跨错误及 panic 恢复保留此租借，使清理持续可观察。
     pub(crate) fn initialize(&mut self, control: Arc<CallControl>) -> EmbeddedResult<()> {
+        self.initialize_for_session(control, None)
+    }
+
+    /// Initialize once under `control`, propagating the host-owned optional `session_id`.
+    /// 在 `control` 下仅初始化一次，传递宿主拥有的可选 `session_id`。
+    /// Return the original initialization failure without replaying source.
+    /// 返回原始初始化错误，不重放源码。
+    pub(super) fn initialize_for_session(
+        &mut self,
+        control: Arc<CallControl>,
+        session_id: Option<&str>,
+    ) -> EmbeddedResult<()> {
         control.check()?;
         if self.pool.lock()?.closed {
             return Err(closed());
@@ -792,7 +804,9 @@ impl ModuleLease {
             if let Some(capabilities) = &self.pool.capabilities {
                 resident.module.bind_capabilities(capabilities.clone())?;
             }
-            resident.module.initialize(control)?;
+            resident
+                .module
+                .initialize_for_session(control, session_id)?;
         }
         resident.reservation.mark_ready()?;
         if self.pool.lock()?.closed {
@@ -867,6 +881,18 @@ impl ModuleLease {
         let value = resident.module.invoke(invocation)?;
         resident.uses = next_use;
         Ok(value)
+    }
+
+    /// Return whether a pinned VM can serve another call within its declared use limit.
+    /// 返回固定 VM 是否可以在声明的使用上限内服务下一次调用。
+    pub(super) fn can_retain_session(&self) -> bool {
+        self.ready
+            && self.resident.as_ref().is_some_and(|resident| {
+                self.pool
+                    .policy
+                    .max_uses
+                    .is_none_or(|limit| resident.uses < limit)
+            })
     }
 
     /// Return immutable instance identity or a closed-handle error.

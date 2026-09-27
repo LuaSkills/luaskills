@@ -11,7 +11,11 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+mod sessions;
 mod workers;
+
+pub use sessions::{EmbeddedSessionOpening, EmbeddedSessionPhase, EmbeddedSessionSnapshot};
+use sessions::{ScheduledRequest, ScheduledSession};
 
 /// Owned structured request admitted under one original deadline.
 /// 在单个原始截止时间下接纳的拥有所有权的结构化请求。
@@ -90,7 +94,7 @@ struct ScheduledCall {
     control: Arc<CallControl>,
     /// Owned request remains charged until actual dispatch.
     /// 拥有所有权的请求在实际分发前持续计费。
-    request: EmbeddedCall,
+    request: ScheduledRequest,
     /// Exact admitted wire size from the authoritative serializer.
     /// 来自权威序列化器的精确入场线协议大小。
     bytes: usize,
@@ -99,6 +103,9 @@ struct ScheduledCall {
 /// Retained completion cannot become terminal before VM retirement and host evidence sealing.
 /// 保留的完成记录在 VM 退役与宿主证据封存前不能成为终态。
 struct PendingCompletion {
+    /// Successful session ownership remains exclusive until operation evidence is sealed.
+    /// 成功会话的所有权保持独占，直到操作证据封存。
+    session_lease: Option<Box<ModuleLease>>,
     /// Whether the sole owner has already entered cleaning, independent of execution admission.
     /// 唯一所有者是否已进入清理，独立于执行入场。
     cleaning_started: bool,
@@ -137,6 +144,9 @@ struct SchedulerState {
     /// Exact domain registrations, never resolved by mutable plugin name at execution time.
     /// 精确域注册，执行时绝不通过可变插件名重新解析。
     pools: BTreeMap<String, ScheduledPool>,
+    /// Bounded exact session identities; closed entries remain queryable until explicitly forgotten.
+    /// 有界精确会话身份；关闭条目在显式遗忘前仍可查询。
+    sessions: BTreeMap<String, ScheduledSession>,
     /// Per-plugin FIFO containers, scanned without bypassing a domain's earlier request.
     /// 逐插件先进先出容器，扫描时不越过同一域更早的请求。
     queues: BTreeMap<String, VecDeque<ScheduledCall>>,
@@ -247,6 +257,7 @@ impl EmbeddedRuntime {
                 failure: None,
                 sequence: 0,
                 pools: BTreeMap::new(),
+                sessions: BTreeMap::new(),
                 queues: BTreeMap::new(),
                 rotation: VecDeque::new(),
                 queued: 0,
@@ -319,12 +330,6 @@ impl EmbeddedRuntime {
         permissions: Arc<CapabilityPermissions>,
         revision: String,
     ) -> EmbeddedResult<String> {
-        if policy.reuse == InstanceReuse::Session {
-            return Err(EmbeddedError::new(
-                EmbeddedErrorCode::Unsupported,
-                "scheduled session ownership is not yet available",
-            ));
-        }
         let binding =
             ModuleCapabilities::new(self.center.capabilities.snapshot()?, permissions, revision)?;
         let inputs = definition
@@ -387,53 +392,18 @@ impl EmbeddedRuntime {
         json_size(&request.arguments, config.max_value_bytes)?;
         let bytes = json_size(&request, config.max_queued_bytes)?;
         let mut state = self.center.lock()?;
-        if state.closing {
-            return Err(closed());
-        }
         let pool = state.pools.get(&request.pool_id).ok_or_else(not_found)?;
-        if pool.closed {
-            return Err(closed());
-        }
-        pool.inputs
-            .get(&request.export)
-            .ok_or_else(|| EmbeddedError::invalid("module export is not declared"))?
-            .validate(&request.arguments)?;
-        if pool.queued >= pool.pool.policy().max_queued_calls
-            || state.queued >= config.max_queued_calls
-            || bytes > config.max_queued_bytes.saturating_sub(state.bytes)
-        {
-            return Err(EmbeddedError::new(
-                EmbeddedErrorCode::CapacityExceeded,
-                "embedded request queue capacity reached",
+        if pool.pool.policy().reuse == InstanceReuse::Session {
+            return Err(EmbeddedError::invalid(
+                "session pools require an explicit session",
             ));
         }
-        let plugin = pool.plugin_id.clone();
-        let (handle, owner) = self.center.operations.admit(Arc::clone(&control))?;
-        let id = handle.snapshot()?.operation_id;
-        state
-            .pools
-            .get_mut(&request.pool_id)
-            .expect("validated pool exists")
-            .queued += 1;
-        state.queued += 1;
-        state.bytes += bytes;
-        state.live.insert(id.clone(), Arc::clone(&control));
-        if !state.queues.contains_key(&plugin) {
-            state.rotation.push_back(plugin.clone());
-        }
-        state
-            .queues
-            .entry(plugin)
-            .or_default()
-            .push_back(ScheduledCall {
-                id,
-                owner,
-                control,
-                request,
-                bytes,
-            });
-        self.center.changed.notify_all();
-        Ok(handle)
+        self.center.enqueue(
+            &mut state,
+            ScheduledRequest::Invoke(request),
+            control,
+            bytes,
+        )
     }
 
     /// Query exact `id`; forgotten identities never imply execution did not happen.
@@ -469,7 +439,11 @@ impl EmbeddedRuntime {
     pub fn forget_pool(&self, id: &str) -> EmbeddedResult<()> {
         let mut state = self.center.lock()?;
         let pool = state.pools.get(id).ok_or_else(not_found)?;
-        if !pool.closed || pool.queued != 0 || pool.active != 0 || pool.pool.usage()?.resident != 0
+        if !pool.closed
+            || pool.queued != 0
+            || pool.active != 0
+            || pool.pool.usage()?.resident != 0
+            || state.sessions.values().any(|session| session.pool_id == id)
         {
             return Err(EmbeddedError::new(
                 EmbeddedErrorCode::Busy,

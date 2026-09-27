@@ -37,5 +37,8 @@ pub use operations::{
     OperationSnapshot,
 };
 pub use pool::{EmbeddedPoolManager, ModuleLease, ModulePool};
-pub use scheduler::{EmbeddedCall, EmbeddedRuntime, EmbeddedRuntimeUsage};
+pub use scheduler::{
+    EmbeddedCall, EmbeddedRuntime, EmbeddedRuntimeUsage, EmbeddedSessionOpening,
+    EmbeddedSessionPhase, EmbeddedSessionSnapshot,
+};
 pub use schema::{EMBEDDED_SCHEMA_DIALECT, JsonContract};

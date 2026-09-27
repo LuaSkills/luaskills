@@ -115,6 +115,7 @@ pub(super) fn pool_manager(layout: &SystemRuntimeTestLayout) -> Arc<EmbeddedPool
 pub(super) fn pool_config() -> EmbeddedRuntimeConfig {
     EmbeddedRuntimeConfig {
         max_registered_pools: 8,
+        max_sessions: 8,
         max_registered_capabilities: 8,
         max_resident_vms: 3,
         max_running_calls: 2,

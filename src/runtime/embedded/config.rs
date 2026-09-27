@@ -9,6 +9,9 @@ pub struct EmbeddedRuntimeConfig {
     /// Maximum concurrently registered pool declarations, including draining generations.
     /// 同时注册的池声明数量上限，包含正在排空的代次。
     pub max_registered_pools: usize,
+    /// Maximum retained session identities, including closed sessions awaiting explicit removal.
+    /// 保留会话身份的数量上限，包含等待显式移除的已关闭会话。
+    pub max_sessions: usize,
     /// Maximum retained capability registrations, including draining or unforgotten retired entries.
     /// 能力注册保留上限，包含正在排空或尚未遗忘的已退役条目。
     pub max_registered_capabilities: usize,
@@ -57,7 +60,10 @@ impl EmbeddedRuntimeConfig {
                 "effect retention limits must be positive",
             ));
         }
-        if self.max_registered_pools == 0 || self.max_registered_capabilities == 0 {
+        if self.max_registered_pools == 0
+            || self.max_registered_capabilities == 0
+            || self.max_sessions == 0
+        {
             return Err(EmbeddedError::invalid(
                 "registration limits must be positive",
             ));

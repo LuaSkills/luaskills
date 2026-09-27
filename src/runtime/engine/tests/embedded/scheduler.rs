@@ -4,6 +4,8 @@ use crate::runtime::embedded::capabilities::*;
 use crate::runtime::embedded::*;
 use std::collections::BTreeSet;
 
+mod sessions;
+
 /// Build the real formal runtime with explicit fixture `config` and package trust roots.
 /// 使用显式夹具 `config` 与包信任根构造真实正式运行时。
 fn runtime(layout: &SystemRuntimeTestLayout, config: EmbeddedRuntimeConfig) -> EmbeddedRuntime {

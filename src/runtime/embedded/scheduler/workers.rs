@@ -28,9 +28,16 @@ fn take_call(state: &mut SchedulerState, plugin: &str, index: usize) -> Schedule
     state.bytes -= call.bytes;
     state
         .pools
-        .get_mut(&call.request.pool_id)
+        .get_mut(call.request.pool_id())
         .expect("queued pool is retained")
         .queued -= 1;
+    if let Some(id) = call.request.session_id() {
+        state
+            .sessions
+            .get_mut(id)
+            .expect("queued session exists")
+            .queued -= 1;
+    }
     call
 }
 
@@ -48,49 +55,76 @@ fn select(state: &mut SchedulerState) -> EmbeddedResult<Option<Dispatch>> {
             .get(plugin)
             .expect("rotation references a live queue");
         for (index, call) in queue.iter().enumerate() {
-            if !visited.insert(call.request.pool_id.clone()) {
+            // Different sessions may progress independently; each session and ordinary domain stays FIFO.
+            // 不同会话可以独立推进；每个会话与普通域内部仍保持先进先出。
+            if !visited.insert((
+                call.request.pool_id().to_owned(),
+                call.request.session_id().map(str::to_owned),
+            )) {
                 continue;
             }
             let pool = state
                 .pools
-                .get(&call.request.pool_id)
+                .get(call.request.pool_id())
                 .expect("queued pool is retained");
-            if pool.closed || call.control.check().is_err() {
-                continue;
-            }
-            if pool.active >= pool.pool.policy().max_running_calls {
-                continue;
-            }
-            let prepared = pool.pool.prepare(&call.control);
-            if matches!(&prepared, Err(error) if error.code == EmbeddedErrorCode::CapacityExceeded)
+            if pool.closed
+                || call.control.check().is_err()
+                || pool.active >= pool.pool.policy().max_running_calls
             {
-                // A warm plugin must not starve the next cold plugin by continuously reclaiming its own idle VM.
-                // 已预热插件不能不断重用自身空闲 VM，饿死下一个尚未预热的插件。
-                if !reclaimed {
-                    for candidate in state.pools.values() {
-                        if candidate.pool.retire_idle_for_pressure()? {
-                            reclaimed = true;
-                            break;
+                continue;
+            }
+            let prepared = if let Some(id) = call.request.session_id() {
+                let session = state.sessions.get(id).expect("queued session is retained");
+                if session.closing || session.active.is_some() {
+                    continue;
+                }
+                // Session capacity was reserved at creation; its exact lease is moved only after queue removal.
+                // 会话容量已在创建时预留；仅在移除队列后转移其精确租借。
+                None
+            } else {
+                let prepared = pool.pool.prepare(&call.control);
+                if matches!(&prepared, Err(error) if error.code == EmbeddedErrorCode::CapacityExceeded)
+                {
+                    if !reclaimed {
+                        for candidate in state.pools.values() {
+                            if candidate.pool.retire_idle_for_pressure()? {
+                                reclaimed = true;
+                                break;
+                            }
                         }
                     }
+                    continue;
                 }
-                continue;
-            }
-            // Move the selected plugin behind the others before removing an empty queue.
-            // 在移除空队列前，将选定插件移动到其他插件之后。
+                Some(prepared)
+            };
             state.rotation.rotate_left(rotation_index + 1);
             let call = take_call(state, plugin, index);
-            return Ok(Some(match prepared {
-                Ok(lease) => {
-                    state
-                        .pools
-                        .get_mut(&call.request.pool_id)
-                        .expect("prepared pool exists")
-                        .active += 1;
-                    Dispatch::Ready(call, Box::new(lease))
+            let lease = match prepared {
+                Some(Ok(lease)) => Box::new(lease),
+                Some(Err(error)) => return Ok(Some(Dispatch::Rejected(call, error))),
+                None => {
+                    let session = state
+                        .sessions
+                        .get_mut(
+                            call.request
+                                .session_id()
+                                .expect("session dispatch has identity"),
+                        )
+                        .expect("selected session is retained");
+                    let lease = session
+                        .lease
+                        .take()
+                        .ok_or_else(|| internal("idle session lost its lease"))?;
+                    session.active = Some(call.id.clone());
+                    lease
                 }
-                Err(error) => Dispatch::Rejected(call, error),
-            }));
+            };
+            state
+                .pools
+                .get_mut(call.request.pool_id())
+                .expect("prepared pool exists")
+                .active += 1;
+            return Ok(Some(Dispatch::Ready(call, lease)));
         }
     }
     Ok(None)
@@ -103,27 +137,31 @@ fn invoke(
     mut lease: ModuleLease,
     max_value_bytes: usize,
 ) -> PendingCompletion {
-    // The same control covers initialization, Lua execution and nested host requests.
-    // 同一控制覆盖初始化、Lua 执行及嵌套宿主请求。
+    // Execution keeps the exact session VM and original control across initialization and host calls.
+    // 执行在初始化与宿主调用之间保留精确会话 VM 与原始控制。
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         call.owner.advance(OperationPhase::Initializing)?;
-        lease.initialize(Arc::clone(&call.control))?;
-        call.owner.advance(OperationPhase::Running)?;
-        lease.invoke(ModuleInvocation {
-            operation_id: &call.id,
-            session_id: None,
-            export: &call.request.export,
-            arguments: &call.request.arguments,
-            context: &call.request.context,
-            control: Arc::clone(&call.control),
-        })
+        lease.initialize_for_session(Arc::clone(&call.control), call.request.session_id())?;
+        if let Some(request) = call.request.invocation() {
+            call.owner.advance(OperationPhase::Running)?;
+            lease.invoke(ModuleInvocation {
+                operation_id: &call.id,
+                session_id: call.request.session_id(),
+                export: &request.export,
+                arguments: &request.arguments,
+                context: &request.context,
+                control: Arc::clone(&call.control),
+            })
+        } else {
+            Ok(
+                serde_json::json!({ "session_id": call.request.session_id().expect("creation has identity") }),
+            )
+        }
     }));
     let mut result = match outcome {
         Ok(result) => result,
         Err(_) => Err(internal("embedded invocation panicked")),
     };
-    // Bound retained output before asynchronous cleanup can keep it alive indefinitely.
-    // 在异步清理可能无限保留输出前约束其大小。
     let retained_size = match &result {
         Ok(value) => json_size(value, max_value_bytes),
         Err(error) => json_size(error, max_value_bytes),
@@ -131,27 +169,32 @@ fn invoke(
     if let Err(error) = retained_size {
         result = Err(error);
     }
-    // An uncertain or failed call always retires its instance before operation completion.
-    // 不确定或失败调用始终先退役实例，再完成操作。
-    if result.is_err() {
-        lease.close();
-    }
-    let release = lease.finish();
-    let (retirement, result, effects) = match release {
-        Ok(ModuleRelease::Retiring(receipt)) => (Some(receipt), result, EffectState::Unknown),
-        Ok(ModuleRelease::ReturnedToPool) => (None, result, EffectState::Unknown),
-        Ok(ModuleRelease::NoInstance) => (None, result, EffectState::NotStarted),
-        Err(error) => (None, Err(error), EffectState::Unknown),
+    // A successful pinned lease stays exclusive through operation evidence sealing.
+    // 成功的固定租借在操作证据封存前保持独占。
+    let keep_session =
+        call.request.session_id().is_some() && result.is_ok() && lease.can_retain_session();
+    let (session_lease, retirement, result, effects) = if keep_session {
+        (Some(Box::new(lease)), None, result, EffectState::Unknown)
+    } else {
+        if result.is_err() {
+            lease.close();
+        }
+        match lease.finish() {
+            Ok(ModuleRelease::Retiring(receipt)) => {
+                (None, Some(receipt), result, EffectState::Unknown)
+            }
+            Ok(ModuleRelease::ReturnedToPool) => (None, None, result, EffectState::Unknown),
+            Ok(ModuleRelease::NoInstance) => (None, None, result, EffectState::NotStarted),
+            Err(error) => (None, None, Err(error), EffectState::Unknown),
+        }
     };
-    // Cleanup retains identities and outcomes, not unused application inputs or context copies.
-    // 清理保留身份与结果，不保留不再使用的应用输入或上下文副本。
-    call.request.arguments = Value::Null;
-    call.request.context = LuaInvocationContext::default();
+    call.request.release_values();
     PendingCompletion {
         call,
         result,
         retirement,
         effects,
+        session_lease,
         dispatched: true,
         cleaning_started: false,
     }
@@ -182,6 +225,7 @@ pub(super) fn execute(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
                 invoke(call, *lease, center.pools.config().max_value_bytes)
             }
             Dispatch::Rejected(call, error) => PendingCompletion {
+                session_lease: None,
                 call,
                 result: Err(error),
                 retirement: None,
@@ -194,6 +238,20 @@ pub(super) fn execute(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
         completion.cleaning_started = true;
         {
             let mut state = center.lock()?;
+            if completion.session_lease.is_none()
+                && let Some(id) = completion.call.request.session_id()
+            {
+                // Stop admission immediately when this VM cannot be retained, even if teardown blocks.
+                // 此 VM 无法保留时立即停止入场，即使清理阻塞。
+                let session = state
+                    .sessions
+                    .get_mut(id)
+                    .expect("dispatched session retained");
+                session.closing = true;
+                if let Err(error) = &completion.result {
+                    session.error.get_or_insert_with(|| error.clone());
+                }
+            }
             state.cleaning_count += 1;
             state.cleaning.push(completion);
         }
@@ -214,9 +272,16 @@ fn reject_expired(state: &mut SchedulerState) {
                     if state.closing
                         || state
                             .pools
-                            .get(&call.request.pool_id)
+                            .get(call.request.pool_id())
                             .expect("queued pool exists")
-                            .closed =>
+                            .closed
+                        || call.request.session_id().is_some_and(|id| {
+                            state
+                                .sessions
+                                .get(id)
+                                .expect("queued session exists")
+                                .closing
+                        }) =>
                 {
                     Some(closed())
                 }
@@ -224,8 +289,21 @@ fn reject_expired(state: &mut SchedulerState) {
             };
             if let Some(error) = error {
                 let call = take_call(state, &plugin, index);
+                let session_lease =
+                    if let ScheduledRequest::OpenSession { session_id, .. } = &call.request {
+                        let session = state
+                            .sessions
+                            .get_mut(session_id)
+                            .expect("opening session exists");
+                        session.closing = true;
+                        session.error.get_or_insert_with(|| error.clone());
+                        session.lease.take()
+                    } else {
+                        None
+                    };
                 state.cleaning_count += 1;
                 state.cleaning.push(PendingCompletion {
+                    session_lease,
                     call,
                     result: Err(error),
                     retirement: None,
@@ -246,6 +324,45 @@ fn complete(
     center: &SchedulerCenter,
     mut completion: PendingCompletion,
 ) -> Option<PendingCompletion> {
+    // Serialize readiness publication with close requests, without destroying a VM under this lock.
+    // 使就绪发布与关闭请求串行化，且不在此锁下销毁 VM。
+    let mut state = match center.lock() {
+        Ok(state) => state,
+        Err(error) => {
+            center.fail(error);
+            return Some(completion);
+        }
+    };
+    if let Some(session_id) = completion.call.request.session_id() {
+        let must_close = state.closing
+            || state
+                .pools
+                .get(completion.call.request.pool_id())
+                .expect("active pool exists")
+                .closed
+            || state
+                .sessions
+                .get(session_id)
+                .expect("active session exists")
+                .closing;
+        if must_close && let Some(lease) = completion.session_lease.take() {
+            state
+                .sessions
+                .get_mut(session_id)
+                .expect("active session exists")
+                .closing = true;
+            drop(state);
+            match lease.finish() {
+                Ok(ModuleRelease::Retiring(receipt)) => completion.retirement = Some(receipt),
+                Ok(ModuleRelease::NoInstance) => {}
+                Ok(ModuleRelease::ReturnedToPool) => {
+                    center.fail(internal("session VM returned to ordinary reuse"))
+                }
+                Err(error) => center.fail(error),
+            }
+            return Some(completion);
+        }
+    }
     if let Some(retirement) = &completion.retirement {
         match retirement.snapshot() {
             Ok(snapshot) if snapshot.phase != ModuleRetirementPhase::Completed => {
@@ -253,15 +370,15 @@ fn complete(
             }
             Ok(_) => {}
             Err(error) => {
+                drop(state);
                 center.fail(error);
                 return Some(completion);
             }
         }
     }
-    // The unique owner may still be queued when the supervisor rejected an undispatched request.
-    // 监督器拒绝未分发请求时，唯一所有者仍可能处于排队阶段。
     if !completion.cleaning_started {
         if let Err(error) = completion.call.owner.advance(OperationPhase::Cleaning) {
+            drop(state);
             center.fail(error);
             return Some(completion);
         }
@@ -272,27 +389,48 @@ fn complete(
         .owner
         .complete(completion.result.clone(), completion.effects)
     {
-        Ok(()) => match center.lock() {
-            Ok(mut state) => {
-                state.live.remove(&completion.call.id);
-                state.cleaning_count -= 1;
+        Ok(()) => {
+            state.live.remove(&completion.call.id);
+            state.cleaning_count -= 1;
+            if completion.dispatched {
+                state
+                    .pools
+                    .get_mut(completion.call.request.pool_id())
+                    .expect("active pool retained")
+                    .active -= 1;
+            }
+            if let Some(session_id) = completion.call.request.session_id() {
+                let session = state
+                    .sessions
+                    .get_mut(session_id)
+                    .expect("unfinished session retained");
+                session.unfinished -= 1;
                 if completion.dispatched {
-                    state
-                        .pools
-                        .get_mut(&completion.call.request.pool_id)
-                        .expect("active pool is retained")
-                        .active -= 1;
+                    session.active = None;
+                    if let Some(lease) = completion.session_lease.take() {
+                        session.lease = Some(lease);
+                        session.opened = true;
+                    } else {
+                        session.closing = true;
+                    }
+                } else if matches!(
+                    completion.call.request,
+                    ScheduledRequest::OpenSession { .. }
+                ) {
+                    session.closing = true;
                 }
-                center.changed.notify_all();
-                None
+                if session.closing
+                    && let Err(error) = &completion.result
+                {
+                    session.error.get_or_insert_with(|| error.clone());
+                }
             }
-            Err(error) => {
-                center.fail(error);
-                Some(completion)
-            }
-        },
+            center.changed.notify_all();
+            None
+        }
         Err(error) if error.code == EmbeddedErrorCode::Busy => Some(completion),
         Err(error) => {
+            drop(state);
             center.fail(error);
             Some(completion)
         }
@@ -303,6 +441,7 @@ fn complete(
 /// 在全部执行器可能阻塞于宿主回调时监督取消与完成。
 pub(super) fn supervise(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
     loop {
+        sessions::maintain(center)?;
         // Metadata snapshots avoid running pool maintenance under the scheduler lock.
         // 元数据快照避免在调度锁下运行池维护。
         let pools = center
@@ -325,7 +464,10 @@ pub(super) fn supervise(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
             .collect::<Vec<_>>();
         let mut state = center.lock()?;
         state.cleaning.extend(pending);
-        if state.closing && state.live.is_empty() {
+        if state.closing
+            && state.live.is_empty()
+            && state.sessions.values().all(|session| session.closed)
+        {
             drop(state);
             center.pools.request_close()?;
             if center.capabilities.close_and_poll()? {
