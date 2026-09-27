@@ -4,6 +4,7 @@ use super::*;
 /// 可观察的固定会话生命周期；正在关闭绝不表示其 VM 已销毁。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub enum EmbeddedSessionPhase {
     /// Creation is queued, initializing, or publishing its operation result.
     /// 创建正在排队、初始化或发布操作结果。
@@ -25,6 +26,7 @@ pub enum EmbeddedSessionPhase {
 /// Bounded retained session observation with immutable pool ownership.
 /// 具有不可变池归属的有界保留会话观测。
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct EmbeddedSessionSnapshot {
     /// Runtime-issued opaque identity, never reused after forgetting.
     /// 运行时签发的不透明身份，遗忘后绝不复用。

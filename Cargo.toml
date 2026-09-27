@@ -27,6 +27,16 @@ include = [
 [lib]
 crate-type = ["rlib", "cdylib", "staticlib"]
 
+[features]
+# Generate offline embedded contracts from the exact Rust serialization types only when requested.
+# 仅在显式请求时，从精确 Rust 序列化类型生成离线嵌入式契约。
+contract-generation = ["dep:schemars"]
+
+[[bin]]
+name = "generate_embedded_contract"
+path = "src/bin/generate_embedded_contract.rs"
+required-features = ["contract-generation"]
+
 [dependencies]
 base64 = "0.22"
 encoding_rs = "0.8"
@@ -45,6 +55,9 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Pin the offline schema generator so regenerated SDK contracts remain reproducible.
+# 固定离线 Schema 生成器，使重新生成的 SDK 契约保持可复现。
+schemars = { version = "=1.2.2", optional = true }
 serde_yaml = "0.9"
 sha2 = "0.10"
 tar = "0.4.46"

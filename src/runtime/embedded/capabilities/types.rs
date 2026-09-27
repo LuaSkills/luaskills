@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 /// 宿主执行传输，在能力发布前显式选择。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub enum CapabilityExecution {
     /// Short cooperative Rust callback executed on the owning VM thread.
     /// 在所属 VM 线程执行的短时协作 Rust 回调。
@@ -25,6 +26,7 @@ pub enum CapabilityExecution {
 /// 声明的副作用类别；它不会使外部变更自动具有事务性。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub enum CapabilityEffects {
     /// Host contract promises no externally visible mutation.
     /// 宿主契约承诺不产生外部可见变更。
@@ -38,6 +40,7 @@ pub enum CapabilityEffects {
 /// 显式副作用去重支持，绝不从操作标识推断。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub enum CapabilityIdempotency {
     /// Automatic replay is forbidden; an uncertain result needs host reconciliation.
     /// 禁止自动重放；不确定结果需要宿主对账。
@@ -51,6 +54,7 @@ pub enum CapabilityIdempotency {
 /// 可信调用方必须具备的作用域，独立于 Lua 业务参数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub enum CapabilityScope {
     /// Available during an ordinary operation or session invocation.
     /// 在普通操作或会话调用期间可用。
@@ -64,6 +68,7 @@ pub enum CapabilityScope {
 /// Rust、生成契约与 SDK 共享的不可变能力声明。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct CapabilityDescriptor {
     /// Exact namespaced name; discovery exposes only authorized declarations.
     /// 精确命名空间名称；发现操作仅暴露已授权声明。
@@ -164,6 +169,7 @@ impl CapabilityDescriptor {
 /// 在插件可控参数之外复制的宿主认证调用方数据。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct CapabilityCaller {
     /// Runtime namespace that owns the registration and operation.
     /// 拥有注册及操作的运行时命名空间。

@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 /// 单个宿主侧运行时后端所使用的数据库访问模式。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub enum LuaRuntimeDatabaseProviderMode {
     /// The library loads and calls the local dynamic-library backend directly.
     /// 由库直接加载并调用本地动态库后端。
@@ -27,6 +28,7 @@ pub enum LuaRuntimeDatabaseProviderMode {
 /// 当数据库 provider 模式为 `host_callback` 时所使用的回调传输模式。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub enum LuaRuntimeDatabaseCallbackMode {
     /// The library uses the structured standard callback ABI.
     /// 由库使用结构化标准回调 ABI。

@@ -24,6 +24,7 @@ use sessions::{ScheduledRequest, ScheduledSession};
 /// 在单个原始截止时间下接纳的拥有所有权的结构化请求。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct EmbeddedCall {
     /// Exact immutable pool identity returned by this runtime.
     /// 此运行时返回的精确不可变池身份。
@@ -42,6 +43,7 @@ pub struct EmbeddedCall {
 /// Live scheduler observations; queue bytes exclude already-dispatched request values.
 /// 实时调度观测；队列字节不包含已分发的请求值。
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct EmbeddedRuntimeUsage {
     /// Requests waiting for actual resource admission.
     /// 等待实际资源入场的请求。

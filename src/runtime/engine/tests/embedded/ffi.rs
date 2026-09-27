@@ -44,7 +44,13 @@ fn root_request(transport_id: u64, command: Value) -> Result<Value, i32> {
         luaskills_ffi_embedded_result_free_v1(transport_id, result),
         0
     );
-    Ok(json.unwrap())
+    let json = json.unwrap();
+    #[cfg(feature = "contract-generation")]
+    crate::ffi_embedded::contract::tests::assert_exchange(
+        &serde_json::from_slice(&bytes).unwrap(),
+        &json,
+    );
+    Ok(json)
 }
 
 impl Client {

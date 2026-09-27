@@ -66,6 +66,7 @@ pub struct FfiEmbeddedTransportConfigV1 {
 /// Validated native-sized transport configuration, copied once from the host declaration.
 /// 从宿主声明一次性复制的已校验原生大小传输配置。
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub(super) struct TransportConfig {
     /// Maximum retained runtime identities.
     /// 保留运行时身份数量上限。

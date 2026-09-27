@@ -1,0 +1,4 @@
+# Keep published contract bytes identical on Windows and Unix checkouts.
+# 使发布契约字节在 Windows 和 Unix 检出中保持一致。
+contract.json text eol=lf
+contract.sha256 text eol=lf

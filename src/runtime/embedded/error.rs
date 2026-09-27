@@ -5,6 +5,7 @@ use std::fmt;
 /// Rust 与版本化 FFI 协议共享的稳定机器可读错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub enum EmbeddedErrorCode {
     /// The supplied configuration or request violates its declared contract.
     /// 提供的配置或请求违反其声明的契约。
@@ -54,6 +55,7 @@ pub enum EmbeddedErrorCode {
 /// 结构化错误；`code` 稳定，`message` 为英文诊断信息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct EmbeddedError {
     /// Stable classification consumed by SDKs instead of parsing text.
     /// 供 SDK 使用的稳定分类，避免解析文案。

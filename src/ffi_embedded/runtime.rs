@@ -15,6 +15,7 @@ mod tests;
 /// 初始化所有权独立于核心的执行及关闭状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub(super) enum InitializationPhase {
     /// A known identity exists but no engine or worker has been constructed.
     /// 已存在已知身份，但尚未构造引擎或工作线程。
@@ -81,6 +82,7 @@ pub(super) struct RuntimeLease {
 /// Queryable construction and core closure evidence; no runtime implementation state is inferred by SDKs.
 /// 可查询构造与核心关闭证据；SDK 不推断运行时实现状态。
 #[derive(Serialize)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub(super) struct RuntimeSnapshot {
     /// Exact FFI slot identity used by every control command.
     /// 每个控制命令使用的精确 FFI 槽身份。

@@ -22,6 +22,7 @@ pub const DEFAULT_TOOL_CACHE_MAX_TTL_SECS: u64 = 30 * 60;
 /// Runtime configuration for the shared tool cache, controlling capacity and expiration behavior.
 /// 共享工具缓存的运行时配置，控制容量与过期策略。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct ToolCacheConfig {
     /// Maximum number of entries; oldest entries are evicted when the cache exceeds this size.
     /// 缓存最大条目数，超出后会按创建顺序淘汰最旧条目。

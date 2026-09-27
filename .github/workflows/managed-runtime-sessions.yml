@@ -178,11 +178,25 @@ jobs:
 
       - name: Verify lints
         shell: pwsh
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -j 4 -- -D warnings
+
+      # Derive and validate the same offline contract on all five actual target platforms.
+      # 在全部五个实际目标平台上派生并校验相同离线契约。
+      - name: Verify embedded contract artifact
+        shell: pwsh
+        run: cargo run --locked --features contract-generation --bin generate_embedded_contract -j 4 -- --check
+
+      - name: Verify embedded contract lints
+        shell: pwsh
+        run: cargo clippy --locked --all-targets --features contract-generation -j 4 -- -D warnings
+
+      - name: Verify embedded contract against actual native execution
+        shell: pwsh
+        run: cargo test --locked --features contract-generation --lib embedded_ -j 4 -- --test-threads=1
 
       - name: Run native managed-session acceptance suite
         shell: pwsh
-        run: cargo test --all-targets -- --test-threads=1
+        run: cargo test --locked --all-targets -j 4 -- --test-threads=1
 
   ffi-examples:
     name: FFI examples on Python 3.14 and Node 24

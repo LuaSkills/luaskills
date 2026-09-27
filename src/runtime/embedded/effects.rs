@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 /// 真实处理器生命周期，独立于其报告的业务副作用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub enum HostEffectPhase {
     /// Retention reserved before execution.
     /// 执行前已预留保留容量。
@@ -24,6 +25,7 @@ pub enum HostEffectPhase {
 /// 独立于返回 Lua 的值保留的有界证据。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct HostEffectRecord {
     /// Never-reused identity within the original operation.
     /// 原始操作内绝不复用的身份。

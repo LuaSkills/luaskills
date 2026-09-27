@@ -15,7 +15,10 @@ fn exchange(id: u64, bytes: &[u8]) -> Result<Value, i32> {
     let envelope =
         serde_json::from_slice(unsafe { std::slice::from_raw_parts(result.ptr, result.len) });
     assert_eq!(luaskills_ffi_embedded_result_free_v1(id, result), 0);
-    Ok(envelope.unwrap())
+    let envelope = envelope.unwrap();
+    #[cfg(feature = "contract-generation")]
+    contract::tests::assert_exchange(&serde_json::from_slice(bytes).unwrap(), &envelope);
+    Ok(envelope)
 }
 
 /// Submit a structured root command while preserving native and business failures as separate results.

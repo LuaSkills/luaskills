@@ -4,6 +4,7 @@ use serde_json::Value;
 /// Generic host-side client identity information passed into the LuaSkills runtime.
 /// 传入 LuaSkills 运行时的通用宿主客户端身份信息。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct RuntimeClientInfo {
     /// Stable host-defined client kind, such as `mcp`, `ide`, or `desktop`.
     /// 宿主定义的稳定客户端类型，例如 `mcp`、`ide` 或 `desktop`。
@@ -22,6 +23,7 @@ pub struct RuntimeClientInfo {
 /// Generic request-scoped context injected by the host into one runtime invocation.
 /// 宿主在单次运行时调用中注入的通用请求级上下文。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct RuntimeRequestContext {
     /// Optional host-defined request identifier for audit and cost attribution.
     /// 可选的宿主请求标识符，用于审计和成本归因。

@@ -100,6 +100,7 @@ impl LuaRuntimeLayout {
 /// 运行时自动拉起本地空间控制器进程时使用的进程模式。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub enum LuaRuntimeSpaceControllerProcessMode {
     /// Service mode keeps the controller process alive until an external stop happens.
     /// Service 模式会让控制器进程持续存活，直到外部显式停止。
@@ -113,6 +114,7 @@ pub enum LuaRuntimeSpaceControllerProcessMode {
 /// Host-provided controller client options used when one database backend chooses `space_controller`.
 /// 当数据库后端选择 `space_controller` 时使用的宿主侧控制器客户端选项。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct LuaRuntimeSpaceControllerOptions {
     /// Optional explicit controller endpoint; when omitted the shared default endpoint is used.
     /// 可选的显式控制器端点；缺失时使用共享默认端点。
@@ -172,6 +174,7 @@ impl Default for LuaRuntimeSpaceControllerOptions {
 /// Host-controlled toggles for optional Lua-exposed runtime bridges.
 /// 宿主控制的可选 Lua 暴露运行时桥接开关集合。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct LuaRuntimeCapabilityOptions {
     /// Whether `vulcan.runtime.skills.*` management bridges are exposed to Lua.
     /// 是否将 `vulcan.runtime.skills.*` 管理桥接暴露给 Lua。
@@ -196,6 +199,7 @@ impl Default for LuaRuntimeCapabilityOptions {
 /// One named skill root injected by the host, used to build ordered override environments.
 /// 由宿主注入的单个命名技能根，用于构建有序覆盖环境。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct RuntimeSkillRoot {
     /// Stable root name, limited to ROOT, PROJECT, or USER.
     /// 稳定根名称，仅限 ROOT、PROJECT 或 USER。
@@ -208,6 +212,7 @@ pub struct RuntimeSkillRoot {
 /// Host-provided pool configuration for isolated runlua VMs.
 /// 宿主提供的隔离 runlua 虚拟机池配置。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct LuaRuntimeRunLuaPoolConfig {
     /// Minimum number of isolated runlua VMs kept warm.
     /// 隔离 runlua 虚拟机需要常驻保温的最小数量。
@@ -240,6 +245,7 @@ pub const DEFAULT_MANAGED_RUNTIME_PERSISTENT_SESSION_BUFFER_LIMIT_BYTES_PER_STRE
 /// Host-selected resource policy for managed Python and Node workers and persistent sessions.
 /// 宿主为受管 Python 与 Node Worker 及持久会话选择的资源策略。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct LuaRuntimeManagedRuntimeConfig {
     /// Maximum live workers for one exact environment and package-owner pool key.
     /// 单个精确环境与包所有者池键允许的最大活动 Worker 数量。
@@ -321,6 +327,7 @@ impl LuaRuntimeManagedRuntimeConfig {
 /// Host-provided filesystem and runtime paths consumed by the LuaSkills library.
 /// 宿主提供给 LuaSkills 库消费的文件系统与运行时路径集合。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct LuaRuntimeHostOptions {
     /// Optional canonical LuaSkills runtime root used to derive the fixed runtime layout.
     /// 用于推导固定运行时布局的可选规范 LuaSkills 运行时根目录。
@@ -503,6 +510,7 @@ impl LuaRuntimeHostOptions {
 /// Host-injected invocation context delivered alongside one skill or runlua call.
 /// 宿主在单次 skill 或 runlua 调用时一并注入的调用上下文。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct LuaInvocationContext {
     /// Optional transport/request metadata preserved for Lua consumption.
     /// 供 Lua 消费的可选传输层/请求层元数据。

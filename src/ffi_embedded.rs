@@ -4,9 +4,14 @@
 mod commands;
 mod control;
 mod protocol;
+mod responses;
 mod runtime;
 mod transport;
 mod types;
+mod wire;
+
+#[cfg(feature = "contract-generation")]
+pub mod contract;
 
 #[cfg(test)]
 mod tests;

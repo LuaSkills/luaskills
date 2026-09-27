@@ -23,6 +23,7 @@ pub(super) struct ScheduledPlugin {
 /// Plugin-wide observation from exact immutable pool ownership, including draining generations.
 /// 根据精确不可变池归属形成的插件级观测，包含正在排空的代次。
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct EmbeddedPluginSnapshot {
     /// Trusted host plugin identity used by module definitions and fair scheduling.
     /// 模块定义与公平调度使用的可信宿主插件身份。

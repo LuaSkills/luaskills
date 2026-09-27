@@ -27,6 +27,7 @@ pub enum VmAllocationState {
 /// Current counters for one governor or one execution group.
 /// 单个治理器或执行分组的当前计数。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct PoolUsage {
     /// All allocated slots, including creating and retiring instances.
     /// 全部分配槽位，包含正在创建与退役的实例。

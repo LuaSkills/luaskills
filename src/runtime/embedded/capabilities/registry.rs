@@ -66,6 +66,7 @@ pub struct CapabilityRegistrationRequest {
 /// 精确注册的可观察生命周期，包含注销后仍在排空的调用。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct CapabilityRegistrationStatus {
     /// Opaque identity, never a lossy language number.
     /// 不透明身份，绝不使用有精度损失的语言数值。

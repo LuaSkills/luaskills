@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 /// 一个插件的全部代次与执行域共享的不可变宿主批准聚合预算。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct EmbeddedPluginConfig {
     /// Maximum retained pool identities, including closed generations awaiting explicit removal.
     /// 保留池身份的数量上限，包含等待显式移除的已关闭代次。

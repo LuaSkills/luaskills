@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 /// 显式父级预算；宿主在构造前一次性解析默认值。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct EmbeddedRuntimeConfig {
     /// Maximum retained plugin registrations, including closed entries awaiting explicit removal.
     /// 保留插件注册的数量上限，包含等待显式移除的已关闭条目。
@@ -117,6 +118,7 @@ impl EmbeddedRuntimeConfig {
 /// 容量归属，与实例复用及顺序要求相互独立。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub enum PoolKind {
     /// Capacity shared across independently keyed plugin instances.
     /// 在具有独立匹配键的插件实例之间共享容量。
@@ -130,6 +132,7 @@ pub enum PoolKind {
 /// 由已校验插件契约选择的显式模块状态寿命。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub enum InstanceReuse {
     /// Destroy the instance after one invocation.
     /// 一次调用后销毁实例。
@@ -146,6 +149,7 @@ pub enum InstanceReuse {
 /// 声明的执行后端；不可用的取值直接拒绝，不降级。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub enum ExecutionBackend {
     /// Execute in owned Lua VMs inside the current host process.
     /// 在当前宿主进程内的受管 Lua VM 中执行。
@@ -159,6 +163,7 @@ pub enum ExecutionBackend {
 /// 单个宿主分配的插件执行分组的不可变容量策略。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct PluginPoolConfig {
     /// Shared or dedicated ownership of resident capacity.
     /// 常驻容量的公共或专用归属。

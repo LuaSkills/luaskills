@@ -9,6 +9,7 @@ use std::sync::Arc;
 /// 模块激活时提供的不可变源码与可信路径声明。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct ModuleDefinition {
     /// Host-assigned stable plugin identity.
     /// 宿主分配的稳定插件身份。
@@ -46,6 +47,7 @@ pub struct ModuleDefinition {
 /// 具有显式输入及输出 Schema 的单个具名导出。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct ModuleExport {
     /// Exact Lua table key captured when the module is loaded.
     /// 模块加载时捕获的精确 Lua 表键。

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 /// 执行阶段；取消意图与实际终止分开报告。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub enum OperationPhase {
     /// Accepted and waiting for resource admission.
     /// 已接纳且正在等待资源入场。
@@ -51,6 +52,7 @@ impl OperationPhase {
 /// 宿主报告的副作用结果，独立于执行成功或取消。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub enum EffectState {
     /// No business execution has started.
     /// 尚未开始业务执行。
@@ -73,6 +75,7 @@ pub enum EffectState {
 /// 适合直接序列化给各 SDK 的有界操作快照。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct OperationSnapshot {
     /// Exact host callback evidence retained even after Lua failure, cancellation or output rejection.
     /// 即使 Lua 失败、取消或输出被拒绝也保留的精确宿主回调证据。

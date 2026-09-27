@@ -12,6 +12,7 @@ use std::collections::BTreeSet;
 /// 一个已初始化运行时的类型化命令；每个身份始终绑定该运行时。
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub(super) enum RuntimeCommand {
     /// Register aggregate plugin budgets.
     /// 注册插件聚合预算。
@@ -295,6 +296,7 @@ impl RuntimeCommand {
 /// 严格宿主完成形状匹配 CapabilityOutcome::to_json，保留成功 JSON 空值。
 #[derive(Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub(super) enum HostCompletion {
     /// Exactly the success shape; ok must be true and value remains required even when null.
     /// 精确成功形状；ok 必须为真，value 即使为空值也必须存在。

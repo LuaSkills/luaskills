@@ -103,6 +103,12 @@ FFI 仅接受显式 `queued` 能力。包含 `native` 的整个注册批次在�
 
 若有效配置使某类诊断或结果超出响应预算，查询明确报容量不足，不截断 JSON 或丢弃核心记录；接入方应根据实际最大快照和业务值选择传输预算。容量测试故意使用过小预算，只用于证明入场拒绝不改变业务状态，不构成生产默认配置建议。
 
+## 离线生成契约
+
+当前 Rust 请求及响应类型生成的 Schema 位于 [`embedded/v1/contract.json`](embedded/v1/contract.json)，精确摘要位于 [`embedded/v1/contract.sha256`](embedded/v1/contract.sha256)，生成及同步规则见[离线契约说明](embedded/v1/README.md)。运行时响应映射通过实际分发返回类型约束，不能只更新 SDK 字段表而不更新核心。Schema 负责线帧形状，核心继续负责权限、状态、预算关联及语义校验。
+
+`contract-generation` 为默认关闭的离线构建功能，不改变旧 ABI。五平台工作流会比较当前源码重新生成的精确字节，并将真实 FFI 结果对照生成契约校验。SDK 类型、测试向量、兼容声明及正式核心构建身份仍需在后续 SDK 和发布阶段完成同步，不能将当前 Schema 生成视为完整 SDK 发布验收。
+
 ## 验证入口
 
 - Rust 定向测试：`rtk proxy cargo +1.94.0 test --locked --lib ffi_embedded -j 4 -- --test-threads=1`。

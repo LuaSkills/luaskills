@@ -1,5 +1,8 @@
 use super::commands::{RUNTIME_COMMAND_NAMES, RuntimeCommand};
 use super::runtime::RuntimeSlot;
+use super::wire::{
+    ErrorEnvelope, ErrorStatus, RuntimeReceipt, SuccessStatus, TransportDescription,
+};
 use super::{EMBEDDED_FFI_PROTOCOL_VERSION, EmbeddedFfiStatus, transport::Transport};
 use crate::{
     LuaEngineOptions,
@@ -8,10 +11,23 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 
+/// Root command names verified against the Rust-derived schema during contract generation tests.
+/// 在契约生成测试中对照 Rust 派生 Schema 校验的根命令名称。
+pub(super) const ROOT_COMMAND_NAMES: &[&str] = &[
+    "describe",
+    "runtime_reserve",
+    "runtime_initialize",
+    "runtime_status",
+    "runtime_close",
+    "runtime_free",
+    "runtime",
+];
+
 /// Strict versioned request; unknown fields and commands are explicit protocol errors.
 /// 严格版本化请求；未知字段与命令是明确协议错误。
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub(super) struct Request {
     /// Explicit wire version, checked before dispatch.
     /// 分发前检查的显式线协议版本。
@@ -25,6 +41,7 @@ pub(super) struct Request {
 /// 仅包含已实现命令；新的运行时命令在实际接通后才公布。
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 enum Command {
     /// Execute one typed operation on an exact initialized runtime.
     /// 在精确已初始化运行时上执行一个类型化操作。
@@ -137,14 +154,14 @@ pub(super) fn execute(
     let limit = transport.config.max_response_bytes;
     match request.command {
         Command::Describe {} => respond(
-            Ok(serde_json::json!({
-                "core_version": env!("CARGO_PKG_VERSION"),
-                "protocol_version": EMBEDDED_FFI_PROTOCOL_VERSION,
-                "abi_structure_version": EMBEDDED_FFI_PROTOCOL_VERSION,
-                "commands": ["describe", "runtime_reserve", "runtime_initialize", "runtime_status", "runtime_close", "runtime_free", "runtime"],
-                "runtime_commands": RUNTIME_COMMAND_NAMES,
-                "limits": transport.config,
-            })),
+            Ok(TransportDescription {
+                core_version: env!("CARGO_PKG_VERSION"),
+                protocol_version: EMBEDDED_FFI_PROTOCOL_VERSION,
+                abi_structure_version: EMBEDDED_FFI_PROTOCOL_VERSION,
+                commands: ROOT_COMMAND_NAMES,
+                runtime_commands: RUNTIME_COMMAND_NAMES,
+                limits: &transport.config,
+            }),
             limit,
         ),
         Command::RuntimeReserve {} => {
@@ -207,7 +224,12 @@ pub(super) fn execute(
 /// Encode a fixed acknowledgement for known `id` before any lifecycle mutation can occur.
 /// 在任何生命周期变更能够发生前，为已知 `id` 编码固定确认。
 fn receipt(id: &str, limit: usize) -> Result<Vec<u8>, EmbeddedFfiStatus> {
-    respond(Ok(serde_json::json!({ "runtime_id": id })), limit)
+    respond(
+        Ok(RuntimeReceipt {
+            runtime_id: id.to_owned(),
+        }),
+        limit,
+    )
 }
 
 /// Encode the core `result` as an explicit success or structured failure within `limit`.
@@ -220,15 +242,17 @@ pub(super) fn respond<T: Serialize>(
         Ok(result) => encode(
             &SuccessEnvelope {
                 protocol_version: EMBEDDED_FFI_PROTOCOL_VERSION,
-                status: "ok",
+                status: SuccessStatus::Ok,
                 result: &result,
             },
             limit,
         ),
         Err(error) => encode(
-            &serde_json::json!({
-                "protocol_version": EMBEDDED_FFI_PROTOCOL_VERSION, "status": "error", "error": error,
-            }),
+            &ErrorEnvelope {
+                protocol_version: EMBEDDED_FFI_PROTOCOL_VERSION,
+                status: ErrorStatus::Error,
+                error: &error,
+            },
             limit,
         ),
     }
@@ -237,13 +261,14 @@ pub(super) fn respond<T: Serialize>(
 /// Borrowed success envelope avoids cloning application output during native response publication.
 /// 借用成功信封，避免原生响应发布期间克隆应用输出。
 #[derive(Serialize)]
-struct SuccessEnvelope<'a, T: Serialize> {
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
+pub(super) struct SuccessEnvelope<'a, T: Serialize> {
     /// Single protocol version authority.
     /// 唯一协议版本权威。
     protocol_version: u32,
     /// Exact success discriminator.
     /// 精确成功判别。
-    status: &'static str,
+    status: SuccessStatus,
     /// Borrowed result whose owner lives through serialization.
     /// 借用结果，其所有者跨序列化存活。
     result: &'a T,
@@ -264,7 +289,7 @@ impl PreparedSuccess {
         let bytes = encode(
             &SuccessEnvelope {
                 protocol_version: EMBEDDED_FFI_PROTOCOL_VERSION,
-                status: "ok",
+                status: SuccessStatus::Ok,
                 result: sample,
             },
             limit,
@@ -286,7 +311,7 @@ impl PreparedSuccess {
             &mut self.writer,
             &SuccessEnvelope {
                 protocol_version: EMBEDDED_FFI_PROTOCOL_VERSION,
-                status: "ok",
+                status: SuccessStatus::Ok,
                 result,
             },
         )

@@ -56,6 +56,8 @@ fn command(id: u64, command: Value) -> Value {
         serde_json::from_slice(unsafe { std::slice::from_raw_parts(result.ptr, result.len) })
             .unwrap();
     assert_eq!(luaskills_ffi_embedded_result_free_v1(id, result), 0);
+    #[cfg(feature = "contract-generation")]
+    contract::tests::assert_exchange(&serde_json::from_slice(&bytes).unwrap(), &response);
     response
 }
 

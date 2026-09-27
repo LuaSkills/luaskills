@@ -14,6 +14,7 @@ use std::sync::{Arc, Condvar, Mutex};
 /// 从已入场、已认证调用复制的 SDK 请求。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct HostRequest {
     /// Original operation effect record, absent only for untracked low-level calls.
     /// 原始操作副作用记录，仅未跟踪低层调用省略。
@@ -45,6 +46,7 @@ pub struct HostRequest {
 /// 可观察请求阶段；取消不代表处理器已经终止。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub enum HostRequestPhase {
     /// No SDK handler has received this request.
     /// 尚无 SDK 处理器收到此请求。
@@ -64,6 +66,7 @@ pub enum HostRequestPhase {
 /// 用于 SDK 取消与运行时有序关闭的实时请求状态。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct HostRequestStatus {
     /// Exact request identity.
     /// 精确请求身份。
