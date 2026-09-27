@@ -237,7 +237,7 @@ impl HostRequestBroker {
         // 即使后续尝试遇到错误，也返回已投递请求。
         let mut requests = Vec::new();
         while requests.len() < limit {
-            match self.take_next() {
+            match self.take_next(|_| requests.try_reserve(1).map_err(|_| capacity())) {
                 Ok(Some(request)) => requests.push(request),
                 Ok(None) => break,
                 Err(error) if requests.is_empty() => return Err(error),
@@ -249,9 +249,66 @@ impl HostRequestBroker {
         Ok(requests)
     }
 
-    /// Take one request atomically, retaining the queue head on internal failure.
-    /// 原子取得单个请求，内部失败时保留队首。
-    fn take_next(&self) -> EmbeddedResult<Option<HostRequest>> {
+    /// Deliver up to `limit` requests as one JSON array bounded by `max_bytes`, including brackets and commas.
+    /// 将至多 `limit` 个请求作为一个 JSON 数组投递，由 `max_bytes` 限制且包含方括号与逗号。
+    /// Encoding and output allocation precede dispatch; an oversized head remains queued for explicit recovery.
+    /// 编码与输出分配先于分发；超大队首保持排队，供显式恢复。
+    /// Return every already-delivered prefix even if the next request exceeds the remaining response budget.
+    /// 即使下一个请求超过剩余响应预算，也返回全部已投递前缀。
+    pub fn take_json(&self, limit: usize, max_bytes: usize) -> EmbeddedResult<Vec<u8>> {
+        if limit == 0
+            || limit > self.max_records
+            || max_bytes < 2
+            || max_bytes > isize::MAX as usize
+        {
+            return Err(EmbeddedError::invalid(
+                "invalid host request JSON batch limits",
+            ));
+        }
+        let mut output = Vec::new();
+        output.try_reserve_exact(2).map_err(|_| capacity())?;
+        output.push(b'[');
+        let mut count = 0;
+        while count < limit {
+            let separator = usize::from(count != 0);
+            let remaining = max_bytes.saturating_sub(output.len() + separator + 1);
+            let mut encoded = Vec::new();
+            let delivery = self.take_next(|request| {
+                let size = json_size(request, remaining)?;
+                // Reuse scratch storage if a cancelled head is skipped within this attempt.
+                // 此尝试内跳过已取消队首时复用临时存储。
+                encoded.clear();
+                encoded.try_reserve_exact(size).map_err(|_| capacity())?;
+                serde_json::to_writer(&mut encoded, request).map_err(|_| poisoned())?;
+                // Reserve the delimiter and closing bracket as well, before execution authority can move.
+                // 在执行权能够移动前，同时预留分隔符与结束方括号。
+                output
+                    .try_reserve_exact(encoded.len() + separator + 1)
+                    .map_err(|_| capacity())
+            });
+            match delivery {
+                Ok(Some(_)) => {
+                    if separator != 0 {
+                        output.push(b',');
+                    }
+                    output.extend_from_slice(&encoded);
+                    count += 1;
+                }
+                Ok(None) => break,
+                Err(error) if count == 0 => return Err(error),
+                Err(_) => break,
+            }
+        }
+        output.push(b']');
+        Ok(output)
+    }
+
+    /// Take one request after trusted internal `prepare` succeeds; retain the queue head on delivery failure.
+    /// 在可信内部 `prepare` 成功后取得一个请求；交付失败时保留队首。
+    fn take_next(
+        &self,
+        mut prepare: impl FnMut(&HostRequest) -> EmbeddedResult<()>,
+    ) -> EmbeddedResult<Option<HostRequest>> {
         loop {
             // The queue and dispatch phase share one authority throughout this transition.
             // 此变更期间队列与分发阶段共享同一个权威。
@@ -259,30 +316,35 @@ impl HostRequestBroker {
             if state.closing {
                 return Ok(None);
             }
-            // Do not consume the identity until its delivery transition is committed.
-            // 投递变更提交前不消耗身份。
             let Some(id) = state.ready.front().cloned() else {
                 return Ok(None);
             };
-            // This exact record must still own its validated invocation and admission.
-            // 此精确记录仍必须拥有其已校验调用与入场许可。
             let record = state.records.get_mut(&id).ok_or_else(poisoned)?;
             if record.phase != HostRequestPhase::Queued {
                 return Err(poisoned());
             }
-            // Clone the exact entry so its gate can remain locked while publishing dispatch.
-            // 克隆精确条目，使其门可在发布分发期间保持锁定。
             let prepared = record.prepared.as_ref().ok_or_else(poisoned)?;
             let entry = Arc::clone(&prepared.entry);
-            // Grants and the original deadline are rechecked immediately before the gate.
-            // 在进入门前立即重新检查授权与原始截止时间。
+            if let Err(error) = prepared.invocation.authorize() {
+                if error.code == EmbeddedErrorCode::Internal {
+                    return Err(error);
+                }
+                drop(state);
+                self.cancel(&id, error)?;
+                continue;
+            }
+            // Only trusted internal copying/encoding runs here; no foreign callback is accepted.
+            // 此处仅执行可信内部复制／编码；不接受外部回调。
+            // Prepare a deliverable representation before consuming execution authority.
+            // 消费执行权前准备可交付表示。
+            let mut request = record.request.clone();
+            request.remaining_ms = prepared.invocation.budget.remaining_ms();
+            prepare(&request)?;
+            // Encoding may take time, so recheck the original authority immediately before dispatch.
+            // 编码可能耗时，因此在分发前立即重新检查原始权威。
             let delivery = prepared.invocation.authorize().and_then(|()| {
                 entry.with_dispatch_gate(|| {
                     prepared.effect.begin()?;
-                    // Returning a copied request transfers only execution authority, not core ownership.
-                    // 返回复制请求仅转交执行权，不转交核心所有权。
-                    let mut request = record.request.clone();
-                    request.remaining_ms = prepared.invocation.budget.remaining_ms();
                     record.phase = HostRequestPhase::Dispatched;
                     Ok(request)
                 })?

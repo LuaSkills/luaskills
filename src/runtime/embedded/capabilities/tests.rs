@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod delivery;
 mod effects;
 mod lifetime;
 mod queued;
