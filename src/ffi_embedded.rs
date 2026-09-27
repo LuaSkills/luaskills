@@ -3,6 +3,7 @@
 
 mod commands;
 mod control;
+mod json;
 mod protocol;
 mod responses;
 mod runtime;

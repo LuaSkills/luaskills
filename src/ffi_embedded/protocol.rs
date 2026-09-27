@@ -137,6 +137,7 @@ impl Write for ResponseWriter {
 /// Parse bounded caller `bytes`; return a validated request or an explicit format/version failure.
 /// 解析有界调用方 `bytes`；返回已校验请求或明确格式／版本失败。
 pub(super) fn parse(bytes: &[u8]) -> Result<Request, EmbeddedFfiStatus> {
+    super::json::validate(bytes)?;
     let request: Request =
         serde_json::from_slice(bytes).map_err(|_| EmbeddedFfiStatus::InvalidArgument)?;
     if request.protocol_version != EMBEDDED_FFI_PROTOCOL_VERSION {

@@ -70,6 +70,8 @@ pub fn document() -> Value {
         },
         "commands": ROOT_COMMAND_NAMES,
         "runtime_commands": RUNTIME_COMMAND_NAMES,
+        "json_vectors": serde_json::from_str::<Value>(include_str!("../../contracts/embedded/v1/json-vectors.json"))
+            .expect("checked-in JSON vectors must be valid JSON"),
         "native_status": {
             "ok": EmbeddedFfiStatus::Ok as i32,
             "invalid_argument": EmbeddedFfiStatus::InvalidArgument as i32,

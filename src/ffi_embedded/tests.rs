@@ -1,4 +1,5 @@
 use super::*;
+mod json_vectors;
 use std::sync::{Arc, Barrier};
 
 mod commands;

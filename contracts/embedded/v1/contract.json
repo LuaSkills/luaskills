@@ -147,8 +147,368 @@
     "cargo_lock_sha256": "a611f2757f089f32f6934c885e6214a69abfcdfb1a01a0cc9423ae58d21c886b",
     "name": "luaskills/generate_embedded_contract",
     "schema_draft": "2020-12",
-    "source_sha256": "7bb3a54d8a9e5cc636621d8922d18387d6e84264c66512c412bb8a3fa73a3d93",
+    "source_sha256": "75ecbbaeb7cc3cfb6207cdbc8e00fc2f30d6c1715d92f943ef4dfeadf596a725",
     "source_version": "0.5.9"
+  },
+  "json_vectors": {
+    "invalid": [
+      {
+        "id": "duplicate",
+        "json": "{\"x\":1,\"x\":2}"
+      },
+      {
+        "id": "escaped_duplicate",
+        "json": "{\"x\":1,\"\\u0078\":2}"
+      },
+      {
+        "id": "nested_duplicate",
+        "json": "{\"items\":[{\"x\":false,\"x\":true}]}"
+      },
+      {
+        "id": "u64_overflow",
+        "json": "18446744073709551616"
+      },
+      {
+        "id": "i64_underflow",
+        "json": "-9223372036854775809"
+      },
+      {
+        "id": "nonfinite_float",
+        "json": "1e400"
+      },
+      {
+        "id": "nan",
+        "json": "NaN"
+      },
+      {
+        "id": "infinity",
+        "json": "Infinity"
+      },
+      {
+        "id": "negative_infinity",
+        "json": "-Infinity"
+      },
+      {
+        "id": "high_surrogate",
+        "json": "\"\\ud800\""
+      },
+      {
+        "id": "low_surrogate",
+        "json": "\"\\udc00\""
+      },
+      {
+        "id": "key_surrogate",
+        "json": "{\"\\ud800\":null}"
+      },
+      {
+        "id": "broken_surrogates",
+        "json": "\"\\ud800\\u0041\""
+      },
+      {
+        "id": "trailing",
+        "json": "null true"
+      },
+      {
+        "id": "bom",
+        "json": "﻿null"
+      },
+      {
+        "id": "leading_zero",
+        "json": "01"
+      },
+      {
+        "id": "trailing_comma",
+        "json": "[1,]"
+      },
+      {
+        "id": "unquoted_key",
+        "json": "{x:1}"
+      },
+      {
+        "id": "control_character",
+        "json": "\"a\nb\""
+      },
+      {
+        "id": "missing_value",
+        "json": "{\"x\":}"
+      },
+      {
+        "id": "empty",
+        "json": ""
+      },
+      {
+        "id": "incomplete",
+        "json": "["
+      }
+    ],
+    "invalid_bytes": [
+      {
+        "hex": "ff",
+        "id": "invalid_utf8"
+      },
+      {
+        "hex": "c0af",
+        "id": "overlong_utf8"
+      },
+      {
+        "hex": "22eda08022",
+        "id": "utf8_surrogate"
+      },
+      {
+        "hex": "22e28222",
+        "id": "truncated_utf8"
+      }
+    ],
+    "invalid_envelopes": [
+      {
+        "id": "missing_result",
+        "json": "{\"protocol_version\":1,\"status\":\"ok\"}"
+      },
+      {
+        "id": "unknown_version",
+        "json": "{\"protocol_version\":2,\"status\":\"ok\",\"result\":null}"
+      },
+      {
+        "id": "boolean_version",
+        "json": "{\"protocol_version\":true,\"status\":\"ok\",\"result\":null}"
+      },
+      {
+        "id": "float_version",
+        "json": "{\"protocol_version\":1.0,\"status\":\"ok\",\"result\":null}"
+      },
+      {
+        "id": "extra_member",
+        "json": "{\"protocol_version\":1,\"status\":\"ok\",\"result\":null,\"extra\":null}"
+      },
+      {
+        "id": "conflicting_status",
+        "json": "{\"protocol_version\":1,\"status\":\"error\",\"result\":null,\"error\":{\"code\":\"busy\",\"message\":\"x\"}}"
+      },
+      {
+        "id": "invalid_status",
+        "json": "{\"protocol_version\":1,\"status\":\"success\",\"result\":null}"
+      },
+      {
+        "id": "extra_error_member",
+        "json": "{\"protocol_version\":1,\"status\":\"error\",\"error\":{\"code\":\"busy\",\"message\":\"x\",\"extra\":0}}"
+      },
+      {
+        "id": "nonstring_error",
+        "json": "{\"protocol_version\":1,\"status\":\"error\",\"error\":{\"code\":1,\"message\":\"x\"}}"
+      }
+    ],
+    "valid": [
+      {
+        "expected": [
+          "null"
+        ],
+        "id": "null",
+        "json": "null"
+      },
+      {
+        "expected": [
+          "boolean",
+          false
+        ],
+        "id": "false",
+        "json": "false"
+      },
+      {
+        "expected": [
+          "boolean",
+          true
+        ],
+        "id": "true",
+        "json": "true"
+      },
+      {
+        "expected": [
+          "integer",
+          "0"
+        ],
+        "id": "zero",
+        "json": "0"
+      },
+      {
+        "expected": [
+          "integer",
+          "9007199254740991"
+        ],
+        "id": "safe_boundary",
+        "json": "9007199254740991"
+      },
+      {
+        "expected": [
+          "integer",
+          "9007199254740993"
+        ],
+        "id": "unsafe_exact",
+        "json": "9007199254740993"
+      },
+      {
+        "expected": [
+          "integer",
+          "-9223372036854775808"
+        ],
+        "id": "i64_min",
+        "json": "-9223372036854775808"
+      },
+      {
+        "expected": [
+          "integer",
+          "9223372036854775807"
+        ],
+        "id": "i64_max",
+        "json": "9223372036854775807"
+      },
+      {
+        "expected": [
+          "integer",
+          "18446744073709551615"
+        ],
+        "id": "u64_max",
+        "json": "18446744073709551615"
+      },
+      {
+        "expected": [
+          "float",
+          "4059000000000000"
+        ],
+        "id": "float_integral",
+        "json": "100.0"
+      },
+      {
+        "expected": [
+          "float",
+          "4059000000000000"
+        ],
+        "id": "float_exponent",
+        "json": "1e2"
+      },
+      {
+        "expected": [
+          "float",
+          "3ff4000000000000"
+        ],
+        "id": "float_fraction",
+        "json": "1.25"
+      },
+      {
+        "expected": [
+          "float",
+          "8000000000000000"
+        ],
+        "id": "negative_zero",
+        "json": "-0"
+      },
+      {
+        "expected": [
+          "float",
+          "8000000000000000"
+        ],
+        "id": "negative_float_zero",
+        "json": "-0.0"
+      },
+      {
+        "expected": [
+          "float",
+          "0000000000000000"
+        ],
+        "id": "positive_float_zero",
+        "json": "0.0"
+      },
+      {
+        "expected": [
+          "float",
+          "0000000000000001"
+        ],
+        "id": "float_min_subnormal",
+        "json": "5e-324"
+      },
+      {
+        "expected": [
+          "float",
+          "7fefffffffffffff"
+        ],
+        "id": "float_max",
+        "json": "1.7976931348623157e308"
+      },
+      {
+        "expected": [
+          "string",
+          "中文\u0000🦥"
+        ],
+        "id": "unicode",
+        "json": "\"中文\\u0000\\ud83e\\udda5\""
+      },
+      {
+        "expected": [
+          "array",
+          []
+        ],
+        "id": "empty_array",
+        "json": "[]"
+      },
+      {
+        "expected": [
+          "object",
+          {}
+        ],
+        "id": "empty_object",
+        "json": "{}"
+      },
+      {
+        "expected": [
+          "object",
+          {
+            "__proto__": [
+              "null"
+            ],
+            "constructor": [
+              "boolean",
+              false
+            ],
+            "items": [
+              "array",
+              [
+                [
+                  "object",
+                  {}
+                ],
+                [
+                  "array",
+                  []
+                ],
+                [
+                  "integer",
+                  "9007199254740993"
+                ],
+                [
+                  "float",
+                  "3ff0000000000000"
+                ]
+              ]
+            ]
+          }
+        ],
+        "id": "nested",
+        "json": "{\"__proto__\":null,\"constructor\":false,\"items\":[{},[],9007199254740993,1.0]}"
+      },
+      {
+        "expected": [
+          "object",
+          {
+            "x": [
+              "string",
+              "a \"key\": 1"
+            ]
+          }
+        ],
+        "id": "escaped_key",
+        "json": "{\"\\u0078\":\"a \\\"key\\\": 1\"}"
+      }
+    ],
+    "version": 1
   },
   "native_status": {
     "busy": 3,
