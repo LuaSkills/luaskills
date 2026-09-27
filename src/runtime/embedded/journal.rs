@@ -72,6 +72,13 @@ pub struct OperationJournal {
 }
 
 impl OperationJournal {
+    /// Hold the actual storage gate for deterministic operation-observation concurrency tests.
+    /// 持有真实存储门禁，用于确定性的操作观测并发测试。
+    #[cfg(test)]
+    pub(super) fn block_for_test(&self) -> impl Drop + '_ {
+        self.state.lock().expect("test journal lock is healthy")
+    }
+
     /// Open absolute local `path` under `config`, validating every retained record before returning.
     /// 按 `config` 打开绝对本地 `path`，返回前校验所有保留记录。
     /// Existing unknown formats, corruption, insufficient limits and another owner fail explicitly.
