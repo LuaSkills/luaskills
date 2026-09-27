@@ -128,6 +128,26 @@ Return one JSON description of exported FFI entrypoints.
 FfiOwnedBuffer luaskills_ffi_describe_json(void);
 
 /*
+Dispatch an explicit version-one JSON request through independent transport_id.
+On success result_out owns one buffer freed only with luaskills_ffi_embedded_result_free_v1.
+On failure a valid output is empty; the return code is one EmbeddedFfiStatus value.
+Request bytes must remain readable and immutable until return. The writable output must be
+exclusively borrowed and disjoint from those bytes. Unknown fields and commands are rejected.
+The describe command is {"protocol_version":1,"command":{"type":"describe"}}.
+Discover implemented commands from its result before requiring additional capabilities.
+通过独立 transport_id 分发显式版本一 JSON 请求。
+成功时 result_out 拥有一个仅由 luaskills_ffi_embedded_result_free_v1 释放的缓冲。
+失败时有效输出为空；返回码为一个 EmbeddedFfiStatus 值。
+请求字节必须在返回前保持可读且不可变。可写输出必须独占借用，且与这些字节不重叠。
+未知字段与命令被拒绝。
+描述命令为 {"protocol_version":1,"command":{"type":"describe"}}。
+要求额外能力前，先从其结果发现已实现命令。
+*/
+int32_t luaskills_ffi_embedded_request_v1(
+    uint64_t transport_id, FfiBorrowedBuffer request_json, FfiEmbeddedResultV1 *result_out
+);
+
+/*
 Create one LuaSkills engine from one JSON request.
 通过一段 JSON 请求创建一个 LuaSkills 引擎。
 */

@@ -63,6 +63,107 @@ typedef struct FfiBorrowedBuffer {
     size_t len;
 } FfiBorrowedBuffer;
 
+/* Version-one transport budgets; every limit is explicit and positive. */
+/* 版本一传输预算；每个限制均显式声明且为正数。 */
+typedef struct FfiEmbeddedTransportConfigV1 {
+    /* Must equal sizeof(FfiEmbeddedTransportConfigV1). */
+    /* 必须等于 sizeof(FfiEmbeddedTransportConfigV1)。 */
+    uint32_t struct_size;
+    /* Must equal 1; unknown versions are rejected. */
+    /* 必须等于 1；未知版本被拒绝。 */
+    uint32_t protocol_version;
+    /* Maximum owned runtime registrations, including draining registrations. */
+    /* 拥有的运行时注册数量上限，包含正在排空的注册。 */
+    uint64_t max_runtimes;
+    /* Published buffers plus in-flight reservations. */
+    /* 已发布缓冲与在途预留的合计上限。 */
+    uint64_t max_result_buffers;
+    /* Published bytes plus worst-case bytes reserved before dispatch. */
+    /* 已发布字节与分发前预留最坏情况字节的合计上限。 */
+    uint64_t max_result_bytes;
+    /* Per-response ceiling, no greater than max_result_bytes. */
+    /* 逐响应上限，不得大于 max_result_bytes。 */
+    uint64_t max_response_bytes;
+    /* Readable request byte ceiling, checked before dereferencing the request. */
+    /* 可读请求字节上限，在解引用请求前检查。 */
+    uint64_t max_request_bytes;
+} FfiEmbeddedTransportConfigV1;
+
+/* One read-only result owner; copies do not create additional ownership. */
+/* 一个只读结果所有者；复制不会创建额外所有权。 */
+typedef struct FfiEmbeddedResultV1 {
+    /* Exact address; never pass it to any legacy buffer/string free function. */
+    /* 精确地址；绝不能传给任何旧缓冲／字符串释放函数。 */
+    const uint8_t *ptr;
+    /* Readable byte length; readers must finish before release. */
+    /* 可读字节长度；读取者必须在释放前结束。 */
+    size_t len;
+    /* Exact identity; preserve every uint64_t bit in language bindings. */
+    /* 精确身份；语言绑定中必须保留 uint64_t 的每一位。 */
+    uint64_t allocation_id;
+} FfiEmbeddedResultV1;
+
+/* Stable return codes for the independent transport entrypoints. */
+/* 独立传输入口的稳定返回码。 */
+typedef enum EmbeddedFfiStatus {
+    /* Success; a successful request owns one nonempty result. */
+    /* 成功；成功请求拥有一个非空结果。 */
+    LUASKILLS_EMBEDDED_OK = 0,
+    /* Invalid structure, pointer shape, budget, or request. */
+    /* 无效结构、指针形状、预算或请求。 */
+    LUASKILLS_EMBEDDED_INVALID_ARGUMENT = 1,
+    /* The exact transport or allocation identity is absent. */
+    /* 精确传输或分配身份不存在。 */
+    LUASKILLS_EMBEDDED_NOT_FOUND = 2,
+    /* Close or actual ownership drainage is still required. */
+    /* 仍需关闭或实际所有权排空。 */
+    LUASKILLS_EMBEDDED_BUSY = 3,
+    /* An explicit count or byte budget prevents admission or delivery. */
+    /* 显式数量或字节预算阻止入场或交付。 */
+    LUASKILLS_EMBEDDED_CAPACITY_EXCEEDED = 4,
+    /* A previously acquired transport reference was permanently released. */
+    /* 此前获取的传输引用已永久释放。 */
+    LUASKILLS_EMBEDDED_CLOSED = 5,
+    /* Internal panic, poisoned authority, or identity exhaustion. */
+    /* 内部 panic、权威中毒或身份耗尽。 */
+    LUASKILLS_EMBEDDED_INTERNAL = 6,
+    /* The explicitly declared protocol version is unsupported. */
+    /* 不支持显式声明的协议版本。 */
+    LUASKILLS_EMBEDDED_UNSUPPORTED = 7
+} EmbeddedFfiStatus;
+
+/*
+Create from config and write one exact identity to transport_out; failures zero the output.
+Config must expose its size prefix and the entire structure when that prefix matches sizeof.
+The writable output must be exclusively borrowed and disjoint from config until return.
+从 config 创建并向 transport_out 写入一个精确身份；失败时输出归零。
+Config 必须提供大小前缀，并在该前缀匹配 sizeof 时提供整个结构。
+可写输出必须独占借用，并在返回前与 config 不重叠。
+*/
+int32_t luaskills_ffi_embedded_transport_new_v1(
+    const FfiEmbeddedTransportConfigV1 *config, uint64_t *transport_out
+);
+
+/* Permanently close creation admission for transport_id; retain outstanding ownership. */
+/* 永久关闭 transport_id 的创建入场；保留未完成所有权。 */
+int32_t luaskills_ffi_embedded_transport_close_v1(uint64_t transport_id);
+
+/*
+Free only a closed, fully drained transport_id; return BUSY while ownership remains.
+The host must join all native calls and release all results before unloading this library.
+仅释放已关闭且完全排空的 transport_id；仍有所有权时返回 BUSY。
+宿主必须汇合全部原生调用并释放全部结果后才能卸载此动态库。
+*/
+int32_t luaskills_ffi_embedded_transport_free_v1(uint64_t transport_id);
+
+/*
+Free result only from its exact transport_id; repeated, foreign, and altered descriptors fail.
+This function does not dereference the descriptor's pointer; all readers must already have finished.
+仅从其精确 transport_id 释放 result；重复、外来和被修改的描述符会失败。
+此函数不解引用描述符的指针；所有读取者必须已结束。
+*/
+int32_t luaskills_ffi_embedded_result_free_v1(uint64_t transport_id, FfiEmbeddedResultV1 result);
+
 typedef struct FfiOwnedBuffer {
     /* Exact-length luaskills allocation; null only when len is zero. */
     /* luaskills 精确长度分配；仅当 len 为零时允许为空。 */
