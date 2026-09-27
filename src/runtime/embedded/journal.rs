@@ -4,6 +4,12 @@
 mod storage;
 #[cfg(test)]
 mod tests;
+mod worker;
+
+pub use worker::{
+    JournalWritePhase, JournalWriteReceipt, JournalWriteSnapshot, OperationJournalWorker,
+    OperationJournalWorkerConfig, OperationJournalWorkerStatus,
+};
 
 use super::value_size::json_size;
 use super::{
