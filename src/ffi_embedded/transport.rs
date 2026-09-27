@@ -1,4 +1,6 @@
+use super::runtime::RuntimeSlot;
 use super::types::*;
+use crate::runtime::embedded::{EmbeddedError, EmbeddedErrorCode, EmbeddedResult};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -28,6 +30,9 @@ struct TransportState {
     /// Exact boxed allocations retained until explicit identity-checked release.
     /// 保留到显式身份校验释放的精确 boxed 分配。
     results: BTreeMap<u64, Box<[u8]>>,
+    /// All runtime slots, including reserved, initializing, draining and failed registrations.
+    /// 全部运行时槽，包含已预留、初始化中、正在排空与失败注册。
+    runtimes: BTreeMap<String, Arc<RuntimeSlot>>,
 }
 
 /// Independent FFI client transport; configuration and outstanding results outlive individual calls.
@@ -66,7 +71,7 @@ fn registry() -> Result<MutexGuard<'static, BTreeMap<u64, Arc<Transport>>>, Embe
 
 /// Allocate a never-reused identity or reject exhaustion before publication.
 /// 分配绝不复用的身份，或在发布前拒绝身份耗尽。
-fn identity() -> Result<u64, EmbeddedFfiStatus> {
+pub(super) fn identity() -> Result<u64, EmbeddedFfiStatus> {
     NEXT_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .map_err(|_| EmbeddedFfiStatus::Internal)
@@ -83,6 +88,7 @@ pub(super) fn create(config: TransportConfig) -> Result<u64, EmbeddedFfiStatus> 
             pending: 0,
             bytes: 0,
             results: BTreeMap::new(),
+            runtimes: BTreeMap::new(),
         }),
     });
     let id = identity()?;
@@ -106,7 +112,11 @@ pub(super) fn release(id: u64) -> Result<(), EmbeddedFfiStatus> {
         let mut registry = registry()?;
         let transport = registry.get(&id).ok_or(EmbeddedFfiStatus::NotFound)?;
         let mut state = transport.lock()?;
-        if !state.closing || state.pending != 0 || !state.results.is_empty() {
+        if !state.closing
+            || state.pending != 0
+            || !state.results.is_empty()
+            || !state.runtimes.is_empty()
+        {
             return Err(EmbeddedFfiStatus::Busy);
         }
         state.released = true;
@@ -127,12 +137,29 @@ impl Transport {
     /// Request permanent creation closure; return without releasing outstanding buffers or requests.
     /// 请求永久关闭创建入口；返回时不释放未完成缓冲或请求。
     pub(super) fn request_close(&self) -> Result<(), EmbeddedFfiStatus> {
-        let mut state = self.lock()?;
-        if state.released {
-            return Err(EmbeddedFfiStatus::Closed);
+        let runtimes = {
+            let mut state = self.lock()?;
+            if state.released {
+                return Err(EmbeddedFfiStatus::Closed);
+            }
+            state.closing = true;
+            state.runtimes.values().cloned().collect::<Vec<_>>()
+        };
+        // Attempt every exact slot; one failure must not leave unrelated runtimes accepting work.
+        // 尝试每个精确槽；一个失败不得使无关运行时继续接纳工作。
+        let mut failed = false;
+        for runtime in runtimes {
+            if let Err(error) = runtime.request_close()
+                && error.code != EmbeddedErrorCode::Closed
+            {
+                failed = true;
+            }
         }
-        state.closing = true;
-        Ok(())
+        if failed {
+            Err(EmbeddedFfiStatus::Internal)
+        } else {
+            Ok(())
+        }
     }
 
     /// Reserve result count and worst-case bytes before dispatch; closing still permits drain-control requests.
@@ -182,6 +209,68 @@ impl Transport {
         };
         drop(removed);
         Ok(())
+    }
+
+    /// Register pre-encoded metadata-only `slot` within the exact transport budget and close gate.
+    /// 在精确传输预算及关闭门内注册已预编码且仅含元数据的 `slot`。
+    pub(super) fn register_runtime(&self, slot: Arc<RuntimeSlot>) -> EmbeddedResult<()> {
+        let mut state = self.lock().map_err(runtime_transport_error)?;
+        if state.closing || state.released {
+            return Err(runtime_transport_error(EmbeddedFfiStatus::Closed));
+        }
+        if state.runtimes.len() >= self.config.max_runtimes {
+            return Err(runtime_transport_error(EmbeddedFfiStatus::CapacityExceeded));
+        }
+        state.runtimes.insert(slot.id.clone(), slot);
+        Ok(())
+    }
+
+    /// Clone exact `id` under a short lookup lock; the slot fences stale clones during actual removal.
+    /// 在短查找锁下克隆精确 `id`；槽在实际移除期间阻止陈旧克隆。
+    pub(super) fn runtime(&self, id: &str) -> EmbeddedResult<Arc<RuntimeSlot>> {
+        let state = self.lock().map_err(runtime_transport_error)?;
+        if state.released {
+            return Err(runtime_transport_error(EmbeddedFfiStatus::Closed));
+        }
+        state.runtimes.get(id).cloned().ok_or_else(|| {
+            EmbeddedError::new(
+                EmbeddedErrorCode::NotFound,
+                "FFI runtime identity is not registered in this transport",
+            )
+        })
+    }
+
+    /// Release drained `id` outside the transport lock, then remove only that never-reused identity.
+    /// 在传输锁外释放已排空 `id`，随后仅移除此绝不复用身份。
+    pub(super) fn release_runtime(&self, id: &str) -> EmbeddedResult<()> {
+        let slot = self.runtime(id)?;
+        slot.release()?;
+        let removed = self
+            .lock()
+            .map_err(runtime_transport_error)?
+            .runtimes
+            .remove(id);
+        drop(removed);
+        Ok(())
+    }
+}
+
+/// Map this module's actual transport-owner failures into the structured application error vocabulary.
+/// 将此模块实际传输所有者失败映射为结构化应用错误词汇。
+fn runtime_transport_error(status: EmbeddedFfiStatus) -> EmbeddedError {
+    match status {
+        EmbeddedFfiStatus::Closed => EmbeddedError::new(
+            EmbeddedErrorCode::Closed,
+            "FFI transport admission is closed",
+        ),
+        EmbeddedFfiStatus::CapacityExceeded => EmbeddedError::new(
+            EmbeddedErrorCode::CapacityExceeded,
+            "FFI runtime registration limit reached",
+        ),
+        _ => EmbeddedError::new(
+            EmbeddedErrorCode::Internal,
+            "FFI transport owner is unavailable",
+        ),
     }
 }
 

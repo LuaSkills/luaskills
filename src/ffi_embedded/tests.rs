@@ -1,6 +1,8 @@
 use super::*;
 use std::sync::{Arc, Barrier};
 
+pub(super) mod runtimes;
+
 /// Build explicit small budgets for native transport ownership tests.
 /// 构造显式小预算，用于原生传输所有权测试。
 fn config() -> FfiEmbeddedTransportConfigV1 {
