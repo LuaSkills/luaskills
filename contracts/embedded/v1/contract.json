@@ -1071,7 +1071,7 @@
       },
       "EmbeddedCapacityConfig": {
         "additionalProperties": false,
-        "description": "Immutable capacity policy owned by one plugin across isolated module generations.\n单个插件跨隔离模块代次持有的不可变容量策略。",
+        "description": "Complete capacity policy owned by one plugin across isolated module generations.\n单个插件跨隔离模块代次持有的完整容量策略。",
         "properties": {
           "max_queued_bytes": {
             "description": "Maximum exact serialized bytes of queued requests across members.\n全部成员排队请求精确序列化字节数上限。",
@@ -4881,7 +4881,7 @@
       "$defs": {
         "EmbeddedCapacityConfig": {
           "additionalProperties": false,
-          "description": "Immutable capacity policy owned by one plugin across isolated module generations.\n单个插件跨隔离模块代次持有的不可变容量策略。",
+          "description": "Complete capacity policy owned by one plugin across isolated module generations.\n单个插件跨隔离模块代次持有的完整容量策略。",
           "properties": {
             "max_queued_bytes": {
               "description": "Maximum exact serialized bytes of queued requests across members.\n全部成员排队请求精确序列化字节数上限。",
@@ -4932,7 +4932,7 @@
             },
             "config": {
               "$ref": "#/$defs/EmbeddedCapacityConfig",
-              "description": "Original complete policy, including physical and queued-work budgets.\n原完整策略，包含物理及排队工作预算。"
+              "description": "Current complete policy, including physical and queued-work budgets.\n当前完整策略，包含物理及排队工作预算。"
             },
             "plugin_id": {
               "description": "Exact immutable plugin owner.\n精确不可变插件所有者。",

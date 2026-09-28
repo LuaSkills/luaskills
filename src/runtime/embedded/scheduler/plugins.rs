@@ -252,53 +252,7 @@ impl SchedulerState {
         plugin_id: &str,
         requesting_pool: Option<&str>,
     ) -> EmbeddedResult<usize> {
-        // Only the requesting pool's declared owner may spend its unused guarantee.
-        // 只有请求池已声明的所有者可以消费其未使用保证。
-        let requesting_capacity = requesting_pool
-            .and_then(|id| self.pools.get(id))
-            .and_then(|pool| pool.capacity_id.as_deref());
-        // Independent domains retain their original commitment and release semantics.
-        // 独立域保留原承诺及释放语义。
-        let mut committed = 0usize;
-        for (id, pool) in self
-            .pools
-            .iter()
-            .filter(|(_, pool)| pool.plugin_id == plugin_id && pool.capacity_id.is_none())
-        {
-            // A closing physical registration may already have returned its unused independent guarantee.
-            // 关闭中的物理注册可能已经归还其未使用独立保证。
-            let (usage, guarantee) = pool.pool.accounting()?;
-            // The requester spends only its own still-unused independent guarantee.
-            // 请求方仅消费自身尚未使用的独立保证。
-            let charge = if requesting_pool == Some(id.as_str()) {
-                usage.resident
-            } else {
-                guarantee
-            };
-            committed = committed
-                .checked_add(charge)
-                .ok_or_else(|| internal("plugin commitment overflow"))?;
-        }
-        for (id, capacity) in self
-            .capacities
-            .iter()
-            .filter(|(_, capacity)| capacity.plugin_id == plugin_id)
-        {
-            // Aggregate commitment is charged once even when the capacity currently has no members.
-            // 即使容量当前没有成员，聚合承诺也仅计费一次。
-            let resident = self.capacity_resident(id)?;
-            // One aggregate guarantee remains charged across every member generation.
-            // 单个聚合保证跨全部成员代次保持计费。
-            let charge = if requesting_capacity == Some(id.as_str()) {
-                resident
-            } else {
-                resident.max(capacity.config.resources.min_resident_vms)
-            };
-            committed = committed
-                .checked_add(charge)
-                .ok_or_else(|| internal("plugin commitment overflow"))?;
-        }
-        Ok(committed)
+        self.plugin_commitment_with_capacity(plugin_id, requesting_pool, None)
     }
 
     /// Validate new domain `policy` for an explicitly registered plugin before any registration mutation.

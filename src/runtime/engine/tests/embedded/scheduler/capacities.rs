@@ -5,6 +5,7 @@ use super::*;
 
 mod admission;
 mod closing;
+mod policy;
 
 /// Build capacity resources with explicit kind, minimum and maximum; return bounded test queue policy.
 /// 使用显式类别、最小值及最大值构造容量资源；返回有界测试队列策略。

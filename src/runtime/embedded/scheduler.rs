@@ -12,6 +12,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 mod capacities;
+mod capacity_policy;
 mod finalization;
 mod persistence;
 mod plugins;
@@ -22,6 +23,7 @@ mod sessions_finalization;
 mod workers;
 use capacities::ScheduledCapacity;
 pub use capacities::{EmbeddedCapacityConfig, EmbeddedCapacitySnapshot};
+pub use capacity_policy::EmbeddedCapacityPolicySnapshot;
 use finalization::PendingFinalization;
 
 pub use persistence::{CheckpointRetryState, OperationPersistenceFailure};
@@ -184,8 +186,8 @@ struct SchedulerState {
     /// Immutable plugin-wide admission authority spans all of its pool generations.
     /// 不可变插件级入场权威覆盖其全部池代次。
     plugins: BTreeMap<String, ScheduledPlugin>,
-    /// Plugin-owned guarantees survive individual pool generations and retain immutable limits.
-    /// 插件自有保证跨单个池代次存活，并保留不可变限制。
+    /// Plugin-owned guarantees survive individual pool generations and change only through explicit revisions.
+    /// 插件自有保证跨单个池代次存活，且仅经显式修订变更。
     capacities: BTreeMap<String, ScheduledCapacity>,
     /// Retained operation ownership survives pool removal and is released only by explicit forgetting.
     /// 保留操作归属在池移除后仍存在，仅通过显式遗忘释放。

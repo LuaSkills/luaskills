@@ -28,6 +28,22 @@ pub enum ModulePoolPlacement {
 }
 
 impl EmbeddedPoolManager {
+    /// Revise exact physical ownership for the formal scheduler; reject a closing parent.
+    /// 为正式调度器修订精确物理归属；拒绝关闭中的父级。
+    /// Return validation failures before modifying the governor's effective policy.
+    /// 修改治理器生效策略前返回校验失败。
+    pub(crate) fn revise_capacity(&self, id: &str, config: VmCapacityConfig) -> EmbeddedResult<()> {
+        // Parent closure and policy publication use the same established admission gate.
+        // 父级关闭与策略发布使用同一既有入场门。
+        let state = self.state.lock().map_err(|_| {
+            EmbeddedError::new(EmbeddedErrorCode::Internal, "pool manager lock is poisoned")
+        })?;
+        if state.closing {
+            return Err(closed());
+        }
+        self.governor.revise_capacity(id, config)
+    }
+
     /// Register a persistent physical capacity owner by exact id and config; return any admission failure.
     /// 按精确标识及配置注册持久物理容量所有者；返回任何入场失败。
     /// The registration consumes no VM and is serialized with parent closure.

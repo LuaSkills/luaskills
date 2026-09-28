@@ -3,8 +3,8 @@
 
 use super::*;
 
-/// Immutable capacity policy owned by one plugin across isolated module generations.
-/// 单个插件跨隔离模块代次持有的不可变容量策略。
+/// Complete capacity policy owned by one plugin across isolated module generations.
+/// 单个插件跨隔离模块代次持有的完整容量策略。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
@@ -53,9 +53,12 @@ pub(super) struct ScheduledCapacity {
     /// Immutable plugin owner; a member's definition must name the same plugin.
     /// 不可变插件所有者；成员定义必须指定同一插件。
     pub(super) plugin_id: String,
-    /// Validated policy never replaced while this identity is retained.
-    /// 此身份保留期间绝不替换的已校验策略。
+    /// Validated policy replaced only by the explicit compare-and-swap revision transaction.
+    /// 仅由显式比较交换修订事务替换的已校验策略。
     pub(super) config: EmbeddedCapacityConfig,
+    /// Runtime-wide sequence of the last explicit policy publication; never reused.
+    /// 最近一次显式策略发布的运行时全局序号；绝不复用。
+    pub(super) policy_revision: u64,
     /// Permanent closure rejects membership and business while permitting existing finalization.
     /// 永久关闭拒绝成员注册及业务，同时允许既有关闭执行。
     pub(super) closing: bool,
@@ -72,8 +75,8 @@ pub struct EmbeddedCapacitySnapshot {
     /// Exact immutable plugin owner.
     /// 精确不可变插件所有者。
     pub plugin_id: String,
-    /// Original complete policy, including physical and queued-work budgets.
-    /// 原完整策略，包含物理及排队工作预算。
+    /// Current complete policy, including physical and queued-work budgets.
+    /// 当前完整策略，包含物理及排队工作预算。
     pub config: EmbeddedCapacityConfig,
     /// Actual physical state, including creation, native waiting and retirement.
     /// 实际物理状态，包含创建、原生等待及退役。
@@ -163,49 +166,19 @@ impl EmbeddedRuntime {
             ScheduledCapacity {
                 plugin_id: plugin_id.to_owned(),
                 config,
+                policy_revision: sequence,
                 closing: false,
             },
         );
         Ok(id)
     }
 
-    /// Observe exact capacity id and original plugin ownership; return actual counters or not found.
-    /// 观测精确容量标识及原插件归属；返回实际计数或未找到。
+    /// Observe exact capacity id and original plugin ownership; return current policy and actual counters.
+    /// 观测精确容量标识及原插件归属；返回当前策略及实际计数。
     pub fn capacity(&self, id: &str) -> EmbeddedResult<EmbeddedCapacitySnapshot> {
-        // Hold one scheduling snapshot while the physical governor reports its current counters.
-        // 物理治理器报告当前计数期间，持有单个调度快照。
-        let state = self.center.lock()?;
-        // Exact retained capacity ownership is never resolved through a fallback.
-        // 精确保留容量归属绝不通过回退解析。
-        let capacity = state.capacities.get(id).ok_or_else(not_found)?;
-        // Physical governor snapshot sampled under retained scheduling ownership.
-        // 在保留调度归属期间采样的物理治理器快照。
-        let physical = self.center.pools.capacity(id)?;
-        // Counts and bytes are derived together from the authoritative request queues.
-        // 数量和字节共同从权威请求队列派生。
-        let (queued_calls, queued_bytes) = state.capacity_queue(id);
-        Ok(EmbeddedCapacitySnapshot {
-            capacity_id: id.to_owned(),
-            plugin_id: capacity.plugin_id.clone(),
-            config: capacity.config.clone(),
-            resources: physical.resources,
-            committed_resident_vms: physical.committed_resident_vms,
-            active_operations: state.capacity_active(id),
-            queued_calls,
-            queued_bytes,
-            retained_pools: state
-                .pools
-                .values()
-                .filter(|pool| pool.capacity_id.as_deref() == Some(id))
-                .count(),
-            closing: capacity.closing
-                || state.closing
-                || state
-                    .plugins
-                    .get(&capacity.plugin_id)
-                    .expect("capacity retains plugin")
-                    .closing,
-        })
+        self.center
+            .lock()?
+            .capacity_snapshot(id, &self.center.pools)
     }
 
     /// Close capacity id and every exact member generation; running business drains without replay.

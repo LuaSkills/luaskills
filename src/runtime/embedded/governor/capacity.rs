@@ -7,8 +7,8 @@ use super::*;
 /// 容量所有者的单次原子视图，包含空预留及全部成员的实际 VM 状态。
 #[derive(Debug, Clone, Serialize)]
 pub struct VmCapacitySnapshot {
-    /// Exact immutable policy registered by the trusted owner.
-    /// 可信所有者注册的精确不可变策略。
+    /// Exact currently published physical policy of the trusted owner.
+    /// 可信所有者当前已发布的精确物理策略。
     pub config: VmCapacityConfig,
     /// Actual resident and execution state, never inflated to represent unused guarantees.
     /// 实际常驻及执行状态，绝不为表示未用保证而虚增。
@@ -22,6 +22,40 @@ pub struct VmCapacitySnapshot {
 }
 
 impl PoolGovernor {
+    /// Replace the exact capacity's physical limits after checking the complete parent commitment.
+    /// 检查完整父级承诺后，替换精确容量的物理限制。
+    /// The formal scheduler serializes policy revisions; existing allocations and permits remain owned.
+    /// 正式调度器串行化策略修订；既有分配及许可保持归属。
+    pub(crate) fn revise_capacity(&self, id: &str, config: VmCapacityConfig) -> EmbeddedResult<()> {
+        config.validate(&self.config)?;
+        // Validate replacement and publish it inside the allocation authority's original lock.
+        // 在分配权威的原锁内校验替换并发布。
+        let mut state = self.lock()?;
+        // Missing ownership is never implicitly recreated by a revision.
+        // 修订绝不隐式重建缺失归属。
+        let previous = state
+            .capacities
+            .get(id)
+            .ok_or_else(|| not_found("capacity identity does not exist"))?;
+        // Existing real residents stay charged even when the new maximum is smaller.
+        // 即使新上限更小，既有真实常驻仍保持计费。
+        let resident = state.capacity_usage(id).resident;
+        // The same lock makes subtraction exact; no concurrent teardown can change either sample.
+        // 同一锁使减法精确；并发清理不能改变任一样本。
+        let committed = state
+            .commitment(None)?
+            .checked_sub(resident.max(previous.min_resident_vms))
+            .and_then(|other| other.checked_add(resident.max(config.min_resident_vms)))
+            .ok_or_else(|| EmbeddedError::invalid("resident reservation overflow"))?;
+        if committed > self.config.max_resident_vms {
+            return Err(capacity(
+                "revised reservations exceed available parent capacity",
+            ));
+        }
+        state.capacities.insert(id.to_owned(), config);
+        Ok(())
+    }
+
     /// Register capacity with exact id and policy; return an error if its guarantee cannot be honored.
     /// 使用精确标识及策略注册容量；无法兑现其保证时返回错误。
     /// Registration is independent of module creation and does not initialize any Lua state.
@@ -94,8 +128,8 @@ impl PoolGovernor {
     /// Return an atomic snapshot for exact capacity id, or not found without creating any owner.
     /// 返回精确容量标识的原子快照，或返回未找到且不创建任何所有者。
     pub fn capacity(&self, id: &str) -> EmbeddedResult<VmCapacitySnapshot> {
-        // The same lock protects physical usage, membership and immutable policy.
-        // 同一锁保护物理用量、成员关系及不可变策略。
+        // The same lock protects physical usage, membership and the current policy.
+        // 同一锁保护物理用量、成员关系及当前策略。
         let state = self.lock()?;
         // Absence is an explicit lookup failure, not an inherited default.
         // 缺失是明确查找失败，不是继承默认值。
