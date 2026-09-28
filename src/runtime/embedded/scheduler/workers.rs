@@ -144,6 +144,11 @@ fn select(state: &mut SchedulerState) -> EmbeddedResult<Option<Dispatch>> {
                         .lease
                         .take()
                         .ok_or_else(|| internal("idle session lost its lease"))?;
+                    if session.finalization_reservation.is_some()
+                        && let Some(request) = call.request.invocation()
+                    {
+                        session.finalization_context = request.context.clone();
+                    }
                     session.active = Some(call.id.clone());
                     lease
                 }
@@ -200,7 +205,9 @@ fn invoke(
     }
     // A declared finalizer retains this exact VM until both closing checkpoints are acknowledged.
     // 声明的关闭回调保留此精确 VM，直到两个关闭检查点都已确认。
-    if let Some(plan) = lease.finalization_plan() {
+    if call.request.session_id().is_none()
+        && let Some(plan) = lease.finalization_plan()
+    {
         return PendingCompletion {
             finalization: Some(PendingFinalization::new(lease, plan)),
             call,
@@ -212,10 +219,10 @@ fn invoke(
             cleaning_started: false,
         };
     }
-    // A successful pinned lease stays exclusive through operation evidence sealing.
-    // 成功的固定租借在操作证据封存前保持独占。
-    let keep_session =
-        call.request.session_id().is_some() && result.is_ok() && lease.can_retain_session();
+    // Healthy sessions retain state; failed sessions with a finalizer retain the same VM for independent cleanup.
+    // 健康会话保留状态；带关闭回调的失败会话为独立清理保留同一 VM。
+    let keep_session = call.request.session_id().is_some()
+        && ((result.is_ok() && lease.can_retain_session()) || lease.finalization_plan().is_some());
     let (session_lease, retirement, result, effects) = if keep_session {
         (Some(Box::new(lease)), None, result, EffectState::Unknown)
     } else {
@@ -251,7 +258,10 @@ pub(super) fn execute(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
         let dispatch = {
             let mut state = center.lock()?;
             loop {
-                if state.closing && state.live.is_empty() {
+                if state.closing
+                    && state.live.is_empty()
+                    && state.sessions.values().all(|session| session.closed)
+                {
                     return Ok(());
                 }
                 if state.persistence_failures.is_empty() && !state.shared_checkpoint_failed {
@@ -298,7 +308,12 @@ pub(super) fn execute(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
         };
         {
             let mut state = center.lock()?;
-            if completion.session_lease.is_none()
+            if (completion.session_lease.is_none()
+                || completion.result.is_err()
+                || completion
+                    .session_lease
+                    .as_ref()
+                    .is_some_and(|lease| !lease.can_retain_session()))
                 && let Some(id) = completion.call.request.session_id()
             {
                 // Stop admission immediately when this VM cannot be retained, even if teardown blocks.
@@ -413,7 +428,16 @@ fn complete(
                     .get(session_id)
                     .expect("active session exists")
                     .closing;
-            if must_close && let Some(lease) = completion.session_lease.take() {
+            // Declared session cleanup owns a separate reserved operation after this result is immutable.
+            // 已声明的会话清理在此结果不可变后拥有独立预留操作。
+            let separate_finalizer = completion
+                .session_lease
+                .as_ref()
+                .is_some_and(|lease| lease.finalization_plan().is_some());
+            if must_close
+                && !separate_finalizer
+                && let Some(lease) = completion.session_lease.take()
+            {
                 state
                     .sessions
                     .get_mut(session_id)
@@ -562,6 +586,11 @@ fn complete(
                 return Some(completion);
             }
         };
+        let closing_error = completion
+            .call
+            .owner
+            .pending_completion()
+            .and_then(|snapshot| snapshot.error.clone());
         if let Err(error) = completion.call.owner.publish_completion() {
             drop(state);
             center.fail(error);
@@ -600,9 +629,9 @@ fn complete(
                 session.closing = true;
             }
             if session.closing
-                && let Err(error) = &completion.result
+                && let Some(error) = closing_error
             {
-                session.error.get_or_insert_with(|| error.clone());
+                session.error.get_or_insert(error);
             }
         }
         center.changed.notify_all();

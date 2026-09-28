@@ -1,3 +1,4 @@
+use super::super::operations::OperationReservation;
 use super::*;
 
 /// Observable pinned-session lifecycle; closing never implies that its VM is already destroyed.
@@ -40,11 +41,14 @@ pub struct EmbeddedSessionSnapshot {
     /// Current operation, including initialization and cleanup; absent while idle.
     /// 当前操作，包含初始化与清理；空闲时省略。
     pub active_operation: Option<String>,
+    /// Independently retained closing operation; absent until eligible session cleanup is scheduled.
+    /// 独立保留的关闭操作；符合条件的会话清理被调度前省略。
+    pub finalization_operation: Option<String>,
     /// Accepted calls waiting behind this session's current owner.
     /// 此会话当前所有者之后等待的已接纳调用数。
     pub queued_calls: usize,
-    /// First execution failure that made the session unusable.
-    /// 导致会话不可用的首次执行错误。
+    /// First business or closing failure; a later cleanup error cannot replace the original failure.
+    /// 首次业务或关闭错误；后续清理错误不能替换原始错误。
     pub error: Option<EmbeddedError>,
 }
 
@@ -62,6 +66,15 @@ pub struct EmbeddedSessionOpening {
 /// Scheduler-owned session slot; the lease is absent only while execution or retirement owns it.
 /// 调度器拥有的会话槽；仅执行或退役持有租借时槽内租借才省略。
 pub(super) struct ScheduledSession {
+    /// One reserved closing record, acquired before any initialization effects.
+    /// 在任何初始化副作用前取得的一个预留关闭记录。
+    pub(super) finalization_reservation: Option<OperationReservation>,
+    /// Stable cleanup identity remains observable after the active operation completes.
+    /// 活动操作完成后仍可观察的稳定清理身份。
+    pub(super) finalization_operation: Option<String>,
+    /// Trusted context from the most recently dispatched business call; opening uses the empty context.
+    /// 最近已分发业务调用的可信上下文；开启使用空上下文。
+    pub(super) finalization_context: LuaInvocationContext,
     /// Exact pool, never resolved again by plugin name.
     /// 精确池，绝不再按插件名解析。
     pub(super) pool_id: String,
@@ -120,6 +133,19 @@ impl ScheduledSession {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum ScheduledRequest {
+    /// Explicit lifecycle work consumes reserved retention and never invokes a business export.
+    /// 显式生命周期任务消费预留保留容量，绝不调用业务导出。
+    CloseSession {
+        /// Exact original registered pool.
+        /// 精确原始注册池。
+        pool_id: String,
+        /// Exact pinned session being closed.
+        /// 正在关闭的精确固定会话。
+        session_id: String,
+        /// Last actually dispatched host context, not a queued or user-selected replacement.
+        /// 最后实际分发的宿主上下文，不是排队或用户选择的替代上下文。
+        context: LuaInvocationContext,
+    },
     /// An ordinary invocation governed by the registered pool policy.
     /// 受已注册池策略治理的普通调用。
     Invoke(EmbeddedCall),
@@ -151,7 +177,7 @@ impl ScheduledRequest {
     pub(super) fn pool_id(&self) -> &str {
         match self {
             Self::Invoke(call) | Self::InvokeSession { call, .. } => &call.pool_id,
-            Self::OpenSession { pool_id, .. } => pool_id,
+            Self::OpenSession { pool_id, .. } | Self::CloseSession { pool_id, .. } => pool_id,
         }
     }
 
@@ -160,18 +186,18 @@ impl ScheduledRequest {
     pub(super) fn session_id(&self) -> Option<&str> {
         match self {
             Self::Invoke(_) => None,
-            Self::OpenSession { session_id, .. } | Self::InvokeSession { session_id, .. } => {
-                Some(session_id)
-            }
+            Self::OpenSession { session_id, .. }
+            | Self::InvokeSession { session_id, .. }
+            | Self::CloseSession { session_id, .. } => Some(session_id),
         }
     }
 
-    /// Return the business invocation, or none for creation without a business export.
-    /// 返回业务调用；不含业务导出的创建返回空值。
+    /// Return the business invocation, or none for explicit opening and closing lifecycle requests.
+    /// 返回业务调用；显式开启及关闭生命周期请求返回空值。
     pub(super) fn invocation(&self) -> Option<&EmbeddedCall> {
         match self {
             Self::Invoke(call) | Self::InvokeSession { call, .. } => Some(call),
-            Self::OpenSession { .. } => None,
+            Self::OpenSession { .. } | Self::CloseSession { .. } => None,
         }
     }
 
@@ -184,6 +210,7 @@ impl ScheduledRequest {
                 call.context = LuaInvocationContext::default();
             }
             Self::OpenSession { .. } => {}
+            Self::CloseSession { context, .. } => *context = LuaInvocationContext::default(),
         }
     }
 }
@@ -233,6 +260,16 @@ impl EmbeddedRuntime {
                 "plugin retained session capacity reached",
             ));
         }
+        let plugin_id = pool.plugin_id.clone();
+        let needs_finalization = pool.pool.finalizer().is_some();
+        if needs_finalization
+            && plugin.operations >= plugin.config.max_operations - plugin.reserved_operations
+        {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::CapacityExceeded,
+                "plugin operation retention capacity reached",
+            ));
+        }
         let lease = pool.pool.prepare_with_budget(
             &control,
             true,
@@ -248,9 +285,30 @@ impl EmbeddedRuntime {
             session_id: session_id.clone(),
         };
         let bytes = json_size(&request, self.center.pools.config().max_queued_bytes)?;
+        // Reserve without creating an operation or starting its closing deadline while the session is idle.
+        // 预留时不创建操作，也不在会话空闲期间启动其关闭截止时间。
+        let finalization_reservation = if needs_finalization {
+            let pool = state.pools.get(pool_id).expect("registered pool");
+            let reserved = self.center.operations.reserve_module(
+                &pool.pool,
+                &session_id,
+                &pool.pool.finalizer().expect("declared finalizer").export,
+            )?;
+            state
+                .plugins
+                .get_mut(&plugin_id)
+                .expect("registered plugin")
+                .reserved_operations += 1;
+            Some(reserved)
+        } else {
+            None
+        };
         state.sessions.insert(
             session_id.clone(),
             ScheduledSession {
+                finalization_reservation,
+                finalization_operation: None,
+                finalization_context: LuaInvocationContext::default(),
                 pool_id: pool_id.to_owned(),
                 lease: Some(Box::new(lease)),
                 active: None,
@@ -272,6 +330,13 @@ impl EmbeddedRuntime {
             Err(error) => {
                 // No Lua code has run, so releasing this preparation cannot invoke user destructors.
                 // 尚未运行 Lua 代码，因此释放此准备不会调用用户析构器。
+                if needs_finalization {
+                    state
+                        .plugins
+                        .get_mut(&plugin_id)
+                        .expect("registered plugin")
+                        .reserved_operations -= 1;
+                }
                 state.sessions.remove(&session_id);
                 Err(error)
             }
@@ -354,6 +419,7 @@ impl EmbeddedRuntime {
             pool_id: session.pool_id.clone(),
             phase: session.phase(),
             active_operation: session.active.clone(),
+            finalization_operation: session.finalization_operation.clone(),
             queued_calls: session.queued,
             error: session.error.clone(),
         })
@@ -431,7 +497,8 @@ impl SchedulerCenter {
                     .config
                     .max_queued_bytes
                     .saturating_sub(plugin_state.bytes)
-            || plugin_state.operations >= plugin_state.config.max_operations
+            || plugin_state.operations
+                >= plugin_state.config.max_operations - plugin_state.reserved_operations
         {
             return Err(EmbeddedError::new(
                 EmbeddedErrorCode::CapacityExceeded,
@@ -506,22 +573,37 @@ pub(super) fn maintain(center: &SchedulerCenter) -> EmbeddedResult<()> {
         let closing = state.closing;
         let mut cancel = Vec::new();
         let mut retiring = Vec::new();
+        let mut finalizing = Vec::new();
         for (id, session) in &mut state.sessions {
             session.closing |= closing || closing_pools.contains(&session.pool_id);
             if !session.closing {
                 continue;
             }
             if let Some(active) = &session.active {
-                cancel.push(active.clone());
-            } else if let Some(lease) = session.lease.take() {
-                session.retiring = true;
-                retiring.push((id.clone(), lease));
+                if session.finalization_operation.as_ref() != Some(active) {
+                    cancel.push(active.clone());
+                }
+            } else if session.unfinished == 0
+                && let Some(lease) = &session.lease
+            {
+                if lease.finalization_plan().is_some() {
+                    finalizing.push(id.clone());
+                } else {
+                    session.retiring = true;
+                    retiring.push((
+                        id.clone(),
+                        session.lease.take().expect("idle session lease"),
+                    ));
+                }
             }
         }
         for id in cancel {
             if let Some(control) = state.live.get(&id) {
                 control.cancel();
             }
+        }
+        for id in finalizing {
+            sessions_finalization::schedule(center, &mut state, &id)?;
         }
         retiring
     };
@@ -542,6 +624,7 @@ pub(super) fn maintain(center: &SchedulerCenter) -> EmbeddedResult<()> {
         session.retiring = false;
     }
     let mut state = center.lock()?;
+    let mut unused = Vec::new();
     for session in state.sessions.values_mut() {
         if session.closing
             && session.active.is_none()
@@ -554,7 +637,29 @@ pub(super) fn maintain(center: &SchedulerCenter) -> EmbeddedResult<()> {
                 None => true,
             };
             session.closed = drained;
+            if drained {
+                session.finalization_context = LuaInvocationContext::default();
+                if let Some(reservation) = session.finalization_reservation.take() {
+                    // Failed or cancelled initialization never created an eligible closing export.
+                    // 失败或取消的初始化从未创建符合关闭条件的导出。
+                    unused.push((session.pool_id.clone(), reservation));
+                }
+            }
         }
+    }
+    for (pool_id, reservation) in unused {
+        let plugin_id = state
+            .pools
+            .get(&pool_id)
+            .expect("session pool retained")
+            .plugin_id
+            .clone();
+        state
+            .plugins
+            .get_mut(&plugin_id)
+            .expect("session plugin retained")
+            .reserved_operations -= 1;
+        drop(reservation);
     }
     Ok(())
 }

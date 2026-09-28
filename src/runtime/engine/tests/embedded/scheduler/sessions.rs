@@ -1,4 +1,5 @@
 use super::*;
+mod finalization;
 
 /// Open the exact session pool and require completed initialization before returning its identity.
 /// 打开精确会话池，要求初始化完成后才返回其身份。

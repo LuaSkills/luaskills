@@ -8029,6 +8029,12 @@
               "minimum": 0,
               "type": "integer"
             },
+            "reserved_operations": {
+              "description": "Capacity reserved for closing long-lived instances, before their operation identities become queryable.\n为关闭长生命周期实例预留的容量，此时相应操作身份尚不可查询。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "resources": {
               "$ref": "#/$defs/PoolUsage",
               "description": "Actual resident VM counters through confirmed destruction.\n持续记账到确认销毁的实际常驻 VM 计数。"
@@ -8063,6 +8069,7 @@
             "retained_pools",
             "retained_sessions",
             "retained_operations",
+            "reserved_operations",
             "closing"
           ],
           "type": "object"
@@ -8678,7 +8685,14 @@
                   "type": "null"
                 }
               ],
-              "description": "First execution failure that made the session unusable.\n导致会话不可用的首次执行错误。"
+              "description": "First business or closing failure; a later cleanup error cannot replace the original failure.\n首次业务或关闭错误；后续清理错误不能替换原始错误。"
+            },
+            "finalization_operation": {
+              "description": "Independently retained closing operation; absent until eligible session cleanup is scheduled.\n独立保留的关闭操作；符合条件的会话清理被调度前省略。",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "phase": {
               "$ref": "#/$defs/EmbeddedSessionPhase",
@@ -8704,6 +8718,7 @@
             "pool_id",
             "phase",
             "active_operation",
+            "finalization_operation",
             "queued_calls",
             "error"
           ],

@@ -199,17 +199,15 @@ fn embedded_scheduler_finalization_survives_runtime_close_and_waits_for_host_ack
 fn embedded_scheduler_finalization_validates_registration_and_initialization() {
     let layout = SystemRuntimeTestLayout::new("automatic closing admission validation");
     let runtime = runtime(&layout, pool_config());
-    for reuse in [InstanceReuse::Reusable, InstanceReuse::Session] {
-        let error = runtime
-            .register_pool(
-                closing_definition(&layout, "error('must not initialize')", 100),
-                pool_policy(reuse),
-                permissions(),
-                "r1".into(),
-            )
-            .unwrap_err();
-        assert_eq!(error.code, EmbeddedErrorCode::Unsupported);
-    }
+    let error = runtime
+        .register_pool(
+            closing_definition(&layout, "error('must not initialize')", 100),
+            pool_policy(InstanceReuse::Reusable),
+            permissions(),
+            "r1".into(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, EmbeddedErrorCode::Unsupported);
     for invalid in ["export", "arguments", "timeout"] {
         let mut module = closing_definition(&layout, "error('must not initialize')", 100);
         let closing = module.finalizer.as_mut().unwrap();

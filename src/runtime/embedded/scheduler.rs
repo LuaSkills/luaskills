@@ -15,6 +15,7 @@ mod finalization;
 mod persistence;
 mod plugins;
 mod sessions;
+mod sessions_finalization;
 mod workers;
 use finalization::PendingFinalization;
 
@@ -115,8 +116,8 @@ struct PendingCompletion {
     /// Same-VM closing work retained through its intent, actual execution and durable outcome.
     /// 跨意图、真实执行及持久结果保留的同 VM 关闭工作。
     finalization: Option<PendingFinalization>,
-    /// Successful session ownership remains exclusive until operation evidence is sealed.
-    /// 成功会话的所有权保持独占，直到操作证据封存。
+    /// Retained session ownership remains exclusive until business evidence is sealed or closing can be scheduled.
+    /// 保留会话的所有权保持独占，直到业务证据封存或可以调度关闭。
     session_lease: Option<Box<ModuleLease>>,
     /// Whether the sole owner has already entered cleaning, independent of execution admission.
     /// 唯一所有者是否已进入清理，独立于执行入场。
@@ -433,10 +434,10 @@ impl EmbeddedRuntime {
     ) -> EmbeddedResult<String> {
         policy.validate(self.center.pools.config())?;
         if let Some(finalizer) = &definition.finalizer {
-            if policy.reuse != InstanceReuse::SingleCall {
+            if policy.reuse == InstanceReuse::Reusable {
                 return Err(EmbeddedError::new(
                     EmbeddedErrorCode::Unsupported,
-                    "automatic finalization currently requires single-call reuse",
+                    "automatic finalization currently requires single-call or session reuse",
                 ));
             }
             json_size(finalizer, self.center.pools.config().max_value_bytes)?;

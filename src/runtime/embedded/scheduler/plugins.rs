@@ -15,6 +15,9 @@ pub(super) struct ScheduledPlugin {
     /// All retained operation identities, including completed results.
     /// 全部保留操作身份，包含已完成结果。
     pub(super) operations: usize,
+    /// Future lifecycle operations already charged against the plugin retention limit.
+    /// 已计入插件保留上限的未来生命周期操作。
+    pub(super) reserved_operations: usize,
     /// Permanent admission closure until all owned metadata can be explicitly removed.
     /// 永久入场关闭，直到全部所属元数据可以显式移除。
     pub(super) closing: bool,
@@ -55,6 +58,9 @@ pub struct EmbeddedPluginSnapshot {
     /// Retained operations, including results whose callers dropped their handles.
     /// 保留操作，包含调用方已丢弃句柄的结果。
     pub retained_operations: usize,
+    /// Capacity reserved for closing long-lived instances, before their operation identities become queryable.
+    /// 为关闭长生命周期实例预留的容量，此时相应操作身份尚不可查询。
+    pub reserved_operations: usize,
     /// Whether new pool and call admission is permanently closed.
     /// 新池及新调用入场是否已永久关闭。
     pub closing: bool,
@@ -95,6 +101,7 @@ impl EmbeddedRuntime {
                 queued: 0,
                 bytes: 0,
                 operations: 0,
+                reserved_operations: 0,
                 closing: false,
             },
         );
@@ -146,6 +153,7 @@ impl EmbeddedRuntime {
                 .count(),
             retained_sessions: state.plugin_sessions(plugin_id),
             retained_operations: plugin.operations,
+            reserved_operations: plugin.reserved_operations,
             closing: plugin.closing || state.closing,
         })
     }
@@ -196,6 +204,7 @@ impl EmbeddedRuntime {
         let plugin = state.plugins.get(plugin_id).ok_or_else(plugin_not_found)?;
         if (!plugin.closing && !state.closing)
             || plugin.operations != 0
+            || plugin.reserved_operations != 0
             || state.pools.values().any(|pool| pool.plugin_id == plugin_id)
         {
             return Err(EmbeddedError::new(

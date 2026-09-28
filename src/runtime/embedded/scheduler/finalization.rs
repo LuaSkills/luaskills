@@ -137,17 +137,17 @@ pub(super) fn execute(mut completion: PendingCompletion, maximum: usize) -> Pend
             .finalization
             .as_mut()
             .expect("worker owns closing VM");
-        let request = completion
-            .call
-            .request
-            .invocation()
-            .expect("single-call request exists");
+        let context = match &completion.call.request {
+            ScheduledRequest::Invoke(request) => &request.context,
+            ScheduledRequest::CloseSession { context, .. } => context,
+            _ => return Err(internal("unsupported automatic finalization request")),
+        };
         closing.lease.finalize(ModuleInvocation {
             operation_id: &completion.call.id,
-            session_id: None,
+            session_id: completion.call.request.session_id(),
             export: &closing.plan.export,
             arguments: &closing.plan.arguments,
-            context: &request.context,
+            context,
             control,
         })
     }));

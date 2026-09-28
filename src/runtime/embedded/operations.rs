@@ -12,6 +12,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 mod admission;
+mod reservation;
+pub(super) use reservation::OperationReservation;
 mod finalization;
 use finalization::FinalizationOwnership;
 pub use finalization::{OperationFinalization, OperationOutcome};
@@ -488,6 +490,9 @@ impl OperationOwner {
 /// Private registry state; result retention is explicit and bounded.
 /// 私有注册表状态；结果保留显式且有界。
 struct OperationRegistryState {
+    /// Capacity owned by future lifecycle operations, without starting a deadline or publishing an identity.
+    /// 未来生命周期操作拥有的容量，不启动截止时间，也不发布身份。
+    reserved: usize,
     /// Monotonic sequence never reused after explicit record removal.
     /// 显式移除记录后也不会复用的单调序号。
     sequence: u64,
@@ -519,7 +524,7 @@ pub struct OperationRegistry {
     max_value_bytes: usize,
     /// Admission and explicit retention changes are atomic.
     /// 入场与显式保留变更为原子操作。
-    state: Mutex<OperationRegistryState>,
+    state: Arc<Mutex<OperationRegistryState>>,
 }
 
 impl OperationRegistry {
@@ -537,10 +542,11 @@ impl OperationRegistry {
             runtime_id,
             max_operations: config.max_operations,
             max_value_bytes: config.max_value_bytes,
-            state: Mutex::new(OperationRegistryState {
+            state: Arc::new(Mutex::new(OperationRegistryState {
+                reserved: 0,
                 sequence: 0,
                 records: BTreeMap::new(),
-            }),
+            })),
         })
     }
 

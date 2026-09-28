@@ -402,6 +402,14 @@ pub struct ModulePool {
 }
 
 impl ModulePool {
+    /// Borrow the immutable declared finalizer for lifecycle admission before VM initialization.
+    /// 在 VM 初始化之前，借用不可变的已声明关闭回调以安排生命周期入场。
+    /// Return none only when the registered module declares no automatic closing export.
+    /// 仅已注册模块未声明自动关闭导出时返回空值。
+    pub(super) fn finalizer(&self) -> Option<&ModuleFinalizer> {
+        self.definition.finalizer.as_ref()
+    }
+
     /// Derive immutable authority for `operation_id`, optional `session_id` and declared `export` from this exact pool.
     /// 从此精确池为 `operation_id`、可选 `session_id` 及已声明 `export` 派生不可变权威。
     /// Return context without locking, executing source or consulting a newer capability registration.
