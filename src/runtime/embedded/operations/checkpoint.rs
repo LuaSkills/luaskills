@@ -111,9 +111,12 @@ enum Attempt {
     },
 }
 
-/// Immutable phase/result candidate plus its unique disk attempt; polling cannot replace the candidate.
-/// 不可变阶段或结果候选及其唯一磁盘尝试；轮询不能替换候选。
+/// Immutable phase/result/intent candidate plus its unique disk attempt; polling cannot replace the candidate.
+/// 不可变阶段、结果或意图候选及其唯一磁盘尝试；轮询不能替换候选。
 pub(super) struct PendingCheckpoint {
+    /// Present only for execution intent; acknowledging it must not publish a fictitious handler lifecycle.
+    /// 仅执行意图存在此值；确认它不能发布虚构的处理器生命周期。
+    effect_start: Option<String>,
     /// The exact owned snapshot submitted to storage, never reconstructed from newer observations.
     /// 提交到存储的精确自有快照，绝不从较新观测重新构造。
     snapshot: Arc<OperationSnapshot>,
@@ -127,6 +130,7 @@ impl PendingCheckpoint {
     /// 在首次有界队列入场前保留不可变 `snapshot`。
     fn new(snapshot: Arc<OperationSnapshot>) -> Self {
         Self {
+            effect_start: None,
             snapshot,
             attempt: Attempt::New,
         }
@@ -202,6 +206,106 @@ impl PendingCheckpoint {
                 Err(error)
             }
         }
+    }
+}
+
+impl Operation {
+    /// Persist the exact ledger record's execution intent for `effect_id`; `wait` selects execution-thread waiting.
+    /// 持久化 `effect_id` 对应精确账本记录的执行意图；`wait` 选择执行线程等待。
+    /// Share phase ordering and revision authority; acknowledging intent does not itself dispatch a handler.
+    /// 共享阶段排序及修订权威；确认意图本身不分发处理器。
+    pub(in crate::runtime::embedded) fn checkpoint_effect_start(
+        &self,
+        effect_id: &str,
+        wait: bool,
+    ) -> EmbeddedResult<bool> {
+        // This path is reached only through the immutable persistent ledger binding installed at admission.
+        // 此路径仅通过入场时安装的不可变持久账本绑定进入。
+        let history = self.history.as_ref().ok_or_else(poisoned)?;
+        if !history.is_queued() {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::Unsupported,
+                "persistent host dispatch requires a journal worker",
+            ));
+        }
+        // Nonblocking callers never wait for another execution thread's checkpoint gate.
+        // 非阻塞调用方绝不等待另一执行线程的检查点门禁。
+        let mut transition = if wait {
+            self.transition.lock().map_err(|_| poisoned())?
+        } else {
+            match self.transition.try_lock() {
+                Ok(transition) => transition,
+                Err(TryLockError::WouldBlock) => return Ok(false),
+                Err(TryLockError::Poisoned(_)) => return Err(poisoned()),
+            }
+        };
+        if let Some(checkpoint) = transition.as_mut() {
+            // A retained phase belongs to its owner; a callback must not publish that owner's transition.
+            // 保留阶段属于其所有者；回调不能发布该所有者的变更。
+            if checkpoint.effect_start.is_none() {
+                return if wait {
+                    Err(EmbeddedError::new(
+                        EmbeddedErrorCode::Busy,
+                        "operation phase checkpoint is pending",
+                    ))
+                } else {
+                    Ok(false)
+                };
+            }
+            // Drain an earlier intent even if its requester was cancelled; never retry a known failure here.
+            // 即使原请求方已取消也排空较早意图；此处绝不重试已知失败。
+            let same_effect = checkpoint.effect_start.as_deref() == Some(effect_id);
+            if !checkpoint.drive(history, wait, false)? {
+                return Ok(false);
+            }
+            transition.take();
+            if same_effect {
+                return Ok(true);
+            }
+        }
+        // Capture only after acquiring the sole mutation gate so an older intent cannot overwrite a newer phase.
+        // 仅在取得唯一变更门禁后捕获，避免旧意图覆盖较新阶段。
+        let mut snapshot = self.lock()?.clone();
+        if snapshot.phase.is_terminal() {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::Closed,
+                "operation is terminal",
+            ));
+        }
+        snapshot.cancellation_requested = self.control.is_cancelled();
+        snapshot.host_effects = self.effects.snapshot()?;
+        // The exact ledger owns identity and request binding; no application argument supplies either value.
+        // 精确账本拥有身份与请求绑定；两者均不由应用参数提供。
+        let record = snapshot
+            .host_effects
+            .iter_mut()
+            .find(|record| record.effect_id == effect_id)
+            .ok_or_else(poisoned)?;
+        if record.phase != super::super::HostEffectPhase::Prepared {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::Busy,
+                "host effect was already dispatched",
+            ));
+        }
+        // Disk records conservative execution permission before the live ledger changes to actual dispatch.
+        // 磁盘先记录保守执行许可，实时账本随后才变更为实际分发。
+        record.phase = super::super::HostEffectPhase::Running;
+        record.effects = EffectState::Unknown;
+        snapshot.effects = merge_effects(snapshot.effects, &snapshot.host_effects);
+        // Keep the original candidate across queue rejection, cancellation and explicit owner recovery.
+        // 跨队列拒绝、取消及显式所有者恢复保留原始候选。
+        let mut checkpoint = PendingCheckpoint::new(Arc::new(snapshot));
+        checkpoint.effect_start = Some(effect_id.to_owned());
+        *transition = Some(checkpoint);
+        if !transition
+            .as_mut()
+            .expect("retained execution intent")
+            .drive(history, wait, false)?
+        {
+            return Ok(false);
+        }
+        transition.take();
+        Ok(true)
     }
 }
 
@@ -403,7 +507,11 @@ impl OperationOwner {
         if !checkpoint.drive(history, wait, retry)? {
             return Ok(false);
         }
-        *self.operation.lock()? = checkpoint.snapshot.as_ref().clone();
+        // Intent persistence authorizes a separate live dispatch; recovery alone never dispatches a handler.
+        // 意图持久化授权另行执行实时分发；恢复本身绝不分发处理器。
+        if checkpoint.effect_start.is_none() {
+            *self.operation.lock()? = checkpoint.snapshot.as_ref().clone();
+        }
         transition.take();
         self.operation.changed.notify_all();
         Ok(true)

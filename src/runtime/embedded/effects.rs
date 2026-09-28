@@ -2,7 +2,7 @@ use super::value_size::json_size;
 use super::{EffectState, EmbeddedError, EmbeddedErrorCode, EmbeddedResult};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 /// Actual handler lifecycle, separate from its reported business effect.
 /// 真实处理器生命周期，独立于其报告的业务副作用。
@@ -72,6 +72,9 @@ struct LedgerState {
 /// 控制对象与只读观察者共享的单操作有界日志。
 #[derive(Debug)]
 pub(super) struct EffectLedger {
+    /// Persistent operations share their exact mutation gate without creating an ownership cycle.
+    /// 持久操作共享其精确变更门禁，不创建所有权循环。
+    operation: Option<Weak<super::operations::Operation>>,
     /// Trusted runtime namespace.
     /// 可信运行时命名空间。
     runtime_id: String,
@@ -92,13 +95,17 @@ pub(super) struct EffectLedger {
 impl EffectLedger {
     /// Create empty evidence for exact runtime/operation identities and explicit retention budgets.
     /// 为精确运行时及操作身份和显式保留预算创建空证据。
+    /// `operation` binds persistent dispatch to its exact owner; None explicitly selects memory-only evidence.
+    /// `operation` 将持久分发绑定到精确所有者；None 显式选择纯内存证据。
     pub(super) fn new(
         runtime_id: String,
         operation_id: String,
         max_records: usize,
         max_bytes: usize,
+        operation: Option<Weak<super::operations::Operation>>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            operation,
             runtime_id,
             operation_id,
             max_records,
@@ -211,6 +218,30 @@ pub(crate) struct EffectAttempt {
 }
 
 impl EffectAttempt {
+    /// Persist this attempt's original dispatch intent; `wait` is allowed only on a native execution thread.
+    /// 持久化此尝试的原始分发意图；仅原生执行线程允许设置 `wait`。
+    /// Return false for an in-flight write without changing actual handler ownership or running user code.
+    /// 写入在途时返回假，不改变真实处理器所有权，也不运行用户代码。
+    pub(crate) fn checkpoint_start(&self, wait: bool) -> EmbeddedResult<bool> {
+        // Untracked calls and explicitly memory-only ledgers preserve their existing dispatch contract.
+        // 未跟踪调用及显式纯内存账本保留其既有分发契约。
+        let Some((ledger, _, effect_id)) = &self.owner else {
+            return Ok(true);
+        };
+        let Some(operation) = &ledger.operation else {
+            return Ok(true);
+        };
+        // Losing the exact persistent owner cannot silently turn this invocation into an untracked one.
+        // 精确持久所有者丢失不能将本次调用静默转为未跟踪调用。
+        let operation = operation.upgrade().ok_or_else(|| {
+            EmbeddedError::new(
+                EmbeddedErrorCode::Closed,
+                "persistent operation owner was released",
+            )
+        })?;
+        operation.checkpoint_effect_start(effect_id, wait)
+    }
+
     /// Construct an untracked low-level attempt without silently allocating an implicit journal.
     /// 构造未跟踪低层尝试，不静默分配隐式日志。
     pub(super) fn untracked() -> Self {

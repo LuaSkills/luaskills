@@ -347,16 +347,23 @@ impl HostRequestBroker {
             // 编码可能耗时，因此在分发前立即重新检查原始权威。
             let delivery = prepared.invocation.authorize().and_then(|()| {
                 entry.with_dispatch_gate(|| {
+                    // Queue consumers only submit or observe; pending disk intent leaves the request queued.
+                    // 队列消费者仅提交或观测；磁盘意图待完成时请求继续排队。
+                    if !prepared.effect.checkpoint_start(false)? {
+                        return Ok(None);
+                    }
+                    prepared.invocation.authorize()?;
                     prepared.effect.begin()?;
                     record.phase = HostRequestPhase::Dispatched;
-                    Ok(request)
+                    Ok(Some(request))
                 })?
             });
             match delivery {
-                Ok(request) => {
+                Ok(Some(request)) => {
                     state.ready.pop_front();
                     return Ok(Some(request));
                 }
+                Ok(None) => return Ok(None),
                 Err(error) if error.code == EmbeddedErrorCode::Internal => return Err(error),
                 Err(error) => {
                     drop(state);

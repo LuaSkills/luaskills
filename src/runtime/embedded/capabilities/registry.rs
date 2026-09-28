@@ -982,7 +982,11 @@ impl CapabilitySnapshot {
             .native
             .as_ref()
             .expect("native registration owns its validated callback");
-        effect.begin()?;
+        // Disk acknowledgement precedes dispatch, and waiting cannot extend the original authority or deadline.
+        // 磁盘确认先于分发，等待不能延长原始权限或截止时间。
+        effect.checkpoint_start(true)?;
+        invocation.authorize()?;
+        entry.with_dispatch_gate(|| effect.begin())??;
         // Fixed panic diagnostics do not expose private callback values.
         // 固定 panic 诊断不暴露私有回调值。
         let outcome =

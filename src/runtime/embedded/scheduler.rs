@@ -245,8 +245,8 @@ pub struct EmbeddedRuntime {
 impl EmbeddedRuntime {
     /// Build runtime phase persistence using exact host-owned `writer`; the host closes and joins that writer separately.
     /// 使用精确宿主自有 `writer` 构造运行时阶段持久化；宿主另行关闭并等待该写入者。
-    /// Per-effect write-ahead evidence and cross-process recovery remain separate integration requirements.
-    /// 逐次副作用预写证据及跨进程恢复仍是独立接入要求。
+    /// Host dispatch intents share this writer; immediate outcome checkpoints and cross-process recovery remain pending.
+    /// 宿主分发意图共享此写入者；即时结果检查点及跨进程恢复仍待接入。
     pub fn with_journal_worker(
         engine: Arc<LuaEngine>,
         config: EmbeddedRuntimeConfig,

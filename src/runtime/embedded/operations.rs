@@ -161,9 +161,9 @@ fn advance_snapshot(snapshot: &mut OperationSnapshot, phase: OperationPhase) -> 
 
 /// State shared by one read/cancel handle and its sole execution owner.
 /// 单个读取与取消句柄和其唯一执行所有者共享的状态。
-struct Operation {
-    /// Serializes phase checkpoint ownership separately from client observation and cancellation.
-    /// 将阶段检查点所有权与客户端观测、取消分开串行化。
+pub(super) struct Operation {
+    /// Serializes phase and host-intent checkpoints separately from client observation and cancellation.
+    /// 将阶段及宿主意图检查点与客户端观测、取消分开串行化。
     transition: Mutex<Option<PendingCheckpoint>>,
     /// Explicit durable checkpoints for this operation; absence preserves the existing memory-only API.
     /// 此操作的显式持久检查点；省略时保留既有仅内存 API。
@@ -574,18 +574,9 @@ impl OperationRegistry {
         // Opaque strings preserve the full identity in every supported SDK.
         // 不透明字符串在所有受支持 SDK 中保留完整身份。
         let id = super::IdentityKind::Operation.render(&self.runtime_id, sequence);
-        // The original control can belong to exactly one registered operation for its whole lifetime.
-        // 原始控制对象在整个生命周期内只能归属于一个注册操作。
-        let effects = EffectLedger::new(
-            self.runtime_id.clone(),
-            id.clone(),
-            self.max_effect_records,
-            self.max_effect_bytes,
-        );
-        control.attach_effects(Arc::clone(&effects))?;
-        // Prepare the complete record before making it discoverable.
-        // 在记录可被发现前完整构造记录。
-        let operation = Arc::new(Operation {
+        // Construct the immutable persistence binding before exposing the ledger through shared control.
+        // 在通过共享控制对象暴露账本之前构造不可变持久绑定。
+        let operation = Arc::new_cyclic(|operation| Operation {
             transition: Mutex::new(None),
             history: self.journal.as_ref().map(|journal| OperationHistory {
                 backend: journal.clone(),
@@ -593,8 +584,14 @@ impl OperationRegistry {
                 revision: Mutex::new(None),
             }),
             id: id.clone(),
-            effects,
-            control,
+            effects: EffectLedger::new(
+                self.runtime_id.clone(),
+                id.clone(),
+                self.max_effect_records,
+                self.max_effect_bytes,
+                self.journal.as_ref().map(|_| operation.clone()),
+            ),
+            control: Arc::clone(&control),
             snapshot: Mutex::new(OperationSnapshot {
                 host_effects: Vec::new(),
                 operation_id: id.clone(),
@@ -607,6 +604,9 @@ impl OperationRegistry {
             changed: Condvar::new(),
             max_value_bytes: self.max_value_bytes,
         });
+        // The original control belongs to one operation; failed attachment publishes no registry identity.
+        // 原始控制对象只归属于一个操作；绑定失败不发布注册表身份。
+        control.attach_effects(Arc::clone(&operation.effects))?;
         state.sequence = sequence;
         state.records.insert(id, Arc::clone(&operation));
         Ok((

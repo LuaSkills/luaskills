@@ -3,6 +3,8 @@
 
 use super::*;
 
+mod intent;
+
 /// One bounded fixture observation budget; production storage has its own ownership lifecycle.
 /// 单一有界夹具观测预算；生产存储具有自己的所有权生命周期。
 const OBSERVE: Duration = Duration::from_secs(8);
