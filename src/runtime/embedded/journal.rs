@@ -131,6 +131,7 @@ impl OperationJournal {
         snapshot: &OperationSnapshot,
     ) -> EmbeddedResult<JournalOperation> {
         self.validate_key(runtime_id, &snapshot.operation_id)?;
+        validate_callers(runtime_id, snapshot)?;
         json_size(snapshot, self.config.max_record_bytes)?;
         let record = JournalOperation {
             runtime_id: runtime_id.to_owned(),
@@ -162,6 +163,7 @@ impl OperationJournal {
         snapshot: &OperationSnapshot,
     ) -> EmbeddedResult<JournalOperation> {
         self.validate_key(runtime_id, &snapshot.operation_id)?;
+        validate_callers(runtime_id, snapshot)?;
         json_size(snapshot, self.config.max_record_bytes)?;
         let revision = expected_revision
             .checked_add(1)
@@ -386,6 +388,7 @@ impl OperationJournal {
         {
             return Err(corrupt());
         }
+        validate_callers(runtime_id, &record.snapshot).map_err(|_| corrupt())?;
         Ok(record)
     }
 
@@ -405,6 +408,24 @@ impl OperationJournal {
         }
         Ok(state)
     }
+}
+
+/// Validate each original caller against the stored runtime and operation before accepting or restoring evidence.
+/// 接纳或恢复证据前，对照存储的运行时及操作校验每个原始调用方。
+/// Return an explicit identity error; no current plugin registration supplies missing historical fields.
+/// 返回明确身份错误；不从当前插件注册补充缺失的历史字段。
+fn validate_callers(runtime_id: &str, snapshot: &OperationSnapshot) -> EmbeddedResult<()> {
+    // Each retained effect carries its own original authority, including low-level host-managed calls.
+    // 每条保留副作用携带其自身原始权威，包括低层宿主管理调用。
+    for effect in &snapshot.host_effects {
+        effect.caller.validate(runtime_id)?;
+        if effect.caller.operation_id != snapshot.operation_id {
+            return Err(EmbeddedError::invalid(
+                "historical effect caller does not match its operation",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Return a bounded retention error without exposing database paths or application values.

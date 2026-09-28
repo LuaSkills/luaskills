@@ -1,4 +1,5 @@
 use super::HostEffectRecord;
+use super::capabilities::CapabilityCaller;
 use super::effects::{EffectAttempt, EffectLedger};
 use super::{EmbeddedError, EmbeddedErrorCode, EmbeddedResult};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -92,8 +93,7 @@ impl CallControl {
     /// 在原始可信调用方身份下预留单个精确能力的证据。
     pub(crate) fn reserve_effect(
         &self,
-        runtime_id: &str,
-        operation_id: &str,
+        caller: &CapabilityCaller,
         registration_id: &str,
         name: &str,
         version: &str,
@@ -111,9 +111,7 @@ impl CallControl {
             }
         };
         match ledger {
-            Some(ledger) => {
-                ledger.prepare(runtime_id, operation_id, registration_id, name, version)
-            }
+            Some(ledger) => ledger.prepare(caller, registration_id, name, version),
             None => Ok(EffectAttempt::untracked()),
         }
     }

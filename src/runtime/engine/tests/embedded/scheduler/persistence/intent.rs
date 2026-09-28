@@ -50,6 +50,18 @@ fn embedded_effect_intent_lua_initialization_and_call_are_durable() {
                     stage => panic!("unexpected fixture stage: {stage}"),
                 };
                 assert_eq!(stored.snapshot.phase, expected);
+                // Compare the durable caller before handler execution, not a later reconstructed module identity.
+                // 在处理器执行前比较持久调用方，不比较稍后重建的模块身份。
+                assert_eq!(
+                    stored
+                        .snapshot
+                        .host_effects
+                        .iter()
+                        .find(|record| Some(record.effect_id.as_str()) == call.effect_id.as_deref())
+                        .unwrap()
+                        .caller,
+                    call.caller,
+                );
                 assert!(stored.snapshot.host_effects.iter().any(|record| Some(
                     record.effect_id.as_str()
                 )

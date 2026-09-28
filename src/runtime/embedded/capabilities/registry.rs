@@ -857,8 +857,7 @@ impl CapabilitySnapshot {
         // Retention failure is detected before native execution or SDK publication can produce effects.
         // 在原生执行或 SDK 发布可能产生副作用前检测保留失败。
         let effect = control.reserve_effect(
-            &caller.runtime_id,
-            &caller.operation_id,
+            &caller,
             &entry.id,
             &entry.descriptor.name,
             &entry.descriptor.version,

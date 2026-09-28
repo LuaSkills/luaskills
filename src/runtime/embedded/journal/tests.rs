@@ -4,6 +4,8 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 
+mod identity;
+
 /// Own one newly created temporary directory, isolated from other tests and user files.
 /// 拥有一个新建临时目录，与其他测试及用户文件隔离。
 struct Directory(PathBuf);
@@ -215,6 +217,16 @@ fn embedded_journal_capacity_and_unresolved_retention() {
     record.phase = OperationPhase::Failed;
     record.effects = EffectState::Committed;
     record.host_effects.push(HostEffectRecord {
+        caller: super::super::capabilities::CapabilityCaller {
+            runtime_id: "runtime".into(),
+            operation_id: "first".into(),
+            plugin_id: "journal-plugin".into(),
+            package_generation: "generation-one".into(),
+            execution_revision: "revision-one".into(),
+            security_partition: "test".into(),
+            session_id: None,
+            workspace_root: None,
+        },
         effect_id: "effect".into(),
         registration_id: "registration".into(),
         capability_name: "write".into(),
@@ -305,9 +317,14 @@ fn embedded_journal_unknown_database_unchanged() {
     let future_path = directory.0.join("future.db");
     drop(OperationJournal::open(&future_path, config()).unwrap());
     {
-        Connection::open(&future_path)
-            .unwrap()
-            .pragma_update(None, "user_version", 2)
+        // Derive an unsupported future version from the actual current file instead of duplicating its version.
+        // 从真实当前文件派生不支持的未来版本，不重复定义其版本。
+        let connection = Connection::open(&future_path).unwrap();
+        let current: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", current + 1)
             .unwrap();
     }
     let original = std::fs::read(&future_path).unwrap();

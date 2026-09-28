@@ -200,7 +200,7 @@ pub struct CapabilityCaller {
 impl CapabilityCaller {
     /// Verify nonempty authority fields and exact owning `runtime_id` before dispatch.
     /// 分发前校验非空权威字段及精确所属 `runtime_id`。
-    pub(super) fn validate(&self, runtime_id: &str) -> EmbeddedResult<()> {
+    pub(in crate::runtime::embedded) fn validate(&self, runtime_id: &str) -> EmbeddedResult<()> {
         if self.runtime_id != runtime_id
             || [
                 &self.plugin_id,

@@ -1,3 +1,4 @@
+use super::capabilities::CapabilityCaller;
 use super::value_size::json_size;
 use super::{EffectState, EmbeddedError, EmbeddedErrorCode, EmbeddedResult};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,9 @@ pub enum HostEffectPhase {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct HostEffectRecord {
+    /// Original host-bound caller identity, retained for reconciliation without consulting a newer plugin generation.
+    /// 原始宿主绑定调用身份；对账保留该身份，不查询较新的插件代次。
+    pub caller: CapabilityCaller,
     /// Never-reused identity within the original operation.
     /// 原始操作内绝不复用的身份。
     pub effect_id: String,
@@ -129,13 +133,12 @@ impl EffectLedger {
     /// 宿主执行前预留精确注册证据；拒绝错误调用方或耗尽容量。
     pub(super) fn prepare(
         self: &Arc<Self>,
-        runtime_id: &str,
-        operation_id: &str,
+        caller: &CapabilityCaller,
         registration_id: &str,
         name: &str,
         version: &str,
     ) -> EmbeddedResult<EffectAttempt> {
-        if runtime_id != self.runtime_id || operation_id != self.operation_id {
+        if caller.runtime_id != self.runtime_id || caller.operation_id != self.operation_id {
             return Err(EmbeddedError::invalid(
                 "capability caller does not match its operation journal",
             ));
@@ -155,6 +158,7 @@ impl EffectLedger {
         let sequence = state.sequence.checked_add(1).ok_or_else(capacity)?;
         let id = format!("{}:effect:{sequence}", self.operation_id);
         let record = HostEffectRecord {
+            caller: caller.clone(),
             effect_id: id.clone(),
             registration_id: registration_id.into(),
             capability_name: name.into(),

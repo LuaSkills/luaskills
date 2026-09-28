@@ -4487,6 +4487,61 @@
     },
     "operation_status": {
       "$defs": {
+        "CapabilityCaller": {
+          "additionalProperties": false,
+          "description": "Host-authenticated caller data copied outside plugin-controlled arguments.\n在插件可控参数之外复制的宿主认证调用方数据。",
+          "properties": {
+            "execution_revision": {
+              "description": "Immutable execution and initialization-configuration revision.\n不可变执行与初始化配置修订。",
+              "type": "string"
+            },
+            "operation_id": {
+              "description": "Exact operation whose original budget applies.\n适用原始预算的精确操作。",
+              "type": "string"
+            },
+            "package_generation": {
+              "description": "Immutable package and dependency generation.\n不可变包与依赖代次。",
+              "type": "string"
+            },
+            "plugin_id": {
+              "description": "Exact activated plugin identity.\n精确激活的插件身份。",
+              "type": "string"
+            },
+            "runtime_id": {
+              "description": "Runtime namespace that owns the registration and operation.\n拥有注册及操作的运行时命名空间。",
+              "type": "string"
+            },
+            "security_partition": {
+              "description": "Trusted user/workspace partition, never copied from a Lua argument.\n可信用户与工作区分区，绝不从 Lua 参数复制。",
+              "type": "string"
+            },
+            "session_id": {
+              "description": "Optional fixed session required by session-scoped capabilities.\n会话作用域能力要求的可选固定会话。",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workspace_root": {
+              "description": "Explicit authorized workspace; absent means package-only context.\n显式授权工作区；省略表示仅包内上下文。",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "runtime_id",
+            "plugin_id",
+            "package_generation",
+            "execution_revision",
+            "security_partition",
+            "operation_id",
+            "session_id",
+            "workspace_root"
+          ],
+          "type": "object"
+        },
         "EffectState": {
           "description": "Host-reported effect outcome, independent from execution success or cancellation.\n宿主报告的副作用结果，独立于执行成功或取消。",
           "oneOf": [
@@ -4635,6 +4690,10 @@
           "additionalProperties": false,
           "description": "Bounded evidence retained independently from values returned to Lua.\n独立于返回 Lua 的值保留的有界证据。",
           "properties": {
+            "caller": {
+              "$ref": "#/$defs/CapabilityCaller",
+              "description": "Original host-bound caller identity, retained for reconciliation without consulting a newer plugin generation.\n原始宿主绑定调用身份；对账保留该身份，不查询较新的插件代次。"
+            },
             "capability_name": {
               "description": "Public capability name, excluding business arguments and credentials.\n公开能力名称，不包含业务参数与凭证。",
               "type": "string"
@@ -4668,6 +4727,7 @@
             }
           },
           "required": [
+            "caller",
             "effect_id",
             "registration_id",
             "capability_name",
@@ -4813,6 +4873,61 @@
     },
     "operation_wait": {
       "$defs": {
+        "CapabilityCaller": {
+          "additionalProperties": false,
+          "description": "Host-authenticated caller data copied outside plugin-controlled arguments.\n在插件可控参数之外复制的宿主认证调用方数据。",
+          "properties": {
+            "execution_revision": {
+              "description": "Immutable execution and initialization-configuration revision.\n不可变执行与初始化配置修订。",
+              "type": "string"
+            },
+            "operation_id": {
+              "description": "Exact operation whose original budget applies.\n适用原始预算的精确操作。",
+              "type": "string"
+            },
+            "package_generation": {
+              "description": "Immutable package and dependency generation.\n不可变包与依赖代次。",
+              "type": "string"
+            },
+            "plugin_id": {
+              "description": "Exact activated plugin identity.\n精确激活的插件身份。",
+              "type": "string"
+            },
+            "runtime_id": {
+              "description": "Runtime namespace that owns the registration and operation.\n拥有注册及操作的运行时命名空间。",
+              "type": "string"
+            },
+            "security_partition": {
+              "description": "Trusted user/workspace partition, never copied from a Lua argument.\n可信用户与工作区分区，绝不从 Lua 参数复制。",
+              "type": "string"
+            },
+            "session_id": {
+              "description": "Optional fixed session required by session-scoped capabilities.\n会话作用域能力要求的可选固定会话。",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workspace_root": {
+              "description": "Explicit authorized workspace; absent means package-only context.\n显式授权工作区；省略表示仅包内上下文。",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "runtime_id",
+            "plugin_id",
+            "package_generation",
+            "execution_revision",
+            "security_partition",
+            "operation_id",
+            "session_id",
+            "workspace_root"
+          ],
+          "type": "object"
+        },
         "EffectState": {
           "description": "Host-reported effect outcome, independent from execution success or cancellation.\n宿主报告的副作用结果，独立于执行成功或取消。",
           "oneOf": [
@@ -4961,6 +5076,10 @@
           "additionalProperties": false,
           "description": "Bounded evidence retained independently from values returned to Lua.\n独立于返回 Lua 的值保留的有界证据。",
           "properties": {
+            "caller": {
+              "$ref": "#/$defs/CapabilityCaller",
+              "description": "Original host-bound caller identity, retained for reconciliation without consulting a newer plugin generation.\n原始宿主绑定调用身份；对账保留该身份，不查询较新的插件代次。"
+            },
             "capability_name": {
               "description": "Public capability name, excluding business arguments and credentials.\n公开能力名称，不包含业务参数与凭证。",
               "type": "string"
@@ -4994,6 +5113,7 @@
             }
           },
           "required": [
+            "caller",
             "effect_id",
             "registration_id",
             "capability_name",
