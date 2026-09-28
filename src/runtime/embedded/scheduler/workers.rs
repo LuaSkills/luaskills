@@ -236,7 +236,9 @@ pub(super) fn execute(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
                 if state.closing {
                     return Ok(());
                 }
-                if let Some(dispatch) = select(&mut state)? {
+                if state.persistence_failures.is_empty()
+                    && let Some(dispatch) = select(&mut state)?
+                {
                     break dispatch;
                 }
                 state = center
@@ -246,7 +248,7 @@ pub(super) fn execute(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
                     .0;
             }
         };
-        let mut completion = match dispatch {
+        let completion = match dispatch {
             Dispatch::Ready(call, lease) => {
                 invoke(call, *lease, center.pools.config().max_value_bytes)
             }
@@ -260,8 +262,6 @@ pub(super) fn execute(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
                 cleaning_started: false,
             },
         };
-        completion.call.owner.advance(OperationPhase::Cleaning)?;
-        completion.cleaning_started = true;
         {
             let mut state = center.lock()?;
             if completion.session_lease.is_none()
@@ -350,116 +350,202 @@ fn complete(
     center: &SchedulerCenter,
     mut completion: PendingCompletion,
 ) -> Option<PendingCompletion> {
-    // Serialize readiness publication with close requests, without destroying a VM under this lock.
-    // 使就绪发布与关闭请求串行化，且不在此锁下销毁 VM。
-    let mut state = match center.lock() {
-        Ok(state) => state,
-        Err(error) => {
-            center.fail(error);
-            return Some(completion);
-        }
-    };
-    if let Some(session_id) = completion.call.request.session_id() {
-        let must_close = state.closing
-            || state
-                .pools
-                .get(completion.call.request.pool_id())
-                .expect("active pool exists")
-                .closed
-            || state
-                .sessions
-                .get(session_id)
-                .expect("active session exists")
-                .closing;
-        if must_close && let Some(lease) = completion.session_lease.take() {
-            state
-                .sessions
-                .get_mut(session_id)
-                .expect("active session exists")
-                .closing = true;
-            drop(state);
-            match lease.finish() {
-                Ok(ModuleRelease::Retiring(receipt)) => completion.retirement = Some(receipt),
-                Ok(ModuleRelease::NoInstance) => {}
-                Ok(ModuleRelease::ReturnedToPool) => {
-                    center.fail(internal("session VM returned to ordinary reuse"))
-                }
-                Err(error) => center.fail(error),
-            }
-            return Some(completion);
-        }
-    }
-    if let Some(retirement) = &completion.retirement {
-        match retirement.snapshot() {
-            Ok(snapshot) if snapshot.phase != ModuleRetirementPhase::Completed => {
-                return Some(completion);
-            }
-            Ok(_) => {}
+    loop {
+        // Completion preparation serializes with close requests; no filesystem work occurs under metadata.
+        // 完成准备与关闭请求串行化；元数据锁下不执行文件系统工作。
+        let mut state = match center.lock() {
+            Ok(state) => state,
             Err(error) => {
-                drop(state);
                 center.fail(error);
                 return Some(completion);
             }
+        };
+        if completion.call.owner.pending_completion().is_none()
+            && let Some(session_id) = completion.call.request.session_id()
+        {
+            // A close observed before preparation belongs to this operation's required cleanup.
+            // 准备前观测到的关闭属于此操作必须完成的清理。
+            let must_close = state.closing
+                || state
+                    .pools
+                    .get(completion.call.request.pool_id())
+                    .expect("active pool exists")
+                    .closed
+                || state
+                    .sessions
+                    .get(session_id)
+                    .expect("active session exists")
+                    .closing;
+            if must_close && let Some(lease) = completion.session_lease.take() {
+                state
+                    .sessions
+                    .get_mut(session_id)
+                    .expect("active session exists")
+                    .closing = true;
+                drop(state);
+                match lease.finish() {
+                    Ok(ModuleRelease::Retiring(receipt)) => completion.retirement = Some(receipt),
+                    Ok(ModuleRelease::NoInstance) => {}
+                    Ok(ModuleRelease::ReturnedToPool) => {
+                        center.fail(internal("session VM returned to ordinary reuse"))
+                    }
+                    Err(error) => center.fail(error),
+                }
+                return Some(completion);
+            }
         }
-    }
-    if !completion.cleaning_started {
-        if let Err(error) = completion.call.owner.advance(OperationPhase::Cleaning) {
+        // Consume at most one explicit retry request; ordinary maintenance only observes original attempts.
+        // 最多消耗一个显式重试请求；普通维护仅观测原始尝试。
+        let retry = match state.persistence_failures.get_mut(&completion.call.id) {
+            Some(failure) => match failure.retry {
+                CheckpointRetryState::Waiting => return Some(completion),
+                CheckpointRetryState::Requested => {
+                    failure.retry = CheckpointRetryState::Retrying;
+                    true
+                }
+                CheckpointRetryState::Retrying => false,
+            },
+            None => false,
+        };
+        if !completion.cleaning_started {
+            drop(state);
+            // A failed execution-stage checkpoint remains owned and must be resolved before cleaning advances.
+            // 失败的执行阶段检查点继续被拥有，必须解决后才能推进清理。
+            let phase = match completion.call.owner.pending_phase() {
+                Ok(Some(phase)) => phase,
+                Ok(None) => OperationPhase::Cleaning,
+                Err(error) if error.code == EmbeddedErrorCode::Busy => return Some(completion),
+                Err(error) => {
+                    center.fail(error);
+                    return Some(completion);
+                }
+            };
+            // Neither path waits for disk; explicit retry can only resubmit the retained candidate.
+            // 两条路径均不等待磁盘；显式重试只能重新提交保留候选。
+            let progress = if retry {
+                completion.call.owner.retry_advance()
+            } else {
+                completion.call.owner.poll_advance(phase)
+            };
+            match progress {
+                Ok(false) => return Some(completion),
+                Ok(true) => {
+                    if let Err(error) = center.checkpoint_recovered(&completion.call.id) {
+                        center.fail(error);
+                        return Some(completion);
+                    }
+                    completion.cleaning_started = phase == OperationPhase::Cleaning;
+                    // Reacquire metadata and reconsider close before freezing a terminal decision.
+                    // 冻结终态决定前重新获取元数据并再次判断关闭。
+                    continue;
+                }
+                Err(error) => {
+                    center.checkpoint_failed(&completion.call.id, phase, error);
+                    return Some(completion);
+                }
+            }
+        }
+        if let Some(retirement) = &completion.retirement {
+            match retirement.snapshot() {
+                Ok(snapshot) if snapshot.phase != ModuleRetirementPhase::Completed => {
+                    return Some(completion);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    drop(state);
+                    center.fail(error);
+                    return Some(completion);
+                }
+            }
+        }
+        if completion.call.owner.pending_completion().is_none() {
+            // Freeze business evidence and the session-close decision once, while metadata is still serialized.
+            // 在元数据仍串行化时，只冻结一次业务证据及会话关闭决定。
+            match completion
+                .call
+                .owner
+                .prepare_completion(completion.result.clone(), completion.effects)
+            {
+                Ok(()) => {}
+                Err(error) if error.code == EmbeddedErrorCode::Busy => return Some(completion),
+                Err(error) => {
+                    drop(state);
+                    center.fail(error);
+                    return Some(completion);
+                }
+            }
+        }
+        // The candidate's exact phase reports storage failure without pretending public terminal publication.
+        // 候选的精确阶段用于报告存储故障，不伪装为公开终态发布。
+        let phase = completion
+            .call
+            .owner
+            .pending_completion()
+            .expect("prepared terminal candidate")
+            .phase;
+        drop(state);
+        match completion.call.owner.poll_completion_checkpoint(retry) {
+            Ok(false) => return Some(completion),
+            Err(error) => {
+                center.checkpoint_failed(&completion.call.id, phase, error);
+                return Some(completion);
+            }
+            Ok(true) => {}
+        }
+        // Disk is acknowledged before reacquiring metadata; publication and release remain one atomic decision.
+        // 重新获取元数据前磁盘已确认；发布与释放保持为一个原子决定。
+        let mut state = match center.lock() {
+            Ok(state) => state,
+            Err(error) => {
+                center.fail(error);
+                return Some(completion);
+            }
+        };
+        if let Err(error) = completion.call.owner.publish_completion() {
             drop(state);
             center.fail(error);
             return Some(completion);
         }
-        completion.cleaning_started = true;
-    }
-    match completion
-        .call
-        .owner
-        .complete(completion.result.clone(), completion.effects)
-    {
-        Ok(()) => {
-            state.live.remove(&completion.call.id);
-            state.cleaning_count -= 1;
+        state.persistence_failures.remove(&completion.call.id);
+        state.live.remove(&completion.call.id);
+        state.cleaning_count -= 1;
+        if completion.dispatched {
+            state
+                .pools
+                .get_mut(completion.call.request.pool_id())
+                .expect("active pool retained")
+                .active -= 1;
+        }
+        if let Some(session_id) = completion.call.request.session_id() {
+            // Close after preparation belongs to the following session lifecycle; it cannot rewrite this result.
+            // 准备后的关闭属于后续会话生命周期，不能改写此结果。
+            let session = state
+                .sessions
+                .get_mut(session_id)
+                .expect("unfinished session retained");
+            session.unfinished -= 1;
             if completion.dispatched {
-                state
-                    .pools
-                    .get_mut(completion.call.request.pool_id())
-                    .expect("active pool retained")
-                    .active -= 1;
-            }
-            if let Some(session_id) = completion.call.request.session_id() {
-                let session = state
-                    .sessions
-                    .get_mut(session_id)
-                    .expect("unfinished session retained");
-                session.unfinished -= 1;
-                if completion.dispatched {
-                    session.active = None;
-                    if let Some(lease) = completion.session_lease.take() {
-                        session.lease = Some(lease);
-                        session.opened = true;
-                    } else {
-                        session.closing = true;
-                    }
-                } else if matches!(
-                    completion.call.request,
-                    ScheduledRequest::OpenSession { .. }
-                ) {
+                session.active = None;
+                if let Some(lease) = completion.session_lease.take() {
+                    session.lease = Some(lease);
+                    session.opened = true;
+                } else {
                     session.closing = true;
                 }
-                if session.closing
-                    && let Err(error) = &completion.result
-                {
-                    session.error.get_or_insert_with(|| error.clone());
-                }
+            } else if matches!(
+                completion.call.request,
+                ScheduledRequest::OpenSession { .. }
+            ) {
+                session.closing = true;
             }
-            center.changed.notify_all();
-            None
+            if session.closing
+                && let Err(error) = &completion.result
+            {
+                session.error.get_or_insert_with(|| error.clone());
+            }
         }
-        Err(error) if error.code == EmbeddedErrorCode::Busy => Some(completion),
-        Err(error) => {
-            drop(state);
-            center.fail(error);
-            Some(completion)
-        }
+        center.changed.notify_all();
+        return None;
     }
 }
 

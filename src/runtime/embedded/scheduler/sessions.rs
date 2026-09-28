@@ -204,6 +204,7 @@ impl EmbeddedRuntime {
         if state.closing {
             return Err(closed());
         }
+        state.check_persistence_admission()?;
         if state.sessions.len() >= self.center.pools.config().max_sessions {
             return Err(EmbeddedError::new(
                 EmbeddedErrorCode::CapacityExceeded,
@@ -395,6 +396,7 @@ impl SchedulerCenter {
         if state.closing {
             return Err(closed());
         }
+        state.check_persistence_admission()?;
         let pool = state.pools.get(request.pool_id()).ok_or_else(not_found)?;
         if pool.closed {
             return Err(closed());

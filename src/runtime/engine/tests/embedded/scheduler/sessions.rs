@@ -2,7 +2,7 @@ use super::*;
 
 /// Open the exact session pool and require completed initialization before returning its identity.
 /// 打开精确会话池，要求初始化完成后才返回其身份。
-fn opened(runtime: &EmbeddedRuntime, pool: &str) -> String {
+pub(super) fn opened(runtime: &EmbeddedRuntime, pool: &str) -> String {
     let opening = runtime.open_session(pool, Duration::from_secs(5)).unwrap();
     let result = opening.operation.wait(Duration::from_secs(3)).unwrap();
     assert_eq!(result.phase, OperationPhase::Succeeded, "{result:?}");
@@ -15,7 +15,11 @@ fn opened(runtime: &EmbeddedRuntime, pool: &str) -> String {
 
 /// Submit one real session export with fixture context and a bounded execution deadline.
 /// 使用夹具上下文和有界执行截止时间提交一个真实会话导出。
-fn session_call(runtime: &EmbeddedRuntime, session: &str, arguments: Value) -> OperationHandle {
+pub(super) fn session_call(
+    runtime: &EmbeddedRuntime,
+    session: &str,
+    arguments: Value,
+) -> OperationHandle {
     runtime
         .submit_session(
             session,
@@ -29,7 +33,7 @@ fn session_call(runtime: &EmbeddedRuntime, session: &str, arguments: Value) -> O
 
 /// Wait only for observed session closure, never infer it from a close request or operation result.
 /// 仅等待观察到的会话关闭，绝不从关闭请求或操作结果推断关闭。
-fn closed_session(runtime: &EmbeddedRuntime, session: &str) -> EmbeddedSessionSnapshot {
+pub(super) fn closed_session(runtime: &EmbeddedRuntime, session: &str) -> EmbeddedSessionSnapshot {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let snapshot = runtime.session(session).unwrap();

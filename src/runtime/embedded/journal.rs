@@ -81,7 +81,7 @@ impl OperationJournal {
     /// Hold the actual storage gate for deterministic operation-observation concurrency tests.
     /// 持有真实存储门禁，用于确定性的操作观测并发测试。
     #[cfg(test)]
-    pub(super) fn block_for_test(&self) -> impl Drop + '_ {
+    pub(crate) fn block_for_test(&self) -> impl Drop + '_ {
         self.state.lock().expect("test journal lock is healthy")
     }
 

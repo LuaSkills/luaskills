@@ -48,7 +48,8 @@ pub use operations::{
 pub use plugin_config::EmbeddedPluginConfig;
 pub use pool::{EmbeddedPoolManager, ModuleLease, ModulePool};
 pub use scheduler::{
-    EmbeddedCall, EmbeddedPluginSnapshot, EmbeddedRuntime, EmbeddedRuntimeUsage,
-    EmbeddedSessionOpening, EmbeddedSessionPhase, EmbeddedSessionSnapshot,
+    CheckpointRetryState, EmbeddedCall, EmbeddedPluginSnapshot, EmbeddedRuntime,
+    EmbeddedRuntimeUsage, EmbeddedSessionOpening, EmbeddedSessionPhase, EmbeddedSessionSnapshot,
+    OperationPersistenceFailure,
 };
 pub use schema::{EMBEDDED_SCHEMA_DIALECT, JsonContract};

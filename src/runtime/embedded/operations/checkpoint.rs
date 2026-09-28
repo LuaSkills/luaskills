@@ -87,6 +87,9 @@ impl OperationHistory {
 /// State of one original checkpoint attempt; failed polling never creates another disk write.
 /// 单个原始检查点尝试的状态；失败轮询绝不创建另一次磁盘写入。
 enum Attempt {
+    /// Storage revision is acknowledged, but terminal publication can still await scheduler bookkeeping.
+    /// 存储修订已确认，但终态发布仍可能等待调度记账。
+    Acknowledged,
     /// No attempt has been submitted yet.
     /// 尚未提交尝试。
     New,
@@ -151,6 +154,7 @@ impl PendingCheckpoint {
         // Borrow the actual receipt until its observation has been captured.
         // 保持借用真实回执，直至捕获其观测。
         let receipt = match &self.attempt {
+            Attempt::Acknowledged => return Ok(true),
             Attempt::Submitted(receipt) => receipt,
             Attempt::Failed(error) | Attempt::Unobservable { error, .. } => {
                 return Err(error.clone());
@@ -188,6 +192,7 @@ impl PendingCheckpoint {
         match acknowledged(&observed) {
             Ok(next) => {
                 history.accept(previous, next)?;
+                self.attempt = Attempt::Acknowledged;
                 Ok(true)
             }
             Err(error) => {
@@ -201,6 +206,101 @@ impl PendingCheckpoint {
 }
 
 impl OperationOwner {
+    /// Inspect the retained phase before scheduler cleanup, without waiting for another transition owner.
+    /// 调度清理前检查保留阶段，不等待另一个变更所有者。
+    pub(crate) fn pending_phase(&self) -> EmbeddedResult<Option<OperationPhase>> {
+        // A busy phase gate is not permission to bypass the original candidate.
+        // 阶段门禁忙碌不代表可以绕过原始候选。
+        let transition = self
+            .operation
+            .transition
+            .try_lock()
+            .map_err(|error| match error {
+                TryLockError::WouldBlock => EmbeddedError::new(
+                    EmbeddedErrorCode::Busy,
+                    "operation transition is still owned",
+                ),
+                TryLockError::Poisoned(_) => poisoned(),
+            })?;
+        Ok(transition
+            .as_ref()
+            .map(|checkpoint| checkpoint.snapshot.phase))
+    }
+
+    /// Observe or explicitly retry terminal persistence outside scheduler metadata, without publishing completion.
+    /// 在调度元数据之外观测或显式重试终态持久化，不发布完成状态。
+    pub(crate) fn poll_completion_checkpoint(&mut self, retry: bool) -> EmbeddedResult<bool> {
+        self.drive_completion_checkpoint(false, retry)
+    }
+
+    /// Drive terminal storage under explicit `wait` and `retry` policy while keeping publication separate.
+    /// 按显式 `wait` 及 `retry` 策略推进终态存储，同时保持发布独立。
+    fn drive_completion_checkpoint(&mut self, wait: bool, retry: bool) -> EmbeddedResult<bool> {
+        if self.operation.lock()?.phase != OperationPhase::Cleaning {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::Busy,
+                "operation completion requires finished execution and cleanup",
+            ));
+        }
+        // Preserve original business evidence and the cancellation observation captured at preparation.
+        // 保留原始业务证据及准备时捕获的取消观测。
+        let snapshot = self.pending_completion.as_ref().ok_or_else(|| {
+            EmbeddedError::new(
+                EmbeddedErrorCode::Busy,
+                "operation has no retained terminal checkpoint",
+            )
+        })?;
+        // Memory mode is ready immediately; direct storage is never silently executed by a poll.
+        // 内存模式立即就绪；轮询绝不静默执行直接存储。
+        let Some(history) = &self.operation.history else {
+            return Ok(true);
+        };
+        if !history.is_queued() {
+            return Err(EmbeddedError::invalid(
+                "nonblocking checkpoints require a journal worker",
+            ));
+        }
+        // An acknowledged checkpoint remains ready on repeated observations without advancing revision twice.
+        // 已确认检查点在重复观测中保持就绪，不重复推进修订。
+        let checkpoint = self
+            .completion_checkpoint
+            .get_or_insert_with(|| PendingCheckpoint::new(Arc::clone(snapshot)));
+        checkpoint.drive(history, wait, retry)
+    }
+
+    /// Publish an already acknowledged terminal result with no storage work, allowing atomic scheduler bookkeeping.
+    /// 不执行存储工作地发布已确认终态结果，使调度记账可以保持原子性。
+    pub(crate) fn publish_completion(&mut self) -> EmbeddedResult<()> {
+        if self.operation.history.is_some()
+            && !self
+                .completion_checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| matches!(checkpoint.attempt, Attempt::Acknowledged))
+        {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::Busy,
+                "terminal checkpoint is not acknowledged",
+            ));
+        }
+        // Acquire public state only after storage is done; the scheduler may hold its metadata lock here.
+        // 存储结束后才获取公开状态；调度器可以在此处持有其元数据锁。
+        let mut current = self.operation.lock()?;
+        if current.phase != OperationPhase::Cleaning || self.pending_completion.is_none() {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::Busy,
+                "operation has no publishable terminal checkpoint",
+            ));
+        }
+        self.completion_checkpoint.take();
+        *current = Arc::unwrap_or_clone(
+            self.pending_completion
+                .take()
+                .expect("validated original terminal candidate"),
+        );
+        self.operation.changed.notify_all();
+        Ok(())
+    }
+
     /// Start or observe nonterminal `phase` without waiting for disk or a competing owner transition.
     /// 开始或观测非终态 `phase`，不等待磁盘或竞争中的所有者变更。
     /// Return false while pending; retain failures until an explicit retry of the original phase.
@@ -417,55 +517,21 @@ impl OperationOwner {
     /// Drive the frozen terminal candidate with explicit `wait` and `retry` policy; publish only after acknowledgement.
     /// 按显式 `wait` 及 `retry` 策略推进冻结终态候选；仅在确认后发布。
     pub(super) fn drive_completion(&mut self, wait: bool, retry: bool) -> EmbeddedResult<bool> {
-        // Reject synchronous storage before any control-thread submission can occur.
-        // 在任何控制线程提交发生前拒绝同步存储。
-        let history = self
-            .operation
-            .history
-            .as_ref()
-            .expect("persistent completion has history");
-        if !history.is_queued() {
-            return Err(EmbeddedError::invalid(
-                "nonblocking checkpoints require a journal worker",
-            ));
-        }
-        if self.operation.lock()?.phase != OperationPhase::Cleaning {
-            return Err(EmbeddedError::new(
-                EmbeddedErrorCode::Busy,
-                "operation completion requires finished execution and cleanup",
-            ));
-        }
-        // This immutable result remains the sole source even when cancellation changes during disk waiting.
-        // 即使磁盘等待期间取消发生变化，此不可变结果仍是唯一来源。
-        let snapshot = self.pending_completion.as_ref().ok_or_else(|| {
-            EmbeddedError::new(
-                EmbeddedErrorCode::Busy,
-                "operation has no retained terminal checkpoint",
-            )
-        })?;
-        // First observation creates one attempt; subsequent observations keep its exact identity and bytes.
-        // 首次观测创建一次尝试；后续观测保留其精确身份及字节。
-        let checkpoint = self
-            .completion_checkpoint
-            .get_or_insert_with(|| PendingCheckpoint::new(Arc::clone(snapshot)));
-        if !checkpoint.drive(history, wait, retry)? {
+        if !self.drive_completion_checkpoint(wait, retry)? {
             return Ok(false);
         }
-        // Drop redundant receipt/candidate ownership before moving the terminal result when it is unique.
-        // 结果唯一时移动终态结果之前，先释放冗余回执和候选所有权。
-        let mut current = self.operation.lock()?;
-        self.completion_checkpoint.take();
-        *current = Arc::unwrap_or_clone(
-            self.pending_completion
-                .take()
-                .expect("acknowledged completion retains its original result"),
-        );
-        self.operation.changed.notify_all();
+        self.publish_completion()?;
         Ok(true)
     }
 }
 
 impl OperationRegistry {
+    /// Report the explicit queued-history selection without maintaining another runtime mode flag.
+    /// 报告显式队列历史选择，不维护另一个运行时模式标记。
+    pub(crate) fn has_queued_history(&self) -> bool {
+        matches!(self.journal, Some(HistoryBackend::Queued(_)))
+    }
+
     /// Create a registry backed by exact shared `writer` and fresh trusted `runtime_id` using `config` limits.
     /// 按 `config` 上限，以精确共享 `writer` 和全新可信 `runtime_id` 创建注册表。
     /// The host owns writer close/join; admission stays memory-only and owner polling never waits for disk.

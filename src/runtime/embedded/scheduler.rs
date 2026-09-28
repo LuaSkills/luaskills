@@ -11,10 +11,12 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+mod persistence;
 mod plugins;
 mod sessions;
 mod workers;
 
+pub use persistence::{CheckpointRetryState, OperationPersistenceFailure};
 pub use plugins::EmbeddedPluginSnapshot;
 use plugins::ScheduledPlugin;
 pub use sessions::{EmbeddedSessionOpening, EmbeddedSessionPhase, EmbeddedSessionSnapshot};
@@ -134,6 +136,9 @@ struct PendingCompletion {
 /// Short-lock scheduling metadata contains no Lua execution or native destructor work.
 /// 短时锁调度元数据不包含 Lua 执行或原生析构工作。
 struct SchedulerState {
+    /// One observable fault per unfinished operation, retained through an explicitly requested retry.
+    /// 每个未完成操作的一项可观测故障，跨显式请求的重试保留。
+    persistence_failures: BTreeMap<String, OperationPersistenceFailure>,
     /// Cleanup count includes work temporarily detached by the supervisor.
     /// 清理计数包含被监督器临时摘除的任务。
     cleaning_count: usize,
@@ -238,11 +243,25 @@ pub struct EmbeddedRuntime {
 }
 
 impl EmbeddedRuntime {
-    /// Create independent execution around `engine` and explicit `config`, returning an owned runtime.
-    /// 围绕 `engine` 与显式 `config` 创建独立执行，返回受管运行时。
-    /// Failed worker construction closes already-started workers before returning the error.
-    /// 工作线程构造失败时，在返回错误前关闭已经启动的工作线程。
-    pub fn new(engine: Arc<LuaEngine>, config: EmbeddedRuntimeConfig) -> EmbeddedResult<Self> {
+    /// Build runtime phase persistence using exact host-owned `writer`; the host closes and joins that writer separately.
+    /// 使用精确宿主自有 `writer` 构造运行时阶段持久化；宿主另行关闭并等待该写入者。
+    /// Per-effect write-ahead evidence and cross-process recovery remain separate integration requirements.
+    /// 逐次副作用预写证据及跨进程恢复仍是独立接入要求。
+    pub fn with_journal_worker(
+        engine: Arc<LuaEngine>,
+        config: EmbeddedRuntimeConfig,
+        writer: Arc<OperationJournalWorker>,
+    ) -> EmbeddedResult<Self> {
+        Self::build(engine, config, Some(writer))
+    }
+
+    /// Construct fixed workers for `engine` and validated `config`, using only the explicitly selected `writer`.
+    /// 为 `engine` 及已校验 `config` 构造固定工作线程，仅使用显式选择的 `writer`。
+    fn build(
+        engine: Arc<LuaEngine>,
+        config: EmbeddedRuntimeConfig,
+        writer: Option<Arc<OperationJournalWorker>>,
+    ) -> EmbeddedResult<Self> {
         config.validate()?;
         // Namespace creation fails explicitly; time and process IDs are not fallback identities.
         // 命名空间创建明确失败；时间和进程号不作为备用身份。
@@ -256,8 +275,17 @@ impl EmbeddedRuntime {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
+        // Capabilities retain this exact fresh runtime namespace.
+        // 能力保留此精确全新运行时命名空间。
         let capabilities = CapabilityRegistry::new(id.clone(), config.clone())?;
-        let operations = OperationRegistry::new(id.clone(), &config)?;
+        // Backend selection is explicit; no probing or automatic persistence fallback occurs.
+        // 后端选择明确；不探测，也不自动回退持久化。
+        let operations = match writer {
+            Some(writer) => OperationRegistry::with_journal_worker(id.clone(), &config, writer)?,
+            None => OperationRegistry::new(id.clone(), &config)?,
+        };
+        // The center owns all scheduling metadata independently from thread join handles.
+        // 中心独立于线程等待句柄拥有全部调度元数据。
         let center = Arc::new(SchedulerCenter {
             id,
             capabilities,
@@ -278,17 +306,26 @@ impl EmbeddedRuntime {
                 live: BTreeMap::new(),
                 cleaning: Vec::new(),
                 cleaning_count: 0,
+                persistence_failures: BTreeMap::new(),
             }),
             changed: Condvar::new(),
         });
+        // Only the configured fixed workers and one supervisor can be created.
+        // 仅允许创建已配置固定工作线程及一个监督器。
         let mut workers = Vec::new();
         // Spawn one independent supervisor and a fixed execution count; requests cannot add threads.
         // 启动一个独立监督器与固定数量执行线程；请求不能增加线程。
         for index in 0..=config.max_running_calls {
+            // Real worker ownership outlives any observing runtime handle.
+            // 真实工作线程所有权寿命超过任何观测运行时句柄。
             let worker_center = Arc::clone(&center);
+            // Every spawned worker reports failure through the retained center.
+            // 每个启动的工作线程都通过保留中心报告故障。
             let spawn = std::thread::Builder::new()
                 .name(format!("luaskills-embedded-{index}"))
                 .spawn(move || {
+                    // Preserve infrastructure failure without unwinding through the host.
+                    // 保留基础设施故障，不通过宿主展开栈。
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         if index == 0 {
                             workers::supervise(&worker_center)
@@ -318,6 +355,14 @@ impl EmbeddedRuntime {
             center,
             workers: Mutex::new(workers),
         })
+    }
+
+    /// Create independent execution around `engine` and explicit `config`, returning an owned runtime.
+    /// 围绕 `engine` 与显式 `config` 创建独立执行，返回受管运行时。
+    /// Failed worker construction closes already-started workers before returning the error.
+    /// 工作线程构造失败时，在返回错误前关闭已经启动的工作线程。
+    pub fn new(engine: Arc<LuaEngine>, config: EmbeddedRuntimeConfig) -> EmbeddedResult<Self> {
+        Self::build(engine, config, None)
     }
 
     /// Return this runtime's immutable opaque namespace.
