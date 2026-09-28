@@ -450,3 +450,85 @@ fn embedded_session_finalization_initialization_failure_releases_reservation() {
     runtime.forget_session(&opening.session_id).unwrap();
     shutdown(&runtime);
 }
+
+/// Repeated session stop requests preserve the already-running independent closing callback and its identity.
+/// 重复会话停止请求保留已运行的独立关闭回调及其身份。
+#[test]
+fn embedded_session_finalization_repeated_close_preserves_active_shutdown() {
+    // The actual queued request proves closing entered before a second controller requests the same stop.
+    // 真实排队请求证明第二个控制器请求相同停止前，关闭阶段已经入场。
+    let layout = SystemRuntimeTestLayout::new("repeated session close during finalization");
+    let runtime = runtime(&layout, pool_config());
+    runtime
+        .capabilities()
+        .register(vec![CapabilityRegistrationRequest {
+            descriptor: super::super::super::capabilities::descriptor(
+                "test.close",
+                CapabilityExecution::Queued,
+            ),
+            native: None,
+        }])
+        .expect("register closing callback");
+    let pool = runtime.register_pool(
+        closing_definition(&layout,
+            "return {call=function() return 1 end, shutdown=function() local r=vulcan.host.call('test.close','closing'); assert(r.ok); return r.value end}",
+            5000),
+        pool_policy(InstanceReuse::Session), permissions(), "r1".into(),
+    ).expect("register pinned closing instance");
+    let session = opened(&runtime, &pool);
+    runtime.close_session(&session).expect("first stop");
+    let closing = host_request(&runtime);
+    let closing_id = closing.caller.operation_id.clone();
+    assert_eq!(closing.arguments, json!("closing"));
+    for _ in 0..3 {
+        runtime
+            .close_session(&session)
+            .expect("repeat session stop");
+        assert_eq!(
+            runtime
+                .session(&session)
+                .expect("same session")
+                .finalization_operation
+                .as_deref(),
+            Some(closing_id.as_str())
+        );
+        assert_eq!(
+            runtime
+                .plugin(&layout.package_id)
+                .expect("physical owner")
+                .resources
+                .resident,
+            1
+        );
+    }
+    runtime
+        .capabilities()
+        .host_requests()
+        .complete(
+            &closing.request_id,
+            CapabilityOutcome {
+                result: Ok(json!("closed once")),
+                effects: EffectState::Committed,
+            },
+        )
+        .expect("acknowledge original callback");
+    let result = closed_operation(&runtime, &session);
+    assert_eq!(result.operation_id, closing_id);
+    assert_eq!(
+        result.phase,
+        OperationPhase::Succeeded,
+        "repeat close must not cancel its finalizer: {result:?}"
+    );
+    assert_eq!(result.host_effects.len(), 1);
+    assert_eq!(
+        result
+            .finalization
+            .expect("closing stages")
+            .outcome
+            .expect("closing outcome")
+            .result()
+            .expect("successful shutdown"),
+        json!("closed once")
+    );
+    shutdown(&runtime);
+}
