@@ -289,6 +289,16 @@ pub struct CapabilityBudget {
 }
 
 impl CapabilityBudget {
+    /// Return whether the core registered this call in the operation's finalization stage.
+    /// 返回核心是否将此调用注册为操作的关闭阶段。
+    /// No argument or export name controls this marker; errors report unavailable core evidence.
+    /// 参数或导出名称均不能控制此标记；错误表示核心证据不可用。
+    /// This observation grants no permission and does not replace live authorization or budget checks.
+    /// 此观测不授予权限，也不能替代实时授权或预算检查。
+    pub fn is_finalization(&self) -> EmbeddedResult<bool> {
+        self.control.is_finalization()
+    }
+
     /// Derive a bounded child from original `control` and declared `max_call_ms`.
     /// 根据原始 `control` 与声明的 `max_call_ms` 派生受限子预算。
     pub(super) fn new(control: Arc<CallControl>, max_call_ms: u64) -> EmbeddedResult<Self> {

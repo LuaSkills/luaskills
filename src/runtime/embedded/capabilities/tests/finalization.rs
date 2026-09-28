@@ -32,8 +32,11 @@ fn embedded_operation_finalization_preserves_results_identity_and_stage_admissio
             register(
                 &capabilities,
                 "test.stage",
-                Arc::new(move |_| {
-                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Arc::new(move |invocation| {
+                    // Only the second admitted call owns core finalization evidence, regardless of arguments.
+                    // 仅第二次已接纳调用拥有核心关闭证据，与参数无关。
+                    let index = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    assert_eq!(invocation.budget.is_finalization().unwrap(), index == 1);
                     value(Value::Null)
                 }),
             );
@@ -48,7 +51,7 @@ fn embedded_operation_finalization_preserves_results_identity_and_stage_admissio
                     "test.stage",
                     identity.clone(),
                     Arc::clone(&permissions),
-                    Value::Null,
+                    json!({"is_finalization": true}),
                     owner.control(),
                 )
                 .unwrap()
