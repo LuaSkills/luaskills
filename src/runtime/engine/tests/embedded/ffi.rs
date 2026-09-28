@@ -7,6 +7,38 @@ use crate::runtime::embedded::{EmbeddedPluginConfig, InstanceReuse, OperationSna
 
 mod persistence;
 
+/// The public C transport executes a real module from the exact host-authorized external generation.
+/// 公开 C 传输从宿主精确授权的外部代次执行真实模块。
+#[test]
+fn ffi_embedded_pipeline_authorizes_external_package_generation() {
+    // Preserve the same SDK-style client while moving only the fixture package outside System.
+    // 保持同一个 SDK 风格客户端，仅将夹具包移出 System。
+    let layout = super::paths::external_layout("ffi external package");
+    // Every command passes through the public versioned C ABI.
+    // 每条命令都经过公开版本化 C ABI。
+    let client = Client::new(&layout);
+    // Reuse proves a real resident module is retained in the formally registered pool.
+    // 复用证明正式注册池中保留了真实常驻模块。
+    let pool = client.pool(&layout,
+        "local n=0; return {call=function() n=n+1; return {root=vulcan.runtime.system_plugin.root,count=n} end}",
+        InstanceReuse::Reusable);
+    for count in [1, 2] {
+        // Wait for the actual operation, not merely a successful submission response.
+        // 等待实际操作，而非仅等待成功提交响应。
+        let operation = client.submit(&pool, Value::Null);
+        // The formal terminal state retains exact physical package output and state.
+        // 正式终态保留精确物理包输出及状态。
+        let done = client.terminal(&operation);
+        assert!(done.error.is_none(), "{done:?}");
+        assert_eq!(
+            done.value,
+            Some(json!({"root":render_host_visible_path(&layout.package_root),"count":count}))
+        );
+        client.ok(json!({"type":"operation_forget","operation_id":operation}));
+    }
+    client.close();
+}
+
 /// A test SDK client that calls only the new public C entrypoints for all runtime work.
 /// 一个测试 SDK 客户端，全部运行时工作仅调用新的公开 C 入口。
 struct Client {

@@ -6,6 +6,7 @@ use crate::runtime::embedded::{
 };
 
 mod capabilities;
+mod paths;
 
 /// One exclusively borrowed VM with immutable, validated function exports.
 /// 单个被独占借用且具有不可变已校验函数导出的 VM。
@@ -169,43 +170,10 @@ impl LuaEngine {
         if instance_id.trim().is_empty() {
             return Err(EmbeddedError::invalid("instance identity must be nonempty"));
         }
-        // Reuse exactly the trusted package and logical-directory resolution contract.
-        // 精确复用可信包与逻辑目录解析契约。
-        let request = SystemRuntimeSessionCreateRequest {
-            sid: instance_id.to_owned(),
-            ttl_sec: Some(0),
-            replace: false,
-            cwd: definition.cwd.clone(),
-            workspace_root: definition.workspace_root.clone(),
-            mounts: definition.mounts.clone(),
-            system_package: SystemRuntimePackageRequest {
-                id: definition.plugin_id.clone(),
-                root: definition.package_root.clone(),
-                dependencies_file: definition.dependencies_file.clone(),
-            },
-        };
         // No VM or callback is allocated until path identities have been established.
         // 在路径身份确立前不分配 VM 或回调。
         let paths = self
-            .resolve_system_runtime_lease_path_context(&request)
-            .map_err(execution_error)?;
-        // This exact package is required by the System path resolver, never guessed.
-        // 此精确包由 System 路径解析器强制提供，不进行猜测。
-        let package = paths.managed_package.as_ref().ok_or_else(|| {
-            EmbeddedError::new(
-                EmbeddedErrorCode::Internal,
-                "System package binding is missing",
-            )
-        })?;
-        package
-            .lease_binding()
-            .ok_or_else(|| {
-                EmbeddedError::new(
-                    EmbeddedErrorCode::Internal,
-                    "System lease binding is missing",
-                )
-            })?
-            .bind(instance_id.to_owned(), 1)
+            .resolve_embedded_module_paths(&definition, instance_id)
             .map_err(execution_error)?;
         // Each instance has one immutable incarnation; package generation is tracked separately.
         // 每个实例只有一个不可变生命周期；包代次独立记录。
@@ -216,7 +184,7 @@ impl LuaEngine {
             paths.cwd.as_deref().ok_or_else(|| {
                 EmbeddedError::new(
                     EmbeddedErrorCode::Internal,
-                    "System logical directory is missing",
+                    "module logical directory is missing",
                 )
             })?,
             resolve_host_default_text_encoding(self.host_options.as_ref())
@@ -380,8 +348,8 @@ impl EmbeddedModule {
         self.paths
             .validate_live_system_directory_identities()
             .map_err(execution_error)?;
-        // A System module always owns this validated package context.
-        // System 模块始终拥有此已校验包上下文。
+        // An embedded module always owns this validated exact host package context.
+        // 嵌入式模块始终拥有此已校验的宿主精确包上下文。
         let package = self.paths.managed_package.as_ref().ok_or_else(|| {
             EmbeddedError::new(EmbeddedErrorCode::Internal, "module package disappeared")
         })?;

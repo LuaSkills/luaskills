@@ -52,6 +52,8 @@
 
 ## 运行时业务命令
 
+`pool_register.definition.package_root` 是可信 SDK 宿主显式授权的精确绝对包目录，可位于旧 System 根之外；定义必须由宿主核验，不能直接转发不可信插件参数。核心保留包内依赖清单、授权工作区及逻辑目录和原生对象身份校验，旧 System 租约信任根限制保持不变。字段形状未变，生成契约描述与摘要同步；实际安全边界见[精确模块包授权](embedded-runtime.md#当前类型化模块)。
+
 业务命令放在 `{"protocol_version":1,"command":{"type":"runtime","runtime_id":"精确已初始化身份","operation":{...}}}` 中，`operation.type` 是下表命令名。外壳与类型化命令拒绝未知字段。嵌入的核心配置和声明继续以各自 Rust 类型及其序列化约束为权威；既有 `LuaInvocationContext` 的行为不由 FFI 重定义。
 
 | 命令 | `operation` 中的其余字段 | 成功结果 |

@@ -9,6 +9,7 @@ use crate::runtime::embedded::{
 
 mod capabilities;
 mod ffi;
+mod paths;
 mod pools;
 mod scheduler;
 

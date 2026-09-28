@@ -2069,7 +2069,7 @@
             "description": "Trusted mount metadata; must be a JSON object.\n可信挂载元数据，必须为 JSON 对象。"
           },
           "package_root": {
-            "description": "Absolute plugin root inside the configured System trust root.\n位于已配置 System 信任根内的绝对插件根目录。",
+            "description": "Exact absolute plugin root authorized by the trusted host, independent of legacy System roots.\n可信宿主授权的精确绝对插件根目录，独立于旧 System 根。",
             "type": "string"
           },
           "plugin_id": {

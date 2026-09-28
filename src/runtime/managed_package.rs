@@ -77,6 +77,8 @@ use crate::runtime::path::{normalize_host_input_path_text, render_host_visible_p
 use crate::skill::dependencies::PackageDependencyManifest;
 use crate::skill::manifest::validate_luaskills_identifier;
 
+mod embedded;
+
 /// Package kind that owns one managed Python or Node runtime context.
 /// 拥有单个受管 Python 或 Node 运行时上下文的包类型。
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -87,6 +89,9 @@ pub(crate) enum ManagedRuntimePackageKind {
     /// Host-owned package bound to one persistent System lease.
     /// 绑定到持久 System lease 的宿主所有包。
     SystemPlugin,
+    /// Host-authorized exact package bound to one formal embedded module.
+    /// 绑定到正式嵌入式模块的宿主精确授权包。
+    EmbeddedPlugin,
 }
 
 impl ManagedRuntimePackageKind {
@@ -96,6 +101,7 @@ impl ManagedRuntimePackageKind {
         match self {
             Self::Skill => "skill",
             Self::SystemPlugin => "system_plugin",
+            Self::EmbeddedPlugin => "embedded_plugin",
         }
     }
 }

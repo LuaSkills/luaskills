@@ -17,8 +17,8 @@ pub struct ModuleDefinition {
     /// Host-assigned immutable code and dependency generation.
     /// 宿主分配的不可变代码与依赖代次。
     pub generation: String,
-    /// Absolute plugin root inside the configured System trust root.
-    /// 位于已配置 System 信任根内的绝对插件根目录。
+    /// Exact absolute plugin root authorized by the trusted host, independent of legacy System roots.
+    /// 可信宿主授权的精确绝对插件根目录，独立于旧 System 根。
     pub package_root: String,
     /// Package-relative dependency manifest, validated by the existing package loader.
     /// 由既有包加载器校验的包相对依赖清单。
