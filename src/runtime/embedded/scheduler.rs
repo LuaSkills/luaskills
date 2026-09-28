@@ -440,16 +440,17 @@ impl EmbeddedRuntime {
         self.register_pool_internal(definition, policy, permissions, revision, Some(owner), None)
     }
 
-    /// Publishes one validated pool with an optional Rust-only generation owner.
-    /// 发布一个已校验池，并可携带仅供 Rust 使用的代次所有者。
-    /// Inputs freeze definition, policy, permissions and revision; errors publish no scheduled pool.
-    /// 输入冻结定义、策略、权限及修订；错误不会发布调度池。
-    fn register_pool_internal(
+    /// Register definition and policy with the exact prevalidated binding, preserving its snapshot without rereading.
+    /// 使用精确预校验 binding 注册 definition 和 policy，保留其快照而不重新读取。
+    /// owner optionally pins native resources; capacity_id selects an exact capacity or an independent pool when absent.
+    /// owner 可选固定原生资源；capacity_id 选择精确容量，省略时选择独立池。
+    /// Returns the original pool identity or rejects foreign runtime authority, invalid policy, or closed capacity.
+    /// 返回原池身份，或拒绝外来运行时权威、无效策略和已关闭容量。
+    pub fn register_pool_with_binding(
         &self,
         definition: ModuleDefinition,
         policy: PluginPoolConfig,
-        permissions: Arc<CapabilityPermissions>,
-        revision: String,
+        binding: ModuleCapabilities,
         owner: Option<ModuleResourceOwner>,
         capacity_id: Option<&str>,
     ) -> EmbeddedResult<String> {
@@ -457,10 +458,11 @@ impl EmbeddedRuntime {
         if let Some(finalizer) = &definition.finalizer {
             json_size(finalizer, self.center.pools.config().max_value_bytes)?;
         }
-        // Capability membership remains frozen independently from physical resource ownership.
-        // 能力成员独立于物理资源所有权保持冻结。
-        let binding =
-            ModuleCapabilities::new(self.center.capabilities.snapshot()?, permissions, revision)?;
+        // The validated snapshot must belong to this exact native runtime, never another parent.
+        // 已校验快照必须属于此精确原生运行时，绝不能属于另一父级。
+        self.center
+            .capabilities
+            .validate_snapshot(&binding.snapshot)?;
         // Compile admission contracts before any scheduled pool is published.
         // 发布任何调度池之前编译入场契约。
         let inputs = definition
@@ -531,6 +533,26 @@ impl EmbeddedRuntime {
             },
         );
         Ok(id)
+    }
+
+    /// Publishes one validated pool with an optional Rust-only generation owner.
+    /// 发布一个已校验池，并可携带仅供 Rust 使用的代次所有者。
+    /// Inputs freeze definition, policy, permissions and revision; errors publish no scheduled pool.
+    /// 输入冻结定义、策略、权限及修订；错误不会发布调度池。
+    fn register_pool_internal(
+        &self,
+        definition: ModuleDefinition,
+        policy: PluginPoolConfig,
+        permissions: Arc<CapabilityPermissions>,
+        revision: String,
+        owner: Option<ModuleResourceOwner>,
+        capacity_id: Option<&str>,
+    ) -> EmbeddedResult<String> {
+        // Ordinary callers explicitly select the registry's current immutable snapshot.
+        // 普通调用方明确选择注册表当前不可变快照。
+        let binding =
+            ModuleCapabilities::new(self.center.capabilities.snapshot()?, permissions, revision)?;
+        self.register_pool_with_binding(definition, policy, binding, owner, capacity_id)
     }
 
     /// Submit owned `request` under an original finite `timeout`, returning query/cancel authority.

@@ -398,6 +398,20 @@ pub struct CapabilityRegistry {
 }
 
 impl CapabilityRegistry {
+    /// Validate that snapshot shares this registry's actual broker, returning an error for foreign authority.
+    /// 校验 snapshot 共享此注册表的真实代理；外来权威返回错误。
+    /// Equal caller-supplied namespace strings never substitute for native ownership identity.
+    /// 相同的调用方提供命名空间字符串绝不能替代原生所有权身份。
+    pub(crate) fn validate_snapshot(&self, snapshot: &CapabilitySnapshot) -> EmbeddedResult<()> {
+        if !Arc::ptr_eq(&self.broker, &snapshot.broker) {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::PermissionDenied,
+                "module capability binding belongs to another registry",
+            ));
+        }
+        Ok(())
+    }
+
     /// Construct an empty registry bound to `runtime_id` and validated `config`.
     /// 构造绑定 `runtime_id` 与已校验 `config` 的空注册表。
     pub fn new(runtime_id: String, config: EmbeddedRuntimeConfig) -> EmbeddedResult<Arc<Self>> {
