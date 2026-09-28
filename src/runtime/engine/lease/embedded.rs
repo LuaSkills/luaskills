@@ -35,6 +35,9 @@ pub struct EmbeddedModule {
     /// Only successful execution and cleanup restore reusability.
     /// 只有执行及清理成功后才恢复可复用状态。
     reusable: bool,
+    /// Claimed before any explicit closing-export attempt; never reset by success, errors or unwinding.
+    /// 在任何显式关闭导出尝试前认领；成功、错误或栈展开均不重置。
+    finalization_started: bool,
     /// Set only after owned managed resources confirm successful retirement.
     /// 仅在所属受管资源确认退役成功后设置。
     closed: bool,
@@ -178,6 +181,13 @@ impl LuaEngine {
         // Each instance has one immutable incarnation; package generation is tracked separately.
         // 每个实例只有一个不可变生命周期；包代次独立记录。
         let vm = self.create_system_runtime_vm().map_err(execution_error)?;
+        // LuaJIT traces can bypass instruction hooks; disable the engine before any plugin code loads.
+        // LuaJIT 跟踪代码可能绕过指令钩子；在任何插件源码加载前禁用编译引擎。
+        vm.lua
+            .load("jit.off(); jit.flush()")
+            .set_name("embedded_execution_budget")
+            .exec()
+            .map_err(execution_error)?;
         Self::configure_runtime_lease_vm(&vm.lua, &paths).map_err(execution_error)?;
         logical_cwd::install(
             &vm.lua,
@@ -204,6 +214,7 @@ impl LuaEngine {
             pending_contracts: Some(contracts),
             definition,
             reusable: false,
+            finalization_started: false,
             closed: false,
         })
     }
@@ -291,12 +302,42 @@ impl EmbeddedModule {
     /// Return structured JSON; failed execution or cleanup prevents subsequent reuse.
     /// 返回结构化 JSON；执行或清理失败会阻止后续复用。
     pub fn invoke(&mut self, invocation: ModuleInvocation<'_>) -> EmbeddedResult<Value> {
-        if self.closed || !self.reusable {
+        if self.closed || !self.reusable || self.finalization_started {
             return Err(EmbeddedError::new(
                 EmbeddedErrorCode::Closed,
                 "module is closed or requires retirement",
             ));
         }
+        self.invoke_export(invocation)
+    }
+
+    /// Attempt the declared closing export once in this initialized VM using the supplied finite budget.
+    /// 使用提供的有限预算，在此已初始化 VM 中至多尝试一次声明的关闭导出。
+    /// Return only the closing result; failures remain terminal and never authorize source replay or reuse.
+    /// 只返回关闭结果；失败仍是终态，不授权重放源码或复用实例。
+    pub(crate) fn finalize(&mut self, invocation: ModuleInvocation<'_>) -> EmbeddedResult<Value> {
+        if self.closed || self.finalization_started || self.exports.is_empty() {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::Closed,
+                "module is not initialized or finalization was already attempted",
+            ));
+        }
+        // Claim before validation and user code so every error and unwind remains at most once.
+        // 在校验和用户代码前认领，确保所有错误和栈展开仍至多执行一次。
+        self.finalization_started = true;
+        self.reusable = false;
+        // Preserve the caller-owned business outcome and use only the separate closing invocation.
+        // 保留调用方拥有的业务结果，只使用独立的关闭调用。
+        let result = self.invoke_export(invocation);
+        self.reusable = false;
+        result
+    }
+
+    /// Execute one captured export with its declared schemas, trusted context and explicit budget.
+    /// 使用声明的 Schema、可信上下文和显式预算执行一个已捕获导出。
+    /// Return the validated value or execution error; the caller owns lifecycle admission.
+    /// 返回校验后的值或执行错误；调用方负责生命周期入场。
+    fn invoke_export(&mut self, invocation: ModuleInvocation<'_>) -> EmbeddedResult<Value> {
         // Function and schemas are captured together from the exact activation declaration.
         // 函数与 Schema 从精确激活声明中一同捕获。
         let export = self
@@ -435,7 +476,7 @@ impl EmbeddedModule {
     /// Report whether successful execution and cleanup permit another call.
     /// 报告执行及清理成功后是否允许再次调用。
     pub fn is_reusable(&self) -> bool {
-        self.reusable && !self.closed
+        self.reusable && !self.closed && !self.finalization_started
     }
 
     /// Retire owned processes and workers; retain this instance on cleanup failure.

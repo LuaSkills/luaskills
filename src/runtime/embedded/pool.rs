@@ -998,6 +998,23 @@ impl ModuleLease {
         Ok(value)
     }
 
+    /// Attempt one declared closing export on this VM with an independently supplied finite control.
+    /// 使用独立提供的有限控制，在此 VM 上尝试一次声明的关闭导出。
+    /// Return its result separately from business execution; call finish or close to retire the VM.
+    /// 将其结果与业务执行分别返回；调用 finish 或 close 才会退役 VM。
+    /// Closed pools and exhausted business-use limits still allow cleanup, without restoring permissions.
+    /// 已关闭池和耗尽的业务使用额度仍允许清理，但不恢复权限。
+    /// Capacity rejection precedes the attempt and permits explicit retry; all entered attempts are terminal.
+    /// 容量拒绝发生于尝试之前并允许显式重试；所有已经进入的尝试均为终态。
+    pub fn finalize(&mut self, invocation: ModuleInvocation<'_>) -> EmbeddedResult<Value> {
+        // Keep real VM ownership and execution accounting until the closing call actually returns.
+        // 在关闭调用实际返回前保持真实 VM 所有权和执行记账。
+        let resident = self.resident.as_mut().ok_or_else(closed)?;
+        let _permit = resident.reservation.begin_execution()?;
+        self.ready = false;
+        resident.module.finalize(invocation)
+    }
+
     /// Return whether a pinned VM can serve another call within its declared use limit.
     /// 返回固定 VM 是否可以在声明的使用上限内服务下一次调用。
     pub(super) fn can_retain_session(&self) -> bool {
