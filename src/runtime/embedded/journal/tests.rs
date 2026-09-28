@@ -6,6 +6,7 @@ use std::sync::{Arc, Barrier};
 
 mod context;
 mod identity;
+mod reconciliation;
 mod recovery;
 
 /// Own one newly created temporary directory, isolated from other tests and user files.

@@ -1,12 +1,16 @@
 //! Explicit disk history; records never become live operations merely by reopening the journal.
 //! 显式磁盘历史；重新打开日志绝不使记录自动成为活动操作。
 
+mod reconciliation;
 mod recovery;
 mod storage;
 #[cfg(test)]
 mod tests;
 mod worker;
 
+pub use reconciliation::{
+    HostEffectReconciliation, OperationReconciliation, ReconciledExecution, ResolvedEffectState,
+};
 pub use worker::{
     JournalWritePhase, JournalWriteReceipt, JournalWriteSnapshot, OperationJournalWorker,
     OperationJournalWorkerConfig, OperationJournalWorkerStatus,
@@ -55,6 +59,10 @@ pub struct JournalOperation {
     /// Exact last committed observation; an unfinished phase remains unfinished after restart.
     /// 最后提交的精确观测；未结束的阶段在重启后仍保持未结束。
     pub snapshot: OperationSnapshot,
+    /// Separate final host attestation; the original snapshot remains unchanged, including unknown results.
+    /// 独立最终宿主证明；原始快照保持不变，包括未知结果。
+    #[serde(deserialize_with = "reconciliation::present_reconciliation")]
+    pub reconciliation: Option<OperationReconciliation>,
 }
 
 /// Single connection and sticky unproven-commit failure protected by the journal's own lock.
@@ -186,12 +194,13 @@ impl OperationJournal {
         self.validate_key(runtime_id, operation_id)?;
         self.transaction(|connection| {
             let record = self.expect(connection, runtime_id, operation_id, expected_revision)?;
-            if !record.snapshot.phase.is_terminal()
-                || record.snapshot.effects == EffectState::Unknown
-                || record.snapshot.host_effects.iter().any(|effect| {
-                    effect.phase != HostEffectPhase::Completed
-                        || effect.effects == EffectState::Unknown
-                })
+            if record.reconciliation.is_none()
+                && (!record.snapshot.phase.is_terminal()
+                    || record.snapshot.effects == EffectState::Unknown
+                    || record.snapshot.host_effects.iter().any(|effect| {
+                        effect.phase != HostEffectPhase::Completed
+                            || effect.effects == EffectState::Unknown
+                    }))
             {
                 return Err(EmbeddedError::new(
                     EmbeddedErrorCode::Busy,
@@ -368,6 +377,14 @@ impl OperationJournal {
             return Err(corrupt());
         }
         validate_callers(runtime_id, &record.snapshot).map_err(|_| corrupt())?;
+        if let Some(reconciliation) = &record.reconciliation {
+            if record.revision < 2 {
+                return Err(corrupt());
+            }
+            reconciliation
+                .validate(&record.snapshot)
+                .map_err(|_| corrupt())?;
+        }
         Ok(record)
     }
 

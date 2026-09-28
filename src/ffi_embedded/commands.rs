@@ -1,7 +1,7 @@
 use crate::LuaInvocationContext;
 use crate::runtime::embedded::{
     EffectState, EmbeddedCall, EmbeddedError, EmbeddedPluginConfig, EmbeddedResult,
-    ModuleDefinition, PluginPoolConfig,
+    ModuleDefinition, OperationReconciliation, PluginPoolConfig,
     capabilities::{CapabilityDescriptor, CapabilityOutcome},
 };
 use serde::Deserialize;
@@ -50,6 +50,22 @@ pub(super) enum RuntimeCommand {
         /// Original history key returned by a prior row, with no inferred current-runtime substitution.
         /// 前一行返回的原始历史键，不推断替换为当前运行时。
         after: Option<HistoryCursor>,
+    },
+    /// Attach final trusted-host evidence after all original execution owners have stopped; never replay execution.
+    /// 全部原执行所有者停止后附加最终可信宿主证据；绝不重放执行。
+    HistoryReconcile {
+        /// Original historical runtime namespace.
+        /// 原始历史运行时命名空间。
+        history_runtime_id: String,
+        /// Exact original operation identity.
+        /// 精确原始操作身份。
+        operation_id: String,
+        /// Positive original revision; exact retries must retain this predecessor and all resolution fields.
+        /// 原始正修订号；精确重试必须保留此前驱及全部对账字段。
+        expected_revision: u64,
+        /// Complete host-authorized evidence; this API does not authenticate supplied resolver names.
+        /// 完整宿主授权证据；此 API 不认证所提供的对账者名称。
+        resolution: Box<OperationReconciliation>,
     },
     /// Forget reconciled history only after any matching live runtime operation has been explicitly forgotten.
     /// 仅在显式遗忘任何匹配的活动运行时操作后，遗忘已对账历史。
@@ -317,6 +333,7 @@ pub(super) const RUNTIME_COMMAND_NAMES: &[&str] = &[
     "storage_recover",
     "history_get",
     "history_next",
+    "history_reconcile",
     "history_forget",
     "plugin_register",
     "plugin_status",

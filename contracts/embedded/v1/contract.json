@@ -20,6 +20,7 @@
       "host_request_queue_v1",
       "in_memory_effect_evidence_v1",
       "durable_operation_history_v1",
+      "historical_effect_reconciliation_v1",
       "live_storage_recovery_v1",
       "strict_json_v1"
     ]
@@ -1411,6 +1412,30 @@
         ],
         "description": "Strict host completion shapes match CapabilityOutcome::to_json, preserving successful JSON null.\n严格宿主完成形状匹配 CapabilityOutcome::to_json，保留成功 JSON 空值。"
       },
+      "HostEffectReconciliation": {
+        "additionalProperties": false,
+        "description": "Resolution for one exact original host effect; neither registration nor caller identity can be supplied anew.\n一个精确原宿主副作用的结论；不得重新提供注册或调用方身份。",
+        "properties": {
+          "effect_id": {
+            "description": "Exact effect identity from the original snapshot, in the same order as its original records.\n原始快照中的精确副作用身份，顺序与其原始记录相同。",
+            "type": "string"
+          },
+          "effects": {
+            "$ref": "#/$defs/ResolvedEffectState",
+            "description": "Proven final outcome of this original effect, never a retry's outcome.\n此原始副作用的已证实最终结果，绝非重试结果。"
+          },
+          "evidence": {
+            "description": "Nonempty host audit or transaction-query reference; credentials and business payloads do not belong here.\n非空宿主审计或事务查询引用；此处不应包含凭证及业务载荷。",
+            "type": "string"
+          }
+        },
+        "required": [
+          "effect_id",
+          "effects",
+          "evidence"
+        ],
+        "type": "object"
+      },
       "InstanceReuse": {
         "description": "Explicit module-state lifetime selected by a validated plugin contract.\n由已校验插件契约选择的显式模块状态寿命。",
         "oneOf": [
@@ -2153,6 +2178,48 @@
         ],
         "type": "object"
       },
+      "OperationReconciliation": {
+        "additionalProperties": false,
+        "description": "One bounded, final, host-authored attestation covering execution closure and every retained effect.\n一份有界、最终且由宿主编写的证明，覆盖执行关闭及每个保留副作用。\nThis API does not authenticate the attestation; the embedding host must authorize the resolver and verify evidence.\n此 API 不认证证明；嵌入宿主必须授权对账者并核验证据。",
+        "properties": {
+          "effects": {
+            "$ref": "#/$defs/ResolvedEffectState",
+            "description": "Resolved aggregate covering both recorded callbacks and any other effects from the original Lua execution.\n已解决的聚合结论，覆盖记录回调及原 Lua 执行的其他副作用。"
+          },
+          "evidence": {
+            "description": "Nonempty evidence reference proving owner closure and the whole operation's external-effect conclusion.\n非空证据引用，证明所有者关闭及整个操作的外部副作用结论。",
+            "type": "string"
+          },
+          "execution": {
+            "$ref": "#/$defs/ReconciledExecution",
+            "description": "Closure evidence consistent with the unchanged original execution phase.\n与未改变原执行阶段一致的关闭证据。"
+          },
+          "host_effects": {
+            "description": "Exactly one resolution per original effect, preserving original order and known outcomes.\n每个原始副作用精确一个结论，保留原始顺序及已知结果。",
+            "items": {
+              "$ref": "#/$defs/HostEffectReconciliation"
+            },
+            "type": "array"
+          },
+          "resolution_id": {
+            "description": "Stable host-assigned resolution identity, retained unchanged across observation or storage retries.\n宿主分配的稳定对账身份，跨观测或存储重试保持不变。",
+            "type": "string"
+          },
+          "resolver": {
+            "description": "Authorized host resolver identity, not a plugin-supplied authority claim or an authentication credential.\n已授权宿主对账者身份，不是插件提供的权限声明或认证凭证。",
+            "type": "string"
+          }
+        },
+        "required": [
+          "resolution_id",
+          "resolver",
+          "evidence",
+          "execution",
+          "effects",
+          "host_effects"
+        ],
+        "type": "object"
+      },
       "PluginPoolConfig": {
         "additionalProperties": false,
         "description": "Immutable capacity policy for one host-assigned plugin execution group.\n单个宿主分配的插件执行分组的不可变容量策略。",
@@ -2239,6 +2306,46 @@
           {
             "const": "dedicated",
             "description": "Host-approved capacity with a non-lendable minimum reservation.\n宿主批准且具有不可出借最小预留的容量。",
+            "type": "string"
+          }
+        ]
+      },
+      "ReconciledExecution": {
+        "description": "Historical execution closure asserted by the trusted host after actual owners have stopped.\n实际所有者停止后，由可信宿主断言的历史执行关闭。",
+        "oneOf": [
+          {
+            "const": "observed_terminal",
+            "description": "The unchanged original snapshot already contains an observed terminal execution result.\n未改变的原始快照已包含观测到的终态执行结果。",
+            "type": "string"
+          },
+          {
+            "const": "stopped_without_result",
+            "description": "Actual owners stopped without a durable terminal result; the original nonterminal snapshot stays unchanged.\n实际所有者停止但没有持久终态结果；原非终态快照保持不变。",
+            "type": "string"
+          }
+        ]
+      },
+      "ResolvedEffectState": {
+        "description": "Explicit resolved effects; unknown outcomes remain unreconciled instead of being coerced into success.\n显式已解决副作用；未知结果保持未对账，不强制转为成功。",
+        "oneOf": [
+          {
+            "const": "not_started",
+            "description": "Trusted evidence proves the business effect never started.\n可信证据证明业务副作用从未开始。",
+            "type": "string"
+          },
+          {
+            "const": "not_applicable",
+            "description": "Trusted evidence proves no externally visible mutation applies.\n可信证据证明不存在适用的外部可见变更。",
+            "type": "string"
+          },
+          {
+            "const": "committed",
+            "description": "The original external transaction is proven committed.\n原外部事务已证实提交。",
+            "type": "string"
+          },
+          {
+            "const": "rolled_back",
+            "description": "The original external transaction is proven rolled back.\n原外部事务已证实回滚。",
             "type": "string"
           }
         ]
@@ -2385,6 +2492,42 @@
             },
             "required": [
               "type"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Attach final trusted-host evidence after all original execution owners have stopped; never replay execution.\n全部原执行所有者停止后附加最终可信宿主证据；绝不重放执行。",
+            "properties": {
+              "expected_revision": {
+                "description": "Positive original revision; exact retries must retain this predecessor and all resolution fields.\n原始正修订号；精确重试必须保留此前驱及全部对账字段。",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "history_runtime_id": {
+                "description": "Original historical runtime namespace.\n原始历史运行时命名空间。",
+                "type": "string"
+              },
+              "operation_id": {
+                "description": "Exact original operation identity.\n精确原始操作身份。",
+                "type": "string"
+              },
+              "resolution": {
+                "$ref": "#/$defs/OperationReconciliation",
+                "description": "Complete host-authorized evidence; this API does not authenticate supplied resolver names.\n完整宿主授权证据；此 API 不认证所提供的对账者名称。"
+              },
+              "type": {
+                "const": "history_reconcile",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "history_runtime_id",
+              "operation_id",
+              "expected_revision",
+              "resolution"
             ],
             "type": "object"
           },
@@ -3878,6 +4021,7 @@
     "storage_recover",
     "history_get",
     "history_next",
+    "history_reconcile",
     "history_forget",
     "plugin_register",
     "plugin_status",
@@ -4599,6 +4743,30 @@
             }
           ]
         },
+        "HostEffectReconciliation": {
+          "additionalProperties": false,
+          "description": "Resolution for one exact original host effect; neither registration nor caller identity can be supplied anew.\n一个精确原宿主副作用的结论；不得重新提供注册或调用方身份。",
+          "properties": {
+            "effect_id": {
+              "description": "Exact effect identity from the original snapshot, in the same order as its original records.\n原始快照中的精确副作用身份，顺序与其原始记录相同。",
+              "type": "string"
+            },
+            "effects": {
+              "$ref": "#/$defs/ResolvedEffectState",
+              "description": "Proven final outcome of this original effect, never a retry's outcome.\n此原始副作用的已证实最终结果，绝非重试结果。"
+            },
+            "evidence": {
+              "description": "Nonempty host audit or transaction-query reference; credentials and business payloads do not belong here.\n非空宿主审计或事务查询引用；此处不应包含凭证及业务载荷。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "effect_id",
+            "effects",
+            "evidence"
+          ],
+          "type": "object"
+        },
         "HostEffectRecord": {
           "additionalProperties": false,
           "description": "Bounded evidence retained independently from values returned to Lua.\n独立于返回 Lua 的值保留的有界证据。",
@@ -4655,6 +4823,17 @@
           "additionalProperties": false,
           "description": "Historical checkpoint, not a live handle and not evidence authorizing execution replay.\n历史检查点，不是活动句柄，也不是授权执行重放的证据。",
           "properties": {
+            "reconciliation": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/OperationReconciliation"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Separate final host attestation; the original snapshot remains unchanged, including unknown results.\n独立最终宿主证明；原始快照保持不变，包括未知结果。"
+            },
             "revision": {
               "description": "Monotonic compare-and-swap revision; positive and bounded by SQLite's signed integer.\n单调比较交换修订号；为正数且受 SQLite 有符号整数范围约束。",
               "format": "uint64",
@@ -4673,7 +4852,8 @@
           "required": [
             "runtime_id",
             "revision",
-            "snapshot"
+            "snapshot",
+            "reconciliation"
           ],
           "type": "object"
         },
@@ -4778,6 +4958,48 @@
             }
           ]
         },
+        "OperationReconciliation": {
+          "additionalProperties": false,
+          "description": "One bounded, final, host-authored attestation covering execution closure and every retained effect.\n一份有界、最终且由宿主编写的证明，覆盖执行关闭及每个保留副作用。\nThis API does not authenticate the attestation; the embedding host must authorize the resolver and verify evidence.\n此 API 不认证证明；嵌入宿主必须授权对账者并核验证据。",
+          "properties": {
+            "effects": {
+              "$ref": "#/$defs/ResolvedEffectState",
+              "description": "Resolved aggregate covering both recorded callbacks and any other effects from the original Lua execution.\n已解决的聚合结论，覆盖记录回调及原 Lua 执行的其他副作用。"
+            },
+            "evidence": {
+              "description": "Nonempty evidence reference proving owner closure and the whole operation's external-effect conclusion.\n非空证据引用，证明所有者关闭及整个操作的外部副作用结论。",
+              "type": "string"
+            },
+            "execution": {
+              "$ref": "#/$defs/ReconciledExecution",
+              "description": "Closure evidence consistent with the unchanged original execution phase.\n与未改变原执行阶段一致的关闭证据。"
+            },
+            "host_effects": {
+              "description": "Exactly one resolution per original effect, preserving original order and known outcomes.\n每个原始副作用精确一个结论，保留原始顺序及已知结果。",
+              "items": {
+                "$ref": "#/$defs/HostEffectReconciliation"
+              },
+              "type": "array"
+            },
+            "resolution_id": {
+              "description": "Stable host-assigned resolution identity, retained unchanged across observation or storage retries.\n宿主分配的稳定对账身份，跨观测或存储重试保持不变。",
+              "type": "string"
+            },
+            "resolver": {
+              "description": "Authorized host resolver identity, not a plugin-supplied authority claim or an authentication credential.\n已授权宿主对账者身份，不是插件提供的权限声明或认证凭证。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "resolution_id",
+            "resolver",
+            "evidence",
+            "execution",
+            "effects",
+            "host_effects"
+          ],
+          "type": "object"
+        },
         "OperationSnapshot": {
           "additionalProperties": false,
           "description": "Bounded operation snapshot suitable for direct serialization to every SDK.\n适合直接序列化给各 SDK 的有界操作快照。",
@@ -4833,6 +5055,46 @@
             "effects"
           ],
           "type": "object"
+        },
+        "ReconciledExecution": {
+          "description": "Historical execution closure asserted by the trusted host after actual owners have stopped.\n实际所有者停止后，由可信宿主断言的历史执行关闭。",
+          "oneOf": [
+            {
+              "const": "observed_terminal",
+              "description": "The unchanged original snapshot already contains an observed terminal execution result.\n未改变的原始快照已包含观测到的终态执行结果。",
+              "type": "string"
+            },
+            {
+              "const": "stopped_without_result",
+              "description": "Actual owners stopped without a durable terminal result; the original nonterminal snapshot stays unchanged.\n实际所有者停止但没有持久终态结果；原非终态快照保持不变。",
+              "type": "string"
+            }
+          ]
+        },
+        "ResolvedEffectState": {
+          "description": "Explicit resolved effects; unknown outcomes remain unreconciled instead of being coerced into success.\n显式已解决副作用；未知结果保持未对账，不强制转为成功。",
+          "oneOf": [
+            {
+              "const": "not_started",
+              "description": "Trusted evidence proves the business effect never started.\n可信证据证明业务副作用从未开始。",
+              "type": "string"
+            },
+            {
+              "const": "not_applicable",
+              "description": "Trusted evidence proves no externally visible mutation applies.\n可信证据证明不存在适用的外部可见变更。",
+              "type": "string"
+            },
+            {
+              "const": "committed",
+              "description": "The original external transaction is proven committed.\n原外部事务已证实提交。",
+              "type": "string"
+            },
+            {
+              "const": "rolled_back",
+              "description": "The original external transaction is proven rolled back.\n原外部事务已证实回滚。",
+              "type": "string"
+            }
+          ]
         },
         "SuccessStatus": {
           "description": "Single legal success discriminator, shared by live encoding and derived contracts.\n实际编码及派生契约共享的唯一合法成功判别。",
@@ -5079,6 +5341,30 @@
             }
           ]
         },
+        "HostEffectReconciliation": {
+          "additionalProperties": false,
+          "description": "Resolution for one exact original host effect; neither registration nor caller identity can be supplied anew.\n一个精确原宿主副作用的结论；不得重新提供注册或调用方身份。",
+          "properties": {
+            "effect_id": {
+              "description": "Exact effect identity from the original snapshot, in the same order as its original records.\n原始快照中的精确副作用身份，顺序与其原始记录相同。",
+              "type": "string"
+            },
+            "effects": {
+              "$ref": "#/$defs/ResolvedEffectState",
+              "description": "Proven final outcome of this original effect, never a retry's outcome.\n此原始副作用的已证实最终结果，绝非重试结果。"
+            },
+            "evidence": {
+              "description": "Nonempty host audit or transaction-query reference; credentials and business payloads do not belong here.\n非空宿主审计或事务查询引用；此处不应包含凭证及业务载荷。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "effect_id",
+            "effects",
+            "evidence"
+          ],
+          "type": "object"
+        },
         "HostEffectRecord": {
           "additionalProperties": false,
           "description": "Bounded evidence retained independently from values returned to Lua.\n独立于返回 Lua 的值保留的有界证据。",
@@ -5135,6 +5421,17 @@
           "additionalProperties": false,
           "description": "Historical checkpoint, not a live handle and not evidence authorizing execution replay.\n历史检查点，不是活动句柄，也不是授权执行重放的证据。",
           "properties": {
+            "reconciliation": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/OperationReconciliation"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Separate final host attestation; the original snapshot remains unchanged, including unknown results.\n独立最终宿主证明；原始快照保持不变，包括未知结果。"
+            },
             "revision": {
               "description": "Monotonic compare-and-swap revision; positive and bounded by SQLite's signed integer.\n单调比较交换修订号；为正数且受 SQLite 有符号整数范围约束。",
               "format": "uint64",
@@ -5153,7 +5450,8 @@
           "required": [
             "runtime_id",
             "revision",
-            "snapshot"
+            "snapshot",
+            "reconciliation"
           ],
           "type": "object"
         },
@@ -5258,6 +5556,48 @@
             }
           ]
         },
+        "OperationReconciliation": {
+          "additionalProperties": false,
+          "description": "One bounded, final, host-authored attestation covering execution closure and every retained effect.\n一份有界、最终且由宿主编写的证明，覆盖执行关闭及每个保留副作用。\nThis API does not authenticate the attestation; the embedding host must authorize the resolver and verify evidence.\n此 API 不认证证明；嵌入宿主必须授权对账者并核验证据。",
+          "properties": {
+            "effects": {
+              "$ref": "#/$defs/ResolvedEffectState",
+              "description": "Resolved aggregate covering both recorded callbacks and any other effects from the original Lua execution.\n已解决的聚合结论，覆盖记录回调及原 Lua 执行的其他副作用。"
+            },
+            "evidence": {
+              "description": "Nonempty evidence reference proving owner closure and the whole operation's external-effect conclusion.\n非空证据引用，证明所有者关闭及整个操作的外部副作用结论。",
+              "type": "string"
+            },
+            "execution": {
+              "$ref": "#/$defs/ReconciledExecution",
+              "description": "Closure evidence consistent with the unchanged original execution phase.\n与未改变原执行阶段一致的关闭证据。"
+            },
+            "host_effects": {
+              "description": "Exactly one resolution per original effect, preserving original order and known outcomes.\n每个原始副作用精确一个结论，保留原始顺序及已知结果。",
+              "items": {
+                "$ref": "#/$defs/HostEffectReconciliation"
+              },
+              "type": "array"
+            },
+            "resolution_id": {
+              "description": "Stable host-assigned resolution identity, retained unchanged across observation or storage retries.\n宿主分配的稳定对账身份，跨观测或存储重试保持不变。",
+              "type": "string"
+            },
+            "resolver": {
+              "description": "Authorized host resolver identity, not a plugin-supplied authority claim or an authentication credential.\n已授权宿主对账者身份，不是插件提供的权限声明或认证凭证。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "resolution_id",
+            "resolver",
+            "evidence",
+            "execution",
+            "effects",
+            "host_effects"
+          ],
+          "type": "object"
+        },
         "OperationSnapshot": {
           "additionalProperties": false,
           "description": "Bounded operation snapshot suitable for direct serialization to every SDK.\n适合直接序列化给各 SDK 的有界操作快照。",
@@ -5314,6 +5654,46 @@
           ],
           "type": "object"
         },
+        "ReconciledExecution": {
+          "description": "Historical execution closure asserted by the trusted host after actual owners have stopped.\n实际所有者停止后，由可信宿主断言的历史执行关闭。",
+          "oneOf": [
+            {
+              "const": "observed_terminal",
+              "description": "The unchanged original snapshot already contains an observed terminal execution result.\n未改变的原始快照已包含观测到的终态执行结果。",
+              "type": "string"
+            },
+            {
+              "const": "stopped_without_result",
+              "description": "Actual owners stopped without a durable terminal result; the original nonterminal snapshot stays unchanged.\n实际所有者停止但没有持久终态结果；原非终态快照保持不变。",
+              "type": "string"
+            }
+          ]
+        },
+        "ResolvedEffectState": {
+          "description": "Explicit resolved effects; unknown outcomes remain unreconciled instead of being coerced into success.\n显式已解决副作用；未知结果保持未对账，不强制转为成功。",
+          "oneOf": [
+            {
+              "const": "not_started",
+              "description": "Trusted evidence proves the business effect never started.\n可信证据证明业务副作用从未开始。",
+              "type": "string"
+            },
+            {
+              "const": "not_applicable",
+              "description": "Trusted evidence proves no externally visible mutation applies.\n可信证据证明不存在适用的外部可见变更。",
+              "type": "string"
+            },
+            {
+              "const": "committed",
+              "description": "The original external transaction is proven committed.\n原外部事务已证实提交。",
+              "type": "string"
+            },
+            {
+              "const": "rolled_back",
+              "description": "The original external transaction is proven rolled back.\n原外部事务已证实回滚。",
+              "type": "string"
+            }
+          ]
+        },
         "SuccessStatus": {
           "description": "Single legal success discriminator, shared by live encoding and derived contracts.\n实际编码及派生契约共享的唯一合法成功判别。",
           "oneOf": [
@@ -5344,6 +5724,47 @@
             }
           ],
           "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。"
+        },
+        "status": {
+          "$ref": "#/$defs/SuccessStatus",
+          "description": "Exact success discriminator.\n精确成功判别。"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "status",
+        "result"
+      ],
+      "title": "SuccessEnvelope",
+      "type": "object"
+    },
+    "history_reconcile": {
+      "$defs": {
+        "SuccessStatus": {
+          "description": "Single legal success discriminator, shared by live encoding and derived contracts.\n实际编码及派生契约共享的唯一合法成功判别。",
+          "oneOf": [
+            {
+              "const": "ok",
+              "description": "Successfully delivered result, including explicit JSON null.\n已成功交付结果，包含显式 JSON 空值。",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Borrowed success envelope avoids cloning application output during native response publication.\n借用成功信封，避免原生响应发布期间克隆应用输出。",
+      "properties": {
+        "protocol_version": {
+          "description": "Single protocol version authority.\n唯一协议版本权威。",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "status": {
           "$ref": "#/$defs/SuccessStatus",

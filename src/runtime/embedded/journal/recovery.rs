@@ -118,6 +118,7 @@ impl OperationJournal {
             runtime_id: runtime_id.to_owned(),
             revision,
             snapshot: snapshot.clone(),
+            reconciliation: None,
         };
         // The same bytes supply both comparison and durable mutation.
         // 同一字节同时用于比较及持久变更。
@@ -154,6 +155,9 @@ impl OperationJournal {
                     }
                     if current.snapshot.context != snapshot.context {
                         return Err(EmbeddedError::invalid("operation history context is immutable"));
+                    }
+                    if current.reconciliation.is_some() {
+                        return Err(EmbeddedError::new(EmbeddedErrorCode::AlreadyCompleted, "reconciled operation history is immutable"));
                     }
                     connection.execute("UPDATE operations SET revision=?3, document=?4, digest=?5 WHERE runtime_id=?1 AND operation_id=?2",
                         params![runtime_id, snapshot.operation_id, revision as i64, document, Sha256::digest(&document).as_slice()]).map_err(storage::error)?;

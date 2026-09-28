@@ -8,9 +8,9 @@ use std::time::Duration;
 /// Private SQLite file-format marker, independent of the FFI and package versions.
 /// 私有 SQLite 文件格式标记，独立于 FFI 及软件包版本。
 const APPLICATION_ID: i64 = 0x4c53_4f4a;
-/// Third journal schema requires explicit operation context even before the first host effect; old files stay untouched.
-/// 第三版日志结构要求首次宿主副作用前也有明确操作上下文；旧文件保持原字节。
-const SCHEMA_VERSION: i64 = 3;
+/// Fourth journal schema separates final host reconciliation from immutable original execution evidence.
+/// 第四版日志结构将最终宿主对账与不可变原执行证据分离。
+const SCHEMA_VERSION: i64 = 4;
 /// Single authority for the file-format page size and database-cap rounding.
 /// 文件格式页大小及数据库上限取整的唯一权威。
 const PAGE_BYTES: u64 = 4096;

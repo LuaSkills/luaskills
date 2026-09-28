@@ -23,6 +23,7 @@ pub const EMBEDDED_CAPABILITIES: &[&str] = &[
     "host_request_queue_v1",
     "in_memory_effect_evidence_v1",
     "durable_operation_history_v1",
+    "historical_effect_reconciliation_v1",
     "live_storage_recovery_v1",
     "strict_json_v1",
 ];

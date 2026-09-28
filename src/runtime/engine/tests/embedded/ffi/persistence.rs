@@ -54,6 +54,13 @@ fn ffi_embedded_pipeline_persistence_preserves_context_and_reopened_history() {
     assert_eq!(history["snapshot"]["context"]["pool_id"], pool_id);
     assert_eq!(client.ok(json!({"type":"history_next"})), history);
     assert_eq!(client.command(json!({"type":"history_forget","history_runtime_id":namespace,"operation_id":operation_id,"expected_revision":history["revision"]}))["error"]["code"], "busy");
+    // The trusted host inspected this exact pure fixture source; its identity alone is not evidence.
+    // 可信宿主已检查此精确纯夹具源码；仅身份本身不是证据。
+    let resolution = json!({"resolution_id":"fixture-audit","resolver":"trusted-test-host",
+        "evidence":"fixture:pure-source-and-stopped-owner","execution":"observed_terminal",
+        "effects":"not_applicable","host_effects":[]});
+    assert!(history["reconciliation"].is_null());
+    assert_eq!(client.command(json!({"type":"history_reconcile","history_runtime_id":namespace,"operation_id":operation_id,"expected_revision":history["revision"],"resolution":resolution}))["error"]["code"], "busy");
     client.close();
     // A new runtime may read old evidence but cannot use its operation as a current handle.
     // 新运行时可以读取旧证据，但不能将其操作用作当前句柄。
@@ -76,6 +83,24 @@ fn ffi_embedded_pipeline_persistence_preserves_context_and_reopened_history() {
     assert_eq!(history["snapshot"]["effects"], "unknown");
     assert_eq!(reopened.command(json!({"type":"history_forget","history_runtime_id":namespace,"operation_id":operation_id,"expected_revision":history["revision"]}))["error"]["code"], "busy");
     assert_eq!(reopened.ok(json!({"type":"history_next"})), history);
+    // Historical resolution changes only the audit attachment, and exact retries share one durable revision.
+    // 历史对账仅改变审计附件，精确重试共享一个持久修订。
+    let reconciled_revision = reopened.ok(json!({"type":"history_reconcile","history_runtime_id":namespace,"operation_id":operation_id,"expected_revision":history["revision"],"resolution":resolution}));
+    assert_eq!(
+        reconciled_revision.as_u64().unwrap(),
+        history["revision"].as_u64().unwrap() + 1
+    );
+    assert_eq!(reopened.ok(json!({"type":"history_reconcile","history_runtime_id":namespace,"operation_id":operation_id,"expected_revision":history["revision"],"resolution":resolution})), reconciled_revision);
+    // The original unknown observation stays intact beside the trusted host's separate conclusion.
+    // 原始未知观测在可信宿主独立结论旁保持完整。
+    let reconciled = reopened.ok(
+        json!({"type":"history_get","history_runtime_id":namespace,"operation_id":operation_id}),
+    );
+    assert_eq!(reconciled["snapshot"], history["snapshot"]);
+    assert_eq!(reconciled["reconciliation"], resolution);
+    assert_eq!(reopened.command(json!({"type":"history_forget","history_runtime_id":namespace,"operation_id":operation_id,"expected_revision":history["revision"]}))["error"]["code"], "stale_generation");
+    reopened.ok(json!({"type":"history_forget","history_runtime_id":namespace,"operation_id":operation_id,"expected_revision":reconciled_revision}));
+    assert!(reopened.ok(json!({"type":"history_get","history_runtime_id":namespace,"operation_id":operation_id})).is_null());
     // Forgetting current in-memory state still cannot erase unresolved durable evidence.
     // 遗忘当前内存状态仍不能抹除未决持久证据。
     let next_pool = reopened.pool(
@@ -99,5 +124,6 @@ fn ffi_embedded_pipeline_persistence_preserves_context_and_reopened_history() {
     reopened.ok(json!({"type":"operation_forget","operation_id":next_operation}));
     assert_eq!(reopened.command(json!({"type":"history_forget","history_runtime_id":next_history["runtime_id"],"operation_id":next_operation,"expected_revision":next_history["revision"]}))["error"]["code"], "busy");
     assert_eq!(reopened.ok(json!({"type":"history_get","history_runtime_id":next_namespace,"operation_id":next_operation})), next_history);
+    reopened.ok(json!({"type":"history_reconcile","history_runtime_id":next_namespace,"operation_id":next_operation,"expected_revision":next_history["revision"],"resolution":resolution}));
     reopened.close();
 }

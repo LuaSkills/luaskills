@@ -36,9 +36,10 @@ pub use error::{EmbeddedError, EmbeddedErrorCode, EmbeddedResult};
 pub use governor::{ExecutionPermit, PoolGovernor, PoolUsage, VmAllocationState, VmReservation};
 pub(crate) use identity::IdentityKind;
 pub use journal::{
-    JournalOperation, JournalWritePhase, JournalWriteReceipt, JournalWriteSnapshot,
-    OperationJournal, OperationJournalConfig, OperationJournalWorker, OperationJournalWorkerConfig,
-    OperationJournalWorkerStatus,
+    HostEffectReconciliation, JournalOperation, JournalWritePhase, JournalWriteReceipt,
+    JournalWriteSnapshot, OperationJournal, OperationJournalConfig, OperationJournalWorker,
+    OperationJournalWorkerConfig, OperationJournalWorkerStatus, OperationReconciliation,
+    ReconciledExecution, ResolvedEffectState,
 };
 pub use module::{ModuleDefinition, ModuleExport, ModuleInvocation};
 pub use operations::{

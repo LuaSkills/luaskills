@@ -30,6 +30,9 @@ pub(super) type HistoryGet = Option<crate::runtime::embedded::JournalOperation>;
 /// One record after the original cursor, or explicit end of enumeration.
 /// 原游标后的一条记录，或明确枚举结束。
 pub(super) type HistoryNext = Option<crate::runtime::embedded::JournalOperation>;
+/// Durable successor revision of the final trusted-host reconciliation.
+/// 最终可信宿主对账的持久后继修订。
+pub(super) type HistoryReconcile = u64;
 /// Acknowledgement of exact historical removal.
 /// 精确历史删除的确认。
 pub(super) type HistoryForget = ();
@@ -147,6 +150,7 @@ pub(super) fn schemas() -> serde_json::Value {
         "storage_recover": super::contract::response::<StorageRecover>(),
         "history_get": super::contract::response::<HistoryGet>(),
         "history_next": super::contract::response::<HistoryNext>(),
+        "history_reconcile": super::contract::response::<HistoryReconcile>(),
         "history_forget": super::contract::response::<HistoryForget>(),
         "plugin_register": super::contract::response::<PluginRegister>(),
         "plugin_status": super::contract::response::<PluginStatus>(),

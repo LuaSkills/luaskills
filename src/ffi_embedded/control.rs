@@ -7,7 +7,9 @@ use super::{EMBEDDED_FFI_PROTOCOL_VERSION, EmbeddedFfiStatus};
 use crate::runtime::embedded::capabilities::{
     CapabilityExecution, CapabilityPermissions, CapabilityRegistrationRequest, HostRequestBroker,
 };
-use crate::runtime::embedded::{EmbeddedError, EmbeddedErrorCode, EmbeddedResult, IdentityKind};
+use crate::runtime::embedded::{
+    EmbeddedError, EmbeddedErrorCode, EmbeddedResult, EmbeddedRuntime, IdentityKind,
+};
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
@@ -67,6 +69,24 @@ pub(super) fn execute(
             }),
             limit,
         ),
+        RuntimeCommand::HistoryReconcile {
+            history_runtime_id,
+            operation_id,
+            expected_revision,
+            resolution,
+        } => mutate::<responses::HistoryReconcile>(
+            &u64::MAX,
+            || {
+                require_history_released(runtime, &history_runtime_id, &operation_id)?;
+                lease.persistence()?.journal.reconcile(
+                    &history_runtime_id,
+                    &operation_id,
+                    expected_revision,
+                    &resolution,
+                )
+            },
+            limit,
+        ),
         RuntimeCommand::HistoryForget {
             history_runtime_id,
             operation_id,
@@ -74,18 +94,7 @@ pub(super) fn execute(
         } => mutate::<responses::HistoryForget>(
             &(),
             || {
-                if history_runtime_id == runtime.id() {
-                    match runtime.operation(&operation_id) {
-                        Ok(_) => {
-                            return Err(EmbeddedError::new(
-                                EmbeddedErrorCode::Busy,
-                                "forget the retained runtime operation before removing its history",
-                            ));
-                        }
-                        Err(error) if error.code == EmbeddedErrorCode::NotFound => {}
-                        Err(error) => return Err(error),
-                    }
-                }
+                require_history_released(runtime, &history_runtime_id, &operation_id)?;
                 lease.persistence()?.journal.forget(
                     &history_runtime_id,
                     &operation_id,
@@ -343,6 +352,30 @@ pub(super) fn execute(
             limit,
         ),
     }
+}
+
+/// Reject mutation of `operation_id` history in `history_runtime_id` while this runtime retains its owner.
+/// 此运行时仍保留所有者时，拒绝变更 `history_runtime_id` 内的 `operation_id` 历史。
+/// Return permission only for absent live identity; external stopped-owner evidence remains the trusted host's duty.
+/// 仅在活动身份缺失时返回许可；外部所有者停止证据仍由可信宿主负责。
+fn require_history_released(
+    runtime: &EmbeddedRuntime,
+    history_runtime_id: &str,
+    operation_id: &str,
+) -> EmbeddedResult<()> {
+    if history_runtime_id == runtime.id() {
+        match runtime.operation(operation_id) {
+            Ok(_) => {
+                return Err(EmbeddedError::new(
+                    EmbeddedErrorCode::Busy,
+                    "forget the retained runtime operation before reconciling or removing its history",
+                ));
+            }
+            Err(error) if error.code == EmbeddedErrorCode::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Retain a success allocation for `sample`, run `action`, and encode its actual result without reallocating success storage.
