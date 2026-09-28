@@ -32,15 +32,14 @@ impl HistoryBackend {
         snapshot: &OperationSnapshot,
     ) -> EmbeddedResult<u64> {
         match self {
-            Self::Direct(journal) => match revision {
-                None => journal.insert(runtime_id, snapshot),
-                Some(previous) => journal.replace(runtime_id, previous, snapshot),
-            }
-            .map(|record| record.revision),
+            Self::Direct(journal) => journal
+                .checkpoint(runtime_id, revision, snapshot)
+                .map(|record| record.revision),
             Self::Queued(writer) => {
                 // This explicitly synchronous path may only run on an execution thread.
                 // 此显式同步路径只能在执行线程运行。
-                let receipt = writer.submit(runtime_id, revision, Arc::new(snapshot.clone()))?;
+                let receipt =
+                    writer.submit_checkpoint(runtime_id, revision, Arc::new(snapshot.clone()))?;
                 acknowledged(&receipt.wait_until_completed()?)
             }
         }
@@ -67,7 +66,7 @@ impl OperationHistory {
         // Owner mutation ordering ensures no second checkpoint races this captured revision.
         // 所有者变更顺序确保不存在与捕获修订竞争的第二个检查点。
         let revision = self.revision.lock().map_err(|_| poisoned())?;
-        writer.submit(&self.runtime_id, *revision, snapshot)
+        writer.submit_checkpoint(&self.runtime_id, *revision, snapshot)
     }
 
     /// Accept `next` only for the still-current `previous` revision from the original receipt.

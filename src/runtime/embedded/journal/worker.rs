@@ -88,6 +88,9 @@ pub struct OperationJournalWorkerStatus {
 /// 传给存储线程的不可变有界工作；共享应用快照，不再次复制。
 #[derive(Serialize)]
 struct WriteRequest {
+    /// Only the internal runtime checkpoint path may acknowledge an identical committed successor.
+    /// 仅内部运行时检查点路径可确认相同的已提交后继。
+    reconcile: bool,
     /// Original host runtime namespace.
     /// 原始宿主运行时命名空间。
     runtime_id: String,
@@ -356,14 +359,15 @@ impl WriterCenter {
             let request = &receipt.request;
             // Record the exact acknowledged revision; failures remain attached to this original attempt.
             // 记录精确确认修订号；失败继续附着于此次原始尝试。
-            let result = match request.expected_revision {
-                None => self.journal.insert(&request.runtime_id, &request.snapshot),
-                Some(revision) => {
-                    self.journal
-                        .replace(&request.runtime_id, revision, &request.snapshot)
-                }
-            }
-            .map(|record| record.revision);
+            let result = self
+                .journal
+                .write_checkpoint(
+                    &request.runtime_id,
+                    request.expected_revision,
+                    &request.snapshot,
+                    request.reconcile,
+                )
+                .map(|record| record.revision);
             receipt.complete(result);
             #[cfg(test)]
             tests::inject_fault(self, tests::WriteFault::AfterPublication);
@@ -461,6 +465,33 @@ impl OperationJournalWorker {
         expected_revision: Option<u64>,
         snapshot: Arc<OperationSnapshot>,
     ) -> EmbeddedResult<JournalWriteReceipt> {
+        self.submit_request(runtime_id, expected_revision, snapshot, false)
+    }
+
+    /// Admit the runtime's exact original checkpoint, permitting identical-successor acknowledgement after recovery.
+    /// 接纳运行时精确原检查点，允许恢复后确认相同后继。
+    /// `runtime_id`, `expected_revision` and `snapshot` retain original authority; return a bounded nonblocking receipt.
+    /// `runtime_id`、`expected_revision` 及 `snapshot` 保留原权威；返回有界非阻塞回执。
+    pub(in crate::runtime::embedded) fn submit_checkpoint(
+        &self,
+        runtime_id: &str,
+        expected_revision: Option<u64>,
+        snapshot: Arc<OperationSnapshot>,
+    ) -> EmbeddedResult<JournalWriteReceipt> {
+        self.submit_request(runtime_id, expected_revision, snapshot, true)
+    }
+
+    /// Queue `snapshot` for the exact runtime and predecessor, preserving the explicitly selected `reconcile` semantics.
+    /// 为精确运行时及前驱排入 `snapshot`，保留明确选择的 `reconcile` 语义。
+    /// Return the shared receipt after count and byte admission, or reject before publishing work.
+    /// 数量及字节入场后返回共享回执，或在发布工作前拒绝。
+    fn submit_request(
+        &self,
+        runtime_id: &str,
+        expected_revision: Option<u64>,
+        snapshot: Arc<OperationSnapshot>,
+        reconcile: bool,
+    ) -> EmbeddedResult<JournalWriteReceipt> {
         self.center
             .journal
             .validate_key(runtime_id, &snapshot.operation_id)?;
@@ -472,6 +503,7 @@ impl OperationJournalWorker {
         // Serialize only into the counting sink before acquiring queue metadata.
         // 在获取队列元数据前，仅向计数接收器序列化。
         let request = WriteRequest {
+            reconcile,
             runtime_id: runtime_id.to_owned(),
             expected_revision,
             snapshot,

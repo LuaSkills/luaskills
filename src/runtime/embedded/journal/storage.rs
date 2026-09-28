@@ -24,6 +24,24 @@ const SCHEMA: &str = "CREATE TABLE operations(runtime_id TEXT NOT NULL, operatio
 /// Open and configure exact `path` with verified durability, ownership and capacity settings.
 /// 使用已验证的持久性、所有权及容量设置打开精确 `path`。
 pub(super) fn open(path: &Path, config: OperationJournalConfig) -> EmbeddedResult<Connection> {
+    open_controlled(path, config, true)
+}
+
+/// Reopen the exact existing `path` with `config`; missing history is never replaced by an empty database.
+/// 按 `config` 重新打开精确既有 `path`；缺失历史绝不替换为空数据库。
+pub(super) fn reopen(path: &Path, config: OperationJournalConfig) -> EmbeddedResult<Connection> {
+    open_controlled(path, config, false)
+}
+
+/// Open validated `path` with `config`, permitting initial creation only when `allow_create` is explicit.
+/// 按 `config` 打开已校验 `path`，仅在明确 `allow_create` 时允许首次创建。
+/// Return the exclusively owned connection after format, integrity and durability checks.
+/// 完成格式、完整性及持久性检查后返回独占连接。
+fn open_controlled(
+    path: &Path,
+    config: OperationJournalConfig,
+    allow_create: bool,
+) -> EmbeddedResult<Connection> {
     if !path.is_absolute()
         || path.file_name().is_none()
         || config.max_records == 0
@@ -87,6 +105,12 @@ pub(super) fn open(path: &Path, config: OperationJournalConfig) -> EmbeddedResul
             ));
         }
     };
+    if !existing && !allow_create {
+        return Err(EmbeddedError::new(
+            EmbeddedErrorCode::NotFound,
+            "operation history recovery requires the original database",
+        ));
+    }
     let shared_flags = OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;

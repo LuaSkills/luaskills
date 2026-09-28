@@ -389,6 +389,7 @@ fn embedded_journal_worker_enforces_total_byte_budget() {
     // Calculate the actual serialized byte representation rather than duplicating a size formula.
     // 计算实际序列化字节表示，不复制大小公式。
     let bytes = serde_json::to_vec(&WriteRequest {
+        reconcile: false,
         runtime_id: "runtime".into(),
         expected_revision: None,
         snapshot: Arc::clone(&first_snapshot),

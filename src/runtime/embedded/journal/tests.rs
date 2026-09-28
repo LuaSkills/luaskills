@@ -6,6 +6,7 @@ use std::sync::{Arc, Barrier};
 
 mod context;
 mod identity;
+mod recovery;
 
 /// Own one newly created temporary directory, isolated from other tests and user files.
 /// 拥有一个新建临时目录，与其他测试及用户文件隔离。
@@ -430,12 +431,12 @@ fn embedded_journal_crash_child() {
     if mode == "before_commit" {
         let state = journal.lock().unwrap();
         state
-            .connection
+            .connection()
             .execute_batch(
                 "BEGIN IMMEDIATE; UPDATE operations SET revision=2, document=zeroblob(8192)",
             )
             .unwrap();
-        state.connection.cache_flush().unwrap();
+        state.connection().cache_flush().unwrap();
         assert!(PathBuf::from(format!("{}-journal", path.display())).exists());
     } else {
         assert_eq!(mode, "after_commit");

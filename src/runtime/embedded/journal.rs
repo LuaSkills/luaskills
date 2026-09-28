@@ -1,6 +1,7 @@
 //! Explicit disk history; records never become live operations merely by reopening the journal.
 //! 显式磁盘历史；重新打开日志绝不使记录自动成为活动操作。
 
+mod recovery;
 mod storage;
 #[cfg(test)]
 mod tests;
@@ -19,7 +20,7 @@ use super::{
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 /// Explicit retention budgets; SQLite journal/cache overhead is separate from the database-file cap.
@@ -56,12 +57,16 @@ pub struct JournalOperation {
 /// Single connection and sticky unproven-commit failure protected by the journal's own lock.
 /// 日志专用锁保护的单连接及不可自动清除的提交未证实故障。
 struct JournalState {
-    /// Exclusive database connection retained until the journal itself is dropped.
-    /// 保留至日志本身释放的独占数据库连接。
-    connection: Connection,
-    /// Uncertain commit/rollback blocks subsequent mutations until close and explicit reopen.
-    /// 不确定的提交或回滚阻止后续变更，直至关闭并显式重新打开。
+    /// The exclusive connection is absent only while explicit storage recovery remains incomplete.
+    /// 仅在显式存储恢复尚未完成时缺少独占连接。
+    connection: Option<Connection>,
+    /// Uncertain commit/rollback blocks reads and writes until explicit validated recovery.
+    /// 不确定提交或回滚阻止读写，直至显式验证恢复。
     failure: Option<EmbeddedError>,
+    /// Test-only transaction outcome applied before the wrapper consumes its confirmation.
+    /// 包装器消费确认前应用的仅测试事务结果。
+    #[cfg(test)]
+    lost_confirmation: Option<bool>,
 }
 
 /// Bounded synchronous history owned by a trusted host; callers must not hold scheduler locks.
@@ -69,6 +74,9 @@ struct JournalState {
 /// One owner opens a local database in a host-controlled directory; plugins never choose this path.
 /// 单个所有者打开宿主管理目录内的本地数据库；插件不得选择此路径。
 pub struct OperationJournal {
+    /// Original absolute host-owned database path; recovery never selects another file or creates a replacement.
+    /// 原始绝对宿主数据库路径；恢复绝不选择其他文件或创建替代文件。
+    path: PathBuf,
     /// Validated immutable limits shared by every read and mutation.
     /// 所有读取及变更共享的已校验不可变上限。
     config: OperationJournalConfig,
@@ -90,35 +98,26 @@ impl OperationJournal {
     /// Existing unknown formats, corruption, insufficient limits and another owner fail explicitly.
     /// 已有未知格式、损坏、上限不足或其他所有者都会明确失败。
     pub fn open(path: &Path, config: OperationJournalConfig) -> EmbeddedResult<Self> {
+        // Preserve the original path and exclusive ownership across later explicit recovery.
+        // 跨后续显式恢复保留原始路径及独占所有权。
         let connection = storage::open(path, config)?;
+        // Publish no journal until every stored record has been validated.
+        // 全部存储记录通过校验前不发布日志。
         let journal = Self {
+            path: path.to_owned(),
             config,
             state: Mutex::new(JournalState {
-                connection,
+                connection: Some(connection),
                 failure: None,
+                #[cfg(test)]
+                lost_confirmation: None,
             }),
         };
         {
+            // Validation uses the same bounded reader as explicit recovery.
+            // 校验使用与显式恢复相同的有界读取器。
             let state = journal.lock()?;
-            let count: i64 = state
-                .connection
-                .query_row("SELECT count(*) FROM operations", [], |row| row.get(0))
-                .map_err(storage::error)?;
-            if count < 0 || count as u64 > config.max_records as u64 {
-                return Err(capacity());
-            }
-            // Stream one row at a time so validation never allocates the entire history.
-            // 每次流式处理一行，避免校验时分配全部历史。
-            let mut statement = state
-                .connection
-                .prepare(
-                    "SELECT runtime_id, operation_id, revision, document, digest FROM operations",
-                )
-                .map_err(storage::error)?;
-            let mut rows = statement.query([]).map_err(storage::error)?;
-            while let Some(row) = rows.next().map_err(storage::error)? {
-                journal.decode(row)?;
-            }
+            journal.validate_contents(state.connection())?;
         }
         Ok(journal)
     }
@@ -130,26 +129,7 @@ impl OperationJournal {
         runtime_id: &str,
         snapshot: &OperationSnapshot,
     ) -> EmbeddedResult<JournalOperation> {
-        self.validate_key(runtime_id, &snapshot.operation_id)?;
-        validate_callers(runtime_id, snapshot)?;
-        json_size(snapshot, self.config.max_record_bytes)?;
-        let record = JournalOperation {
-            runtime_id: runtime_id.to_owned(),
-            revision: 1,
-            snapshot: snapshot.clone(),
-        };
-        let document = self.encode(&record)?;
-        self.transaction(|connection| {
-            if self.read(connection, runtime_id, &snapshot.operation_id)?.is_some() {
-                return Err(EmbeddedError::new(EmbeddedErrorCode::AlreadyCompleted, "operation history identity already exists"));
-            }
-            let count: i64 = connection.query_row("SELECT count(*) FROM operations", [], |row| row.get(0)).map_err(storage::error)?;
-            if count as u64 >= self.config.max_records as u64 { return Err(capacity()); }
-            connection.execute("INSERT INTO operations(runtime_id, operation_id, revision, document, digest) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![runtime_id, snapshot.operation_id, record.revision as i64, document, Sha256::digest(&document).as_slice()]).map_err(storage::error)?;
-            Ok(())
-        })?;
-        Ok(record)
+        self.write_checkpoint(runtime_id, None, snapshot, false)
     }
 
     /// Replace the exact record only at `expected_revision`, returning the new durable revision.
@@ -162,33 +142,7 @@ impl OperationJournal {
         expected_revision: u64,
         snapshot: &OperationSnapshot,
     ) -> EmbeddedResult<JournalOperation> {
-        self.validate_key(runtime_id, &snapshot.operation_id)?;
-        validate_callers(runtime_id, snapshot)?;
-        json_size(snapshot, self.config.max_record_bytes)?;
-        let revision = expected_revision
-            .checked_add(1)
-            .filter(|value| expected_revision > 0 && *value <= i64::MAX as u64)
-            .ok_or_else(|| {
-                EmbeddedError::invalid("operation history revision is exhausted or invalid")
-            })?;
-        let record = JournalOperation {
-            runtime_id: runtime_id.to_owned(),
-            revision,
-            snapshot: snapshot.clone(),
-        };
-        let document = self.encode(&record)?;
-        self.transaction(|connection| {
-            // Context belongs to admission and cannot be retargeted by later checkpoint or recovery writes.
-            // 上下文归属于入场，不能被后续检查点或恢复写入重新指向。
-            let previous = self.expect(connection, runtime_id, &snapshot.operation_id, expected_revision)?;
-            if previous.snapshot.context != snapshot.context {
-                return Err(EmbeddedError::invalid("operation history context is immutable"));
-            }
-            connection.execute("UPDATE operations SET revision=?3, document=?4, digest=?5 WHERE runtime_id=?1 AND operation_id=?2",
-                params![runtime_id, snapshot.operation_id, revision as i64, document, Sha256::digest(&document).as_slice()]).map_err(storage::error)?;
-            Ok(())
-        })?;
-        Ok(record)
+        self.write_checkpoint(runtime_id, Some(expected_revision), snapshot, false)
     }
 
     /// Read historical evidence by exact identity; absence does not prove that execution never occurred.
@@ -199,7 +153,7 @@ impl OperationJournal {
         operation_id: &str,
     ) -> EmbeddedResult<Option<JournalOperation>> {
         self.validate_key(runtime_id, operation_id)?;
-        self.read(&self.lock()?.connection, runtime_id, operation_id)
+        self.read(self.lock()?.connection(), runtime_id, operation_id)
     }
 
     /// Return one historical row after exact `(runtime_id, operation_id)` in binary key order.
@@ -212,8 +166,8 @@ impl OperationJournal {
         }
         let state = self.lock()?;
         let result = match after {
-            None => state.connection.query_row("SELECT runtime_id, operation_id, revision, document, digest FROM operations ORDER BY runtime_id, operation_id LIMIT 1", [], |row| Ok(self.decode(row))),
-            Some((runtime_id, operation_id)) => state.connection.query_row("SELECT runtime_id, operation_id, revision, document, digest FROM operations WHERE (runtime_id, operation_id) > (?1, ?2) ORDER BY runtime_id, operation_id LIMIT 1", params![runtime_id, operation_id], |row| Ok(self.decode(row))),
+            None => state.connection().query_row("SELECT runtime_id, operation_id, revision, document, digest FROM operations ORDER BY runtime_id, operation_id LIMIT 1", [], |row| Ok(self.decode(row))),
+            Some((runtime_id, operation_id)) => state.connection().query_row("SELECT runtime_id, operation_id, revision, document, digest FROM operations WHERE (runtime_id, operation_id) > (?1, ?2) ORDER BY runtime_id, operation_id LIMIT 1", params![runtime_id, operation_id], |row| Ok(self.decode(row))),
         };
         result.optional().map_err(storage::error)?.transpose()
     }
@@ -258,22 +212,39 @@ impl OperationJournal {
         mutation: impl FnOnce(&Connection) -> EmbeddedResult<()>,
     ) -> EmbeddedResult<()> {
         let mut state = self.lock()?;
+        // Capture the one-shot test outcome before borrowing the transaction fields.
+        // 借用事务字段前捕获单次测试结果。
+        #[cfg(test)]
+        let lost_confirmation = state.lost_confirmation.take();
         let JournalState {
             connection,
             failure,
+            ..
         } = &mut *state;
         let transaction = connection
+            .as_mut()
+            .expect("healthy journal retains its exclusive connection")
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage::error)?;
         match mutation(&transaction) {
-            Ok(()) => match transaction.commit() {
-                Ok(()) => Ok(()),
-                Err(_) => {
-                    let error = uncertain();
-                    *failure = Some(error.clone());
-                    Err(error)
+            Ok(()) => {
+                // Execute a real test transaction outcome before its wrapper attempts to confirm it.
+                // 在包装器尝试确认前执行真实的测试事务结果。
+                #[cfg(test)]
+                if let Some(committed) = lost_confirmation {
+                    transaction
+                        .execute_batch(if committed { "COMMIT" } else { "ROLLBACK" })
+                        .map_err(storage::error)?;
                 }
-            },
+                match transaction.commit() {
+                    Ok(()) => Ok(()),
+                    Err(_) => {
+                        let error = uncertain();
+                        *failure = Some(error.clone());
+                        Err(error)
+                    }
+                }
+            }
             // SQLITE_FULL and selected I/O errors may already have rolled back the transaction.
             // SQLITE_FULL 及部分 I/O 错误可能已经回滚事务。
             // This connection is exclusively owned and mutation closures never commit themselves.
@@ -410,6 +381,9 @@ impl OperationJournal {
         // 回滚失败可能留下连接内未提交字节；绝不将其标记为持久证据。
         if let Some(error) = &state.failure {
             return Err(error.clone());
+        }
+        if state.connection.is_none() {
+            return Err(uncertain());
         }
         Ok(state)
     }
