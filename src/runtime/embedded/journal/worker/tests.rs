@@ -2,7 +2,9 @@
 //! 有界写入者的真实存储与确定性所有权测试。
 
 use super::*;
-use crate::runtime::embedded::{EffectState, OperationJournalConfig, OperationPhase};
+use crate::runtime::embedded::{
+    EffectState, OperationContext, OperationJournalConfig, OperationPhase,
+};
 use std::path::PathBuf;
 use std::sync::mpsc;
 
@@ -95,6 +97,7 @@ impl Drop for Directory {
 /// 返回一个由 `id` 标识的不可变未决检查点。
 fn snapshot(id: &str) -> Arc<OperationSnapshot> {
     Arc::new(OperationSnapshot {
+        context: OperationContext::Unbound,
         operation_id: id.into(),
         phase: OperationPhase::Running,
         cancellation_requested: false,

@@ -137,7 +137,14 @@ fn embedded_journal_caller_mismatch_rejects_mutation() {
 fn embedded_journal_caller_corruption_and_legacy_schema_are_preserved() {
     // Cover malformed current documents separately from the exact unsupported historical format.
     // 分别覆盖当前畸形文档及精确不支持历史格式。
-    for damage in ["missing", "runtime", "operation", "legacy"] {
+    for damage in [
+        "missing",
+        "runtime",
+        "operation",
+        "missing-context",
+        "legacy",
+        "legacy-two",
+    ] {
         // Change persisted bytes deliberately after releasing the actual journal owner.
         // 释放真实日志所有者后，有意修改持久字节。
         let directory = Directory::new();
@@ -158,11 +165,24 @@ fn embedded_journal_caller_corruption_and_legacy_schema_are_preserved() {
             .find(|effect| effect["effect_id"] == "original-effect")
             .unwrap();
         match damage {
-            "missing" | "legacy" => {
+            "missing" => {
                 effect.as_object_mut().unwrap().remove("caller");
+            }
+            "legacy" => {
+                effect.as_object_mut().unwrap().remove("caller");
+                encoded["snapshot"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("context");
             }
             "runtime" => effect["caller"]["runtime_id"] = json!("different"),
             "operation" => effect["caller"]["operation_id"] = json!("different"),
+            "missing-context" | "legacy-two" => {
+                encoded["snapshot"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("context");
+            }
             _ => unreachable!(),
         }
         {
@@ -182,6 +202,10 @@ fn embedded_journal_caller_corruption_and_legacy_schema_are_preserved() {
                 // Version one is the exact historical format without caller identity, not the current version constant.
                 // 第一版是缺少调用身份的精确历史格式，不是当前版本常量。
                 connection.pragma_update(None, "user_version", 1).unwrap();
+            } else if damage == "legacy-two" {
+                // Version two retained effect callers but had no operation context.
+                // 第二版保留副作用调用方，但没有操作上下文。
+                connection.pragma_update(None, "user_version", 2).unwrap();
             }
         }
         // Save exact bytes to prove refusal does not rewrite or repair historical evidence.
@@ -194,7 +218,7 @@ fn embedded_journal_caller_corruption_and_legacy_schema_are_preserved() {
             .unwrap();
         assert_eq!(
             failure.code,
-            if damage == "legacy" {
+            if matches!(damage, "legacy" | "legacy-two") {
                 EmbeddedErrorCode::Unsupported
             } else {
                 EmbeddedErrorCode::Internal

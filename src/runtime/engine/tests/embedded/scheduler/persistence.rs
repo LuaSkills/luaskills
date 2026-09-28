@@ -3,12 +3,17 @@
 
 use super::*;
 
+mod context;
 mod intent;
 mod outcome;
 
 /// One bounded fixture observation budget; production storage has its own ownership lifecycle.
 /// 单一有界夹具观测预算；生产存储具有自己的所有权生命周期。
 const OBSERVE: Duration = Duration::from_secs(8);
+
+/// A terminal payload large enough to require more space than one accepted filler record.
+/// 足够大的终态载荷，其所需空间超过单个已接纳填充记录。
+const TERMINAL_RESULT_BYTES: usize = 12 * 1024;
 
 /// Return storage limits with caller-selected `max_records` and `max_database_bytes`.
 /// 返回由调用方指定 `max_records` 和 `max_database_bytes` 的存储上限。
@@ -114,6 +119,7 @@ fn shutdown_durable(runtime: &EmbeddedRuntime, writer: &OperationJournalWorker) 
 /// 返回已对账终态填充项，其 `bytes` 载荷故意消费真实存储。
 fn filler(bytes: usize) -> OperationSnapshot {
     OperationSnapshot {
+        context: OperationContext::Unbound,
         operation_id: "filler".into(),
         phase: OperationPhase::Succeeded,
         cancellation_requested: false,
@@ -122,6 +128,46 @@ fn filler(bytes: usize) -> OperationSnapshot {
         error: None,
         host_effects: Vec::new(),
     }
+}
+
+/// Fill `journal` to an actual capacity refusal, release one filler for Cleaning, and return the retained IDs.
+/// 填充 `journal` 至真实容量拒绝，为清理阶段释放一项填充，并返回仍保留的身份。
+/// `limits` are the journal's configured bounds; larger terminal growth must still fail in SQLite.
+/// `limits` 为日志配置上限；较大的终态增长仍须在 SQLite 中失败。
+fn fill_database(journal: &OperationJournal, limits: OperationJournalConfig) -> Vec<String> {
+    // Each filler stays below the document budget while terminal growth exceeds a filler's footprint.
+    // 每项填充均低于文档预算，同时终态增长超过填充项占用。
+    let filler_bytes = limits.max_record_bytes / 4;
+    assert!(TERMINAL_RESULT_BYTES > filler_bytes);
+    // Only successfully committed fixtures are removed before retrying the original checkpoint.
+    // 重试原检查点前仅删除成功提交的夹具。
+    let mut committed = Vec::new();
+    for index in 0..limits.max_records {
+        // Unique historical identities leave the active runtime's exact revision untouched.
+        // 唯一历史身份保持活动运行时的精确修订不变。
+        let mut record = filler(filler_bytes);
+        record.operation_id = format!("filler-{index}");
+        match journal.insert("old-runtime", &record) {
+            Ok(_) => committed.push(record.operation_id),
+            Err(error) => {
+                assert_eq!(error.code, EmbeddedErrorCode::CapacityExceeded);
+                // Record-count or JSON-budget failures would not prove the intended SQLite transaction boundary.
+                // 记录数量或 JSON 预算失败无法证明预期 SQLite 事务边界。
+                assert_eq!(error.message, "operation history database operation failed");
+                assert!(
+                    !committed.is_empty(),
+                    "no disk-pressure fixture was accepted"
+                );
+                // Free one proven footprint for the small Cleaning rewrite while retaining terminal pressure.
+                // 释放一份已证实占用供小型清理重写使用，同时保留终态压力。
+                let spare = committed.pop().unwrap();
+                journal.forget("old-runtime", &spare, 1).unwrap();
+                assert!(!committed.is_empty(), "no terminal disk pressure remains");
+                return committed;
+            }
+        }
+    }
+    panic!("database pressure was not reached before the fixture record limit");
 }
 
 /// Real Lua results are persisted before observation, and immediate forgetting remains atomic with scheduler release.
@@ -357,13 +403,21 @@ fn embedded_scheduler_persistence_disk_wait_keeps_supervisor_live() {
 /// 一次 Lua 调用后的真实页耗尽保留原始结果，绝不重放业务执行。
 #[test]
 fn embedded_scheduler_persistence_terminal_failure_retries_only_storage() {
-    // Four database pages fit phase evidence plus the filler but not the larger terminal result.
-    // 四个数据库页容纳阶段证据及填充项，但容不下更大的终态结果。
+    // Initial capacity must accommodate real admission metadata before deliberately applying disk pressure.
+    // 初始容量必须容纳真实入场元数据，随后才有意施加磁盘压力。
     let layout = SystemRuntimeTestLayout::new("embedded durable terminal capacity");
+    // Allow the deliberately large result through value validation so SQLite supplies the actual failure.
+    // 允许故意扩大的结果通过值校验，使 SQLite 产生真实失败。
+    let mut config = pool_config();
+    config.max_value_bytes = TERMINAL_RESULT_BYTES + 2;
+    config.max_queued_bytes = config.max_value_bytes;
+    config.max_host_request_bytes = config.max_value_bytes;
+    // Keep record and database budgets explicit for the bounded fill procedure.
+    // 为有界填充过程保留明确的记录及数据库预算。
+    let limits = journal_config(16, 32 * 1024);
     // Page capacity, rather than a mocked writer error, forces the actual transaction failure.
     // 使用页容量而非模拟写入错误迫使真实事务失败。
-    let (journal, writer, runtime) =
-        durable_runtime(&layout, pool_config(), journal_config(16, 16 * 1024));
+    let (journal, writer, runtime) = durable_runtime(&layout, config, limits);
     // The fixture releases the Lua business gate even during assertion unwinding.
     // 即使断言展开，夹具仍释放 Lua 业务门禁。
     let release = FinalizerRelease(layout.package_root.join("business-release"));
@@ -373,7 +427,7 @@ fn embedded_scheduler_persistence_terminal_failure_retries_only_storage() {
         -- Retain controlled file and clock functions for deterministic fixture coordination.
         -- 保留受控文件及计时函数以进行确定性夹具协调。
         local open, clock = io.open, os.clock
-        return {call=function()
+        return {call=function(result_bytes)
             -- The append is the observable business effect whose duplication is forbidden.
             -- 此追加是禁止重复的可观测业务副作用。
             local count=assert(open('business-count','a')); count:write('x'); count:close()
@@ -389,7 +443,7 @@ fn embedded_scheduler_persistence_terminal_failure_retries_only_storage() {
                 local ok, released=pcall(open,'business-release','r')
                 if ok and released then released:close(); break end
             until clock() >= deadline
-            return string.rep('v',900)
+            return string.rep('v',result_bytes)
         end}
     "#;
     // Ordinary reusable execution permits inspection after failure without migrating the original call.
@@ -404,12 +458,16 @@ fn embedded_scheduler_persistence_terminal_failure_retries_only_storage() {
         .unwrap();
     // Keep one original operation identity across the real failed disk transaction.
     // 跨真实失败磁盘事务保留一个原始操作身份。
-    let operation = runtime.submit(call(&pool, json!(null)), OBSERVE).unwrap();
+    let operation = runtime
+        .submit(call(&pool, json!(TERMINAL_RESULT_BYTES)), OBSERVE)
+        .unwrap();
     until(
         || layout.package_root.join("business-entered").exists(),
         "Lua business never reached its gate",
     );
-    journal.insert("old-runtime", &filler(8192)).unwrap();
+    // Derive pressure from actual accepted records, independent of evolving context field lengths.
+    // 按实际接纳记录形成压力，不依赖持续演进的上下文字段长度。
+    let fillers = fill_database(&journal, limits);
     drop(release);
     // Public Cleaning is distinct from the successful but unacknowledged terminal candidate.
     // 公开清理状态区别于成功但尚未确认的终态候选。
@@ -425,7 +483,9 @@ fn embedded_scheduler_persistence_terminal_failure_retries_only_storage() {
         fs::read_to_string(layout.package_root.join("business-count")).unwrap(),
         "x"
     );
-    journal.forget("old-runtime", "filler", 1).unwrap();
+    for id in fillers {
+        journal.forget("old-runtime", &id, 1).unwrap();
+    }
     assert_eq!(
         runtime
             .persistence_failure(operation.id())
@@ -453,7 +513,7 @@ fn embedded_scheduler_persistence_terminal_failure_retries_only_storage() {
         "{:?}",
         result.error
     );
-    assert_eq!(result.value, Some(json!("v".repeat(900))));
+    assert_eq!(result.value, Some(json!("v".repeat(TERMINAL_RESULT_BYTES))));
     assert_eq!(
         fs::read_to_string(layout.package_root.join("business-count")).unwrap(),
         "x"
@@ -469,10 +529,18 @@ fn embedded_scheduler_persistence_late_session_close_preserves_prepared_result()
     // The open session and its later call share one retained VM and exact runtime namespace.
     // 打开的会话及其后续调用共享一个保留 VM 和精确运行时命名空间。
     let layout = SystemRuntimeTestLayout::new("embedded durable late session close");
+    // Admit the large terminal value before applying actual database pressure.
+    // 施加真实数据库压力前，允许较大终态值入场。
+    let mut config = pool_config();
+    config.max_value_bytes = TERMINAL_RESULT_BYTES + 2;
+    config.max_queued_bytes = config.max_value_bytes;
+    config.max_host_request_bytes = config.max_value_bytes;
+    // Both opening and invocation checkpoints fit before filling the remaining database capacity.
+    // 填充剩余数据库容量前，开启及调用检查点均能容纳。
+    let limits = journal_config(16, 32 * 1024);
     // A real terminal write failure provides a deterministic pause after preparation.
     // 真实终态写入失败在准备之后提供确定性暂停。
-    let (journal, writer, runtime) =
-        durable_runtime(&layout, pool_config(), journal_config(16, 16 * 1024));
+    let (journal, writer, runtime) = durable_runtime(&layout, config, limits);
     // Business progress and VM destruction have separately owned release markers.
     // 业务推进和 VM 销毁具有独立拥有的释放标记。
     let business_release = FinalizerRelease(layout.package_root.join("business-release"));
@@ -502,7 +570,7 @@ fn embedded_scheduler_persistence_late_session_close_preserves_prepared_result()
                 if ok and released then released:close(); break end
             until clock() >= deadline
         end
-        return {call=function()
+        return {call=function(result_bytes)
             -- Keep finalization pinned to the session's actual VM lifetime.
             -- 将析构固定到会话的真实 VM 生命周期。
             assert(proxy ~= nil)
@@ -521,7 +589,7 @@ fn embedded_scheduler_persistence_late_session_close_preserves_prepared_result()
                 local ok, released=pcall(open,'business-release','r')
                 if ok and released then released:close(); break end
             until clock() >= deadline
-            return string.rep('v',900)
+            return string.rep('v',result_bytes)
         end}
     "#;
     // Session reuse retains this precise VM after the business function succeeds.
@@ -539,12 +607,19 @@ fn embedded_scheduler_persistence_late_session_close_preserves_prepared_result()
     let session = super::sessions::opened(&runtime, &pool);
     // The business operation remains the same through failure, late close and disk-only retry.
     // 业务操作在失败、较晚关闭及仅磁盘重试过程中保持相同。
-    let operation = super::sessions::session_call(&runtime, &session, json!(null));
+    let operation = super::sessions::session_call(&runtime, &session, json!(TERMINAL_RESULT_BYTES));
     until(
-        || layout.package_root.join("business-entered").exists(),
+        || {
+            if let Ok(Some(failed)) = runtime.persistence_failure(operation.id()) {
+                panic!("session checkpoint failed before business entry: {failed:?}");
+            }
+            layout.package_root.join("business-entered").exists()
+        },
         "session business never reached its gate",
     );
-    journal.insert("old-runtime", &filler(8192)).unwrap();
+    // Accepted historical records supply real storage pressure without guessing a fixed filler length.
+    // 已接纳历史记录提供真实存储压力，不推测固定填充长度。
+    let fillers = fill_database(&journal, limits);
     drop(business_release);
     assert_eq!(
         failure(&runtime, &operation).phase,
@@ -560,7 +635,9 @@ fn embedded_scheduler_persistence_late_session_close_preserves_prepared_result()
         OperationPhase::Cleaning
     );
     assert!(!layout.package_root.join("finalizer-entered").exists());
-    journal.forget("old-runtime", "filler", 1).unwrap();
+    for id in fillers {
+        journal.forget("old-runtime", &id, 1).unwrap();
+    }
     runtime.retry_checkpoint(operation.id()).unwrap();
     // The close linearized after preparation, so the original successful business value remains successful.
     // 关闭在线性顺序中晚于准备，因此原成功业务值保持成功。
@@ -571,7 +648,7 @@ fn embedded_scheduler_persistence_late_session_close_preserves_prepared_result()
         "{:?}",
         result.error
     );
-    assert_eq!(result.value, Some(json!("v".repeat(900))));
+    assert_eq!(result.value, Some(json!("v".repeat(TERMINAL_RESULT_BYTES))));
     until(
         || layout.package_root.join("finalizer-entered").exists(),
         "late close never started actual session retirement",

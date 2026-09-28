@@ -1210,7 +1210,7 @@
         "description": "Explicit parent budgets; hosts resolve defaults once before construction.\n显式父级预算；宿主在构造前一次性解析默认值。",
         "properties": {
           "max_effect_bytes_per_operation": {
-            "description": "Maximum serialized effect metadata bytes retained by one operation.\n单次操作保留的副作用元数据序列化字节上限。",
+            "description": "Maximum serialized module context and effect metadata bytes retained by one operation.\n单次操作保留的模块上下文及副作用元数据序列化字节上限。",
             "format": "uint",
             "minimum": 0,
             "type": "integer"
@@ -4738,6 +4738,62 @@
           ],
           "type": "object"
         },
+        "OperationContext": {
+          "description": "Explicit operation origin; unbound low-level work is never inferred to belong to a current plugin.\n明确的操作来源；未绑定的低层工作绝不被推断归属于当前插件。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "description": "The low-level host admitted this operation without a module binding.\n低层宿主接纳此操作时没有模块绑定。",
+              "properties": {
+                "kind": {
+                  "const": "unbound",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "The formal scheduler froze this module context before publishing the operation.\n正式调度器在发布操作前冻结了此模块上下文。",
+              "properties": {
+                "caller": {
+                  "$ref": "#/$defs/CapabilityCaller",
+                  "description": "Original trusted caller shared by initialization and this operation's host callbacks.\n初始化及此操作宿主回调共同使用的原始可信调用方。"
+                },
+                "capability_revision": {
+                  "description": "Exact capability membership snapshot frozen when the pool was registered.\n注册池时冻结的精确能力成员快照。",
+                  "type": "string"
+                },
+                "export": {
+                  "description": "Requested declared export; absent only for a fixed-session opening operation.\n请求的已声明导出；仅固定会话开启操作省略。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "const": "module",
+                  "type": "string"
+                },
+                "pool_id": {
+                  "description": "Exact retained pool identity, not a lookup of the plugin's newest pool.\n精确保留池身份，不查询插件最新的池。",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "pool_id",
+                "caller",
+                "capability_revision",
+                "export"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "OperationPhase": {
           "description": "Execution phase; cancellation intent is reported separately from actual termination.\n执行阶段；取消意图与实际终止分开报告。",
           "oneOf": [
@@ -4791,6 +4847,10 @@
               "description": "Whether cooperative cancellation has been requested.\n是否已请求协作取消。",
               "type": "boolean"
             },
+            "context": {
+              "$ref": "#/$defs/OperationContext",
+              "description": "Admission-time module authority, or an explicit unbound low-level origin; never reconstructed from effects.\n入场时模块权威，或明确未绑定的低层来源；绝不从副作用重建。"
+            },
             "effects": {
               "$ref": "#/$defs/EffectState",
               "description": "Explicit effect status; successful execution does not automatically imply commit.\n显式副作用状态；执行成功不自动表示提交。"
@@ -4826,6 +4886,7 @@
             }
           },
           "required": [
+            "context",
             "host_effects",
             "operation_id",
             "phase",
@@ -5124,6 +5185,62 @@
           ],
           "type": "object"
         },
+        "OperationContext": {
+          "description": "Explicit operation origin; unbound low-level work is never inferred to belong to a current plugin.\n明确的操作来源；未绑定的低层工作绝不被推断归属于当前插件。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "description": "The low-level host admitted this operation without a module binding.\n低层宿主接纳此操作时没有模块绑定。",
+              "properties": {
+                "kind": {
+                  "const": "unbound",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "The formal scheduler froze this module context before publishing the operation.\n正式调度器在发布操作前冻结了此模块上下文。",
+              "properties": {
+                "caller": {
+                  "$ref": "#/$defs/CapabilityCaller",
+                  "description": "Original trusted caller shared by initialization and this operation's host callbacks.\n初始化及此操作宿主回调共同使用的原始可信调用方。"
+                },
+                "capability_revision": {
+                  "description": "Exact capability membership snapshot frozen when the pool was registered.\n注册池时冻结的精确能力成员快照。",
+                  "type": "string"
+                },
+                "export": {
+                  "description": "Requested declared export; absent only for a fixed-session opening operation.\n请求的已声明导出；仅固定会话开启操作省略。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "const": "module",
+                  "type": "string"
+                },
+                "pool_id": {
+                  "description": "Exact retained pool identity, not a lookup of the plugin's newest pool.\n精确保留池身份，不查询插件最新的池。",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "pool_id",
+                "caller",
+                "capability_revision",
+                "export"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "OperationPhase": {
           "description": "Execution phase; cancellation intent is reported separately from actual termination.\n执行阶段；取消意图与实际终止分开报告。",
           "oneOf": [
@@ -5177,6 +5294,10 @@
               "description": "Whether cooperative cancellation has been requested.\n是否已请求协作取消。",
               "type": "boolean"
             },
+            "context": {
+              "$ref": "#/$defs/OperationContext",
+              "description": "Admission-time module authority, or an explicit unbound low-level origin; never reconstructed from effects.\n入场时模块权威，或明确未绑定的低层来源；绝不从副作用重建。"
+            },
             "effects": {
               "$ref": "#/$defs/EffectState",
               "description": "Explicit effect status; successful execution does not automatically imply commit.\n显式副作用状态；执行成功不自动表示提交。"
@@ -5212,6 +5333,7 @@
             }
           },
           "required": [
+            "context",
             "host_effects",
             "operation_id",
             "phase",

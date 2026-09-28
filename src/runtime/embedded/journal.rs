@@ -178,7 +178,12 @@ impl OperationJournal {
         };
         let document = self.encode(&record)?;
         self.transaction(|connection| {
-            self.expect(connection, runtime_id, &snapshot.operation_id, expected_revision)?;
+            // Context belongs to admission and cannot be retargeted by later checkpoint or recovery writes.
+            // 上下文归属于入场，不能被后续检查点或恢复写入重新指向。
+            let previous = self.expect(connection, runtime_id, &snapshot.operation_id, expected_revision)?;
+            if previous.snapshot.context != snapshot.context {
+                return Err(EmbeddedError::invalid("operation history context is immutable"));
+            }
             connection.execute("UPDATE operations SET revision=?3, document=?4, digest=?5 WHERE runtime_id=?1 AND operation_id=?2",
                 params![runtime_id, snapshot.operation_id, revision as i64, document, Sha256::digest(&document).as_slice()]).map_err(storage::error)?;
             Ok(())
@@ -415,10 +420,22 @@ impl OperationJournal {
 /// Return an explicit identity error; no current plugin registration supplies missing historical fields.
 /// 返回明确身份错误；不从当前插件注册补充缺失的历史字段。
 fn validate_callers(runtime_id: &str, snapshot: &OperationSnapshot) -> EmbeddedResult<()> {
+    snapshot
+        .context
+        .validate(runtime_id, &snapshot.operation_id)?;
     // Each retained effect carries its own original authority, including low-level host-managed calls.
     // 每条保留副作用携带其自身原始权威，包括低层宿主管理调用。
     for effect in &snapshot.host_effects {
         effect.caller.validate(runtime_id)?;
+        if snapshot
+            .context
+            .caller()
+            .is_some_and(|caller| caller != &effect.caller)
+        {
+            return Err(EmbeddedError::invalid(
+                "historical effect caller contradicts its operation context",
+            ));
+        }
         if effect.caller.operation_id != snapshot.operation_id {
             return Err(EmbeddedError::invalid(
                 "historical effect caller does not match its operation",

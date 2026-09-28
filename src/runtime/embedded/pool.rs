@@ -3,7 +3,8 @@ use super::retirement::RetirementService;
 use super::{
     CallControl, EmbeddedError, EmbeddedErrorCode, EmbeddedModule, EmbeddedResult,
     EmbeddedRuntimeConfig, InstanceReuse, ModuleAcquireFailure, ModuleDefinition, ModuleInvocation,
-    ModuleRelease, ModuleRetirement, PluginPoolConfig, PoolGovernor, PoolUsage, VmReservation,
+    ModuleOperationContext, ModuleRelease, ModuleRetirement, OperationContext, PluginPoolConfig,
+    PoolGovernor, PoolUsage, VmReservation,
 };
 use crate::runtime::engine::LuaEngine;
 use serde_json::Value;
@@ -374,6 +375,36 @@ pub struct ModulePool {
 }
 
 impl ModulePool {
+    /// Derive immutable authority for `operation_id`, optional `session_id` and declared `export` from this exact pool.
+    /// 从此精确池为 `operation_id`、可选 `session_id` 及已声明 `export` 派生不可变权威。
+    /// Return context without locking, executing source or consulting a newer capability registration.
+    /// 返回上下文，不加锁、不执行源码，也不查询较新的能力注册。
+    pub(super) fn operation_context(
+        &self,
+        operation_id: &str,
+        session_id: Option<&str>,
+        export: Option<&str>,
+    ) -> EmbeddedResult<OperationContext> {
+        // Formal scheduler pools always own a binding; low-level unbound pools cannot impersonate them.
+        // 正式调度器的池始终拥有绑定；低层未绑定池不能冒充它们。
+        let binding = self.capabilities.as_ref().ok_or_else(|| {
+            EmbeddedError::new(
+                EmbeddedErrorCode::Unsupported,
+                "pool has no capability binding",
+            )
+        })?;
+        Ok(OperationContext::Module(Box::new(ModuleOperationContext {
+            pool_id: self.registration.group.clone(),
+            caller: binding.caller(
+                &self.definition,
+                operation_id.to_owned(),
+                session_id.map(str::to_owned),
+            )?,
+            capability_revision: binding.snapshot_revision(),
+            export: export.map(str::to_owned),
+        })))
+    }
+
     /// Revoke live `permission` from this exact module binding without replacing its capability snapshot.
     /// 从此精确模块绑定撤销实时 `permission`，不替换能力快照。
     pub(super) fn revoke_capability_permission(&self, permission: &str) -> EmbeddedResult<bool> {

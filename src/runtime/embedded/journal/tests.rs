@@ -1,9 +1,10 @@
 use super::*;
-use crate::runtime::embedded::{HostEffectRecord, OperationPhase};
+use crate::runtime::embedded::{HostEffectRecord, OperationContext, OperationPhase};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 
+mod context;
 mod identity;
 
 /// Own one newly created temporary directory, isolated from other tests and user files.
@@ -54,6 +55,7 @@ fn config() -> OperationJournalConfig {
 /// 为 `id` 构造尚未结束且副作用未知的检查点，不编造终态证据。
 fn snapshot(id: &str) -> OperationSnapshot {
     OperationSnapshot {
+        context: OperationContext::Unbound,
         operation_id: id.into(),
         phase: OperationPhase::Running,
         cancellation_requested: false,

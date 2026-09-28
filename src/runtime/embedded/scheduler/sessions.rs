@@ -438,7 +438,14 @@ impl SchedulerCenter {
                 "plugin queue or retained operation capacity reached",
             ));
         }
-        let (handle, owner) = self.operations.admit(Arc::clone(&control))?;
+        // Freeze this pool's authority before publishing the operation or its shared control identity.
+        // 发布操作或其共享控制身份前，冻结此池的权威。
+        let (handle, owner) = self.operations.admit_module(
+            Arc::clone(&control),
+            &pool.pool,
+            request.session_id(),
+            request.invocation().map(|call| call.export.as_str()),
+        )?;
         let id = handle.id().to_owned();
         let plugin_state = state
             .plugins

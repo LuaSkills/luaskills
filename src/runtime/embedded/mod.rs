@@ -42,8 +42,8 @@ pub use journal::{
 };
 pub use module::{ModuleDefinition, ModuleExport, ModuleInvocation};
 pub use operations::{
-    EffectState, OperationHandle, OperationOwner, OperationPhase, OperationRegistry,
-    OperationSnapshot,
+    EffectState, ModuleOperationContext, OperationContext, OperationHandle, OperationOwner,
+    OperationPhase, OperationRegistry, OperationSnapshot,
 };
 pub use plugin_config::EmbeddedPluginConfig;
 pub use pool::{EmbeddedPoolManager, ModuleLease, ModulePool};

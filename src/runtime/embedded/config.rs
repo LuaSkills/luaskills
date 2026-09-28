@@ -37,8 +37,8 @@ pub struct EmbeddedRuntimeConfig {
     /// Maximum host effect records retained by one operation, including completed callbacks.
     /// 单次操作保留的宿主副作用记录上限，包含已完成回调。
     pub max_effect_records_per_operation: usize,
-    /// Maximum serialized effect metadata bytes retained by one operation.
-    /// 单次操作保留的副作用元数据序列化字节上限。
+    /// Maximum serialized module context and effect metadata bytes retained by one operation.
+    /// 单次操作保留的模块上下文及副作用元数据序列化字节上限。
     pub max_effect_bytes_per_operation: usize,
     /// Maximum pending host requests across all plugin instances.
     /// 所有插件实例待完成宿主请求的数量上限。

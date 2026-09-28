@@ -11,6 +11,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+mod admission;
+mod context;
+pub use context::{ModuleOperationContext, OperationContext};
 mod checkpoint;
 use checkpoint::{HistoryBackend, PendingCheckpoint};
 
@@ -86,6 +89,9 @@ pub enum EffectState {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct OperationSnapshot {
+    /// Admission-time module authority, or an explicit unbound low-level origin; never reconstructed from effects.
+    /// 入场时模块权威，或明确未绑定的低层来源；绝不从副作用重建。
+    pub context: OperationContext,
     /// Exact host callback evidence retained even after Lua failure, cancellation or output rejection.
     /// 即使 Lua 失败、取消或输出被拒绝也保留的精确宿主回调证据。
     pub host_effects: Vec<HostEffectRecord>,
@@ -489,8 +495,8 @@ pub struct OperationRegistry {
     /// Retained host effect count per operation, copied from the authoritative configuration.
     /// 从权威配置复制的逐操作宿主副作用保留数量。
     max_effect_records: usize,
-    /// Retained host effect metadata bytes per operation.
-    /// 逐操作宿主副作用元数据保留字节数。
+    /// Retained module context and host effect metadata bytes per operation.
+    /// 逐操作模块上下文及宿主副作用元数据保留字节数。
     max_effect_bytes: usize,
     /// Trusted runtime namespace used only to format opaque operation IDs.
     /// 仅用于生成不透明操作 ID 的可信运行时命名空间。
@@ -548,77 +554,15 @@ impl OperationRegistry {
         Ok(registry)
     }
 
-    /// Admit work with original `control`, returning a client handle and unique owner.
-    /// 使用原始 `control` 接纳工作，返回客户端句柄与唯一所有者。
+    /// Admit explicitly unbound low-level work with original `control`, returning a client handle and unique owner.
+    /// 使用原始 `control` 接纳明确未绑定的低层工作，返回客户端句柄与唯一所有者。
     /// Reject exhausted retention capacity; never evict unfinished work.
     /// 保留容量耗尽时拒绝接纳；绝不驱逐未完成工作。
     pub fn admit(
         &self,
         control: Arc<CallControl>,
     ) -> EmbeddedResult<(OperationHandle, OperationOwner)> {
-        control.check()?;
-        // Allocate identity and retention capacity in the same transaction.
-        // 在同一次事务中分配身份与保留容量。
-        let mut state = self.lock()?;
-        if state.records.len() >= self.max_operations {
-            return Err(EmbeddedError::new(
-                EmbeddedErrorCode::CapacityExceeded,
-                "operation retention capacity reached",
-            ));
-        }
-        // Checked counters never wrap into a previously used public identity.
-        // 受检计数器绝不回绕到之前使用过的公开身份。
-        let sequence = state.sequence.checked_add(1).ok_or_else(|| {
-            EmbeddedError::new(EmbeddedErrorCode::Internal, "operation identity exhausted")
-        })?;
-        // Opaque strings preserve the full identity in every supported SDK.
-        // 不透明字符串在所有受支持 SDK 中保留完整身份。
-        let id = super::IdentityKind::Operation.render(&self.runtime_id, sequence);
-        // Construct the immutable persistence binding before exposing the ledger through shared control.
-        // 在通过共享控制对象暴露账本之前构造不可变持久绑定。
-        let operation = Arc::new_cyclic(|operation| Operation {
-            transition: Mutex::new(None),
-            history: self.journal.as_ref().map(|journal| OperationHistory {
-                backend: journal.clone(),
-                runtime_id: self.runtime_id.clone(),
-                revision: Mutex::new(None),
-            }),
-            id: id.clone(),
-            effects: EffectLedger::new(
-                self.runtime_id.clone(),
-                id.clone(),
-                self.max_effect_records,
-                self.max_effect_bytes,
-                self.journal.as_ref().map(|_| operation.clone()),
-            ),
-            control: Arc::clone(&control),
-            snapshot: Mutex::new(OperationSnapshot {
-                host_effects: Vec::new(),
-                operation_id: id.clone(),
-                phase: OperationPhase::Queued,
-                cancellation_requested: false,
-                effects: EffectState::NotStarted,
-                value: None,
-                error: None,
-            }),
-            changed: Condvar::new(),
-            max_value_bytes: self.max_value_bytes,
-        });
-        // The original control belongs to one operation; failed attachment publishes no registry identity.
-        // 原始控制对象只归属于一个操作；绑定失败不发布注册表身份。
-        control.attach_effects(Arc::clone(&operation.effects))?;
-        state.sequence = sequence;
-        state.records.insert(id, Arc::clone(&operation));
-        Ok((
-            OperationHandle {
-                operation: Arc::clone(&operation),
-            },
-            OperationOwner {
-                operation,
-                pending_completion: None,
-                completion_checkpoint: None,
-            },
-        ))
+        self.admit_context(control, |_| Ok(OperationContext::Unbound))
     }
 
     /// Query the exact `id`; unknown or explicitly expired identities return not-found.

@@ -800,12 +800,30 @@ fn embedded_scheduler_pool_replacement_never_retargets_old_operations() {
             Duration::from_secs(5),
         )
         .unwrap();
+    // The still-queued operation already owns original module authority before any host effect exists.
+    // 尚在排队的操作在任何宿主副作用出现前已经拥有原始模块权威。
+    let admitted = queued.snapshot().unwrap();
+    assert_eq!(admitted.phase, OperationPhase::Queued);
+    assert!(admitted.host_effects.is_empty());
+    match &admitted.context {
+        OperationContext::Module(context) => {
+            assert_eq!(context.pool_id, old);
+            assert_eq!(context.caller.plugin_id, request.caller.plugin_id);
+            assert_eq!(
+                context.caller.package_generation,
+                request.caller.package_generation
+            );
+            assert_eq!(context.caller.operation_id, queued.id());
+        }
+        OperationContext::Unbound => panic!("queued formal operation lost original module context"),
+    }
     runtime.close_pool(&old).unwrap();
     assert_eq!(
         runtime.forget_pool(&old).unwrap_err().code,
         EmbeddedErrorCode::Busy
     );
     let old_result = queued.wait(Duration::from_secs(3)).unwrap();
+    assert_eq!(old_result.context, admitted.context);
     assert_eq!(old_result.error.unwrap().code, EmbeddedErrorCode::Closed);
     assert_eq!(old_result.effects, EffectState::NotStarted);
     let mut replacement = definition(

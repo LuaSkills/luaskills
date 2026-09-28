@@ -64,8 +64,8 @@ struct LedgerState {
     /// Monotonic identity counter.
     /// 单调身份计数器。
     sequence: u64,
-    /// Reserved serialized record bytes.
-    /// 预留序列化记录字节数。
+    /// Reserved serialized module context and record bytes.
+    /// 预留序列化模块上下文及记录字节数。
     bytes: usize,
     /// Records retained until the operation is released.
     /// 保留至操作释放的记录。
@@ -76,6 +76,9 @@ struct LedgerState {
 /// 控制对象与只读观察者共享的单操作有界日志。
 #[derive(Debug)]
 pub(super) struct EffectLedger {
+    /// Exact admitted module caller; absent only for explicitly unbound low-level operations.
+    /// 精确入场模块调用方；仅明确未绑定的低层操作省略。
+    caller: Option<CapabilityCaller>,
     /// Persistent operations share their exact mutation gate without creating an ownership cycle.
     /// 持久操作共享其精确变更门禁，不创建所有权循环。
     operation: Option<Weak<super::operations::Operation>>,
@@ -101,14 +104,21 @@ impl EffectLedger {
     /// 为精确运行时及操作身份和显式保留预算创建空证据。
     /// `operation` binds persistent dispatch to its exact owner; None explicitly selects memory-only evidence.
     /// `operation` 将持久分发绑定到精确所有者；None 显式选择纯内存证据。
+    /// `caller` freezes module authority and `context_bytes` reserves its already-validated share of `max_bytes`.
+    /// `caller` 冻结模块权威，`context_bytes` 预留其已经校验的 `max_bytes` 份额。
+    /// Return the shared ledger whose dynamic context and records consume one authoritative byte budget.
+    /// 返回共享账本；其动态上下文及记录共同消耗一个权威字节预算。
     pub(super) fn new(
         runtime_id: String,
         operation_id: String,
         max_records: usize,
         max_bytes: usize,
         operation: Option<Weak<super::operations::Operation>>,
+        caller: Option<CapabilityCaller>,
+        context_bytes: usize,
     ) -> Arc<Self> {
         Arc::new(Self {
+            caller,
             operation,
             runtime_id,
             operation_id,
@@ -117,7 +127,7 @@ impl EffectLedger {
             state: Mutex::new(LedgerState {
                 sealed: false,
                 sequence: 0,
-                bytes: 0,
+                bytes: context_bytes,
                 records: BTreeMap::new(),
             }),
         })
@@ -141,6 +151,11 @@ impl EffectLedger {
         if caller.runtime_id != self.runtime_id || caller.operation_id != self.operation_id {
             return Err(EmbeddedError::invalid(
                 "capability caller does not match its operation journal",
+            ));
+        }
+        if self.caller.as_ref().is_some_and(|bound| bound != caller) {
+            return Err(EmbeddedError::invalid(
+                "capability caller does not match admitted module context",
             ));
         }
         // Reserve count, bytes and identity atomically before any handler can start.
