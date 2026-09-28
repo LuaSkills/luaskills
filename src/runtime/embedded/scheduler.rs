@@ -14,6 +14,7 @@ use std::time::Duration;
 mod finalization;
 mod persistence;
 mod plugins;
+mod reusable;
 mod sessions;
 mod sessions_finalization;
 mod workers;
@@ -22,6 +23,7 @@ use finalization::PendingFinalization;
 pub use persistence::{CheckpointRetryState, OperationPersistenceFailure};
 pub use plugins::EmbeddedPluginSnapshot;
 use plugins::ScheduledPlugin;
+use reusable::ScheduledReusable;
 pub use sessions::{EmbeddedSessionOpening, EmbeddedSessionPhase, EmbeddedSessionSnapshot};
 use sessions::{ScheduledRequest, ScheduledSession};
 
@@ -93,6 +95,9 @@ struct ScheduledPool {
 /// Unique operation ownership moves from the queue to one worker and then the cleanup supervisor.
 /// 唯一操作所有权从队列转移到一个工作线程，再转移至清理监督器。
 struct ScheduledCall {
+    /// Exact scheduler-owned reusable instance selected at dispatch, absent for queued and session work.
+    /// 分发时选定的调度器所有可复用实例；排队及会话任务省略。
+    reusable_instance: Option<String>,
     /// Stable original operation identity.
     /// 稳定的原始操作身份。
     id: String,
@@ -116,9 +121,9 @@ struct PendingCompletion {
     /// Same-VM closing work retained through its intent, actual execution and durable outcome.
     /// 跨意图、真实执行及持久结果保留的同 VM 关闭工作。
     finalization: Option<PendingFinalization>,
-    /// Retained session ownership remains exclusive until business evidence is sealed or closing can be scheduled.
-    /// 保留会话的所有权保持独占，直到业务证据封存或可以调度关闭。
-    session_lease: Option<Box<ModuleLease>>,
+    /// Session and reusable ownership remain exclusive until business evidence is sealed or closing can be scheduled.
+    /// 会话及可复用实例所有权保持独占，直到业务证据封存或可以调度关闭。
+    retained_lease: Option<Box<ModuleLease>>,
     /// Whether the sole owner has already entered cleaning, independent of execution admission.
     /// 唯一所有者是否已进入清理，独立于执行入场。
     cleaning_started: bool,
@@ -142,6 +147,9 @@ struct PendingCompletion {
 /// Short-lock scheduling metadata contains no Lua execution or native destructor work.
 /// 短时锁调度元数据不包含 Lua 执行或原生析构工作。
 struct SchedulerState {
+    /// The only idle-cache ownership for formally scheduled reusable pools.
+    /// 正式调度可复用池的唯一空闲缓存所有权。
+    reusable_instances: BTreeMap<String, ScheduledReusable>,
     /// Closing continuations use existing workers and retain the original active-operation charge.
     /// 关闭续行使用既有工作线程，并保留原活动操作记账。
     finalizing: VecDeque<PendingCompletion>,
@@ -304,6 +312,7 @@ impl EmbeddedRuntime {
             operations,
             pools: EmbeddedPoolManager::new(engine, config.clone())?,
             state: Mutex::new(SchedulerState {
+                reusable_instances: BTreeMap::new(),
                 finalizing: VecDeque::new(),
                 closing: false,
                 failure: None,
@@ -584,12 +593,17 @@ impl EmbeddedRuntime {
     /// 旧身份保持未知，不能解析到新注册代次。
     pub fn forget_pool(&self, id: &str) -> EmbeddedResult<()> {
         let mut state = self.center.lock()?;
+        reusable::prune(&mut state)?;
         let pool = state.pools.get(id).ok_or_else(not_found)?;
         if !pool.closed
             || pool.queued != 0
             || pool.active != 0
             || pool.pool.usage()?.resident != 0
             || state.sessions.values().any(|session| session.pool_id == id)
+            || state
+                .reusable_instances
+                .values()
+                .any(|instance| instance.pool_id == id)
         {
             return Err(EmbeddedError::new(
                 EmbeddedErrorCode::Busy,

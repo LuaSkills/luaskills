@@ -78,9 +78,10 @@ pub(super) fn schedule(
     state.cleaning_count += 1;
     state.cleaning.push(PendingCompletion {
         finalization: Some(PendingFinalization::new(*lease, plan)),
-        session_lease: None,
+        retained_lease: None,
         cleaning_started: false,
         call: ScheduledCall {
+            reusable_instance: None,
             id,
             owner,
             control,

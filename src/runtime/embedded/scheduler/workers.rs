@@ -66,11 +66,15 @@ fn select(state: &mut SchedulerState) -> EmbeddedResult<Option<Dispatch>> {
             continue;
         }
         let mut visited = BTreeSet::new();
-        let queue = state
+        // Queue membership is unchanged until the selected call is removed and this function returns.
+        // 选定调用被移除且此函数返回之前，队列成员保持不变。
+        let queued = state
             .queues
             .get(plugin)
-            .expect("rotation references a live queue");
-        for (index, call) in queue.iter().enumerate() {
+            .expect("rotation references a live queue")
+            .len();
+        for index in 0..queued {
+            let call = &state.queues.get(plugin).expect("scanned queue retained")[index];
             // Different sessions may progress independently; each session and ordinary domain stays FIFO.
             // 不同会话可以独立推进；每个会话与普通域内部仍保持先进先出。
             if !visited.insert((
@@ -98,38 +102,43 @@ fn select(state: &mut SchedulerState) -> EmbeddedResult<Option<Dispatch>> {
                 // 会话容量已在创建时预留；仅在移除队列后转移其精确租借。
                 None
             } else {
-                let allow_new = state.plugin_allows_allocation(call.request.pool_id())?;
-                let prepared = pool
-                    .pool
-                    .prepare_with_budget(&call.control, false, allow_new);
+                let pool_id = call.request.pool_id().to_owned();
+                let operation_id = call.id.clone();
+                let control = Arc::clone(&call.control);
+                let physical = Arc::clone(&pool.pool);
+                let allow_new = state.plugin_allows_allocation(&pool_id)?;
+                let prepared = if physical.policy().reuse == InstanceReuse::Reusable {
+                    reusable::prepare(state, &pool_id, &operation_id, &control)
+                        .map(|(lease, id)| (lease, Some(id)))
+                } else {
+                    physical
+                        .prepare_with_budget(&control, false, allow_new)
+                        .map(|lease| (lease, None))
+                };
                 if matches!(&prepared, Err(error) if error.code == EmbeddedErrorCode::CapacityExceeded)
                 {
                     // A full target domain cannot benefit from evicting any other domain's cache.
                     // 目标域自身已满时，驱逐其他域的缓存不能帮助它。
-                    if pool.pool.usage()?.resident >= pool.pool.policy().max_resident_vms {
+                    if physical.usage()?.resident >= physical.policy().max_resident_vms {
                         continue;
                     }
                     if !reclaimed {
-                        for candidate in state.pools.values() {
-                            // Plugin-local exhaustion can only be relieved by retiring that plugin's own idle state.
-                            // 插件局部耗尽只能通过退役该插件自身的空闲状态缓解。
-                            if !allow_new && candidate.plugin_id != *plugin {
-                                continue;
-                            }
-                            if candidate.pool.retire_idle_for_pressure()? {
-                                reclaimed = true;
-                                break;
-                            }
-                        }
+                        // Formal reusable caches have one owner; pressure never retires the low-level cache behind it.
+                        // 正式可复用缓存只有一个所有者；容量压力绝不绕过它退役底层缓存。
+                        reclaimed =
+                            reusable::reclaim(state, (!allow_new).then_some(plugin.as_str()));
                     }
                     continue;
                 }
                 Some(prepared)
             };
             state.rotation.rotate_left(rotation_index + 1);
-            let call = take_call(state, plugin, index);
+            let mut call = take_call(state, plugin, index);
             let lease = match prepared {
-                Some(Ok(lease)) => Box::new(lease),
+                Some(Ok((lease, instance_id))) => {
+                    call.reusable_instance = instance_id;
+                    Box::new(lease)
+                }
                 Some(Err(error)) => return Ok(Some(Dispatch::Rejected(call, error))),
                 None => {
                     let session = state
@@ -171,8 +180,8 @@ fn invoke(
     mut lease: ModuleLease,
     max_value_bytes: usize,
 ) -> PendingCompletion {
-    // Execution keeps the exact session VM and original control across initialization and host calls.
-    // 执行在初始化与宿主调用之间保留精确会话 VM 与原始控制。
+    // Execution keeps the exact leased VM and original control across initialization and host calls.
+    // 执行在初始化与宿主调用之间保留精确租借 VM 与原始控制。
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         call.owner.advance(OperationPhase::Initializing)?;
         lease.initialize_for_session(Arc::clone(&call.control), call.request.session_id())?;
@@ -206,6 +215,7 @@ fn invoke(
     // A declared finalizer retains this exact VM until both closing checkpoints are acknowledged.
     // 声明的关闭回调保留此精确 VM，直到两个关闭检查点都已确认。
     if call.request.session_id().is_none()
+        && call.reusable_instance.is_none()
         && let Some(plan) = lease.finalization_plan()
     {
         return PendingCompletion {
@@ -214,16 +224,16 @@ fn invoke(
             result,
             retirement: None,
             effects: EffectState::Unknown,
-            session_lease: None,
+            retained_lease: None,
             dispatched: true,
             cleaning_started: false,
         };
     }
-    // Healthy sessions retain state; failed sessions with a finalizer retain the same VM for independent cleanup.
-    // 健康会话保留状态；带关闭回调的失败会话为独立清理保留同一 VM。
-    let keep_session = call.request.session_id().is_some()
+    // Retained domains keep healthy state; eligible finalization keeps failed state for independent cleanup.
+    // 保留型执行域保存健康状态；符合关闭条件的失败状态保留给独立清理。
+    let keep_lease = (call.request.session_id().is_some() || call.reusable_instance.is_some())
         && ((result.is_ok() && lease.can_retain_session()) || lease.finalization_plan().is_some());
-    let (session_lease, retirement, result, effects) = if keep_session {
+    let (retained_lease, retirement, result, effects) = if keep_lease {
         (Some(Box::new(lease)), None, result, EffectState::Unknown)
     } else {
         if result.is_err() {
@@ -245,7 +255,7 @@ fn invoke(
         result,
         retirement,
         effects,
-        session_lease,
+        retained_lease,
         dispatched: true,
         cleaning_started: false,
     }
@@ -261,6 +271,7 @@ pub(super) fn execute(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
                 if state.closing
                     && state.live.is_empty()
                     && state.sessions.values().all(|session| session.closed)
+                    && state.reusable_instances.is_empty()
                 {
                     return Ok(());
                 }
@@ -291,7 +302,7 @@ pub(super) fn execute(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
             Dispatch::Rejected(call, error) => (
                 PendingCompletion {
                     finalization: None,
-                    session_lease: None,
+                    retained_lease: None,
                     call,
                     result: Err(error),
                     retirement: None,
@@ -308,10 +319,10 @@ pub(super) fn execute(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
         };
         {
             let mut state = center.lock()?;
-            if (completion.session_lease.is_none()
+            if (completion.retained_lease.is_none()
                 || completion.result.is_err()
                 || completion
-                    .session_lease
+                    .retained_lease
                     .as_ref()
                     .is_some_and(|lease| !lease.can_retain_session()))
                 && let Some(id) = completion.call.request.session_id()
@@ -326,6 +337,20 @@ pub(super) fn execute(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
                 if let Err(error) = &completion.result {
                     session.error.get_or_insert_with(|| error.clone());
                 }
+            }
+            if let Some(id) = &completion.call.reusable_instance
+                && (completion.retained_lease.is_none()
+                    || completion.result.is_err()
+                    || completion
+                        .retained_lease
+                        .as_ref()
+                        .is_some_and(|lease| !lease.can_retain_session()))
+            {
+                state
+                    .reusable_instances
+                    .get_mut(id)
+                    .expect("active reusable instance")
+                    .closing = true;
             }
             if newly_dispatched {
                 state.cleaning_count += 1;
@@ -366,7 +391,7 @@ fn reject_expired(state: &mut SchedulerState) {
             };
             if let Some(error) = error {
                 let call = take_call(state, &plugin, index);
-                let session_lease =
+                let retained_lease =
                     if let ScheduledRequest::OpenSession { session_id, .. } = &call.request {
                         let session = state
                             .sessions
@@ -381,7 +406,7 @@ fn reject_expired(state: &mut SchedulerState) {
                 state.cleaning_count += 1;
                 state.cleaning.push(PendingCompletion {
                     finalization: None,
-                    session_lease,
+                    retained_lease,
                     call,
                     result: Err(error),
                     retirement: None,
@@ -413,42 +438,59 @@ fn complete(
             }
         };
         if completion.call.owner.pending_completion().is_none()
-            && let Some(session_id) = completion.call.request.session_id()
+            && completion.retained_lease.is_some()
         {
-            // A close observed before preparation belongs to this operation's required cleanup.
-            // 准备前观测到的关闭属于此操作必须完成的清理。
-            let must_close = state.closing
-                || state
-                    .pools
-                    .get(completion.call.request.pool_id())
-                    .expect("active pool exists")
-                    .closed
-                || state
-                    .sessions
-                    .get(session_id)
-                    .expect("active session exists")
-                    .closing;
-            // Declared session cleanup owns a separate reserved operation after this result is immutable.
-            // 已声明的会话清理在此结果不可变后拥有独立预留操作。
+            // Freeze close together with the original result while its exact lease remains exclusively retained.
+            // 在精确租借保持独占保留期间，与原始结果一起冻结关闭决定。
+            let must_close =
+                state.closing
+                    || state
+                        .pools
+                        .get(completion.call.request.pool_id())
+                        .expect("retained pool exists")
+                        .closed
+                    || completion.call.request.session_id().is_some_and(|id| {
+                        state.sessions.get(id).expect("retained session").closing
+                    })
+                    || completion
+                        .call
+                        .reusable_instance
+                        .as_ref()
+                        .is_some_and(|id| {
+                            state
+                                .reusable_instances
+                                .get(id)
+                                .expect("retained reusable instance")
+                                .closing
+                        });
             let separate_finalizer = completion
-                .session_lease
+                .retained_lease
                 .as_ref()
                 .is_some_and(|lease| lease.finalization_plan().is_some());
             if must_close
                 && !separate_finalizer
-                && let Some(lease) = completion.session_lease.take()
+                && let Some(lease) = completion.retained_lease.take()
             {
-                state
-                    .sessions
-                    .get_mut(session_id)
-                    .expect("active session exists")
-                    .closing = true;
+                if let Some(id) = completion.call.request.session_id() {
+                    state
+                        .sessions
+                        .get_mut(id)
+                        .expect("retained session")
+                        .closing = true;
+                }
+                if let Some(id) = &completion.call.reusable_instance {
+                    state
+                        .reusable_instances
+                        .get_mut(id)
+                        .expect("retained reusable instance")
+                        .closing = true;
+                }
                 drop(state);
                 match lease.finish() {
                     Ok(ModuleRelease::Retiring(receipt)) => completion.retirement = Some(receipt),
                     Ok(ModuleRelease::NoInstance) => {}
                     Ok(ModuleRelease::ReturnedToPool) => {
-                        center.fail(internal("session VM returned to ordinary reuse"))
+                        center.fail(internal("scheduler-owned VM returned to physical cache"))
                     }
                     Err(error) => center.fail(error),
                 }
@@ -544,8 +586,8 @@ fn complete(
             }
         }
         if completion.call.owner.pending_completion().is_none() {
-            // Freeze business evidence and the session-close decision once, while metadata is still serialized.
-            // 在元数据仍串行化时，只冻结一次业务证据及会话关闭决定。
+            // Freeze business evidence and the retained-lease close decision once under serialized metadata.
+            // 在元数据串行化时，只冻结一次业务证据及保留租借的关闭决定。
             match completion
                 .call
                 .owner
@@ -606,6 +648,24 @@ fn complete(
                 .expect("active pool retained")
                 .active -= 1;
         }
+        if let Some(id) = &completion.call.reusable_instance {
+            if let Some(lease) = completion.retained_lease.take() {
+                let instance = state
+                    .reusable_instances
+                    .get_mut(id)
+                    .expect("unfinished reusable instance retained");
+                instance.active = None;
+                instance.lease = Some(lease);
+                instance.idle_since = std::time::Instant::now();
+            } else {
+                // Actual teardown was acknowledged before terminal publication, so this metadata can now leave.
+                // 终态发布前已确认实际清理，因此现在可以移除此元数据。
+                state
+                    .reusable_instances
+                    .remove(id)
+                    .expect("completed reusable instance retained");
+            }
+        }
         if let Some(session_id) = completion.call.request.session_id() {
             // Close after preparation belongs to the following session lifecycle; it cannot rewrite this result.
             // 准备后的关闭属于后续会话生命周期，不能改写此结果。
@@ -616,7 +676,7 @@ fn complete(
             session.unfinished -= 1;
             if completion.dispatched {
                 session.active = None;
-                if let Some(lease) = completion.session_lease.take() {
+                if let Some(lease) = completion.retained_lease.take() {
                     session.lease = Some(lease);
                     session.opened = true;
                 } else {
@@ -646,17 +706,7 @@ pub(super) fn supervise(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
         center.capabilities.host_requests().maintain_completions()?;
         center.observe_shared_checkpoint_failures()?;
         sessions::maintain(center)?;
-        // Metadata snapshots avoid running pool maintenance under the scheduler lock.
-        // 元数据快照避免在调度锁下运行池维护。
-        let pools = center
-            .lock()?
-            .pools
-            .values()
-            .map(|pool| Arc::clone(&pool.pool))
-            .collect::<Vec<_>>();
-        for pool in pools {
-            pool.retire_expired()?;
-        }
+        reusable::maintain(center)?;
         let pending = {
             let mut state = center.lock()?;
             reject_expired(&mut state);
@@ -671,6 +721,7 @@ pub(super) fn supervise(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
         if state.closing
             && state.live.is_empty()
             && state.sessions.values().all(|session| session.closed)
+            && state.reusable_instances.is_empty()
         {
             drop(state);
             center.pools.request_close()?;

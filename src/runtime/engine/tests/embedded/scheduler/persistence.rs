@@ -7,6 +7,7 @@ mod context;
 mod finalization;
 mod intent;
 mod outcome;
+mod reusable;
 
 /// One bounded fixture observation budget; production storage has its own ownership lifecycle.
 /// 单一有界夹具观测预算；生产存储具有自己的所有权生命周期。

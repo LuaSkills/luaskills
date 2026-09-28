@@ -707,26 +707,6 @@ impl ModulePool {
         Ok(count)
     }
 
-    /// Retire at most one idle instance under parent pressure, preserving the declared dedicated minimum.
-    /// 在父级压力下最多退役一个空闲实例，保留声明的专用最小值。
-    /// Return whether ownership moved to retirement; never run VM destructors on the dispatcher.
-    /// 返回所有权是否转移至退役；绝不在分发器上运行 VM 析构器。
-    pub(crate) fn retire_idle_for_pressure(&self) -> EmbeddedResult<bool> {
-        let resident = {
-            let mut state = self.lock()?;
-            if state.idle.len() <= self.policy.min_resident_vms {
-                return Ok(false);
-            }
-            state.idle.pop()
-        };
-        if let Some(resident) = resident {
-            self.manager.retirement.enqueue(resident);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
     /// Return exact group resource accounting including pinned and retiring instances.
     /// 返回包含固定与退役实例的精确分组资源记账。
     pub fn usage(&self) -> EmbeddedResult<PoolUsage> {
@@ -862,6 +842,18 @@ pub struct ModuleLease {
 }
 
 impl ModuleLease {
+    /// Borrow the exact reserved or constructed instance identity before scheduler publication.
+    /// 在调度器发布前借用精确预留或已构造的实例身份。
+    /// Return closed only when this lease no longer owns either explicit allocation state.
+    /// 仅此租借不再拥有任一明确分配状态时返回已关闭。
+    pub(super) fn allocation_id(&self) -> EmbeddedResult<&str> {
+        match (&self.pending, &self.resident) {
+            (Some(pending), None) => Ok(&pending.instance_id),
+            (None, Some(resident)) => Ok(&resident.instance_id),
+            _ => Err(closed()),
+        }
+    }
+
     /// Clone an eligible initialized module's immutable closing declaration for the scheduler.
     /// 为调度器克隆符合条件的已初始化模块的不可变关闭声明。
     pub(crate) fn finalization_plan(&self) -> Option<ModuleFinalizer> {

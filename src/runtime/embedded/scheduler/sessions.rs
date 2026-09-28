@@ -546,6 +546,7 @@ impl SchedulerCenter {
             .entry(plugin)
             .or_default()
             .push_back(ScheduledCall {
+                reusable_instance: None,
                 id,
                 owner,
                 control,
