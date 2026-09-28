@@ -2,6 +2,8 @@ use super::*;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
+mod capacities;
+
 /// Send a complete JSON request and release any returned allocation before exposing its parsed envelope.
 /// 发送完整 JSON 请求，并在暴露解析后信封前释放所有返回分配。
 fn exchange(id: u64, bytes: &[u8]) -> Result<Value, i32> {

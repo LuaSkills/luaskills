@@ -1,7 +1,7 @@
 use crate::LuaInvocationContext;
 use crate::runtime::embedded::{
-    EffectState, EmbeddedCall, EmbeddedError, EmbeddedPluginConfig, EmbeddedResult,
-    ModuleDefinition, OperationReconciliation, PluginPoolConfig,
+    EffectState, EmbeddedCall, EmbeddedCapacityConfig, EmbeddedError, EmbeddedPluginConfig,
+    EmbeddedResult, ModuleDefinition, OperationReconciliation, PluginPoolConfig,
     capabilities::{CapabilityDescriptor, CapabilityOutcome},
 };
 use serde::Deserialize;
@@ -114,9 +114,43 @@ pub(super) enum RuntimeCommand {
         /// 精确宿主分配的插件身份。
         plugin_id: String,
     },
+    /// Register immutable capacity owned by one existing plugin without creating a VM.
+    /// 注册单个既有插件拥有的不可变容量，不创建 VM。
+    CapacityRegister {
+        /// Exact previously registered plugin owner.
+        /// 精确先前已注册插件所有者。
+        plugin_id: String,
+        /// Complete physical and queued-work budgets; no implicit defaults are inserted.
+        /// 完整物理及排队工作预算；不插入隐式默认值。
+        config: EmbeddedCapacityConfig,
+    },
+    /// Read actual capacity ownership, including cleanup and unused physical guarantees.
+    /// 读取实际容量归属，包含清理及未使用物理保证。
+    CapacityStatus {
+        /// Exact runtime-issued capacity identity.
+        /// 精确运行时签发容量身份。
+        capacity_id: String,
+    },
+    /// Close capacity admission and all exact members without claiming actual resource completion.
+    /// 关闭容量入场及全部精确成员，不宣称实际资源已完成。
+    CapacityClose {
+        /// Exact runtime-issued capacity identity.
+        /// 精确运行时签发容量身份。
+        capacity_id: String,
+    },
+    /// Forget a closed capacity only after every member and physical owner has drained.
+    /// 仅在全部成员及物理所有者排空后遗忘已关闭容量。
+    CapacityForget {
+        /// Exact runtime-issued capacity identity.
+        /// 精确运行时签发容量身份。
+        capacity_id: String,
+    },
     /// Register immutable source and capability authority without executing Lua.
     /// 注册不可变源码及能力权威，不执行 Lua。
     PoolRegister {
+        /// Optional exact capacity owner; omission or null explicitly selects independent placement.
+        /// 可选精确容量所有者；省略或空值显式选择独立归属。
+        capacity_id: Option<String>,
         /// Immutable package and module declaration.
         /// 不可变包与模块声明。
         definition: Box<ModuleDefinition>,
@@ -356,6 +390,10 @@ pub(super) const RUNTIME_COMMAND_NAMES: &[&str] = &[
     "plugin_status",
     "plugin_close",
     "plugin_forget",
+    "capacity_register",
+    "capacity_status",
+    "capacity_close",
+    "capacity_forget",
     "pool_register",
     "pool_status",
     "pool_close",
@@ -389,6 +427,7 @@ impl RuntimeCommand {
         matches!(
             self,
             Self::PluginRegister { .. }
+                | Self::CapacityRegister { .. }
                 | Self::PoolRegister { .. }
                 | Self::CallSubmit { .. }
                 | Self::SessionOpen { .. }

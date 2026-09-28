@@ -1,10 +1,13 @@
 //! One response type authority used by both native dispatch and offline schema generation.
 //! 原生分发及离线 Schema 生成共同使用的唯一响应类型权威。
 
-use super::wire::{OperationReceipt, PoolReceipt, RegistrationReceipt, SessionReceipt};
+use super::wire::{
+    CapacityReceipt, OperationReceipt, PoolReceipt, RegistrationReceipt, SessionReceipt,
+};
 use crate::runtime::embedded::capabilities::{CapabilityDescriptor, CapabilityRegistrationStatus};
 use crate::runtime::embedded::{
-    EmbeddedPluginSnapshot, EmbeddedSessionSnapshot, OperationSnapshot, PoolUsage,
+    EmbeddedCapacitySnapshot, EmbeddedPluginSnapshot, EmbeddedSessionSnapshot, OperationSnapshot,
+    PoolUsage,
 };
 
 /// Successful `plugin_register` result, enforced by the native dispatcher before serialization.
@@ -51,6 +54,22 @@ pub(super) type PluginClose = ();
 /// Successful `plugin_forget` result, enforced by the native dispatcher before serialization.
 /// `plugin_forget` 成功结果，在序列化前由原生分发器强制校验。
 pub(super) type PluginForget = ();
+
+/// Successful capacity registration returns the exact retained identity.
+/// 成功容量注册返回精确保留身份。
+pub(super) type CapacityRegister = CapacityReceipt;
+
+/// Capacity status uses the same authoritative snapshot as the formal Rust scheduler.
+/// 容量状态使用与正式 Rust 调度器相同的权威快照。
+pub(super) type CapacityStatus = EmbeddedCapacitySnapshot;
+
+/// Capacity close acknowledges admission closure without promising physical completion.
+/// 容量关闭确认入场已关闭，不承诺物理完成。
+pub(super) type CapacityClose = ();
+
+/// Capacity forget acknowledges actual removal after all members have been forgotten.
+/// 容量遗忘确认全部成员遗忘后的实际移除。
+pub(super) type CapacityForget = ();
 
 /// Successful `pool_register` result, enforced by the native dispatcher before serialization.
 /// `pool_register` 成功结果，在序列化前由原生分发器强制校验。
@@ -164,6 +183,10 @@ pub(super) fn schemas() -> serde_json::Value {
         "plugin_status": super::contract::response::<PluginStatus>(),
         "plugin_close": super::contract::response::<PluginClose>(),
         "plugin_forget": super::contract::response::<PluginForget>(),
+        "capacity_register": super::contract::response::<CapacityRegister>(),
+        "capacity_status": super::contract::response::<CapacityStatus>(),
+        "capacity_close": super::contract::response::<CapacityClose>(),
+        "capacity_forget": super::contract::response::<CapacityForget>(),
         "pool_register": super::contract::response::<PoolRegister>(),
         "pool_status": super::contract::response::<PoolStatus>(),
         "pool_close": super::contract::response::<PoolClose>(),

@@ -5,6 +5,7 @@ use crate::ffi_standard::FfiBorrowedBuffer;
 use crate::runtime::embedded::capabilities::{CapabilityEffects, CapabilityExecution, HostRequest};
 use crate::runtime::embedded::{EmbeddedPluginConfig, InstanceReuse, OperationSnapshot};
 
+mod capacities;
 mod persistence;
 
 /// The public C transport executes a real module from the exact host-authorized external generation.

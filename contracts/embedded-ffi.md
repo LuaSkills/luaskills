@@ -61,7 +61,10 @@
 | `plugin_register` | `plugin_id`、`config: EmbeddedPluginConfig` | `null` |
 | `plugin_status` | `plugin_id` | 核心插件状态与聚合用量 |
 | `plugin_close`、`plugin_forget` | `plugin_id` | `null` |
-| `pool_register` | `definition: ModuleDefinition`、`policy: PluginPoolConfig`、`permissions: string[]`、`execution_revision` | `{pool_id}` |
+| `capacity_register` | `plugin_id`、`config: EmbeddedCapacityConfig` | `{capacity_id}` |
+| `capacity_status` | `capacity_id` | 正式容量状态，包含物理保证、成员数、排队及清理期活动量 |
+| `capacity_close`、`capacity_forget` | `capacity_id` | `null` |
+| `pool_register` | `definition: ModuleDefinition`、`policy: PluginPoolConfig`、`permissions: string[]`、`execution_revision`、可选 `capacity_id` | `{pool_id}` |
 | `pool_status` | `pool_id` | `PoolUsage`，来自实际资源计数 |
 | `pool_close`、`pool_forget` | `pool_id` | `null` |
 | `pool_revoke_permission` | `pool_id`、`permission` | 是否实际移除了授权的布尔值 |
@@ -96,7 +99,18 @@ FFI 仅接受显式 `queued` 能力。包含 `native` 的整个注册批次在�
 
 `effects` 以 `EffectState` 为权威，允许 `not_started`、`not_applicable`、`committed`、`rolled_back`、`unknown`，并继续接受核心对声明和结果的语义校验。判别布尔值与形状冲突时不消费处理器所有权。已分发请求即使被取消、能力被注销或运行时开始关闭，仍须在真实宿主处理结束后完成确认；终态操作保留逐宿主副作用证据，不能把取消解释成回滚。
 
-运行时槽关闭后，新插件、池、会话、操作及能力注册均拒绝入场；查询、撤权、取消、关闭、遗忘和宿主确认继续可用。此关闭门独立于核心初始化完成时机，不能利用「关闭已返回、构造刚完成」的间隙创建新工作。
+运行时槽关闭后，新插件、容量、池、会话、操作及能力注册均拒绝入场；查询、撤权、取消、关闭、遗忘和宿主确认继续可用。此关闭门独立于核心初始化完成时机，不能利用「关闭已返回、构造刚完成」的间隙创建新工作。
+
+容量分组通过构造前描述中的 `capacity_groups_v1` 声明。容量登记按核心最长不透明身份预留完整成功回执，
+回执不足时不登记容量，也不扣留专用预留；关闭及遗忘同样先完成响应预留。配置和状态直接使用正式
+Rust 类型，不复制第二套预算字段。当前新增命令沿用版本一 JSON 及 C 结构，精确契约摘要发生变化；
+SDK 必须同步包内契约后才能消费候选库，不能仅依据包版本相同跳过描述校验。
+
+`pool_register.capacity_id` 省略或显式空值表示原独立归属；提供字符串则必须是当前运行时中、
+归属同一插件且未关闭的精确容量。未知、外来或关闭身份直接失败，不回退独立池。成员局部最小值为零，
+避免重复保证。关闭容量只停止入场并请求原成员排空；空容量预留在全部成员显式遗忘、实际物理注销及
+`capacity_forget` 成功后归还。状态、关闭和遗忘应走 SDK 控制通道，登记走工作通道。
+此处的 C ABI 接通不表示三个 SDK 的类型句柄、安装包及各平台分发已完成验收。
 
 `operation_list` 发现内存保留操作，按实际入场发布顺序返回身份，不按提前预留的身份字符串排序。`limit` 不得超过核心 `max_operations`；响应仍受 FFI 响应字节预算约束，超出时可缩小查询数量。返回的 `after_operation_id` 为本页最后身份，空页保留输入游标；`has_more` 仅说明本次观测尚有更多记录，后续发布仍可沿保留游标查询。游标已遗忘或来自另一运行时会返回未找到，与池过滤条件不符则拒绝；重新以空游标枚举，不能据缺失推断未执行。精确池过滤使用原操作上下文，池元数据遗忘后仍有效。分页不提供跨多次调用的全局快照，也不包含尚未转换的关闭预留。持久历史继续使用独立 `history_*` 接口。
 

@@ -49,6 +49,16 @@ pub(super) struct RuntimeReceipt {
     pub(super) runtime_id: String,
 }
 
+/// Exact capacity identity shared by response reservation and successful native registration.
+/// 响应预留及成功原生注册共享的精确容量身份。
+#[derive(Serialize)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
+pub(super) struct CapacityReceipt {
+    /// Immutable runtime-qualified core capacity identity.
+    /// 不可变且运行时限定的核心容量身份。
+    pub(super) capacity_id: String,
+}
+
 /// Actual pool registration acknowledgement shared by capacity preparation and publication.
 /// 容量准备及发布共享的实际池注册确认。
 #[derive(Serialize)]

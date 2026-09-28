@@ -2,7 +2,9 @@ use super::commands::RuntimeCommand;
 use super::protocol::{PreparedSuccess, respond};
 use super::responses;
 use super::runtime::RuntimeSlot;
-use super::wire::{OperationReceipt, PoolReceipt, RegistrationReceipt, SessionReceipt};
+use super::wire::{
+    CapacityReceipt, OperationReceipt, PoolReceipt, RegistrationReceipt, SessionReceipt,
+};
 use super::{EMBEDDED_FFI_PROTOCOL_VERSION, EmbeddedFfiStatus};
 use crate::runtime::embedded::capabilities::{
     CapabilityExecution, CapabilityPermissions, CapabilityRegistrationRequest, HostRequestBroker,
@@ -124,7 +126,35 @@ pub(super) fn execute(
         RuntimeCommand::PluginForget { plugin_id } => {
             mutate::<responses::PluginForget>(&(), || runtime.forget_plugin(&plugin_id), limit)
         }
+        RuntimeCommand::CapacityRegister { plugin_id, config } => {
+            // Reserve the longest core-issued identity before any physical guarantee is published.
+            // 发布任何物理保证前，预留最长核心签发身份。
+            let sample = CapacityReceipt {
+                capacity_id: IdentityKind::Capacity.longest(runtime.id()),
+            };
+            mutate::<responses::CapacityRegister>(
+                &sample,
+                || {
+                    runtime
+                        .register_capacity(&plugin_id, config)
+                        .map(|capacity_id| CapacityReceipt { capacity_id })
+                },
+                limit,
+            )
+        }
+        RuntimeCommand::CapacityStatus { capacity_id } => {
+            respond::<responses::CapacityStatus>(runtime.capacity(&capacity_id), limit)
+        }
+        RuntimeCommand::CapacityClose { capacity_id } => {
+            mutate::<responses::CapacityClose>(&(), || runtime.close_capacity(&capacity_id), limit)
+        }
+        RuntimeCommand::CapacityForget { capacity_id } => mutate::<responses::CapacityForget>(
+            &(),
+            || runtime.forget_capacity(&capacity_id),
+            limit,
+        ),
         RuntimeCommand::PoolRegister {
+            capacity_id,
             definition,
             policy,
             permissions,
@@ -137,9 +167,21 @@ pub(super) fn execute(
                 &sample,
                 || {
                     let grants = CapabilityPermissions::new(permissions)?;
-                    runtime
-                        .register_pool(*definition, policy, grants, execution_revision)
-                        .map(|pool_id| PoolReceipt { pool_id })
+                    // Explicit optional placement preserves legacy independence without lookup fallbacks.
+                    // 显式可选归属保留旧独立行为，不采用查找回退。
+                    let registered = match capacity_id {
+                        Some(capacity_id) => runtime.register_pool_in_capacity(
+                            &capacity_id,
+                            *definition,
+                            policy,
+                            grants,
+                            execution_revision,
+                        ),
+                        None => {
+                            runtime.register_pool(*definition, policy, grants, execution_revision)
+                        }
+                    };
+                    registered.map(|pool_id| PoolReceipt { pool_id })
                 },
                 limit,
             )
