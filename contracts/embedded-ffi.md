@@ -63,6 +63,8 @@
 | `plugin_close`、`plugin_forget` | `plugin_id` | `null` |
 | `capacity_register` | `plugin_id`、`config: EmbeddedCapacityConfig` | `{capacity_id}` |
 | `capacity_status` | `capacity_id` | 正式容量状态，包含物理保证、成员数、排队及清理期活动量 |
+| `capacity_policy` | `capacity_id` | 原子策略快照，包含不透明字符串 `revision`、当前 `capacity` 和 `pending_convergence` |
+| `capacity_revise` | `capacity_id`、`expected_revision`、完整 `config: EmbeddedCapacityConfig` | 已提交的不透明字符串修订令牌 |
 | `capacity_close`、`capacity_forget` | `capacity_id` | `null` |
 | `pool_register` | `definition: ModuleDefinition`、`policy: PluginPoolConfig`、`permissions: string[]`、`execution_revision`、可选 `capacity_id` | `{pool_id}` |
 | `pool_status` | `pool_id` | `PoolUsage`，来自实际资源计数 |
@@ -99,12 +101,20 @@ FFI 仅接受显式 `queued` 能力。包含 `native` 的整个注册批次在�
 
 `effects` 以 `EffectState` 为权威，允许 `not_started`、`not_applicable`、`committed`、`rolled_back`、`unknown`，并继续接受核心对声明和结果的语义校验。判别布尔值与形状冲突时不消费处理器所有权。已分发请求即使被取消、能力被注销或运行时开始关闭，仍须在真实宿主处理结束后完成确认；终态操作保留逐宿主副作用证据，不能把取消解释成回滚。
 
-运行时槽关闭后，新插件、容量、池、会话、操作及能力注册均拒绝入场；查询、撤权、取消、关闭、遗忘和宿主确认继续可用。此关闭门独立于核心初始化完成时机，不能利用「关闭已返回、构造刚完成」的间隙创建新工作。
+运行时槽关闭后，新插件、容量、池、会话、操作及能力注册和容量策略修订均拒绝入场；查询、撤权、取消、关闭、遗忘和宿主确认继续可用。此关闭门独立于核心初始化完成时机，不能利用「关闭已返回、构造刚完成」的间隙创建新工作。
 
 容量分组通过构造前描述中的 `capacity_groups_v1` 声明。容量登记按核心最长不透明身份预留完整成功回执，
 回执不足时不登记容量，也不扣留专用预留；关闭及遗忘同样先完成响应预留。配置和状态直接使用正式
 Rust 类型，不复制第二套预算字段。当前新增命令沿用版本一 JSON 及 C 结构，精确契约摘要发生变化；
 SDK 必须同步包内契约后才能消费候选库，不能仅依据包版本相同跳过描述校验。
+
+容量策略修订另由 `capacity_policy_revisions_v1` 声明。`capacity_policy` 在原生调度锁内同时读取
+修订、完整策略及真实用量；`capacity_revise` 仅在精确前驱匹配时提交完整替换配置。令牌始终按字符串
+传递，不能转换为数值或自动取新令牌重试。变更前按原生 `u64` 序号的最长字符串编码预留成功响应；
+空间不足不变更策略。过期前驱及执行上限低于已分发操作数量均返回 `busy`，原策略保持不变。
+常驻或队列缩至低于真实占用则允许提交并报告待收敛；原固定会话保留状态，常驻缩容沿原路径退役
+可复用缓存。两项命令均走 SDK 短时控制通道，但修订仍受原生关闭屏障约束。命令回执需要显式保留、
+观察及遗忘；观察超时或交付失败不授权重放变更。完整原生语义见[容量策略修订](embedded-runtime.md#原生容量策略修订)。
 
 `pool_register.capacity_id` 省略或显式空值表示原独立归属；提供字符串则必须是当前运行时中、
 归属同一插件且未关闭的精确容量。未知、外来或关闭身份直接失败，不回退独立池。成员局部最小值为零，

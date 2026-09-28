@@ -18,6 +18,7 @@ pub const EMBEDDED_CAPABILITIES: &[&str] = &[
     "bounded_transports_v1",
     "plugin_budgets_v1",
     "capacity_groups_v1",
+    "capacity_policy_revisions_v1",
     "shared_pools_v1",
     "dedicated_pools_v1",
     "fixed_sessions_v1",

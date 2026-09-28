@@ -131,6 +131,26 @@ pub(super) enum RuntimeCommand {
         /// 精确运行时签发容量身份。
         capacity_id: String,
     },
+    /// Read the current policy token and actual convergence state atomically.
+    /// 原子读取当前策略令牌及实际收敛状态。
+    CapacityPolicy {
+        /// Exact runtime-issued capacity identity.
+        /// 精确运行时签发容量身份。
+        capacity_id: String,
+    },
+    /// Replace complete capacity policy only when the supplied opaque predecessor still matches.
+    /// 仅在提供的不透明前驱仍匹配时替换完整容量策略。
+    CapacityRevise {
+        /// Exact runtime-issued capacity identity; never inferred from plugin name.
+        /// 精确运行时签发容量身份；绝不从插件名推断。
+        capacity_id: String,
+        /// Exact string from capacity_policy; clients must not convert it into a numeric value.
+        /// 来自 capacity_policy 的精确字符串；客户端不得将其转成数值。
+        expected_revision: String,
+        /// Complete replacement policy validated atomically by the original scheduler and governor.
+        /// 由原调度器及治理器原子校验的完整替换策略。
+        config: EmbeddedCapacityConfig,
+    },
     /// Close capacity admission and all exact members without claiming actual resource completion.
     /// 关闭容量入场及全部精确成员，不宣称实际资源已完成。
     CapacityClose {
@@ -392,6 +412,8 @@ pub(super) const RUNTIME_COMMAND_NAMES: &[&str] = &[
     "plugin_forget",
     "capacity_register",
     "capacity_status",
+    "capacity_policy",
+    "capacity_revise",
     "capacity_close",
     "capacity_forget",
     "pool_register",
@@ -428,6 +450,7 @@ impl RuntimeCommand {
             self,
             Self::PluginRegister { .. }
                 | Self::CapacityRegister { .. }
+                | Self::CapacityRevise { .. }
                 | Self::PoolRegister { .. }
                 | Self::CallSubmit { .. }
                 | Self::SessionOpen { .. }

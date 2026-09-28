@@ -145,6 +145,24 @@ pub(super) fn execute(
         RuntimeCommand::CapacityStatus { capacity_id } => {
             respond::<responses::CapacityStatus>(runtime.capacity(&capacity_id), limit)
         }
+        RuntimeCommand::CapacityPolicy { capacity_id } => {
+            respond::<responses::CapacityPolicy>(runtime.capacity_policy(&capacity_id), limit)
+        }
+        RuntimeCommand::CapacityRevise {
+            capacity_id,
+            expected_revision,
+            config,
+        } => {
+            // The native scheduler renders a u64 sequence as an opaque decimal string.
+            // 原生调度器将 u64 序号呈现为不透明十进制字符串。
+            // Reserve the longest such success before any policy or cache ownership can change.
+            // 在任何策略或缓存归属可能变化前预留此类最长成功响应。
+            mutate::<responses::CapacityRevise>(
+                &u64::MAX.to_string(),
+                || runtime.revise_capacity(&capacity_id, &expected_revision, config),
+                limit,
+            )
+        }
         RuntimeCommand::CapacityClose { capacity_id } => {
             mutate::<responses::CapacityClose>(&(), || runtime.close_capacity(&capacity_id), limit)
         }

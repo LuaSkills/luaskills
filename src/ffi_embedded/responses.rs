@@ -63,6 +63,14 @@ pub(super) type CapacityRegister = CapacityReceipt;
 /// 容量状态使用与正式 Rust 调度器相同的权威快照。
 pub(super) type CapacityStatus = EmbeddedCapacitySnapshot;
 
+/// Atomic native revision, complete policy and actual convergence state.
+/// 原子原生修订、完整策略及实际收敛状态。
+pub(super) type CapacityPolicy = crate::runtime::embedded::EmbeddedCapacityPolicySnapshot;
+
+/// Opaque committed revision echoed without numeric conversion.
+/// 原样回传且不经数值转换的已提交不透明修订。
+pub(super) type CapacityRevise = String;
+
 /// Capacity close acknowledges admission closure without promising physical completion.
 /// 容量关闭确认入场已关闭，不承诺物理完成。
 pub(super) type CapacityClose = ();
@@ -169,47 +177,51 @@ pub(super) type HostRequestComplete = ();
 /// 返回命令索引映射；宿主批次帧使用代理实际 HostRequest 序列化。
 #[cfg(feature = "contract-generation")]
 pub(super) fn schemas() -> serde_json::Value {
-    serde_json::json!({
-        "operation_persistence_failure": super::contract::response::<OperationPersistenceFailure>(),
-        "operation_retry_checkpoint": super::contract::response::<OperationRetryCheckpoint>(),
-        "storage_status": super::contract::response::<StorageStatus>(),
-        "storage_recover": super::contract::response::<StorageRecover>(),
-        "storage_worker_recover": super::contract::response::<StorageWorkerRecover>(),
-        "history_get": super::contract::response::<HistoryGet>(),
-        "history_next": super::contract::response::<HistoryNext>(),
-        "history_reconcile": super::contract::response::<HistoryReconcile>(),
-        "history_forget": super::contract::response::<HistoryForget>(),
-        "plugin_register": super::contract::response::<PluginRegister>(),
-        "plugin_status": super::contract::response::<PluginStatus>(),
-        "plugin_close": super::contract::response::<PluginClose>(),
-        "plugin_forget": super::contract::response::<PluginForget>(),
-        "capacity_register": super::contract::response::<CapacityRegister>(),
-        "capacity_status": super::contract::response::<CapacityStatus>(),
-        "capacity_close": super::contract::response::<CapacityClose>(),
-        "capacity_forget": super::contract::response::<CapacityForget>(),
-        "pool_register": super::contract::response::<PoolRegister>(),
-        "pool_status": super::contract::response::<PoolStatus>(),
-        "pool_close": super::contract::response::<PoolClose>(),
-        "pool_forget": super::contract::response::<PoolForget>(),
-        "pool_revoke_permission": super::contract::response::<PoolRevokePermission>(),
-        "call_submit": super::contract::response::<CallSubmit>(),
-        "session_open": super::contract::response::<SessionOpen>(),
-        "session_submit": super::contract::response::<SessionSubmit>(),
-        "session_status": super::contract::response::<SessionStatus>(),
-        "session_close": super::contract::response::<SessionClose>(),
-        "session_forget": super::contract::response::<SessionForget>(),
-        "operation_status": super::contract::response::<OperationStatus>(),
-        "operation_list": super::contract::response::<OperationList>(),
-        "operation_wait": super::contract::response::<OperationWait>(),
-        "operation_cancel": super::contract::response::<OperationCancel>(),
-        "operation_forget": super::contract::response::<OperationForget>(),
-        "capabilities_register": super::contract::response::<CapabilitiesRegister>(),
-        "capabilities_list": super::contract::response::<CapabilitiesList>(),
-        "capability_status": super::contract::response::<CapabilityStatus>(),
-        "capability_unregister": super::contract::response::<CapabilityUnregister>(),
-        "capability_forget": super::contract::response::<CapabilityForget>(),
-        "host_request_status": super::contract::response::<HostRequestStatus>(),
-        "host_request_complete": super::contract::response::<HostRequestComplete>(),
-        "host_requests_take": super::contract::response::<Vec<crate::runtime::embedded::capabilities::HostRequest>>(),
-    })
+    // An ordinary map avoids macro recursion growth when new native commands are added.
+    // 普通映射避免新增原生命令时宏递归深度增长。
+    serde_json::Value::Object([
+        ("operation_persistence_failure", super::contract::response::<OperationPersistenceFailure>()),
+        ("operation_retry_checkpoint", super::contract::response::<OperationRetryCheckpoint>()),
+        ("storage_status", super::contract::response::<StorageStatus>()),
+        ("storage_recover", super::contract::response::<StorageRecover>()),
+        ("storage_worker_recover", super::contract::response::<StorageWorkerRecover>()),
+        ("history_get", super::contract::response::<HistoryGet>()),
+        ("history_next", super::contract::response::<HistoryNext>()),
+        ("history_reconcile", super::contract::response::<HistoryReconcile>()),
+        ("history_forget", super::contract::response::<HistoryForget>()),
+        ("plugin_register", super::contract::response::<PluginRegister>()),
+        ("plugin_status", super::contract::response::<PluginStatus>()),
+        ("plugin_close", super::contract::response::<PluginClose>()),
+        ("plugin_forget", super::contract::response::<PluginForget>()),
+        ("capacity_register", super::contract::response::<CapacityRegister>()),
+        ("capacity_status", super::contract::response::<CapacityStatus>()),
+        ("capacity_policy", super::contract::response::<CapacityPolicy>()),
+        ("capacity_revise", super::contract::response::<CapacityRevise>()),
+        ("capacity_close", super::contract::response::<CapacityClose>()),
+        ("capacity_forget", super::contract::response::<CapacityForget>()),
+        ("pool_register", super::contract::response::<PoolRegister>()),
+        ("pool_status", super::contract::response::<PoolStatus>()),
+        ("pool_close", super::contract::response::<PoolClose>()),
+        ("pool_forget", super::contract::response::<PoolForget>()),
+        ("pool_revoke_permission", super::contract::response::<PoolRevokePermission>()),
+        ("call_submit", super::contract::response::<CallSubmit>()),
+        ("session_open", super::contract::response::<SessionOpen>()),
+        ("session_submit", super::contract::response::<SessionSubmit>()),
+        ("session_status", super::contract::response::<SessionStatus>()),
+        ("session_close", super::contract::response::<SessionClose>()),
+        ("session_forget", super::contract::response::<SessionForget>()),
+        ("operation_status", super::contract::response::<OperationStatus>()),
+        ("operation_list", super::contract::response::<OperationList>()),
+        ("operation_wait", super::contract::response::<OperationWait>()),
+        ("operation_cancel", super::contract::response::<OperationCancel>()),
+        ("operation_forget", super::contract::response::<OperationForget>()),
+        ("capabilities_register", super::contract::response::<CapabilitiesRegister>()),
+        ("capabilities_list", super::contract::response::<CapabilitiesList>()),
+        ("capability_status", super::contract::response::<CapabilityStatus>()),
+        ("capability_unregister", super::contract::response::<CapabilityUnregister>()),
+        ("capability_forget", super::contract::response::<CapabilityForget>()),
+        ("host_request_status", super::contract::response::<HostRequestStatus>()),
+        ("host_request_complete", super::contract::response::<HostRequestComplete>()),
+        ("host_requests_take", super::contract::response::<Vec<crate::runtime::embedded::capabilities::HostRequest>>()),
+    ].into_iter().map(|(command, schema)| (command.to_owned(), schema)).collect())
 }

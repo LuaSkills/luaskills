@@ -15,6 +15,7 @@
       "bounded_transports_v1",
       "plugin_budgets_v1",
       "capacity_groups_v1",
+      "capacity_policy_revisions_v1",
       "shared_pools_v1",
       "dedicated_pools_v1",
       "fixed_sessions_v1",
@@ -2768,6 +2769,54 @@
           },
           {
             "additionalProperties": false,
+            "description": "Read the current policy token and actual convergence state atomically.\n原子读取当前策略令牌及实际收敛状态。",
+            "properties": {
+              "capacity_id": {
+                "description": "Exact runtime-issued capacity identity.\n精确运行时签发容量身份。",
+                "type": "string"
+              },
+              "type": {
+                "const": "capacity_policy",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "capacity_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Replace complete capacity policy only when the supplied opaque predecessor still matches.\n仅在提供的不透明前驱仍匹配时替换完整容量策略。",
+            "properties": {
+              "capacity_id": {
+                "description": "Exact runtime-issued capacity identity; never inferred from plugin name.\n精确运行时签发容量身份；绝不从插件名推断。",
+                "type": "string"
+              },
+              "config": {
+                "$ref": "#/$defs/EmbeddedCapacityConfig",
+                "description": "Complete replacement policy validated atomically by the original scheduler and governor.\n由原调度器及治理器原子校验的完整替换策略。"
+              },
+              "expected_revision": {
+                "description": "Exact string from capacity_policy; clients must not convert it into a numeric value.\n来自 capacity_policy 的精确字符串；客户端不得将其转成数值。",
+                "type": "string"
+              },
+              "type": {
+                "const": "capacity_revise",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "capacity_id",
+              "expected_revision",
+              "config"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
             "description": "Close capacity admission and all exact members without claiming actual resource completion.\n关闭容量入场及全部精确成员，不宣称实际资源已完成。",
             "properties": {
               "capacity_id": {
@@ -4268,6 +4317,8 @@
     "plugin_forget",
     "capacity_register",
     "capacity_status",
+    "capacity_policy",
+    "capacity_revise",
     "capacity_close",
     "capacity_forget",
     "pool_register",
@@ -4825,6 +4876,257 @@
       "title": "SuccessEnvelope",
       "type": "object"
     },
+    "capacity_policy": {
+      "$defs": {
+        "EmbeddedCapacityConfig": {
+          "additionalProperties": false,
+          "description": "Complete capacity policy owned by one plugin across isolated module generations.\n单个插件跨隔离模块代次持有的完整容量策略。",
+          "properties": {
+            "max_queued_bytes": {
+              "description": "Maximum exact serialized bytes of queued requests across members.\n全部成员排队请求精确序列化字节数上限。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_queued_calls": {
+              "description": "Maximum accepted queued requests across every member pool.\n全部成员池已接纳排队请求的数量上限。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "resources": {
+              "$ref": "#/$defs/VmCapacityConfig",
+              "description": "Sole physical guarantee and execution limit used by the governor and scheduler together.\n治理器和调度器共同使用的唯一物理保证及执行上限。"
+            }
+          },
+          "required": [
+            "resources",
+            "max_queued_calls",
+            "max_queued_bytes"
+          ],
+          "type": "object"
+        },
+        "EmbeddedCapacityPolicySnapshot": {
+          "description": "One atomic policy revision and its actual convergence state for an exact capacity.\n单个精确容量的原子策略修订及其实际收敛状态。",
+          "properties": {
+            "capacity": {
+              "$ref": "#/$defs/EmbeddedCapacitySnapshot",
+              "description": "Current policy and physical/scheduling ownership sampled under the same scheduler gate.\n在同一调度门下采样的当前策略及物理／调度归属。"
+            },
+            "pending_convergence": {
+              "description": "Actual usage exceeds at least one current limit; existing work is still allowed to drain.\n实际用量超过至少一个当前上限；既有工作仍允许排空。",
+              "type": "boolean"
+            },
+            "revision": {
+              "description": "Opaque predecessor token for compare-and-swap; clients must echo it without numeric conversion.\n比较交换使用的不透明前驱令牌；客户端必须原样回传，不得数值转换。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "revision",
+            "capacity",
+            "pending_convergence"
+          ],
+          "type": "object"
+        },
+        "EmbeddedCapacitySnapshot": {
+          "description": "Actual capacity status includes physical ownership and scheduler work retained through cleanup.\n实际容量状态包含物理所有权及保留至清理完成的调度工作。",
+          "properties": {
+            "active_operations": {
+              "description": "Dispatched operations keep this charge through actual cleanup and result publication.\n已分发操作跨实际清理及结果发布保留此计费。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "capacity_id": {
+              "description": "Runtime-generated opaque identity, never reused after forgetting.\n运行时生成的不透明身份，遗忘后绝不复用。",
+              "type": "string"
+            },
+            "closing": {
+              "description": "Capacity, owning plugin or parent has permanently closed business admission.\n容量、所属插件或父级已永久关闭业务入场。",
+              "type": "boolean"
+            },
+            "committed_resident_vms": {
+              "description": "Non-lendable commitment remains visible even with zero physical VMs.\n即使物理 VM 为零，不可借用承诺仍可见。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "config": {
+              "$ref": "#/$defs/EmbeddedCapacityConfig",
+              "description": "Current complete policy, including physical and queued-work budgets.\n当前完整策略，包含物理及排队工作预算。"
+            },
+            "plugin_id": {
+              "description": "Exact immutable plugin owner.\n精确不可变插件所有者。",
+              "type": "string"
+            },
+            "queued_bytes": {
+              "description": "Exact serialized bytes retained by those queued requests.\n这些排队请求保留的精确序列化字节数。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "queued_calls": {
+              "description": "Accepted requests still waiting for execution admission.\n仍等待执行入场的已接纳请求。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "resources": {
+              "$ref": "#/$defs/PoolUsage",
+              "description": "Actual physical state, including creation, native waiting and retirement.\n实际物理状态，包含创建、原生等待及退役。"
+            },
+            "retained_pools": {
+              "description": "Retained scheduled member identities, including closed pools awaiting explicit forgetting.\n保留的已调度成员身份，包含等待显式遗忘的已关闭池。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "capacity_id",
+            "plugin_id",
+            "config",
+            "resources",
+            "committed_resident_vms",
+            "active_operations",
+            "queued_calls",
+            "queued_bytes",
+            "retained_pools",
+            "closing"
+          ],
+          "type": "object"
+        },
+        "PoolKind": {
+          "description": "Capacity ownership, separate from instance reuse and ordering requirements.\n容量归属，与实例复用及顺序要求相互独立。",
+          "oneOf": [
+            {
+              "const": "shared",
+              "description": "Capacity shared across independently keyed plugin instances.\n在具有独立匹配键的插件实例之间共享容量。",
+              "type": "string"
+            },
+            {
+              "const": "dedicated",
+              "description": "Host-approved capacity with a non-lendable minimum reservation.\n宿主批准且具有不可出借最小预留的容量。",
+              "type": "string"
+            }
+          ]
+        },
+        "PoolUsage": {
+          "description": "Current counters for one governor or one execution group.\n单个治理器或执行分组的当前计数。",
+          "properties": {
+            "creating": {
+              "description": "Allocations that have not finished initialization.\n尚未完成初始化的分配。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "idle": {
+              "description": "Initialized allocations that do not currently execute.\n已初始化且当前未执行的分配。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "resident": {
+              "description": "All allocated slots, including creating and retiring instances.\n全部分配槽位，包含正在创建与退役的实例。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "retiring": {
+              "description": "Allocations retained until teardown has genuinely completed.\n保留到清理真正完成的分配。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "running": {
+              "description": "Allocations holding a parent and group execution permit together.\n同时持有父级与分组执行许可的分配。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "resident",
+            "creating",
+            "idle",
+            "running",
+            "retiring"
+          ],
+          "type": "object"
+        },
+        "SuccessStatus": {
+          "description": "Single legal success discriminator, shared by live encoding and derived contracts.\n实际编码及派生契约共享的唯一合法成功判别。",
+          "oneOf": [
+            {
+              "const": "ok",
+              "description": "Successfully delivered result, including explicit JSON null.\n已成功交付结果，包含显式 JSON 空值。",
+              "type": "string"
+            }
+          ]
+        },
+        "VmCapacityConfig": {
+          "additionalProperties": false,
+          "description": "Immutable physical VM limits shared by multiple independently isolated module pools.\n多个独立隔离模块池共享的不可变物理 VM 限制。\nThis policy governs resident and actual execution permits, not scheduler queues or plugin authorization.\n此策略治理常驻及实际执行许可，不治理调度队列或插件授权。",
+          "properties": {
+            "kind": {
+              "$ref": "#/$defs/PoolKind",
+              "description": "Shared capacity or a dedicated reservation that other capacity groups cannot borrow.\n公共容量，或其他容量组不能借用的专用预留。"
+            },
+            "max_resident_vms": {
+              "description": "Maximum real slots across every member pool, including creation and retirement.\n全部成员池实际槽位上限，包含创建及退役。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_running_calls": {
+              "description": "Maximum simultaneous physical execution permits across member pools.\n全部成员池同时持有的物理执行许可上限。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "min_resident_vms": {
+              "description": "Minimum committed slots; zero explicitly permits an unreserved group.\n最小承诺槽位；零明确允许无预留分组。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "min_resident_vms",
+            "max_resident_vms",
+            "max_running_calls"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Borrowed success envelope avoids cloning application output during native response publication.\n借用成功信封，避免原生响应发布期间克隆应用输出。",
+      "properties": {
+        "protocol_version": {
+          "description": "Single protocol version authority.\n唯一协议版本权威。",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/EmbeddedCapacityPolicySnapshot",
+          "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。"
+        },
+        "status": {
+          "$ref": "#/$defs/SuccessStatus",
+          "description": "Exact success discriminator.\n精确成功判别。"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "status",
+        "result"
+      ],
+      "title": "SuccessEnvelope",
+      "type": "object"
+    },
     "capacity_register": {
       "$defs": {
         "CapacityReceipt": {
@@ -4863,6 +5165,45 @@
         "result": {
           "$ref": "#/$defs/CapacityReceipt",
           "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。"
+        },
+        "status": {
+          "$ref": "#/$defs/SuccessStatus",
+          "description": "Exact success discriminator.\n精确成功判别。"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "status",
+        "result"
+      ],
+      "title": "SuccessEnvelope",
+      "type": "object"
+    },
+    "capacity_revise": {
+      "$defs": {
+        "SuccessStatus": {
+          "description": "Single legal success discriminator, shared by live encoding and derived contracts.\n实际编码及派生契约共享的唯一合法成功判别。",
+          "oneOf": [
+            {
+              "const": "ok",
+              "description": "Successfully delivered result, including explicit JSON null.\n已成功交付结果，包含显式 JSON 空值。",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Borrowed success envelope avoids cloning application output during native response publication.\n借用成功信封，避免原生响应发布期间克隆应用输出。",
+      "properties": {
+        "protocol_version": {
+          "description": "Single protocol version authority.\n唯一协议版本权威。",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。",
+          "type": "string"
         },
         "status": {
           "$ref": "#/$defs/SuccessStatus",

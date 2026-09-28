@@ -97,6 +97,55 @@ fn ffi_embedded_capacity_response_preflight_prevents_unobservable_mutation() {
         .runtime()
         .register_capacity("owner", capacity_config)
         .unwrap();
+    // The revision preflight reserves its longest possible token, not only the currently short value.
+    // 修订预检预留最长可能令牌，而非仅预留当前短值。
+    let before = lease.runtime().capacity_policy(&capacity_id).unwrap();
+    // This valid change would alter queue admission if an undeliverable command were executed.
+    // 若执行无法交付的命令，此合法变更会改变队列入场。
+    let mut revised = before.capacity.config.clone();
+    revised.max_queued_calls -= 1;
+    // Derive the exact envelope boundary from the same serializer used by native mutation preflight.
+    // 从原生变更预检使用的同一序列化器派生精确信封边界。
+    let required =
+        crate::ffi_embedded::protocol::respond::<String>(Ok(u64::MAX.to_string()), usize::MAX)
+            .unwrap()
+            .len();
+    assert_eq!(
+        control::execute(
+            &slot,
+            RuntimeCommand::CapacityRevise {
+                capacity_id: capacity_id.clone(),
+                expected_revision: before.revision.clone(),
+                config: revised.clone(),
+            },
+            required - 1
+        ),
+        Err(EmbeddedFfiStatus::CapacityExceeded)
+    );
+    assert_eq!(
+        lease
+            .runtime()
+            .capacity_policy(&capacity_id)
+            .unwrap()
+            .revision,
+        before.revision
+    );
+    assert_eq!(
+        lease.runtime().capacity(&capacity_id).unwrap().config,
+        before.capacity.config
+    );
+    // The public command succeeds with an observable opaque token and never silently retries a stale predecessor.
+    // 公开命令通过可观察不透明令牌成功，且绝不静默重试过期前驱。
+    let response = command(id, json!({"type":"runtime","runtime_id":runtime_id,"operation":{
+        "type":"capacity_revise","capacity_id":capacity_id,"expected_revision":before.revision,"config":revised
+    }})).unwrap();
+    assert_eq!(response["status"], "ok");
+    assert!(response["result"].is_string());
+    assert_ne!(response["result"], before.revision);
+    assert_eq!(
+        lease.runtime().capacity(&capacity_id).unwrap().config,
+        revised
+    );
     assert_eq!(
         control::execute(
             &slot,
