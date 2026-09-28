@@ -33,7 +33,7 @@ impl Write for LimitedJsonCounter {
 
 /// Return serialized `value` size within `limit`, rejecting oversized values without a full copy.
 /// 返回 `limit` 内的序列化 `value` 大小，不完整复制就拒绝超大值。
-pub(super) fn json_size(value: &impl Serialize, limit: usize) -> EmbeddedResult<usize> {
+pub fn json_size(value: &impl Serialize, limit: usize) -> EmbeddedResult<usize> {
     // The sink is the only authority for cumulative serialized bytes.
     // 此接收器是累计序列化字节数的唯一权威。
     let mut counter = LimitedJsonCounter { bytes: 0, limit };

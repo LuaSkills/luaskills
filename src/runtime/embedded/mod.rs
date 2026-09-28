@@ -57,3 +57,4 @@ pub use scheduler::{
     OperationPersistenceFailure,
 };
 pub use schema::{EMBEDDED_SCHEMA_DIALECT, JsonContract};
+pub use value_size::json_size;
