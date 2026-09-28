@@ -313,9 +313,9 @@ impl EmbeddedModule {
             invocation.operation_id,
             invocation.session_id,
             |lua| {
-                // JSON conversion preserves the canonical null and empty-container representation.
-                // JSON 转换保留规范空值与空容器表示。
-                let argument = lua.to_value(invocation.arguments)?;
+                // Use the same protected container identities as native capability conversion.
+                // 使用与原生能力转换相同的受保护容器身份。
+                let argument = json_value_to_lua(lua, invocation.arguments)?;
                 // Direct function calls do not compile a new wrapper for every request.
                 // 直接函数调用不为每次请求编译新包装。
                 let result = export.function.call::<LuaValue>(argument)?;

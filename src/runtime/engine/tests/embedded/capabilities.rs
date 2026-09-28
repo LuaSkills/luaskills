@@ -6,6 +6,78 @@ use std::collections::BTreeSet;
 
 mod effects;
 
+/// Forward structured module input through the real native boundary without losing empty container kinds.
+/// 经真实原生边界转发结构化模块输入，且不丢失空容器类型。
+#[test]
+fn embedded_capability_forwarded_arguments_preserve_json_container_types() {
+    // The actual module and native callback share one immutable registry binding.
+    // 真实模块与原生回调共享一个不可变注册表绑定。
+    let layout = SystemRuntimeTestLayout::new("embedded forwarded containers");
+    // Reuse the existing explicit pool budgets and actual VM owner.
+    // 复用现有显式池预算与真实 VM 所有者。
+    let manager = pool_manager(&layout);
+    // Independent runtime namespace prevents global bridge fallback from masking conversion errors.
+    // 独立运行时命名空间避免全局桥接回退掩盖转换错误。
+    let registry =
+        CapabilityRegistry::new("container-runtime".into(), manager.config().clone()).unwrap();
+    // Strict object input reproduces the host's real configuration and storage contracts.
+    // 严格对象输入复现宿主真实配置及存储契约。
+    let mut contract = descriptor("test.forward", CapabilityExecution::Native);
+    contract.input_schema = json!({"type":"object"});
+    registry
+        .register(vec![CapabilityRegistrationRequest {
+            descriptor: contract,
+            native: Some(Arc::new(|invocation| CapabilityOutcome {
+                result: Ok(invocation.arguments.clone()),
+                effects: EffectState::NotApplicable,
+            })),
+        }])
+        .unwrap();
+    // The native result travels back through the typed module result serializer.
+    // 原生结果再经类型化模块结果序列化器返回。
+    let (_, capabilities) = binding(&registry);
+    // The module directly forwards the supplied object, including an empty root object.
+    // 模块直接转发所提供对象，包括空根对象。
+    let pool = manager
+        .create_pool_with_capabilities(
+            "containers".into(),
+            definition(
+                &layout,
+                "return {call=function(a) return vulcan.host.call('test.forward',a) end}",
+            ),
+            pool_policy(InstanceReuse::Reusable),
+            capabilities,
+        )
+        .unwrap();
+    // Retain one VM so subsequent conversions also exercise cached metatables.
+    // 保留一个 VM，使后续转换同时验证缓存元表。
+    let mut lease = pool.acquire(control()).unwrap();
+    for arguments in [
+        json!({}),
+        json!({"object":{},"array":[],"nested":[{},[],null],"text":"中文\u{0}","fraction":1.25}),
+    ] {
+        // Assert on the complete envelope so a schema rejection is visible as a failed round trip.
+        // 对完整信封断言，使 Schema 拒绝作为往返失败可见。
+        let result = lease
+            .invoke(ModuleInvocation {
+                operation_id: "container-forward",
+                session_id: None,
+                export: "call",
+                arguments: &arguments,
+                context: &LuaInvocationContext::default(),
+                control: control(),
+            })
+            .unwrap();
+        assert_eq!(
+            result,
+            json!({"ok":true,"value":arguments,"effects":"not_applicable"})
+        );
+    }
+    pool.close().unwrap();
+    drop(lease);
+    drained(&pool);
+}
+
 /// Return a complete capability contract for actual Lua-to-host integration tests.
 /// 返回真实 Lua 到宿主集成测试所用的完整能力契约。
 pub(super) fn descriptor(name: &str, execution: CapabilityExecution) -> CapabilityDescriptor {
