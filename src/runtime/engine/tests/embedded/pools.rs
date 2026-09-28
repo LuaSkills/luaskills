@@ -1,6 +1,7 @@
 use super::*;
 use crate::runtime::embedded::EmbeddedResult;
 
+mod capacity;
 mod cleanup;
 mod resources;
 

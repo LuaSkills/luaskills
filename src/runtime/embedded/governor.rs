@@ -1,9 +1,13 @@
 use super::{
     EmbeddedError, EmbeddedErrorCode, EmbeddedResult, EmbeddedRuntimeConfig, PluginPoolConfig,
+    VmCapacityConfig,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
+
+mod capacity;
+pub use capacity::VmCapacitySnapshot;
 
 /// Observable lifecycle of one resident allocation, including failed retirement.
 /// 单个常驻分配的可观察生命周期，包含失败退役。
@@ -63,6 +67,12 @@ struct GovernorState {
     /// Validated immutable policies indexed by explicit execution-group identity.
     /// 按显式执行分组身份索引的已校验不可变策略。
     groups: BTreeMap<String, PluginPoolConfig>,
+    /// Persistent capacity ownership outlives individual module groups and their package generations.
+    /// 持久容量归属比单个模块分组及其包代次存活更久。
+    capacities: BTreeMap<String, VmCapacityConfig>,
+    /// Each grouped module belongs to exactly one explicitly registered capacity owner.
+    /// 每个已分组模块精确属于单个显式注册的容量所有者。
+    memberships: BTreeMap<String, String>,
     /// Live allocations counted through real teardown.
     /// 记账到实际清理结束的活跃分配。
     allocations: BTreeMap<u64, Allocation>,
@@ -93,6 +103,8 @@ impl PoolGovernor {
             config,
             state: Mutex::new(GovernorState {
                 groups: BTreeMap::new(),
+                capacities: BTreeMap::new(),
+                memberships: BTreeMap::new(),
                 allocations: BTreeMap::new(),
                 sequence: 0,
             }),
@@ -104,42 +116,7 @@ impl PoolGovernor {
     /// Return success without changing any existing group's effective policy.
     /// 成功返回时不改变任何既有分组的生效策略。
     pub fn register_group(&self, group: &str, policy: PluginPoolConfig) -> EmbeddedResult<()> {
-        if group.trim().is_empty() {
-            return Err(EmbeddedError::invalid("execution group must be nonempty"));
-        }
-        policy.validate(&self.config)?;
-        // All validation and reservation accounting happen in one admission transaction.
-        // 所有校验与预留记账在同一次入场事务中完成。
-        let mut state = self.lock()?;
-        if state.groups.contains_key(group) {
-            return Err(EmbeddedError::new(
-                EmbeddedErrorCode::Busy,
-                "execution group is already registered",
-            ));
-        }
-        if state.groups.len() >= self.config.max_registered_pools {
-            return Err(capacity("registered pool limit reached"));
-        }
-        // Existing resident allocations and unused guarantees cannot be reclaimed implicitly.
-        // 既有常驻分配与未使用保证不能被隐式回收。
-        let committed = state
-            .groups
-            .iter()
-            .try_fold(0usize, |sum, (name, config)| {
-                sum.checked_add(
-                    group_usage(&state, name)
-                        .resident
-                        .max(config.min_resident_vms),
-                )
-                .ok_or_else(|| EmbeddedError::invalid("resident reservation overflow"))
-            })?;
-        if policy.min_resident_vms > self.config.max_resident_vms.saturating_sub(committed) {
-            return Err(capacity(
-                "dedicated reservations exceed available parent capacity",
-            ));
-        }
-        state.groups.insert(group.to_owned(), policy);
-        Ok(())
+        self.register_group_internal(group, policy, None)
     }
 
     /// Remove `group` only when every real allocation has already been released.
@@ -160,6 +137,7 @@ impl PoolGovernor {
             ));
         }
         state.groups.remove(group);
+        state.memberships.remove(group);
         Ok(())
     }
 
@@ -168,11 +146,11 @@ impl PoolGovernor {
     /// Return a non-cloneable slot that must outlive the actual VM and its teardown.
     /// 返回不可克隆的槽位，该槽位必须比实际 VM 及其清理存活更久。
     pub fn reserve(self: &Arc<Self>, group: &str) -> EmbeddedResult<VmReservation> {
-        // No intermediate state owns only one level of the required capacity.
-        // 任何中间状态都不会只持有所需容量中的一个层级。
+        // Admission commits all physical levels under the original metadata lock.
+        // 入场在原元数据锁下提交全部物理层级。
         let mut state = self.lock()?;
-        // Require one exact registered group, never an automatic default group.
-        // 要求一个精确注册的分组，绝不自动使用默认分组。
+        // Require an exact module group; capacity membership is immutable after registration.
+        // 要求精确模块分组；容量成员关系在注册后不可变。
         let policy = state
             .groups
             .get(group)
@@ -180,23 +158,18 @@ impl PoolGovernor {
         if group_usage(&state, group).resident >= policy.max_resident_vms {
             return Err(capacity("execution group resident limit reached"));
         }
-        // Other groups retain unused dedicated guarantees; first-release reservations are not lent.
-        // 其他分组保留未使用的专用保证；首期预留不出借。
-        let committed = state
-            .groups
-            .iter()
-            .try_fold(0usize, |sum, (name, config)| {
-                // The requesting group may consume its own reserved but currently unused slots.
-                // 请求分组可以消耗自身已预留但当前未使用的槽位。
-                let resident = group_usage(&state, name).resident;
-                sum.checked_add(if name == group {
-                    resident
-                } else {
-                    resident.max(config.min_resident_vms)
-                })
-                .ok_or_else(|| EmbeddedError::invalid("resident reservation overflow"))
-            })?;
-        if committed >= self.config.max_resident_vms {
+        if let Some(id) = state.memberships.get(group) {
+            // Registered membership cannot outlive its capacity owner.
+            // 已注册成员关系不能比其容量所有者存活更久。
+            let policy = state
+                .capacities
+                .get(id)
+                .expect("capacity remains while members exist");
+            if state.capacity_usage(id).resident >= policy.max_resident_vms {
+                return Err(capacity("capacity group resident limit reached"));
+            }
+        }
+        if state.commitment(Some(group))? >= self.config.max_resident_vms {
             return Err(capacity("parent resident capacity is occupied or reserved"));
         }
         // Checked identity allocation happens before publishing metadata.
@@ -311,8 +284,19 @@ impl VmReservation {
             {
                 return Err(capacity("execution capacity is occupied"));
             }
-            // Restore this exact phase when the execution permit is released.
-            // 执行许可释放时恢复此精确阶段。
+            if let Some(id) = state.memberships.get(&allocation.group) {
+                // Cross-module capacity admission is atomic with the existing parent and leaf checks.
+                // 跨模块容量入场与既有父级及叶级检查保持原子性。
+                let capacity_policy = state
+                    .capacities
+                    .get(id)
+                    .expect("capacity remains while members exist");
+                if state.capacity_usage(id).running >= capacity_policy.max_running_calls {
+                    return Err(capacity("capacity group execution limit reached"));
+                }
+            }
+            // The permit restores the exact original construction or idle state.
+            // 许可恢复精确原构造或空闲状态。
             let previous = allocation.phase;
             state
                 .allocations

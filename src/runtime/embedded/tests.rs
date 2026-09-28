@@ -1,6 +1,7 @@
 use super::*;
 use std::time::Duration;
 
+mod capacity;
 mod operations;
 
 /// Return explicit small parent budgets for deterministic resource-pressure tests.

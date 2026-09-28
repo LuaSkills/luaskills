@@ -27,6 +27,9 @@ struct PoolManagerState {
     pools: Vec<Weak<ModulePool>>,
 }
 
+mod capacity;
+pub use capacity::ModulePoolPlacement;
+
 /// Parent ownership for real VM pools and one shared background retirement service.
 /// 真实 VM 池与单个共享后台退役服务的父级所有权。
 pub struct EmbeddedPoolManager {
@@ -118,52 +121,13 @@ impl EmbeddedPoolManager {
         capabilities: Option<ModuleCapabilities>,
         owner: Option<ModuleResourceOwner>,
     ) -> EmbeddedResult<Arc<ModulePool>> {
-        definition.validate()?;
-        for export in &definition.exports {
-            export.compile()?;
-        }
-        // Parent admission closes atomically with publication of all reachable pools.
-        // 父级入场相对全部可访问池的发布原子关闭。
-        let mut state = self.state.lock().map_err(|_| {
-            EmbeddedError::new(EmbeddedErrorCode::Internal, "pool manager lock is poisoned")
-        })?;
-        if state.closing {
-            return Err(closed());
-        }
-        self.governor.register_group(&group, policy.clone())?;
-        // The unique registration outlives all modules even after this public owner disappears.
-        // 即使此公开所有者消失，唯一注册仍比全部模块存活更久。
-        let pool = Arc::new(ModulePool {
-            capabilities,
-            manager: Arc::clone(self),
-            registration: Arc::new(PoolRegistration {
-                group,
-                governor: Arc::clone(&self.governor),
-                lifecycle: Mutex::new(RegistrationLifecycle {
-                    closing: false,
-                    released: false,
-                    owner,
-                }),
-            }),
+        self.create_pool_with_placement(
+            ModulePoolPlacement::Independent { group },
             definition,
             policy,
-            state: Mutex::new(ModulePoolState {
-                closed: false,
-                idle: Vec::new(),
-            }),
-        });
-        // Closed handles may remain in SDKs, but must not accumulate weak entries in this registry.
-        // 已关闭句柄可能仍留在 SDK 中，但不能在此注册表累积弱引用条目。
-        state.pools.retain(|pool| {
-            pool.upgrade().is_some_and(|pool| match pool.lock() {
-                Ok(state) => !state.closed,
-                // Preserve a poisoned owner so shutdown reports its actual failure instead of losing it.
-                // 保留中毒所有者，使关闭报告真实失败，而非丢失该对象。
-                Err(_) => true,
-            })
-        });
-        state.pools.push(Arc::downgrade(&pool));
-        Ok(pool)
+            capabilities,
+            owner,
+        )
     }
 
     /// Return parent usage including failed or still-running retirement.

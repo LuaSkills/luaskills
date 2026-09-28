@@ -198,6 +198,19 @@ pub struct PluginPoolConfig {
 }
 
 impl PluginPoolConfig {
+    /// Project physical limits into the sole capacity validator without changing reuse or queue policy.
+    /// 将物理限制投影至唯一容量校验器，不改变复用或队列策略。
+    /// Returns the exact declared limits, without defaults or normalization.
+    /// 返回精确声明限制，不添加默认值或进行归一化。
+    pub fn capacity(&self) -> super::VmCapacityConfig {
+        super::VmCapacityConfig {
+            kind: self.kind,
+            min_resident_vms: self.min_resident_vms,
+            max_resident_vms: self.max_resident_vms,
+            max_running_calls: self.max_running_calls,
+        }
+    }
+
     /// Validate against `parent` without silently normalizing host intent.
     /// 针对 `parent` 校验，且不静默归一化宿主意图。
     /// Return a structured policy or unsupported-backend error on conflict.
@@ -210,29 +223,7 @@ impl PluginPoolConfig {
                 "worker process backend is not available",
             ));
         }
-        if self.max_resident_vms == 0 || self.max_resident_vms > parent.max_resident_vms {
-            return Err(EmbeddedError::invalid(
-                "group resident limit is outside the parent budget",
-            ));
-        }
-        if self.min_resident_vms > self.max_resident_vms {
-            return Err(EmbeddedError::invalid(
-                "group reservation exceeds its resident limit",
-            ));
-        }
-        if self.kind == PoolKind::Shared && self.min_resident_vms != 0 {
-            return Err(EmbeddedError::invalid(
-                "shared groups cannot reserve dedicated capacity",
-            ));
-        }
-        if self.max_running_calls == 0
-            || self.max_running_calls > self.max_resident_vms
-            || self.max_running_calls > parent.max_running_calls
-        {
-            return Err(EmbeddedError::invalid(
-                "group running limit is outside the resident or parent budget",
-            ));
-        }
+        self.capacity().validate(parent)?;
         if self.serial && self.max_running_calls != 1 {
             return Err(EmbeddedError::invalid(
                 "serial groups must declare exactly one running call",

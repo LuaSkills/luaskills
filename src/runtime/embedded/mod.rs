@@ -2,6 +2,7 @@
 //! 由宿主拥有的插件执行机制，与公开租约管理器独立。
 
 pub mod capabilities;
+mod capacity;
 mod cleanup;
 mod config;
 mod control;
@@ -24,6 +25,7 @@ mod value_size;
 mod tests;
 
 pub use crate::runtime::engine::EmbeddedModule;
+pub use capacity::VmCapacityConfig;
 pub use cleanup::{
     ModuleAcquireFailure, ModuleRelease, ModuleRetirement, ModuleRetirementPhase,
     ModuleRetirementSnapshot,
@@ -34,6 +36,7 @@ pub use config::{
 pub use control::CallControl;
 pub use effects::{HostEffectPhase, HostEffectRecord};
 pub use error::{EmbeddedError, EmbeddedErrorCode, EmbeddedResult};
+pub use governor::VmCapacitySnapshot;
 pub use governor::{ExecutionPermit, PoolGovernor, PoolUsage, VmAllocationState, VmReservation};
 pub(crate) use identity::IdentityKind;
 pub use journal::{
@@ -49,7 +52,7 @@ pub use operations::{
     OperationSnapshot,
 };
 pub use plugin_config::EmbeddedPluginConfig;
-pub use pool::{EmbeddedPoolManager, ModuleLease, ModulePool};
+pub use pool::{EmbeddedPoolManager, ModuleLease, ModulePool, ModulePoolPlacement};
 pub use resources::ModuleResourceOwner;
 pub use scheduler::{
     CheckpointRetryState, EmbeddedCall, EmbeddedPluginSnapshot, EmbeddedRuntime,
