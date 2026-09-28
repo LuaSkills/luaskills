@@ -14,6 +14,56 @@ use std::collections::BTreeSet;
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 #[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub(super) enum RuntimeCommand {
+    /// Read retained checkpoint failure without disk I/O or retry.
+    /// 读取保留检查点故障，不进行磁盘 I/O 或重试。
+    OperationPersistenceFailure {
+        /// Exact live operation identity in this runtime.
+        /// 此运行时中的精确活动操作身份。
+        operation_id: String,
+    },
+    /// Request one retry of the original immutable checkpoint, never another business execution.
+    /// 请求重试原不可变检查点一次，绝不再次执行业务。
+    OperationRetryCheckpoint {
+        /// Exact live operation identity retaining the failed candidate.
+        /// 保留失败候选的精确活动操作身份。
+        operation_id: String,
+    },
+    /// Read actual bounded writer ownership without waiting for disk.
+    /// 读取真实有界写入者所有权，不等待磁盘。
+    StorageStatus {},
+    /// Reopen and validate failed storage; this synchronous disk command belongs on a work lane.
+    /// 重新打开并校验失败存储；此同步磁盘命令归入工作通道。
+    StorageRecover {},
+    /// Read historical evidence by its original namespace, without adopting it as a live operation.
+    /// 按原命名空间读取历史证据，不将其接管为活动操作。
+    HistoryGet {
+        /// Original core runtime namespace, distinct from the containing FFI slot identity.
+        /// 原核心运行时命名空间，区别于外层 FFI 槽身份。
+        history_runtime_id: String,
+        /// Exact original operation identity.
+        /// 精确原始操作身份。
+        operation_id: String,
+    },
+    /// Read at most one historical row after an explicit cursor; absence starts enumeration.
+    /// 在显式游标后至多读取一条历史；缺失表示开始枚举。
+    HistoryNext {
+        /// Original history key returned by a prior row, with no inferred current-runtime substitution.
+        /// 前一行返回的原始历史键，不推断替换为当前运行时。
+        after: Option<HistoryCursor>,
+    },
+    /// Forget reconciled history only after any matching live runtime operation has been explicitly forgotten.
+    /// 仅在显式遗忘任何匹配的活动运行时操作后，遗忘已对账历史。
+    HistoryForget {
+        /// Original historical runtime namespace.
+        /// 原始历史运行时命名空间。
+        history_runtime_id: String,
+        /// Exact original operation identity.
+        /// 精确原始操作身份。
+        operation_id: String,
+        /// Positive original revision required for atomic compare-and-swap removal.
+        /// 原子比较交换删除所需的原始正修订号。
+        expected_revision: u64,
+    },
     /// Register aggregate plugin budgets.
     /// 注册插件聚合预算。
     PluginRegister {
@@ -244,9 +294,30 @@ pub(super) enum RuntimeCommand {
     },
 }
 
+/// Exact historical cursor; its fields come from the original durable record, not a newly opened runtime.
+/// 精确历史游标；字段来自原持久记录，不来自新打开的运行时。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
+pub(super) struct HistoryCursor {
+    /// Original core runtime namespace from the returned history record.
+    /// 返回历史记录中的原始核心运行时命名空间。
+    pub(super) runtime_id: String,
+    /// Original operation identity within that namespace.
+    /// 该命名空间中的原始操作身份。
+    pub(super) operation_id: String,
+}
+
 /// Names are advertised only for the commands wired by the exhaustive runtime dispatcher.
 /// 仅为穷尽运行时分发器已接通的命令公布名称。
 pub(super) const RUNTIME_COMMAND_NAMES: &[&str] = &[
+    "operation_persistence_failure",
+    "operation_retry_checkpoint",
+    "storage_status",
+    "storage_recover",
+    "history_get",
+    "history_next",
+    "history_forget",
     "plugin_register",
     "plugin_status",
     "plugin_close",

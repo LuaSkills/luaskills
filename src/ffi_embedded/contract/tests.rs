@@ -211,7 +211,7 @@ fn embedded_contract_completion_presence_matches_parser() {
 fn embedded_contract_response_presence_and_error_discriminators() {
     let success = &contract()["runtime_responses"]["operation_status"];
     let validator = jsonschema::validator_for(success).unwrap();
-    let operation = json!({"host_effects":[],"operation_id":"operation","phase":"succeeded",
+    let operation = json!({"context":{"kind":"unbound"},"host_effects":[],"operation_id":"operation","phase":"succeeded",
         "cancellation_requested":false,"effects":"not_applicable","value":null});
     let mut response =
         json!({"protocol_version":EMBEDDED_FFI_PROTOCOL_VERSION,"status":"ok","result":operation});

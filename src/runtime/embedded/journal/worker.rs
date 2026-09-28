@@ -9,7 +9,7 @@ use crate::runtime::embedded::value_size::json_size;
 use crate::runtime::embedded::{
     EmbeddedError, EmbeddedErrorCode, EmbeddedResult, OperationSnapshot,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::JoinHandle;
@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 
 /// Explicit budgets include queued, executing and caller-retained completed write receipts.
 /// 显式预算包含排队、执行中及调用方仍保留的已完成写入回执。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct OperationJournalWorkerConfig {
     /// Maximum admitted write attempts until their last actual receipt owner releases them.
     /// 最后一个真实回执所有者释放之前，最多接纳的写入尝试数。
@@ -25,6 +27,21 @@ pub struct OperationJournalWorkerConfig {
     /// Cumulative JSON request bytes retained across all admitted write attempts.
     /// 所有已接纳写入尝试合计保留的 JSON 请求字节数。
     pub max_pending_bytes: usize,
+}
+
+impl OperationJournalWorkerConfig {
+    /// Validate positive receipt budgets before storage files or native threads are created.
+    /// 创建存储文件或原生线程前校验正回执预算。
+    /// Return an explicit argument error for a zero count or byte limit.
+    /// 数量或字节上限为零时返回明确参数错误。
+    pub fn validate(&self) -> EmbeddedResult<()> {
+        if self.max_pending_writes == 0 || self.max_pending_bytes == 0 {
+            return Err(EmbeddedError::invalid(
+                "journal worker limits must be positive",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Phase of the storage attempt, independent of plugin operation success or cancellation.
@@ -59,7 +76,8 @@ pub struct JournalWriteSnapshot {
 
 /// Live worker observations; retained receipts keep quota even after the thread has finished.
 /// 实时工作线程观测；线程结束后，保留的回执仍占有配额。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct OperationJournalWorkerStatus {
     /// Total owned attempts including caller-retained completed receipts.
     /// 拥有的尝试总数，包含调用方保留的已完成回执。
@@ -400,11 +418,7 @@ impl OperationJournalWorker {
         journal: Arc<OperationJournal>,
         config: OperationJournalWorkerConfig,
     ) -> EmbeddedResult<Self> {
-        if config.max_pending_writes == 0 || config.max_pending_bytes == 0 {
-            return Err(EmbeddedError::invalid(
-                "journal worker limits must be positive",
-            ));
-        }
+        config.validate()?;
         // The center has no join-handle reference, so its thread cannot form an ownership cycle.
         // 中心不引用等待句柄，因此其线程不能形成所有权引用环。
         let center = Arc::new(WriterCenter {

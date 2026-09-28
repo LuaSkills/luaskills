@@ -7,6 +7,7 @@ use super::*;
 /// 恢复状态独立于操作业务阶段及取消意愿。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub enum CheckpointRetryState {
     /// No retry will run until the host explicitly requests one.
     /// 宿主显式请求之前不会执行重试。
@@ -22,6 +23,7 @@ pub enum CheckpointRetryState {
 /// A failed checkpoint remains queryable by exact operation ID until that original checkpoint is acknowledged.
 /// 失败检查点可按精确操作 ID 查询，直至原检查点得到确认。
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct OperationPersistenceFailure {
     /// Stable original operation identity, never a replacement execution.
     /// 稳定的原始操作身份，绝非替代执行。

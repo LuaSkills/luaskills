@@ -26,6 +26,74 @@ pub(super) fn execute(
     };
     let runtime = lease.runtime();
     match command {
+        RuntimeCommand::OperationPersistenceFailure { operation_id } => {
+            respond::<responses::OperationPersistenceFailure>(
+                runtime.persistence_failure(&operation_id),
+                limit,
+            )
+        }
+        RuntimeCommand::OperationRetryCheckpoint { operation_id } => {
+            mutate::<responses::OperationRetryCheckpoint>(
+                &false,
+                || runtime.retry_checkpoint(&operation_id),
+                limit,
+            )
+        }
+        RuntimeCommand::StorageStatus {} => respond::<responses::StorageStatus>(
+            lease.persistence().and_then(|owner| owner.writer.status()),
+            limit,
+        ),
+        RuntimeCommand::StorageRecover {} => mutate::<responses::StorageRecover>(
+            &false,
+            || lease.persistence()?.journal.recover_storage(),
+            limit,
+        ),
+        RuntimeCommand::HistoryGet {
+            history_runtime_id,
+            operation_id,
+        } => respond::<responses::HistoryGet>(
+            lease
+                .persistence()
+                .and_then(|owner| owner.journal.get(&history_runtime_id, &operation_id)),
+            limit,
+        ),
+        RuntimeCommand::HistoryNext { after } => respond::<responses::HistoryNext>(
+            lease.persistence().and_then(|owner| {
+                owner.journal.next(
+                    after
+                        .as_ref()
+                        .map(|cursor| (cursor.runtime_id.as_str(), cursor.operation_id.as_str())),
+                )
+            }),
+            limit,
+        ),
+        RuntimeCommand::HistoryForget {
+            history_runtime_id,
+            operation_id,
+            expected_revision,
+        } => mutate::<responses::HistoryForget>(
+            &(),
+            || {
+                if history_runtime_id == runtime.id() {
+                    match runtime.operation(&operation_id) {
+                        Ok(_) => {
+                            return Err(EmbeddedError::new(
+                                EmbeddedErrorCode::Busy,
+                                "forget the retained runtime operation before removing its history",
+                            ));
+                        }
+                        Err(error) if error.code == EmbeddedErrorCode::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                lease.persistence()?.journal.forget(
+                    &history_runtime_id,
+                    &operation_id,
+                    expected_revision,
+                )
+            },
+            limit,
+        ),
         RuntimeCommand::PluginRegister { plugin_id, config } => {
             mutate::<responses::PluginRegister>(
                 &(),

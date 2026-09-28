@@ -19,6 +19,8 @@
       "fixed_sessions_v1",
       "host_request_queue_v1",
       "in_memory_effect_evidence_v1",
+      "durable_operation_history_v1",
+      "live_storage_recovery_v1",
       "strict_json_v1"
     ]
   },
@@ -915,6 +917,17 @@
                 "$ref": "#/$defs/LuaEngineOptions",
                 "description": "Explicit core engine options, using the existing engine option contract.\n显式核心引擎选项，使用现有引擎选项契约。"
               },
+              "persistence": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/RuntimePersistenceConfig"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Explicit durable storage; absence selects memory-only execution without creating a database.\n显式持久存储；缺失表示纯内存执行，不创建数据库。"
+              },
               "runtime_config": {
                 "$ref": "#/$defs/EmbeddedRuntimeConfig",
                 "description": "Explicit formal runtime budgets validated before worker construction.\n工作线程构造前校验的显式正式运行时预算。"
@@ -1326,6 +1339,25 @@
             "type": "string"
           }
         ]
+      },
+      "HistoryCursor": {
+        "additionalProperties": false,
+        "description": "Exact historical cursor; its fields come from the original durable record, not a newly opened runtime.\n精确历史游标；字段来自原持久记录，不来自新打开的运行时。",
+        "properties": {
+          "operation_id": {
+            "description": "Original operation identity within that namespace.\n该命名空间中的原始操作身份。",
+            "type": "string"
+          },
+          "runtime_id": {
+            "description": "Original core runtime namespace from the returned history record.\n返回历史记录中的原始核心运行时命名空间。",
+            "type": "string"
+          }
+        },
+        "required": [
+          "runtime_id",
+          "operation_id"
+        ],
+        "type": "object"
       },
       "HostCompletion": {
         "anyOf": [
@@ -2068,6 +2100,59 @@
         ],
         "type": "object"
       },
+      "OperationJournalConfig": {
+        "additionalProperties": false,
+        "description": "Explicit retention budgets; SQLite journal/cache overhead is separate from the database-file cap.\n显式保留预算；SQLite 日志及缓存开销与数据库文件上限分开计算。",
+        "properties": {
+          "max_database_bytes": {
+            "description": "Maximum main database bytes, rounded down to whole SQLite pages.\n主数据库最大字节数，向下取整至完整 SQLite 页。",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_record_bytes": {
+            "description": "Maximum UTF-8 JSON bytes for one complete stored record, including identities and revision.\n单条完整存储记录的最大 UTF-8 JSON 字节数，包含身份及修订号。",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_records": {
+            "description": "Maximum retained operations across all runtime namespaces; no automatic eviction occurs.\n所有运行时命名空间合计保留的最大操作数；不自动淘汰。",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_records",
+          "max_record_bytes",
+          "max_database_bytes"
+        ],
+        "type": "object"
+      },
+      "OperationJournalWorkerConfig": {
+        "additionalProperties": false,
+        "description": "Explicit budgets include queued, executing and caller-retained completed write receipts.\n显式预算包含排队、执行中及调用方仍保留的已完成写入回执。",
+        "properties": {
+          "max_pending_bytes": {
+            "description": "Cumulative JSON request bytes retained across all admitted write attempts.\n所有已接纳写入尝试合计保留的 JSON 请求字节数。",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_pending_writes": {
+            "description": "Maximum admitted write attempts until their last actual receipt owner releases them.\n最后一个真实回执所有者释放之前，最多接纳的写入尝试数。",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_pending_writes",
+          "max_pending_bytes"
+        ],
+        "type": "object"
+      },
       "PluginPoolConfig": {
         "additionalProperties": false,
         "description": "Immutable capacity policy for one host-assigned plugin execution group.\n单个宿主分配的插件执行分组的不可变容量策略。",
@@ -2188,6 +2273,152 @@
       "RuntimeCommand": {
         "description": "Typed commands for one already initialized runtime; every identity stays bound to that runtime.\n一个已初始化运行时的类型化命令；每个身份始终绑定该运行时。",
         "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "Read retained checkpoint failure without disk I/O or retry.\n读取保留检查点故障，不进行磁盘 I/O 或重试。",
+            "properties": {
+              "operation_id": {
+                "description": "Exact live operation identity in this runtime.\n此运行时中的精确活动操作身份。",
+                "type": "string"
+              },
+              "type": {
+                "const": "operation_persistence_failure",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "operation_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Request one retry of the original immutable checkpoint, never another business execution.\n请求重试原不可变检查点一次，绝不再次执行业务。",
+            "properties": {
+              "operation_id": {
+                "description": "Exact live operation identity retaining the failed candidate.\n保留失败候选的精确活动操作身份。",
+                "type": "string"
+              },
+              "type": {
+                "const": "operation_retry_checkpoint",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "operation_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Read actual bounded writer ownership without waiting for disk.\n读取真实有界写入者所有权，不等待磁盘。",
+            "properties": {
+              "type": {
+                "const": "storage_status",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Reopen and validate failed storage; this synchronous disk command belongs on a work lane.\n重新打开并校验失败存储；此同步磁盘命令归入工作通道。",
+            "properties": {
+              "type": {
+                "const": "storage_recover",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Read historical evidence by its original namespace, without adopting it as a live operation.\n按原命名空间读取历史证据，不将其接管为活动操作。",
+            "properties": {
+              "history_runtime_id": {
+                "description": "Original core runtime namespace, distinct from the containing FFI slot identity.\n原核心运行时命名空间，区别于外层 FFI 槽身份。",
+                "type": "string"
+              },
+              "operation_id": {
+                "description": "Exact original operation identity.\n精确原始操作身份。",
+                "type": "string"
+              },
+              "type": {
+                "const": "history_get",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "history_runtime_id",
+              "operation_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Read at most one historical row after an explicit cursor; absence starts enumeration.\n在显式游标后至多读取一条历史；缺失表示开始枚举。",
+            "properties": {
+              "after": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/HistoryCursor"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Original history key returned by a prior row, with no inferred current-runtime substitution.\n前一行返回的原始历史键，不推断替换为当前运行时。"
+              },
+              "type": {
+                "const": "history_next",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Forget reconciled history only after any matching live runtime operation has been explicitly forgotten.\n仅在显式遗忘任何匹配的活动运行时操作后，遗忘已对账历史。",
+            "properties": {
+              "expected_revision": {
+                "description": "Positive original revision required for atomic compare-and-swap removal.\n原子比较交换删除所需的原始正修订号。",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "history_runtime_id": {
+                "description": "Original historical runtime namespace.\n原始历史运行时命名空间。",
+                "type": "string"
+              },
+              "operation_id": {
+                "description": "Exact original operation identity.\n精确原始操作身份。",
+                "type": "string"
+              },
+              "type": {
+                "const": "history_forget",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "history_runtime_id",
+              "operation_id",
+              "expected_revision"
+            ],
+            "type": "object"
+          },
           {
             "additionalProperties": false,
             "description": "Register aggregate plugin budgets.\n注册插件聚合预算。",
@@ -2788,6 +3019,30 @@
           }
         ]
       },
+      "RuntimePersistenceConfig": {
+        "additionalProperties": false,
+        "description": "Explicit host storage selection; omitting this whole object selects the existing memory-only runtime.\n显式宿主存储选择；省略整个对象表示选择既有纯内存运行时。",
+        "properties": {
+          "journal": {
+            "$ref": "#/$defs/OperationJournalConfig",
+            "description": "Explicit durable retention limits, independent of transient runtime budgets.\n显式持久保留上限，独立于瞬态运行时预算。"
+          },
+          "path": {
+            "description": "Absolute database path owned and protected by the host, never a plugin-selected location.\n由宿主拥有和保护的绝对数据库路径，绝非插件选择位置。",
+            "type": "string"
+          },
+          "worker": {
+            "$ref": "#/$defs/OperationJournalWorkerConfig",
+            "description": "Explicit bounded storage-thread receipt limits.\n显式有界存储线程回执上限。"
+          }
+        },
+        "required": [
+          "path",
+          "journal",
+          "worker"
+        ],
+        "type": "object"
+      },
       "RuntimeRequestContext": {
         "description": "Generic request-scoped context injected by the host into one runtime invocation.\n宿主在单次运行时调用中注入的通用请求级上下文。",
         "properties": {
@@ -3385,7 +3640,7 @@
             },
             {
               "const": "failed",
-              "description": "Construction returned an explicit error after releasing unpublished resources.\n构造在释放未发布资源后返回明确错误。",
+              "description": "Construction returned an explicit error; retained storage still requires verified drainage.\n构造返回明确错误；已保留存储仍需验证排空。",
               "type": "string"
             },
             {
@@ -3394,6 +3649,62 @@
               "type": "string"
             }
           ]
+        },
+        "OperationJournalWorkerStatus": {
+          "description": "Live worker observations; retained receipts keep quota even after the thread has finished.\n实时工作线程观测；线程结束后，保留的回执仍占有配额。",
+          "properties": {
+            "closing": {
+              "description": "New attempts are permanently refused while admitted attempts finish normally.\n永久拒绝新尝试，而已接纳尝试正常完成。",
+              "type": "boolean"
+            },
+            "failure": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/EmbeddedError"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "First infrastructure failure; individual database rejection remains on its own receipt.\n首个基础设施故障；单独的数据库拒绝仍位于各自回执。"
+            },
+            "pending_bytes": {
+              "description": "Encoded request bytes reserved until each attempt's last owner disappears.\n每次尝试最后一个所有者消失前预留的请求编码字节数。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pending_writes": {
+              "description": "Total owned attempts including caller-retained completed receipts.\n拥有的尝试总数，包含调用方保留的已完成回执。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "queued_writes": {
+              "description": "Attempts still owned by the queue.\n仍由队列拥有的尝试数。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "worker_exited": {
+              "description": "Actual thread termination, observed from its join handle rather than a provisional flag.\n从等待句柄观测到的真实线程终止，而非临时标记。",
+              "type": "boolean"
+            },
+            "writing": {
+              "description": "Whether a real write is currently owned by the storage thread.\n存储线程当前是否拥有真实写入。",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "pending_writes",
+            "pending_bytes",
+            "queued_writes",
+            "writing",
+            "closing",
+            "worker_exited",
+            "failure"
+          ],
+          "type": "object"
         },
         "PoolUsage": {
           "description": "Current counters for one governor or one execution group.\n单个治理器或执行分组的当前计数。",
@@ -3442,7 +3753,7 @@
           "description": "Queryable construction and core closure evidence; no runtime implementation state is inferred by SDKs.\n可查询构造与核心关闭证据；SDK 不推断运行时实现状态。",
           "properties": {
             "closed": {
-              "description": "True only after native core workers have exited, or no core was ever created.\n仅当原生核心工作线程已退出或从未创建核心时为真。",
+              "description": "True only after construction finishes and all created core and storage workers and receipts drain.\n仅在构造结束且全部已创建核心、存储线程与回执排空后为真。",
               "type": "boolean"
             },
             "closing": {
@@ -3470,6 +3781,17 @@
             "initialization": {
               "$ref": "#/$defs/InitializationPhase",
               "description": "Actual one-shot construction state.\n实际单次构造状态。"
+            },
+            "persistence": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/OperationJournalWorkerStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Actual storage worker status when durable ownership has been created, including failed construction.\n持久所有权创建后的实际存储工作线程状态，包含构造失败。"
             },
             "resources": {
               "anyOf": [
@@ -3506,6 +3828,7 @@
             "closed",
             "usage",
             "resources",
+            "persistence",
             "error"
           ],
           "type": "object"
@@ -3549,6 +3872,13 @@
     }
   },
   "runtime_commands": [
+    "operation_persistence_failure",
+    "operation_retry_checkpoint",
+    "storage_status",
+    "storage_recover",
+    "history_get",
+    "history_next",
+    "history_forget",
     "plugin_register",
     "plugin_status",
     "plugin_close",
@@ -4029,6 +4359,1005 @@
       "title": "SuccessEnvelope",
       "type": "object"
     },
+    "history_forget": {
+      "$defs": {
+        "SuccessStatus": {
+          "description": "Single legal success discriminator, shared by live encoding and derived contracts.\n实际编码及派生契约共享的唯一合法成功判别。",
+          "oneOf": [
+            {
+              "const": "ok",
+              "description": "Successfully delivered result, including explicit JSON null.\n已成功交付结果，包含显式 JSON 空值。",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Borrowed success envelope avoids cloning application output during native response publication.\n借用成功信封，避免原生响应发布期间克隆应用输出。",
+      "properties": {
+        "protocol_version": {
+          "description": "Single protocol version authority.\n唯一协议版本权威。",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。",
+          "type": "null"
+        },
+        "status": {
+          "$ref": "#/$defs/SuccessStatus",
+          "description": "Exact success discriminator.\n精确成功判别。"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "status",
+        "result"
+      ],
+      "title": "SuccessEnvelope",
+      "type": "object"
+    },
+    "history_get": {
+      "$defs": {
+        "CapabilityCaller": {
+          "additionalProperties": false,
+          "description": "Host-authenticated caller data copied outside plugin-controlled arguments.\n在插件可控参数之外复制的宿主认证调用方数据。",
+          "properties": {
+            "execution_revision": {
+              "description": "Immutable execution and initialization-configuration revision.\n不可变执行与初始化配置修订。",
+              "type": "string"
+            },
+            "operation_id": {
+              "description": "Exact operation whose original budget applies.\n适用原始预算的精确操作。",
+              "type": "string"
+            },
+            "package_generation": {
+              "description": "Immutable package and dependency generation.\n不可变包与依赖代次。",
+              "type": "string"
+            },
+            "plugin_id": {
+              "description": "Exact activated plugin identity.\n精确激活的插件身份。",
+              "type": "string"
+            },
+            "runtime_id": {
+              "description": "Runtime namespace that owns the registration and operation.\n拥有注册及操作的运行时命名空间。",
+              "type": "string"
+            },
+            "security_partition": {
+              "description": "Trusted user/workspace partition, never copied from a Lua argument.\n可信用户与工作区分区，绝不从 Lua 参数复制。",
+              "type": "string"
+            },
+            "session_id": {
+              "description": "Optional fixed session required by session-scoped capabilities.\n会话作用域能力要求的可选固定会话。",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workspace_root": {
+              "description": "Explicit authorized workspace; absent means package-only context.\n显式授权工作区；省略表示仅包内上下文。",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "runtime_id",
+            "plugin_id",
+            "package_generation",
+            "execution_revision",
+            "security_partition",
+            "operation_id",
+            "session_id",
+            "workspace_root"
+          ],
+          "type": "object"
+        },
+        "EffectState": {
+          "description": "Host-reported effect outcome, independent from execution success or cancellation.\n宿主报告的副作用结果，独立于执行成功或取消。",
+          "oneOf": [
+            {
+              "const": "not_started",
+              "description": "No business execution has started.\n尚未开始业务执行。",
+              "type": "string"
+            },
+            {
+              "const": "not_applicable",
+              "description": "The declared operation has no externally visible mutations.\n声明的操作不包含外部可见变更。",
+              "type": "string"
+            },
+            {
+              "const": "committed",
+              "description": "A trusted host transaction explicitly confirmed its commit.\n可信宿主事务明确确认其提交。",
+              "type": "string"
+            },
+            {
+              "const": "rolled_back",
+              "description": "A trusted host transaction explicitly confirmed its rollback.\n可信宿主事务明确确认其回滚。",
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "Effects may have occurred; retries require host-specific reconciliation.\n副作用可能已发生；重试需要宿主特定的对账。",
+              "type": "string"
+            }
+          ]
+        },
+        "EmbeddedError": {
+          "additionalProperties": false,
+          "description": "Structured error; `code` is stable and `message` is an English diagnostic.\n结构化错误；`code` 稳定，`message` 为英文诊断信息。",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/EmbeddedErrorCode",
+              "description": "Stable classification consumed by SDKs instead of parsing text.\n供 SDK 使用的稳定分类，避免解析文案。"
+            },
+            "message": {
+              "description": "Human-readable detail without credentials or plugin input dumps.\n不含凭据或插件输入转储的可读详情。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        },
+        "EmbeddedErrorCode": {
+          "description": "Stable machine-readable failures shared by Rust and the versioned FFI protocol.\nRust 与版本化 FFI 协议共享的稳定机器可读错误。",
+          "oneOf": [
+            {
+              "const": "invalid_argument",
+              "description": "The supplied configuration or request violates its declared contract.\n提供的配置或请求违反其声明的契约。",
+              "type": "string"
+            },
+            {
+              "const": "not_found",
+              "description": "The requested identity does not exist or its retained record has expired.\n请求的身份不存在，或其保留记录已经过期。",
+              "type": "string"
+            },
+            {
+              "const": "stale_generation",
+              "description": "The caller supplied an identity from an inactive generation.\n调用方提供了非活动代次的身份。",
+              "type": "string"
+            },
+            {
+              "const": "capacity_exceeded",
+              "description": "A bounded resource cannot admit more work.\n有界资源无法接纳更多工作。",
+              "type": "string"
+            },
+            {
+              "const": "busy",
+              "description": "The requested state transition conflicts with live work.\n请求的状态变更与仍在运行的工作冲突。",
+              "type": "string"
+            },
+            {
+              "const": "already_completed",
+              "description": "This exact request already has a completion owner or retained terminal result.\n此精确请求已具有完成所有者或保留的终态结果。",
+              "type": "string"
+            },
+            {
+              "const": "closed",
+              "description": "The runtime or registration no longer accepts work.\n运行时或注册项已停止接纳工作。",
+              "type": "string"
+            },
+            {
+              "const": "cancelled",
+              "description": "The caller requested cooperative cancellation.\n调用方请求了协作取消。",
+              "type": "string"
+            },
+            {
+              "const": "deadline_exceeded",
+              "description": "The original end-to-end execution budget expired.\n原始端到端执行预算已经耗尽。",
+              "type": "string"
+            },
+            {
+              "const": "permission_denied",
+              "description": "The trusted host did not grant the requested capability.\n可信宿主未授予所请求的能力。",
+              "type": "string"
+            },
+            {
+              "const": "unsupported",
+              "description": "The requested backend or protocol feature is unavailable.\n请求的后端或协议功能不可用。",
+              "type": "string"
+            },
+            {
+              "const": "execution_failed",
+              "description": "Plugin initialization or execution failed.\n插件初始化或执行失败。",
+              "type": "string"
+            },
+            {
+              "const": "cleanup_failed",
+              "description": "Resource teardown failed and still owns its capacity.\n资源清理失败且仍占有容量。",
+              "type": "string"
+            },
+            {
+              "const": "internal",
+              "description": "An internal invariant failed; the caller must not retry mutations blindly.\n内部不变量失败，调用方不得盲目重试有副作用的操作。",
+              "type": "string"
+            }
+          ]
+        },
+        "HostEffectPhase": {
+          "description": "Actual handler lifecycle, separate from its reported business effect.\n真实处理器生命周期，独立于其报告的业务副作用。",
+          "oneOf": [
+            {
+              "const": "prepared",
+              "description": "Retention reserved before execution.\n执行前已预留保留容量。",
+              "type": "string"
+            },
+            {
+              "const": "running",
+              "description": "Handler may execute; cancellation is not completion.\n处理器可能执行；取消不等于完成。",
+              "type": "string"
+            },
+            {
+              "const": "completed",
+              "description": "Actual handler and admission ownership have been released.\n真实处理器及入场所有权已释放。",
+              "type": "string"
+            }
+          ]
+        },
+        "HostEffectRecord": {
+          "additionalProperties": false,
+          "description": "Bounded evidence retained independently from values returned to Lua.\n独立于返回 Lua 的值保留的有界证据。",
+          "properties": {
+            "caller": {
+              "$ref": "#/$defs/CapabilityCaller",
+              "description": "Original host-bound caller identity, retained for reconciliation without consulting a newer plugin generation.\n原始宿主绑定调用身份；对账保留该身份，不查询较新的插件代次。"
+            },
+            "capability_name": {
+              "description": "Public capability name, excluding business arguments and credentials.\n公开能力名称，不包含业务参数与凭证。",
+              "type": "string"
+            },
+            "capability_version": {
+              "description": "Interface version of the exact registration.\n精确注册的接口版本。",
+              "type": "string"
+            },
+            "effect_id": {
+              "description": "Never-reused identity within the original operation.\n原始操作内绝不复用的身份。",
+              "type": "string"
+            },
+            "effects": {
+              "$ref": "#/$defs/EffectState",
+              "description": "Trusted host evidence, independent from caller cancellation.\n可信宿主证据，独立于调用方取消。"
+            },
+            "phase": {
+              "$ref": "#/$defs/HostEffectPhase",
+              "description": "Actual handler ownership lifecycle.\n真实处理器所有权生命周期。"
+            },
+            "registration_id": {
+              "description": "Exact immutable registration identity.\n精确不可变注册身份。",
+              "type": "string"
+            },
+            "request_id": {
+              "description": "SDK request identity for queued execution.\n队列执行的 SDK 请求身份。",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "caller",
+            "effect_id",
+            "registration_id",
+            "capability_name",
+            "capability_version",
+            "request_id",
+            "phase",
+            "effects"
+          ],
+          "type": "object"
+        },
+        "JournalOperation": {
+          "additionalProperties": false,
+          "description": "Historical checkpoint, not a live handle and not evidence authorizing execution replay.\n历史检查点，不是活动句柄，也不是授权执行重放的证据。",
+          "properties": {
+            "revision": {
+              "description": "Monotonic compare-and-swap revision; positive and bounded by SQLite's signed integer.\n单调比较交换修订号；为正数且受 SQLite 有符号整数范围约束。",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "runtime_id": {
+              "description": "Original runtime namespace, never rebound to the namespace of a restarted runtime.\n原始运行时命名空间，绝不重新绑定到重启后的命名空间。",
+              "type": "string"
+            },
+            "snapshot": {
+              "$ref": "#/$defs/OperationSnapshot",
+              "description": "Exact last committed observation; an unfinished phase remains unfinished after restart.\n最后提交的精确观测；未结束的阶段在重启后仍保持未结束。"
+            }
+          },
+          "required": [
+            "runtime_id",
+            "revision",
+            "snapshot"
+          ],
+          "type": "object"
+        },
+        "OperationContext": {
+          "description": "Explicit operation origin; unbound low-level work is never inferred to belong to a current plugin.\n明确的操作来源；未绑定的低层工作绝不被推断归属于当前插件。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "description": "The low-level host admitted this operation without a module binding.\n低层宿主接纳此操作时没有模块绑定。",
+              "properties": {
+                "kind": {
+                  "const": "unbound",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "The formal scheduler froze this module context before publishing the operation.\n正式调度器在发布操作前冻结了此模块上下文。",
+              "properties": {
+                "caller": {
+                  "$ref": "#/$defs/CapabilityCaller",
+                  "description": "Original trusted caller shared by initialization and this operation's host callbacks.\n初始化及此操作宿主回调共同使用的原始可信调用方。"
+                },
+                "capability_revision": {
+                  "description": "Exact capability membership snapshot frozen when the pool was registered.\n注册池时冻结的精确能力成员快照。",
+                  "type": "string"
+                },
+                "export": {
+                  "description": "Requested declared export; absent only for a fixed-session opening operation.\n请求的已声明导出；仅固定会话开启操作省略。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "const": "module",
+                  "type": "string"
+                },
+                "pool_id": {
+                  "description": "Exact retained pool identity, not a lookup of the plugin's newest pool.\n精确保留池身份，不查询插件最新的池。",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "pool_id",
+                "caller",
+                "capability_revision",
+                "export"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "OperationPhase": {
+          "description": "Execution phase; cancellation intent is reported separately from actual termination.\n执行阶段；取消意图与实际终止分开报告。",
+          "oneOf": [
+            {
+              "const": "queued",
+              "description": "Accepted and waiting for resource admission.\n已接纳且正在等待资源入场。",
+              "type": "string"
+            },
+            {
+              "const": "initializing",
+              "description": "Creating or loading the selected VM instance.\n正在创建或加载选定的 VM 实例。",
+              "type": "string"
+            },
+            {
+              "const": "running",
+              "description": "Executing the requested exported function.\n正在执行请求的导出函数。",
+              "type": "string"
+            },
+            {
+              "const": "waiting_for_host",
+              "description": "Still owns its VM while awaiting a host capability result.\n等待宿主能力结果期间仍拥有其 VM。",
+              "type": "string"
+            },
+            {
+              "const": "cleaning",
+              "description": "Execution returned but request-owned cleanup is not yet complete.\n执行已返回，但请求所属清理尚未完成。",
+              "type": "string"
+            },
+            {
+              "const": "succeeded",
+              "description": "Execution and required cleanup completed successfully.\n执行及必要清理已成功完成。",
+              "type": "string"
+            },
+            {
+              "const": "failed",
+              "description": "Execution or cleanup failed and the actual result is available.\n执行或清理失败，且实际结果已经可用。",
+              "type": "string"
+            },
+            {
+              "const": "cancelled",
+              "description": "Cooperative cancellation completed; this does not imply effect rollback.\n协作取消已完成；这不表示副作用已回滚。",
+              "type": "string"
+            }
+          ]
+        },
+        "OperationSnapshot": {
+          "additionalProperties": false,
+          "description": "Bounded operation snapshot suitable for direct serialization to every SDK.\n适合直接序列化给各 SDK 的有界操作快照。",
+          "properties": {
+            "cancellation_requested": {
+              "description": "Whether cooperative cancellation has been requested.\n是否已请求协作取消。",
+              "type": "boolean"
+            },
+            "context": {
+              "$ref": "#/$defs/OperationContext",
+              "description": "Admission-time module authority, or an explicit unbound low-level origin; never reconstructed from effects.\n入场时模块权威，或明确未绑定的低层来源；绝不从副作用重建。"
+            },
+            "effects": {
+              "$ref": "#/$defs/EffectState",
+              "description": "Explicit effect status; successful execution does not automatically imply commit.\n显式副作用状态；执行成功不自动表示提交。"
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/EmbeddedError"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Structured terminal error; absent while execution is still in progress.\n结构化终态错误；执行仍在进行时省略。"
+            },
+            "host_effects": {
+              "description": "Exact host callback evidence retained even after Lua failure, cancellation or output rejection.\n即使 Lua 失败、取消或输出被拒绝也保留的精确宿主回调证据。",
+              "items": {
+                "$ref": "#/$defs/HostEffectRecord"
+              },
+              "type": "array"
+            },
+            "operation_id": {
+              "description": "Opaque identifier, never a JavaScript floating-point integer.\n不透明标识符，绝不使用 JavaScript 浮点整数。",
+              "type": "string"
+            },
+            "phase": {
+              "$ref": "#/$defs/OperationPhase",
+              "description": "Current execution phase, including still-running cancelled requests.\n当前执行阶段，包含已请求取消但仍在运行的请求。"
+            },
+            "value": {
+              "description": "Successful value; absent before completion or on failure, distinct from JSON null.\n成功值；完成前或失败时省略，与 JSON 空值不同。"
+            }
+          },
+          "required": [
+            "context",
+            "host_effects",
+            "operation_id",
+            "phase",
+            "cancellation_requested",
+            "effects"
+          ],
+          "type": "object"
+        },
+        "SuccessStatus": {
+          "description": "Single legal success discriminator, shared by live encoding and derived contracts.\n实际编码及派生契约共享的唯一合法成功判别。",
+          "oneOf": [
+            {
+              "const": "ok",
+              "description": "Successfully delivered result, including explicit JSON null.\n已成功交付结果，包含显式 JSON 空值。",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Borrowed success envelope avoids cloning application output during native response publication.\n借用成功信封，避免原生响应发布期间克隆应用输出。",
+      "properties": {
+        "protocol_version": {
+          "description": "Single protocol version authority.\n唯一协议版本权威。",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JournalOperation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。"
+        },
+        "status": {
+          "$ref": "#/$defs/SuccessStatus",
+          "description": "Exact success discriminator.\n精确成功判别。"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "status",
+        "result"
+      ],
+      "title": "SuccessEnvelope",
+      "type": "object"
+    },
+    "history_next": {
+      "$defs": {
+        "CapabilityCaller": {
+          "additionalProperties": false,
+          "description": "Host-authenticated caller data copied outside plugin-controlled arguments.\n在插件可控参数之外复制的宿主认证调用方数据。",
+          "properties": {
+            "execution_revision": {
+              "description": "Immutable execution and initialization-configuration revision.\n不可变执行与初始化配置修订。",
+              "type": "string"
+            },
+            "operation_id": {
+              "description": "Exact operation whose original budget applies.\n适用原始预算的精确操作。",
+              "type": "string"
+            },
+            "package_generation": {
+              "description": "Immutable package and dependency generation.\n不可变包与依赖代次。",
+              "type": "string"
+            },
+            "plugin_id": {
+              "description": "Exact activated plugin identity.\n精确激活的插件身份。",
+              "type": "string"
+            },
+            "runtime_id": {
+              "description": "Runtime namespace that owns the registration and operation.\n拥有注册及操作的运行时命名空间。",
+              "type": "string"
+            },
+            "security_partition": {
+              "description": "Trusted user/workspace partition, never copied from a Lua argument.\n可信用户与工作区分区，绝不从 Lua 参数复制。",
+              "type": "string"
+            },
+            "session_id": {
+              "description": "Optional fixed session required by session-scoped capabilities.\n会话作用域能力要求的可选固定会话。",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workspace_root": {
+              "description": "Explicit authorized workspace; absent means package-only context.\n显式授权工作区；省略表示仅包内上下文。",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "runtime_id",
+            "plugin_id",
+            "package_generation",
+            "execution_revision",
+            "security_partition",
+            "operation_id",
+            "session_id",
+            "workspace_root"
+          ],
+          "type": "object"
+        },
+        "EffectState": {
+          "description": "Host-reported effect outcome, independent from execution success or cancellation.\n宿主报告的副作用结果，独立于执行成功或取消。",
+          "oneOf": [
+            {
+              "const": "not_started",
+              "description": "No business execution has started.\n尚未开始业务执行。",
+              "type": "string"
+            },
+            {
+              "const": "not_applicable",
+              "description": "The declared operation has no externally visible mutations.\n声明的操作不包含外部可见变更。",
+              "type": "string"
+            },
+            {
+              "const": "committed",
+              "description": "A trusted host transaction explicitly confirmed its commit.\n可信宿主事务明确确认其提交。",
+              "type": "string"
+            },
+            {
+              "const": "rolled_back",
+              "description": "A trusted host transaction explicitly confirmed its rollback.\n可信宿主事务明确确认其回滚。",
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "Effects may have occurred; retries require host-specific reconciliation.\n副作用可能已发生；重试需要宿主特定的对账。",
+              "type": "string"
+            }
+          ]
+        },
+        "EmbeddedError": {
+          "additionalProperties": false,
+          "description": "Structured error; `code` is stable and `message` is an English diagnostic.\n结构化错误；`code` 稳定，`message` 为英文诊断信息。",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/EmbeddedErrorCode",
+              "description": "Stable classification consumed by SDKs instead of parsing text.\n供 SDK 使用的稳定分类，避免解析文案。"
+            },
+            "message": {
+              "description": "Human-readable detail without credentials or plugin input dumps.\n不含凭据或插件输入转储的可读详情。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        },
+        "EmbeddedErrorCode": {
+          "description": "Stable machine-readable failures shared by Rust and the versioned FFI protocol.\nRust 与版本化 FFI 协议共享的稳定机器可读错误。",
+          "oneOf": [
+            {
+              "const": "invalid_argument",
+              "description": "The supplied configuration or request violates its declared contract.\n提供的配置或请求违反其声明的契约。",
+              "type": "string"
+            },
+            {
+              "const": "not_found",
+              "description": "The requested identity does not exist or its retained record has expired.\n请求的身份不存在，或其保留记录已经过期。",
+              "type": "string"
+            },
+            {
+              "const": "stale_generation",
+              "description": "The caller supplied an identity from an inactive generation.\n调用方提供了非活动代次的身份。",
+              "type": "string"
+            },
+            {
+              "const": "capacity_exceeded",
+              "description": "A bounded resource cannot admit more work.\n有界资源无法接纳更多工作。",
+              "type": "string"
+            },
+            {
+              "const": "busy",
+              "description": "The requested state transition conflicts with live work.\n请求的状态变更与仍在运行的工作冲突。",
+              "type": "string"
+            },
+            {
+              "const": "already_completed",
+              "description": "This exact request already has a completion owner or retained terminal result.\n此精确请求已具有完成所有者或保留的终态结果。",
+              "type": "string"
+            },
+            {
+              "const": "closed",
+              "description": "The runtime or registration no longer accepts work.\n运行时或注册项已停止接纳工作。",
+              "type": "string"
+            },
+            {
+              "const": "cancelled",
+              "description": "The caller requested cooperative cancellation.\n调用方请求了协作取消。",
+              "type": "string"
+            },
+            {
+              "const": "deadline_exceeded",
+              "description": "The original end-to-end execution budget expired.\n原始端到端执行预算已经耗尽。",
+              "type": "string"
+            },
+            {
+              "const": "permission_denied",
+              "description": "The trusted host did not grant the requested capability.\n可信宿主未授予所请求的能力。",
+              "type": "string"
+            },
+            {
+              "const": "unsupported",
+              "description": "The requested backend or protocol feature is unavailable.\n请求的后端或协议功能不可用。",
+              "type": "string"
+            },
+            {
+              "const": "execution_failed",
+              "description": "Plugin initialization or execution failed.\n插件初始化或执行失败。",
+              "type": "string"
+            },
+            {
+              "const": "cleanup_failed",
+              "description": "Resource teardown failed and still owns its capacity.\n资源清理失败且仍占有容量。",
+              "type": "string"
+            },
+            {
+              "const": "internal",
+              "description": "An internal invariant failed; the caller must not retry mutations blindly.\n内部不变量失败，调用方不得盲目重试有副作用的操作。",
+              "type": "string"
+            }
+          ]
+        },
+        "HostEffectPhase": {
+          "description": "Actual handler lifecycle, separate from its reported business effect.\n真实处理器生命周期，独立于其报告的业务副作用。",
+          "oneOf": [
+            {
+              "const": "prepared",
+              "description": "Retention reserved before execution.\n执行前已预留保留容量。",
+              "type": "string"
+            },
+            {
+              "const": "running",
+              "description": "Handler may execute; cancellation is not completion.\n处理器可能执行；取消不等于完成。",
+              "type": "string"
+            },
+            {
+              "const": "completed",
+              "description": "Actual handler and admission ownership have been released.\n真实处理器及入场所有权已释放。",
+              "type": "string"
+            }
+          ]
+        },
+        "HostEffectRecord": {
+          "additionalProperties": false,
+          "description": "Bounded evidence retained independently from values returned to Lua.\n独立于返回 Lua 的值保留的有界证据。",
+          "properties": {
+            "caller": {
+              "$ref": "#/$defs/CapabilityCaller",
+              "description": "Original host-bound caller identity, retained for reconciliation without consulting a newer plugin generation.\n原始宿主绑定调用身份；对账保留该身份，不查询较新的插件代次。"
+            },
+            "capability_name": {
+              "description": "Public capability name, excluding business arguments and credentials.\n公开能力名称，不包含业务参数与凭证。",
+              "type": "string"
+            },
+            "capability_version": {
+              "description": "Interface version of the exact registration.\n精确注册的接口版本。",
+              "type": "string"
+            },
+            "effect_id": {
+              "description": "Never-reused identity within the original operation.\n原始操作内绝不复用的身份。",
+              "type": "string"
+            },
+            "effects": {
+              "$ref": "#/$defs/EffectState",
+              "description": "Trusted host evidence, independent from caller cancellation.\n可信宿主证据，独立于调用方取消。"
+            },
+            "phase": {
+              "$ref": "#/$defs/HostEffectPhase",
+              "description": "Actual handler ownership lifecycle.\n真实处理器所有权生命周期。"
+            },
+            "registration_id": {
+              "description": "Exact immutable registration identity.\n精确不可变注册身份。",
+              "type": "string"
+            },
+            "request_id": {
+              "description": "SDK request identity for queued execution.\n队列执行的 SDK 请求身份。",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "caller",
+            "effect_id",
+            "registration_id",
+            "capability_name",
+            "capability_version",
+            "request_id",
+            "phase",
+            "effects"
+          ],
+          "type": "object"
+        },
+        "JournalOperation": {
+          "additionalProperties": false,
+          "description": "Historical checkpoint, not a live handle and not evidence authorizing execution replay.\n历史检查点，不是活动句柄，也不是授权执行重放的证据。",
+          "properties": {
+            "revision": {
+              "description": "Monotonic compare-and-swap revision; positive and bounded by SQLite's signed integer.\n单调比较交换修订号；为正数且受 SQLite 有符号整数范围约束。",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "runtime_id": {
+              "description": "Original runtime namespace, never rebound to the namespace of a restarted runtime.\n原始运行时命名空间，绝不重新绑定到重启后的命名空间。",
+              "type": "string"
+            },
+            "snapshot": {
+              "$ref": "#/$defs/OperationSnapshot",
+              "description": "Exact last committed observation; an unfinished phase remains unfinished after restart.\n最后提交的精确观测；未结束的阶段在重启后仍保持未结束。"
+            }
+          },
+          "required": [
+            "runtime_id",
+            "revision",
+            "snapshot"
+          ],
+          "type": "object"
+        },
+        "OperationContext": {
+          "description": "Explicit operation origin; unbound low-level work is never inferred to belong to a current plugin.\n明确的操作来源；未绑定的低层工作绝不被推断归属于当前插件。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "description": "The low-level host admitted this operation without a module binding.\n低层宿主接纳此操作时没有模块绑定。",
+              "properties": {
+                "kind": {
+                  "const": "unbound",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "The formal scheduler froze this module context before publishing the operation.\n正式调度器在发布操作前冻结了此模块上下文。",
+              "properties": {
+                "caller": {
+                  "$ref": "#/$defs/CapabilityCaller",
+                  "description": "Original trusted caller shared by initialization and this operation's host callbacks.\n初始化及此操作宿主回调共同使用的原始可信调用方。"
+                },
+                "capability_revision": {
+                  "description": "Exact capability membership snapshot frozen when the pool was registered.\n注册池时冻结的精确能力成员快照。",
+                  "type": "string"
+                },
+                "export": {
+                  "description": "Requested declared export; absent only for a fixed-session opening operation.\n请求的已声明导出；仅固定会话开启操作省略。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "kind": {
+                  "const": "module",
+                  "type": "string"
+                },
+                "pool_id": {
+                  "description": "Exact retained pool identity, not a lookup of the plugin's newest pool.\n精确保留池身份，不查询插件最新的池。",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "pool_id",
+                "caller",
+                "capability_revision",
+                "export"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "OperationPhase": {
+          "description": "Execution phase; cancellation intent is reported separately from actual termination.\n执行阶段；取消意图与实际终止分开报告。",
+          "oneOf": [
+            {
+              "const": "queued",
+              "description": "Accepted and waiting for resource admission.\n已接纳且正在等待资源入场。",
+              "type": "string"
+            },
+            {
+              "const": "initializing",
+              "description": "Creating or loading the selected VM instance.\n正在创建或加载选定的 VM 实例。",
+              "type": "string"
+            },
+            {
+              "const": "running",
+              "description": "Executing the requested exported function.\n正在执行请求的导出函数。",
+              "type": "string"
+            },
+            {
+              "const": "waiting_for_host",
+              "description": "Still owns its VM while awaiting a host capability result.\n等待宿主能力结果期间仍拥有其 VM。",
+              "type": "string"
+            },
+            {
+              "const": "cleaning",
+              "description": "Execution returned but request-owned cleanup is not yet complete.\n执行已返回，但请求所属清理尚未完成。",
+              "type": "string"
+            },
+            {
+              "const": "succeeded",
+              "description": "Execution and required cleanup completed successfully.\n执行及必要清理已成功完成。",
+              "type": "string"
+            },
+            {
+              "const": "failed",
+              "description": "Execution or cleanup failed and the actual result is available.\n执行或清理失败，且实际结果已经可用。",
+              "type": "string"
+            },
+            {
+              "const": "cancelled",
+              "description": "Cooperative cancellation completed; this does not imply effect rollback.\n协作取消已完成；这不表示副作用已回滚。",
+              "type": "string"
+            }
+          ]
+        },
+        "OperationSnapshot": {
+          "additionalProperties": false,
+          "description": "Bounded operation snapshot suitable for direct serialization to every SDK.\n适合直接序列化给各 SDK 的有界操作快照。",
+          "properties": {
+            "cancellation_requested": {
+              "description": "Whether cooperative cancellation has been requested.\n是否已请求协作取消。",
+              "type": "boolean"
+            },
+            "context": {
+              "$ref": "#/$defs/OperationContext",
+              "description": "Admission-time module authority, or an explicit unbound low-level origin; never reconstructed from effects.\n入场时模块权威，或明确未绑定的低层来源；绝不从副作用重建。"
+            },
+            "effects": {
+              "$ref": "#/$defs/EffectState",
+              "description": "Explicit effect status; successful execution does not automatically imply commit.\n显式副作用状态；执行成功不自动表示提交。"
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/EmbeddedError"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Structured terminal error; absent while execution is still in progress.\n结构化终态错误；执行仍在进行时省略。"
+            },
+            "host_effects": {
+              "description": "Exact host callback evidence retained even after Lua failure, cancellation or output rejection.\n即使 Lua 失败、取消或输出被拒绝也保留的精确宿主回调证据。",
+              "items": {
+                "$ref": "#/$defs/HostEffectRecord"
+              },
+              "type": "array"
+            },
+            "operation_id": {
+              "description": "Opaque identifier, never a JavaScript floating-point integer.\n不透明标识符，绝不使用 JavaScript 浮点整数。",
+              "type": "string"
+            },
+            "phase": {
+              "$ref": "#/$defs/OperationPhase",
+              "description": "Current execution phase, including still-running cancelled requests.\n当前执行阶段，包含已请求取消但仍在运行的请求。"
+            },
+            "value": {
+              "description": "Successful value; absent before completion or on failure, distinct from JSON null.\n成功值；完成前或失败时省略，与 JSON 空值不同。"
+            }
+          },
+          "required": [
+            "context",
+            "host_effects",
+            "operation_id",
+            "phase",
+            "cancellation_requested",
+            "effects"
+          ],
+          "type": "object"
+        },
+        "SuccessStatus": {
+          "description": "Single legal success discriminator, shared by live encoding and derived contracts.\n实际编码及派生契约共享的唯一合法成功判别。",
+          "oneOf": [
+            {
+              "const": "ok",
+              "description": "Successfully delivered result, including explicit JSON null.\n已成功交付结果，包含显式 JSON 空值。",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Borrowed success envelope avoids cloning application output during native response publication.\n借用成功信封，避免原生响应发布期间克隆应用输出。",
+      "properties": {
+        "protocol_version": {
+          "description": "Single protocol version authority.\n唯一协议版本权威。",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JournalOperation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。"
+        },
+        "status": {
+          "$ref": "#/$defs/SuccessStatus",
+          "description": "Exact success discriminator.\n精确成功判别。"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "status",
+        "result"
+      ],
+      "title": "SuccessEnvelope",
+      "type": "object"
+    },
     "host_request_complete": {
       "$defs": {
         "SuccessStatus": {
@@ -4471,6 +5800,278 @@
         "result": {
           "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。",
           "type": "null"
+        },
+        "status": {
+          "$ref": "#/$defs/SuccessStatus",
+          "description": "Exact success discriminator.\n精确成功判别。"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "status",
+        "result"
+      ],
+      "title": "SuccessEnvelope",
+      "type": "object"
+    },
+    "operation_persistence_failure": {
+      "$defs": {
+        "CheckpointRetryState": {
+          "description": "Recovery state is independent of the operation's business phase and cancellation intent.\n恢复状态独立于操作业务阶段及取消意愿。",
+          "oneOf": [
+            {
+              "const": "waiting",
+              "description": "No retry will run until the host explicitly requests one.\n宿主显式请求之前不会执行重试。",
+              "type": "string"
+            },
+            {
+              "const": "requested",
+              "description": "A single retry request is retained for the original checkpoint owner.\n为原始检查点所有者保留了单次重试请求。",
+              "type": "string"
+            },
+            {
+              "const": "retrying",
+              "description": "The requested retry is being driven; repeated observations cannot create another attempt.\n正在推进已请求重试；重复观测不能创建另一次尝试。",
+              "type": "string"
+            }
+          ]
+        },
+        "EmbeddedError": {
+          "additionalProperties": false,
+          "description": "Structured error; `code` is stable and `message` is an English diagnostic.\n结构化错误；`code` 稳定，`message` 为英文诊断信息。",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/EmbeddedErrorCode",
+              "description": "Stable classification consumed by SDKs instead of parsing text.\n供 SDK 使用的稳定分类，避免解析文案。"
+            },
+            "message": {
+              "description": "Human-readable detail without credentials or plugin input dumps.\n不含凭据或插件输入转储的可读详情。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        },
+        "EmbeddedErrorCode": {
+          "description": "Stable machine-readable failures shared by Rust and the versioned FFI protocol.\nRust 与版本化 FFI 协议共享的稳定机器可读错误。",
+          "oneOf": [
+            {
+              "const": "invalid_argument",
+              "description": "The supplied configuration or request violates its declared contract.\n提供的配置或请求违反其声明的契约。",
+              "type": "string"
+            },
+            {
+              "const": "not_found",
+              "description": "The requested identity does not exist or its retained record has expired.\n请求的身份不存在，或其保留记录已经过期。",
+              "type": "string"
+            },
+            {
+              "const": "stale_generation",
+              "description": "The caller supplied an identity from an inactive generation.\n调用方提供了非活动代次的身份。",
+              "type": "string"
+            },
+            {
+              "const": "capacity_exceeded",
+              "description": "A bounded resource cannot admit more work.\n有界资源无法接纳更多工作。",
+              "type": "string"
+            },
+            {
+              "const": "busy",
+              "description": "The requested state transition conflicts with live work.\n请求的状态变更与仍在运行的工作冲突。",
+              "type": "string"
+            },
+            {
+              "const": "already_completed",
+              "description": "This exact request already has a completion owner or retained terminal result.\n此精确请求已具有完成所有者或保留的终态结果。",
+              "type": "string"
+            },
+            {
+              "const": "closed",
+              "description": "The runtime or registration no longer accepts work.\n运行时或注册项已停止接纳工作。",
+              "type": "string"
+            },
+            {
+              "const": "cancelled",
+              "description": "The caller requested cooperative cancellation.\n调用方请求了协作取消。",
+              "type": "string"
+            },
+            {
+              "const": "deadline_exceeded",
+              "description": "The original end-to-end execution budget expired.\n原始端到端执行预算已经耗尽。",
+              "type": "string"
+            },
+            {
+              "const": "permission_denied",
+              "description": "The trusted host did not grant the requested capability.\n可信宿主未授予所请求的能力。",
+              "type": "string"
+            },
+            {
+              "const": "unsupported",
+              "description": "The requested backend or protocol feature is unavailable.\n请求的后端或协议功能不可用。",
+              "type": "string"
+            },
+            {
+              "const": "execution_failed",
+              "description": "Plugin initialization or execution failed.\n插件初始化或执行失败。",
+              "type": "string"
+            },
+            {
+              "const": "cleanup_failed",
+              "description": "Resource teardown failed and still owns its capacity.\n资源清理失败且仍占有容量。",
+              "type": "string"
+            },
+            {
+              "const": "internal",
+              "description": "An internal invariant failed; the caller must not retry mutations blindly.\n内部不变量失败，调用方不得盲目重试有副作用的操作。",
+              "type": "string"
+            }
+          ]
+        },
+        "OperationPersistenceFailure": {
+          "description": "A failed checkpoint remains queryable by exact operation ID until that original checkpoint is acknowledged.\n失败检查点可按精确操作 ID 查询，直至原检查点得到确认。",
+          "properties": {
+            "error": {
+              "$ref": "#/$defs/EmbeddedError",
+              "description": "Retained persistence error; this does not rewrite the original business result.\n保留的持久化错误；不改写原始业务结果。"
+            },
+            "operation_id": {
+              "description": "Stable original operation identity, never a replacement execution.\n稳定的原始操作身份，绝非替代执行。",
+              "type": "string"
+            },
+            "phase": {
+              "$ref": "#/$defs/OperationPhase",
+              "description": "Exact candidate phase whose write failed; terminal candidates are not yet publicly terminal.\n写入失败的精确候选阶段；终态候选尚不是公开终态。"
+            },
+            "retry": {
+              "$ref": "#/$defs/CheckpointRetryState",
+              "description": "Explicit host retry coordination, separate from ordinary polling.\n显式宿主重试协调，独立于普通轮询。"
+            }
+          },
+          "required": [
+            "operation_id",
+            "phase",
+            "error",
+            "retry"
+          ],
+          "type": "object"
+        },
+        "OperationPhase": {
+          "description": "Execution phase; cancellation intent is reported separately from actual termination.\n执行阶段；取消意图与实际终止分开报告。",
+          "oneOf": [
+            {
+              "const": "queued",
+              "description": "Accepted and waiting for resource admission.\n已接纳且正在等待资源入场。",
+              "type": "string"
+            },
+            {
+              "const": "initializing",
+              "description": "Creating or loading the selected VM instance.\n正在创建或加载选定的 VM 实例。",
+              "type": "string"
+            },
+            {
+              "const": "running",
+              "description": "Executing the requested exported function.\n正在执行请求的导出函数。",
+              "type": "string"
+            },
+            {
+              "const": "waiting_for_host",
+              "description": "Still owns its VM while awaiting a host capability result.\n等待宿主能力结果期间仍拥有其 VM。",
+              "type": "string"
+            },
+            {
+              "const": "cleaning",
+              "description": "Execution returned but request-owned cleanup is not yet complete.\n执行已返回，但请求所属清理尚未完成。",
+              "type": "string"
+            },
+            {
+              "const": "succeeded",
+              "description": "Execution and required cleanup completed successfully.\n执行及必要清理已成功完成。",
+              "type": "string"
+            },
+            {
+              "const": "failed",
+              "description": "Execution or cleanup failed and the actual result is available.\n执行或清理失败，且实际结果已经可用。",
+              "type": "string"
+            },
+            {
+              "const": "cancelled",
+              "description": "Cooperative cancellation completed; this does not imply effect rollback.\n协作取消已完成；这不表示副作用已回滚。",
+              "type": "string"
+            }
+          ]
+        },
+        "SuccessStatus": {
+          "description": "Single legal success discriminator, shared by live encoding and derived contracts.\n实际编码及派生契约共享的唯一合法成功判别。",
+          "oneOf": [
+            {
+              "const": "ok",
+              "description": "Successfully delivered result, including explicit JSON null.\n已成功交付结果，包含显式 JSON 空值。",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Borrowed success envelope avoids cloning application output during native response publication.\n借用成功信封，避免原生响应发布期间克隆应用输出。",
+      "properties": {
+        "protocol_version": {
+          "description": "Single protocol version authority.\n唯一协议版本权威。",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OperationPersistenceFailure"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。"
+        },
+        "status": {
+          "$ref": "#/$defs/SuccessStatus",
+          "description": "Exact success discriminator.\n精确成功判别。"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "status",
+        "result"
+      ],
+      "title": "SuccessEnvelope",
+      "type": "object"
+    },
+    "operation_retry_checkpoint": {
+      "$defs": {
+        "SuccessStatus": {
+          "description": "Single legal success discriminator, shared by live encoding and derived contracts.\n实际编码及派生契约共享的唯一合法成功判别。",
+          "oneOf": [
+            {
+              "const": "ok",
+              "description": "Successfully delivered result, including explicit JSON null.\n已成功交付结果，包含显式 JSON 空值。",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Borrowed success envelope avoids cloning application output during native response publication.\n借用成功信封，避免原生响应发布期间克隆应用输出。",
+      "properties": {
+        "protocol_version": {
+          "description": "Single protocol version authority.\n唯一协议版本权威。",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。",
+          "type": "boolean"
         },
         "status": {
           "$ref": "#/$defs/SuccessStatus",
@@ -6349,6 +7950,234 @@
         },
         "result": {
           "$ref": "#/$defs/OperationReceipt",
+          "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。"
+        },
+        "status": {
+          "$ref": "#/$defs/SuccessStatus",
+          "description": "Exact success discriminator.\n精确成功判别。"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "status",
+        "result"
+      ],
+      "title": "SuccessEnvelope",
+      "type": "object"
+    },
+    "storage_recover": {
+      "$defs": {
+        "SuccessStatus": {
+          "description": "Single legal success discriminator, shared by live encoding and derived contracts.\n实际编码及派生契约共享的唯一合法成功判别。",
+          "oneOf": [
+            {
+              "const": "ok",
+              "description": "Successfully delivered result, including explicit JSON null.\n已成功交付结果，包含显式 JSON 空值。",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Borrowed success envelope avoids cloning application output during native response publication.\n借用成功信封，避免原生响应发布期间克隆应用输出。",
+      "properties": {
+        "protocol_version": {
+          "description": "Single protocol version authority.\n唯一协议版本权威。",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。",
+          "type": "boolean"
+        },
+        "status": {
+          "$ref": "#/$defs/SuccessStatus",
+          "description": "Exact success discriminator.\n精确成功判别。"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "status",
+        "result"
+      ],
+      "title": "SuccessEnvelope",
+      "type": "object"
+    },
+    "storage_status": {
+      "$defs": {
+        "EmbeddedError": {
+          "additionalProperties": false,
+          "description": "Structured error; `code` is stable and `message` is an English diagnostic.\n结构化错误；`code` 稳定，`message` 为英文诊断信息。",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/EmbeddedErrorCode",
+              "description": "Stable classification consumed by SDKs instead of parsing text.\n供 SDK 使用的稳定分类，避免解析文案。"
+            },
+            "message": {
+              "description": "Human-readable detail without credentials or plugin input dumps.\n不含凭据或插件输入转储的可读详情。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "type": "object"
+        },
+        "EmbeddedErrorCode": {
+          "description": "Stable machine-readable failures shared by Rust and the versioned FFI protocol.\nRust 与版本化 FFI 协议共享的稳定机器可读错误。",
+          "oneOf": [
+            {
+              "const": "invalid_argument",
+              "description": "The supplied configuration or request violates its declared contract.\n提供的配置或请求违反其声明的契约。",
+              "type": "string"
+            },
+            {
+              "const": "not_found",
+              "description": "The requested identity does not exist or its retained record has expired.\n请求的身份不存在，或其保留记录已经过期。",
+              "type": "string"
+            },
+            {
+              "const": "stale_generation",
+              "description": "The caller supplied an identity from an inactive generation.\n调用方提供了非活动代次的身份。",
+              "type": "string"
+            },
+            {
+              "const": "capacity_exceeded",
+              "description": "A bounded resource cannot admit more work.\n有界资源无法接纳更多工作。",
+              "type": "string"
+            },
+            {
+              "const": "busy",
+              "description": "The requested state transition conflicts with live work.\n请求的状态变更与仍在运行的工作冲突。",
+              "type": "string"
+            },
+            {
+              "const": "already_completed",
+              "description": "This exact request already has a completion owner or retained terminal result.\n此精确请求已具有完成所有者或保留的终态结果。",
+              "type": "string"
+            },
+            {
+              "const": "closed",
+              "description": "The runtime or registration no longer accepts work.\n运行时或注册项已停止接纳工作。",
+              "type": "string"
+            },
+            {
+              "const": "cancelled",
+              "description": "The caller requested cooperative cancellation.\n调用方请求了协作取消。",
+              "type": "string"
+            },
+            {
+              "const": "deadline_exceeded",
+              "description": "The original end-to-end execution budget expired.\n原始端到端执行预算已经耗尽。",
+              "type": "string"
+            },
+            {
+              "const": "permission_denied",
+              "description": "The trusted host did not grant the requested capability.\n可信宿主未授予所请求的能力。",
+              "type": "string"
+            },
+            {
+              "const": "unsupported",
+              "description": "The requested backend or protocol feature is unavailable.\n请求的后端或协议功能不可用。",
+              "type": "string"
+            },
+            {
+              "const": "execution_failed",
+              "description": "Plugin initialization or execution failed.\n插件初始化或执行失败。",
+              "type": "string"
+            },
+            {
+              "const": "cleanup_failed",
+              "description": "Resource teardown failed and still owns its capacity.\n资源清理失败且仍占有容量。",
+              "type": "string"
+            },
+            {
+              "const": "internal",
+              "description": "An internal invariant failed; the caller must not retry mutations blindly.\n内部不变量失败，调用方不得盲目重试有副作用的操作。",
+              "type": "string"
+            }
+          ]
+        },
+        "OperationJournalWorkerStatus": {
+          "description": "Live worker observations; retained receipts keep quota even after the thread has finished.\n实时工作线程观测；线程结束后，保留的回执仍占有配额。",
+          "properties": {
+            "closing": {
+              "description": "New attempts are permanently refused while admitted attempts finish normally.\n永久拒绝新尝试，而已接纳尝试正常完成。",
+              "type": "boolean"
+            },
+            "failure": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/EmbeddedError"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "First infrastructure failure; individual database rejection remains on its own receipt.\n首个基础设施故障；单独的数据库拒绝仍位于各自回执。"
+            },
+            "pending_bytes": {
+              "description": "Encoded request bytes reserved until each attempt's last owner disappears.\n每次尝试最后一个所有者消失前预留的请求编码字节数。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pending_writes": {
+              "description": "Total owned attempts including caller-retained completed receipts.\n拥有的尝试总数，包含调用方保留的已完成回执。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "queued_writes": {
+              "description": "Attempts still owned by the queue.\n仍由队列拥有的尝试数。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "worker_exited": {
+              "description": "Actual thread termination, observed from its join handle rather than a provisional flag.\n从等待句柄观测到的真实线程终止，而非临时标记。",
+              "type": "boolean"
+            },
+            "writing": {
+              "description": "Whether a real write is currently owned by the storage thread.\n存储线程当前是否拥有真实写入。",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "pending_writes",
+            "pending_bytes",
+            "queued_writes",
+            "writing",
+            "closing",
+            "worker_exited",
+            "failure"
+          ],
+          "type": "object"
+        },
+        "SuccessStatus": {
+          "description": "Single legal success discriminator, shared by live encoding and derived contracts.\n实际编码及派生契约共享的唯一合法成功判别。",
+          "oneOf": [
+            {
+              "const": "ok",
+              "description": "Successfully delivered result, including explicit JSON null.\n已成功交付结果，包含显式 JSON 空值。",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Borrowed success envelope avoids cloning application output during native response publication.\n借用成功信封，避免原生响应发布期间克隆应用输出。",
+      "properties": {
+        "protocol_version": {
+          "description": "Single protocol version authority.\n唯一协议版本权威。",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/OperationJournalWorkerStatus",
           "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。"
         },
         "status": {

@@ -40,7 +40,7 @@ pub(in crate::ffi_embedded) fn engine_options() -> LuaEngineOptions {
 
 /// Create a transport whose explicit input allowance can carry complete serialized engine options.
 /// 创建输入额度足以携带完整序列化引擎选项的显式传输。
-fn transport() -> u64 {
+pub(in crate::ffi_embedded) fn transport() -> u64 {
     let mut limits = config();
     limits.max_request_bytes = 16384;
     create(limits)
@@ -48,7 +48,7 @@ fn transport() -> u64 {
 
 /// Execute `command` through the actual C entrypoint and copy/release its result before returning JSON.
 /// 通过实际 C 入口执行 `command`，在返回 JSON 前复制并释放结果。
-fn command(id: u64, command: Value) -> Value {
+pub(in crate::ffi_embedded) fn command(id: u64, command: Value) -> Value {
     let bytes = serde_json::to_vec(&json!({"protocol_version":1,"command":command})).unwrap();
     let (status, result) = request(id, &bytes);
     assert_eq!(status, 0, "native transport rejected command: {command}");
@@ -63,7 +63,7 @@ fn command(id: u64, command: Value) -> Value {
 
 /// Reserve and return a known runtime identity; this command cannot create an engine or native worker.
 /// 预留并返回已知运行时身份；此命令不能创建引擎或原生工作线程。
-fn reserve(id: u64) -> String {
+pub(in crate::ffi_embedded) fn reserve(id: u64) -> String {
     let response = command(id, json!({"type":"runtime_reserve"}));
     assert_eq!(response["status"], "ok");
     response["result"]["runtime_id"]

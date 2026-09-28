@@ -1,5 +1,5 @@
 use super::commands::RuntimeCommand;
-use super::runtime::RuntimeSlot;
+use super::runtime::{RuntimePersistenceConfig, RuntimeSlot};
 use super::wire::{
     ErrorEnvelope, ErrorStatus, RuntimeReceipt, SuccessStatus, TransportDescription,
 };
@@ -71,6 +71,9 @@ enum Command {
         /// Explicit formal runtime budgets validated before worker construction.
         /// 工作线程构造前校验的显式正式运行时预算。
         runtime_config: Box<EmbeddedRuntimeConfig>,
+        /// Explicit durable storage; absence selects memory-only execution without creating a database.
+        /// 显式持久存储；缺失表示纯内存执行，不创建数据库。
+        persistence: Option<RuntimePersistenceConfig>,
     },
     /// Read construction outcome and actual worker closure evidence.
     /// 读取构造结果与实际工作线程关闭证据。
@@ -179,11 +182,12 @@ pub(super) fn execute(
             runtime_id,
             engine_options,
             runtime_config,
+            persistence,
         } => {
             let response = receipt(&runtime_id, limit)?;
             match transport
                 .runtime(&runtime_id)
-                .and_then(|slot| slot.initialize(*engine_options, *runtime_config))
+                .and_then(|slot| slot.initialize(*engine_options, *runtime_config, persistence))
             {
                 Ok(()) => Ok(response),
                 Err(error) => respond::<()>(Err(error), limit),

@@ -5,6 +5,8 @@ use crate::ffi_standard::FfiBorrowedBuffer;
 use crate::runtime::embedded::capabilities::{CapabilityEffects, CapabilityExecution, HostRequest};
 use crate::runtime::embedded::{EmbeddedPluginConfig, InstanceReuse, OperationSnapshot};
 
+mod persistence;
+
 /// A test SDK client that calls only the new public C entrypoints for all runtime work.
 /// 一个测试 SDK 客户端，全部运行时工作仅调用新的公开 C 入口。
 struct Client {
@@ -54,15 +56,13 @@ fn root_request(transport_id: u64, command: Value) -> Result<Value, i32> {
 }
 
 impl Client {
-    /// Construct and initialize a real native runtime under `layout`, then register its explicit plugin policy.
-    /// 在 `layout` 下构造并初始化实际原生运行时，随后注册其显式插件策略。
-    fn new(layout: &SystemRuntimeTestLayout) -> Self {
-        Self::with_response_limit(layout, 32768)
-    }
-
-    /// Build a real native client with an explicit per-response byte limit for admission boundary tests.
-    /// 使用显式逐响应字节上限构造实际原生客户端，用于入场边界测试。
-    fn with_response_limit(layout: &SystemRuntimeTestLayout, response_limit: u64) -> Self {
+    /// Construct a real client from explicit response and optional durable storage declarations.
+    /// 从显式响应及可选持久存储声明构造真实客户端。
+    fn with_storage(
+        layout: &SystemRuntimeTestLayout,
+        response_limit: u64,
+        persistence: Value,
+    ) -> Self {
         let config = FfiEmbeddedTransportConfigV1 {
             struct_size: std::mem::size_of::<FfiEmbeddedTransportConfigV1>() as u32,
             protocol_version: EMBEDDED_FFI_PROTOCOL_VERSION,
@@ -91,7 +91,7 @@ impl Client {
         let initialized = client.root(json!({
             "type":"runtime_initialize", "runtime_id":client.runtime_id,
             "engine_options":LuaEngineOptions::new(LuaVmPoolConfig {min_size:1,max_size:1,idle_ttl_secs:1}, layout.host_options()),
-            "runtime_config":limits,
+            "runtime_config":limits, "persistence":persistence,
         }));
         assert_eq!(initialized["status"], "ok", "{initialized}");
         let status = client.root(json!({"type":"runtime_status","runtime_id":client.runtime_id}));
@@ -104,6 +104,18 @@ impl Client {
             }
         }));
         client
+    }
+
+    /// Construct and initialize a real native runtime under `layout`, then register its explicit plugin policy.
+    /// 在 `layout` 下构造并初始化实际原生运行时，随后注册其显式插件策略。
+    fn new(layout: &SystemRuntimeTestLayout) -> Self {
+        Self::with_response_limit(layout, 32768)
+    }
+
+    /// Build a real native client with an explicit per-response byte limit for admission boundary tests.
+    /// 使用显式逐响应字节上限构造实际原生客户端，用于入场边界测试。
+    fn with_response_limit(layout: &SystemRuntimeTestLayout, response_limit: u64) -> Self {
+        Self::with_storage(layout, response_limit, Value::Null)
     }
 
     /// Execute root `command` and require native transport delivery, leaving business status explicit.

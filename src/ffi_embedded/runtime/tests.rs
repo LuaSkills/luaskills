@@ -3,6 +3,8 @@ use crate::ffi_embedded::tests::runtimes::{engine_options, runtime_config};
 use std::sync::Barrier;
 use std::time::{Duration, Instant};
 
+mod persistence;
+
 /// Construct an actual empty core using the same options as the native protocol fixture.
 /// 使用与原生协议夹具相同的选项构造实际空核心。
 fn core() -> EmbeddedRuntime {

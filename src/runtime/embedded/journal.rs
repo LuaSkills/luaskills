@@ -25,7 +25,9 @@ use std::sync::{Mutex, MutexGuard};
 
 /// Explicit retention budgets; SQLite journal/cache overhead is separate from the database-file cap.
 /// 显式保留预算；SQLite 日志及缓存开销与数据库文件上限分开计算。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct OperationJournalConfig {
     /// Maximum retained operations across all runtime namespaces; no automatic eviction occurs.
     /// 所有运行时命名空间合计保留的最大操作数；不自动淘汰。
@@ -42,6 +44,7 @@ pub struct OperationJournalConfig {
 /// 历史检查点，不是活动句柄，也不是授权执行重放的证据。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct JournalOperation {
     /// Original runtime namespace, never rebound to the namespace of a restarted runtime.
     /// 原始运行时命名空间，绝不重新绑定到重启后的命名空间。

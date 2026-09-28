@@ -1,12 +1,16 @@
 use super::{EmbeddedFfiStatus, transport};
 use crate::runtime::embedded::{
     EmbeddedError, EmbeddedErrorCode, EmbeddedResult, EmbeddedRuntime, EmbeddedRuntimeConfig,
-    EmbeddedRuntimeUsage, PoolUsage,
+    EmbeddedRuntimeUsage, OperationJournalWorkerStatus, PoolUsage,
 };
 use crate::{LuaEngine, LuaEngineOptions};
 use serde::Serialize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+mod persistence;
+use persistence::PersistenceOwner;
+pub(super) use persistence::RuntimePersistenceConfig;
 
 #[cfg(test)]
 mod tests;
@@ -26,8 +30,8 @@ pub(super) enum InitializationPhase {
     /// The actual core owner was stored successfully.
     /// 实际核心所有者已成功保存。
     Ready,
-    /// Construction returned an explicit error after releasing unpublished resources.
-    /// 构造在释放未发布资源后返回明确错误。
+    /// Construction returned an explicit error; retained storage still requires verified drainage.
+    /// 构造返回明确错误；已保留存储仍需验证排空。
     Failed,
     /// Construction panicked and safe library unloading cannot be proven.
     /// 构造发生 panic，无法证明可以安全卸载动态库。
@@ -52,6 +56,9 @@ struct RuntimeState {
     /// Actual core owner, retained until all workers and users have drained.
     /// 实际核心所有者，保留到全部工作线程与使用者排空。
     runtime: Option<Arc<EmbeddedRuntime>>,
+    /// Storage created during initialization, retained even if later core construction fails.
+    /// 初始化期间创建的存储，即使后续核心构造失败也继续保留。
+    persistence: Option<Arc<PersistenceOwner>>,
     /// Retained initialization or close failure, queryable through the known slot identity.
     /// 保留的初始化或关闭失败，可通过已知槽身份查询。
     error: Option<EmbeddedError>,
@@ -74,9 +81,12 @@ pub(super) struct RuntimeLease {
     /// Exact registered slot whose removal is blocked by this lease.
     /// 此租借阻止移除的精确注册槽。
     slot: Arc<RuntimeSlot>,
-    /// Optional only to allow explicit drop ordering in the destructor.
-    /// 仅为允许析构器中的显式释放顺序而设为可选。
+    /// Absent for storage-only cleanup after failed construction; otherwise dropped before the user fence.
+    /// 构造失败后的纯存储清理中不存在；其他情况下在使用者屏障前释放。
     runtime: Option<Arc<EmbeddedRuntime>>,
+    /// Optional durable ownership is dropped before this lease releases the native-user fence.
+    /// 可选持久所有权在此租借释放原生使用者屏障前被丢弃。
+    persistence: Option<Arc<PersistenceOwner>>,
 }
 
 /// Queryable construction and core closure evidence; no runtime implementation state is inferred by SDKs.
@@ -96,8 +106,8 @@ pub(super) struct RuntimeSnapshot {
     /// Whether this slot has permanently closed admission.
     /// 此槽是否已永久关闭入场。
     closing: bool,
-    /// True only after native core workers have exited, or no core was ever created.
-    /// 仅当原生核心工作线程已退出或从未创建核心时为真。
+    /// True only after construction finishes and all created core and storage workers and receipts drain.
+    /// 仅在构造结束且全部已创建核心、存储线程与回执排空后为真。
     closed: bool,
     /// Live scheduler observations directly from the core when available.
     /// 可用时直接来自核心的实时调度观测。
@@ -105,6 +115,9 @@ pub(super) struct RuntimeSnapshot {
     /// Live resident and execution accounting directly from the core when available.
     /// 可用时直接来自核心的实时常驻与执行计数。
     resources: Option<PoolUsage>,
+    /// Actual storage worker status when durable ownership has been created, including failed construction.
+    /// 持久所有权创建后的实际存储工作线程状态，包含构造失败。
+    persistence: Option<OperationJournalWorkerStatus>,
     /// Retained failure; a failed construction still owns its bounded registration until explicit release.
     /// 保留失败；构造失败仍拥有其有界注册，直到显式释放。
     error: Option<EmbeddedError>,
@@ -122,6 +135,7 @@ impl RuntimeSlot {
                 released: false,
                 active: 0,
                 runtime: None,
+                persistence: None,
                 error: None,
             }),
         }))
@@ -148,6 +162,7 @@ impl RuntimeSlot {
         &self,
         options: LuaEngineOptions,
         config: EmbeddedRuntimeConfig,
+        persistence: Option<RuntimePersistenceConfig>,
     ) -> EmbeddedResult<()> {
         self.initialize_with(|| {
             config.validate()?;
@@ -157,7 +172,20 @@ impl RuntimeSlot {
                     format!("engine initialization failed: {error}"),
                 )
             })?;
-            EmbeddedRuntime::new(Arc::new(engine), config)
+            match persistence {
+                None => EmbeddedRuntime::new(Arc::new(engine), config),
+                Some(persistence) => {
+                    // Publish storage ownership before another fallible constructor can leave a native thread alive.
+                    // 在其他可失败构造器可能留下活动原生线程前发布存储所有权。
+                    let owner = PersistenceOwner::new(persistence)?;
+                    self.lock()?.persistence = Some(Arc::clone(&owner));
+                    EmbeddedRuntime::with_journal_worker(
+                        Arc::new(engine),
+                        config,
+                        Arc::clone(&owner.writer),
+                    )
+                }
+            }
         })
     }
 
@@ -197,15 +225,24 @@ impl RuntimeSlot {
                     state.initialization = InitializationPhase::Faulted;
                 }
             }
-            if state.closing {
-                state.runtime.clone()
+            if state.closing || state.initialization == InitializationPhase::Failed {
+                Some((state.runtime.clone(), state.persistence.clone()))
             } else {
                 None
             }
         };
         let close_result = close_after_construction
             .as_ref()
-            .map(|runtime| runtime.request_close());
+            .map(|(runtime, persistence)| {
+                if let Some(runtime) = runtime {
+                    runtime.request_close()
+                } else {
+                    if let Some(persistence) = persistence {
+                        persistence.writer.request_close();
+                    }
+                    Ok(())
+                }
+            });
         drop(close_after_construction);
         let mut state = self.lock()?;
         if let Some(Err(error)) = close_result {
@@ -218,11 +255,12 @@ impl RuntimeSlot {
     /// Retain a core lease from locked `state`; callers run actual core methods after releasing metadata.
     /// 从已锁定 `state` 保留核心租借；调用方在释放元数据后运行实际核心方法。
     fn lease(self: &Arc<Self>, state: &mut RuntimeState) -> Option<RuntimeLease> {
-        state.runtime.as_ref().map(|runtime| {
+        (state.runtime.is_some() || state.persistence.is_some()).then(|| {
             state.active += 1;
             RuntimeLease {
                 slot: Arc::clone(self),
-                runtime: Some(Arc::clone(runtime)),
+                runtime: state.runtime.clone(),
+                persistence: state.persistence.clone(),
             }
         })
     }
@@ -236,12 +274,15 @@ impl RuntimeSlot {
         if admission && state.closing {
             return Err(closed());
         }
-        self.lease(&mut state).ok_or_else(|| {
-            EmbeddedError::new(
+        if state.runtime.is_none() {
+            return Err(EmbeddedError::new(
                 EmbeddedErrorCode::Busy,
                 "FFI runtime has no initialized core; query runtime_status",
-            )
-        })
+            ));
+        }
+        Ok(self
+            .lease(&mut state)
+            .expect("initialized slot creates one retained native lease"))
     }
 
     /// Permanently close this exact slot, including a future core still under construction.
@@ -250,10 +291,18 @@ impl RuntimeSlot {
         let lease = {
             let mut state = self.lock()?;
             state.closing = true;
-            self.lease(&mut state)
+            if state.initialization == InitializationPhase::Initializing {
+                None
+            } else {
+                self.lease(&mut state)
+            }
         };
         if let Some(lease) = lease {
-            lease.runtime().request_close()?;
+            if let Some(runtime) = &lease.runtime {
+                runtime.request_close()?;
+            } else if let Some(persistence) = &lease.persistence {
+                persistence.writer.request_close();
+            }
         }
         Ok(())
     }
@@ -275,16 +324,28 @@ impl RuntimeSlot {
                     ),
                 usage: None,
                 resources: None,
+                persistence: None,
                 error: state.error.clone(),
             };
             (snapshot, self.lease(&mut state))
         };
         if let Some(lease) = lease {
-            let runtime = lease.runtime();
-            snapshot.core_runtime_id = Some(runtime.id().into());
-            snapshot.usage = Some(runtime.usage()?);
-            snapshot.resources = Some(runtime.resources()?);
-            snapshot.closed = runtime.poll_closed()?;
+            if let Some(runtime) = &lease.runtime {
+                snapshot.core_runtime_id = Some(runtime.id().into());
+                snapshot.usage = Some(runtime.usage()?);
+                snapshot.resources = Some(runtime.resources()?);
+            }
+            if snapshot.closing
+                && matches!(
+                    snapshot.initialization,
+                    InitializationPhase::Ready | InitializationPhase::Failed
+                )
+            {
+                snapshot.closed = lease.poll_closed()?;
+            }
+            if let Some(persistence) = &lease.persistence {
+                snapshot.persistence = Some(persistence.writer.status()?);
+            }
         }
         Ok(snapshot)
     }
@@ -310,8 +371,13 @@ impl RuntimeSlot {
             {
                 return Err(busy());
             }
+            if let Some(persistence) = &state.persistence
+                && !persistence.poll_closed()?
+            {
+                return Err(busy());
+            }
             state.released = true;
-            state.runtime.take()
+            (state.runtime.take(), state.persistence.take())
         };
         drop(removed);
         Ok(())
@@ -319,6 +385,32 @@ impl RuntimeSlot {
 }
 
 impl RuntimeLease {
+    /// Observe actual core drainage before asking its independently owned storage worker to close.
+    /// 请求独立拥有的存储工作线程关闭前，观测核心实际排空。
+    /// Return false for remaining ownership; propagate failures rather than asserting safe library unload.
+    /// 尚有所有权时返回假；传播失败，不断言动态库可安全卸载。
+    fn poll_closed(&self) -> EmbeddedResult<bool> {
+        if let Some(runtime) = &self.runtime
+            && !runtime.poll_closed()?
+        {
+            return Ok(false);
+        }
+        match &self.persistence {
+            Some(persistence) => persistence.poll_closed(),
+            None => Ok(true),
+        }
+    }
+
+    /// Borrow explicitly configured storage for this initialized native lease or reject memory-only mode.
+    /// 借用此已初始化原生租借显式配置的存储，或拒绝纯内存模式。
+    pub(super) fn persistence(&self) -> EmbeddedResult<&PersistenceOwner> {
+        self.persistence.as_deref().ok_or_else(|| {
+            EmbeddedError::new(
+                EmbeddedErrorCode::Unsupported,
+                "runtime persistence is not configured",
+            )
+        })
+    }
     /// Borrow the actual core for this live lease; the private constructor always installs its owner.
     /// 为此活动租借借用实际核心；私有构造器始终安装其所有者。
     pub(super) fn runtime(&self) -> &EmbeddedRuntime {
@@ -333,6 +425,7 @@ impl Drop for RuntimeLease {
     /// 在允许槽释放前丢弃实际核心引用，即使外层正在栈展开。
     fn drop(&mut self) {
         drop(self.runtime.take());
+        drop(self.persistence.take());
         let mut state = self
             .slot
             .state

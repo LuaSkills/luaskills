@@ -12,8 +12,8 @@ pub const EMBEDDED_DESCRIPTION_VERSION: u32 = 1;
 /// Maximum descriptor bytes SDKs may copy before parsing untrusted native metadata.
 /// SDK 在解析不可信原生元数据前允许复制的描述字节上限。
 pub const EMBEDDED_DESCRIPTION_MAX_BYTES: usize = 16_384;
-/// Implemented semantic capabilities; future backends and durable recovery are deliberately absent.
-/// 已实现语义能力；未来后端及持久恢复明确不在其中。
+/// Implemented semantic capabilities; process-restart execution recovery and future backends remain absent.
+/// 已实现语义能力；进程重启执行恢复及未来后端仍不在其中。
 pub const EMBEDDED_CAPABILITIES: &[&str] = &[
     "bounded_transports_v1",
     "plugin_budgets_v1",
@@ -22,6 +22,8 @@ pub const EMBEDDED_CAPABILITIES: &[&str] = &[
     "fixed_sessions_v1",
     "host_request_queue_v1",
     "in_memory_effect_evidence_v1",
+    "durable_operation_history_v1",
+    "live_storage_recovery_v1",
     "strict_json_v1",
 ];
 
