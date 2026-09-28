@@ -4,6 +4,7 @@
 use super::*;
 
 mod intent;
+mod outcome;
 use crate::runtime::embedded::{OperationJournalWorker, OperationJournalWorkerConfig};
 
 /// One fixture observation deadline, independent from production storage or operation deadlines.

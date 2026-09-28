@@ -136,6 +136,9 @@ struct PendingCompletion {
 /// Short-lock scheduling metadata contains no Lua execution or native destructor work.
 /// 短时锁调度元数据不包含 Lua 执行或原生析构工作。
 struct SchedulerState {
+    /// Last supervised shared-checkpoint observation pauses dispatch while an active callback awaits repair.
+    /// 上次监督得到的共享检查点观测，在活动回调等待修复时暂停分发。
+    shared_checkpoint_failed: bool,
     /// One observable fault per unfinished operation, retained through an explicitly requested retry.
     /// 每个未完成操作的一项可观测故障，跨显式请求的重试保留。
     persistence_failures: BTreeMap<String, OperationPersistenceFailure>,
@@ -245,8 +248,8 @@ pub struct EmbeddedRuntime {
 impl EmbeddedRuntime {
     /// Build runtime phase persistence using exact host-owned `writer`; the host closes and joins that writer separately.
     /// 使用精确宿主自有 `writer` 构造运行时阶段持久化；宿主另行关闭并等待该写入者。
-    /// Host dispatch intents share this writer; immediate outcome checkpoints and cross-process recovery remain pending.
-    /// 宿主分发意图共享此写入者；即时结果检查点及跨进程恢复仍待接入。
+    /// Host dispatch and returned-effect evidence share this writer; cross-process reconciliation remains separate.
+    /// 宿主分发及已返回副作用证据共享此写入者；跨进程对账仍是独立边界。
     pub fn with_journal_worker(
         engine: Arc<LuaEngine>,
         config: EmbeddedRuntimeConfig,
@@ -307,6 +310,7 @@ impl EmbeddedRuntime {
                 cleaning: Vec::new(),
                 cleaning_count: 0,
                 persistence_failures: BTreeMap::new(),
+                shared_checkpoint_failed: false,
             }),
             changed: Condvar::new(),
         });

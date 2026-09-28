@@ -3,9 +3,12 @@
 
 use super::*;
 use crate::runtime::embedded::{
-    JournalWritePhase, JournalWriteReceipt, JournalWriteSnapshot, OperationJournalWorker,
+    CheckpointRetryState, JournalWritePhase, JournalWriteReceipt, JournalWriteSnapshot,
+    OperationJournalWorker, OperationPersistenceFailure,
 };
 use std::sync::TryLockError;
+
+mod outcome;
 
 /// Host-selected storage strategy; direct and queued persistence are explicit constructor choices.
 /// 宿主选择的存储策略；直接持久化和队列持久化由构造入口显式区分。
@@ -114,9 +117,15 @@ enum Attempt {
 /// Immutable phase/result/intent candidate plus its unique disk attempt; polling cannot replace the candidate.
 /// 不可变阶段、结果或意图候选及其唯一磁盘尝试；轮询不能替换候选。
 pub(super) struct PendingCheckpoint {
-    /// Present only for execution intent; acknowledging it must not publish a fictitious handler lifecycle.
-    /// 仅执行意图存在此值；确认它不能发布虚构的处理器生命周期。
-    effect_start: Option<String>,
+    /// Host checkpoints retain an exact purpose; acknowledgement cannot publish a fictitious handler lifecycle.
+    /// 宿主检查点保留精确用途；确认不能发布虚构的处理器生命周期。
+    effect: Option<CheckpointEffect>,
+    /// Last failed attempt stays observable throughout its explicitly requested retry.
+    /// 上次失败尝试在显式请求的重试全程保持可观测。
+    failure: Option<EmbeddedError>,
+    /// Retry requests belong to this exact immutable candidate, not a mutable operation-wide flag.
+    /// 重试请求属于此精确不可变候选，不属于可变的操作级标记。
+    retry: CheckpointRetryState,
     /// The exact owned snapshot submitted to storage, never reconstructed from newer observations.
     /// 提交到存储的精确自有快照，绝不从较新观测重新构造。
     snapshot: Arc<OperationSnapshot>,
@@ -125,12 +134,25 @@ pub(super) struct PendingCheckpoint {
     attempt: Attempt,
 }
 
+/// Distinguish pre-execution permission from a returned handler's trusted outcome evidence.
+/// 区分执行前许可与已返回处理器的可信结果证据。
+enum CheckpointEffect {
+    /// The exact effect may execute only after this intent is acknowledged.
+    /// 此意图确认后，精确副作用才可执行。
+    Start(String),
+    /// The exact effect's result and admission remain owned until confirmation is acknowledged.
+    /// 在确认得到回执前，精确副作用的结果及入场许可继续被拥有。
+    Outcome(String),
+}
+
 impl PendingCheckpoint {
     /// Retain immutable `snapshot` before the first bounded queue admission.
     /// 在首次有界队列入场前保留不可变 `snapshot`。
     fn new(snapshot: Arc<OperationSnapshot>) -> Self {
         Self {
-            effect_start: None,
+            effect: None,
+            failure: None,
+            retry: CheckpointRetryState::Waiting,
             snapshot,
             attempt: Attempt::New,
         }
@@ -141,6 +163,34 @@ impl PendingCheckpoint {
     /// `retry` permits one new attempt after a known failure; normal polling never resubmits.
     /// `retry` 允许已知失败后新尝试一次；普通轮询绝不重新提交。
     fn drive(
+        &mut self,
+        history: &OperationHistory,
+        wait: bool,
+        retry: bool,
+    ) -> EmbeddedResult<bool> {
+        // Consume explicit requests only for this already retained candidate.
+        // 仅为此已保留候选消耗显式请求。
+        let retry = retry || self.retry == CheckpointRetryState::Requested;
+        if retry {
+            self.retry = CheckpointRetryState::Retrying;
+        }
+        // Preserve failure identity while waiting for the retry's original receipt.
+        // 等待重试的原始回执期间保留故障身份。
+        let result = self.drive_attempt(history, wait, retry);
+        match &result {
+            Ok(true) => self.failure = None,
+            Ok(false) => {}
+            Err(error) => {
+                self.failure = Some(error.clone());
+                self.retry = CheckpointRetryState::Waiting;
+            }
+        }
+        result
+    }
+
+    /// Submit or observe one retained attempt; `retry` never replaces its immutable snapshot.
+    /// 提交或观测一次保留尝试；`retry` 绝不替换其不可变快照。
+    fn drive_attempt(
         &mut self,
         history: &OperationHistory,
         wait: bool,
@@ -242,7 +292,7 @@ impl Operation {
         if let Some(checkpoint) = transition.as_mut() {
             // A retained phase belongs to its owner; a callback must not publish that owner's transition.
             // 保留阶段属于其所有者；回调不能发布该所有者的变更。
-            if checkpoint.effect_start.is_none() {
+            if !matches!(checkpoint.effect, Some(CheckpointEffect::Start(_))) {
                 return if wait {
                     Err(EmbeddedError::new(
                         EmbeddedErrorCode::Busy,
@@ -254,7 +304,8 @@ impl Operation {
             }
             // Drain an earlier intent even if its requester was cancelled; never retry a known failure here.
             // 即使原请求方已取消也排空较早意图；此处绝不重试已知失败。
-            let same_effect = checkpoint.effect_start.as_deref() == Some(effect_id);
+            let same_effect =
+                matches!(&checkpoint.effect, Some(CheckpointEffect::Start(id)) if id == effect_id);
             if !checkpoint.drive(history, wait, false)? {
                 return Ok(false);
             }
@@ -295,7 +346,7 @@ impl Operation {
         // Keep the original candidate across queue rejection, cancellation and explicit owner recovery.
         // 跨队列拒绝、取消及显式所有者恢复保留原始候选。
         let mut checkpoint = PendingCheckpoint::new(Arc::new(snapshot));
-        checkpoint.effect_start = Some(effect_id.to_owned());
+        checkpoint.effect = Some(CheckpointEffect::Start(effect_id.to_owned()));
         *transition = Some(checkpoint);
         if !transition
             .as_mut()
@@ -326,6 +377,16 @@ impl OperationOwner {
                 ),
                 TryLockError::Poisoned(_) => poisoned(),
             })?;
+        // A returned handler still owns confirmation and its actual admission; cleanup cannot consume it.
+        // 已返回处理器仍拥有确认及真实入场许可；清理不能消费它。
+        if transition.as_ref().is_some_and(|checkpoint| {
+            matches!(checkpoint.effect, Some(CheckpointEffect::Outcome(_)))
+        }) {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::Busy,
+                "host outcome confirmation is still owned",
+            ));
+        }
         Ok(transition
             .as_ref()
             .map(|checkpoint| checkpoint.snapshot.phase))
@@ -509,7 +570,13 @@ impl OperationOwner {
         }
         // Intent persistence authorizes a separate live dispatch; recovery alone never dispatches a handler.
         // 意图持久化授权另行执行实时分发；恢复本身绝不分发处理器。
-        if checkpoint.effect_start.is_none() {
+        if matches!(checkpoint.effect, Some(CheckpointEffect::Outcome(_))) {
+            // Explicit low-level recovery acknowledges storage, leaving publication to the actual handler owner.
+            // 显式低层恢复确认存储，将发布留给真实处理器所有者。
+            self.operation.changed.notify_all();
+            return Ok(true);
+        }
+        if checkpoint.effect.is_none() {
             *self.operation.lock()? = checkpoint.snapshot.as_ref().clone();
         }
         transition.take();

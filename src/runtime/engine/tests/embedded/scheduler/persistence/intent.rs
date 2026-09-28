@@ -84,10 +84,10 @@ fn embedded_effect_intent_lua_initialization_and_call_are_durable() {
     );
     assert_eq!(completed.value, Some(json!(7)));
     assert_eq!(count.load(Ordering::SeqCst), 2);
-    // Two stage starts, two intent writes, cleaning and terminal publication produce six exact revisions.
-    // 两次阶段开始、两次意图写入、清理及终态发布产生六次精确修订。
+    // Two stage starts, two intent/outcome pairs, cleaning and terminal publication produce eight exact revisions.
+    // 两次阶段开始、两对意图与结果、清理及终态发布产生八次精确修订。
     let stored = journal.get(runtime.id(), operation.id()).unwrap().unwrap();
-    assert_eq!(stored.revision, 6);
+    assert_eq!(stored.revision, 8);
     assert_eq!(stored.snapshot.host_effects.len(), 2);
     assert!(
         stored
@@ -208,8 +208,11 @@ fn embedded_effect_intent_lua_failure_recovers_storage_without_execution() {
         // 若预期保留故障始终未出现，报告真实操作及写入者证据。
         let deadline = Instant::now() + OBSERVE;
         loop {
-            if let Some(failed) = runtime.persistence_failure(operation.id()).unwrap() {
-                break failed;
+            match runtime.persistence_failure(operation.id()) {
+                Ok(Some(failed)) => break failed,
+                Ok(None) => {}
+                Err(error) if error.code == EmbeddedErrorCode::Busy => {}
+                Err(error) => panic!("unexpected checkpoint observation error: {error:?}"),
             }
             assert!(
                 Instant::now() < deadline,

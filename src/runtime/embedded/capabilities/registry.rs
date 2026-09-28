@@ -1006,6 +1006,9 @@ impl CapabilitySnapshot {
         // 取消或无效输出必须保留真实提交证据。
         effect.observe(outcome.effects);
         let mut outcome = entry.validate_outcome(outcome);
+        // Retain the bounded original result and actual admission through disk failure and explicit recovery.
+        // 跨磁盘失败及显式恢复保留有界原始结果和真实入场许可。
+        effect.confirm_native_outcome()?;
         if let Err(error) = invocation.authorize() {
             outcome.result = Err(error);
         }

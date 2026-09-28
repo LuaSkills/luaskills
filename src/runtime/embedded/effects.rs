@@ -218,6 +218,55 @@ pub(crate) struct EffectAttempt {
 }
 
 impl EffectAttempt {
+    /// Poll returned handler evidence without waiting, preserving the caller's result and permit until true.
+    /// 不等待地轮询已返回处理器证据，在返回真前保留调用方结果及许可。
+    pub(crate) fn poll_outcome(&self) -> EmbeddedResult<bool> {
+        // Explicit memory-only and untracked ledgers have no storage acknowledgement requirement.
+        // 显式纯内存及未跟踪账本没有存储确认要求。
+        let Some((ledger, _, effect_id)) = &self.owner else {
+            return Ok(true);
+        };
+        let Some(operation) = &ledger.operation else {
+            return Ok(true);
+        };
+        // Keep the exact persistent operation alive for this observation without retaining a strong cycle.
+        // 为本次观测保持精确持久操作存活，不保留强引用循环。
+        let operation = operation.upgrade().ok_or_else(|| {
+            EmbeddedError::new(
+                EmbeddedErrorCode::Closed,
+                "persistent operation owner was released",
+            )
+        })?;
+        operation.poll_effect_outcome(effect_id)
+    }
+
+    /// Keep the native result and permit on the caller's stack until exact outcome evidence reaches durable storage.
+    /// 在精确结果证据到达持久存储前，将原生结果及许可保留在调用方栈中。
+    /// Storage failures require explicit operation recovery; cancellation never discards already returned evidence.
+    /// 存储失败要求显式操作恢复；取消绝不丢弃已返回证据。
+    pub(crate) fn confirm_native_outcome(&self) -> EmbeddedResult<()> {
+        // Untracked and memory-only calls need no disk confirmation.
+        // 未跟踪及纯内存调用不需要磁盘确认。
+        let Some((ledger, _, effect_id)) = &self.owner else {
+            return Ok(());
+        };
+        let Some(operation) = &ledger.operation else {
+            return Ok(());
+        };
+        // A strong reference keeps the exact operation alive during native result retention.
+        // 强引用在原生结果保留期间使精确操作保持存活。
+        let operation = operation.upgrade().ok_or_else(|| {
+            EmbeddedError::new(
+                EmbeddedErrorCode::Closed,
+                "persistent operation owner was released",
+            )
+        })?;
+        while !operation.poll_effect_outcome(effect_id)? {
+            operation.wait_checkpoint_change()?;
+        }
+        Ok(())
+    }
+
     /// Persist this attempt's original dispatch intent; `wait` is allowed only on a native execution thread.
     /// 持久化此尝试的原始分发意图；仅原生执行线程允许设置 `wait`。
     /// Return false for an in-flight write without changing actual handler ownership or running user code.

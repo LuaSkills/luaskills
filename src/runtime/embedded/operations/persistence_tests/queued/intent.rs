@@ -84,7 +84,7 @@ fn embedded_effect_intent_direct_backend_rejects_both_transports() {
 
 /// Register one mutating capability with exact `runtime_id`, `execution` and optional native implementation.
 /// 按精确 `runtime_id`、`execution` 及可选原生实现注册一项可变更能力。
-fn capabilities(
+pub(super) fn capabilities(
     runtime_id: &str,
     execution: CapabilityExecution,
     native: Option<NativeCapability>,
@@ -135,7 +135,7 @@ fn identity(registry: &OperationRegistry, operation: &OperationHandle) -> Capabi
 
 /// Submit a queued call using the original owner control and exact admitted identity.
 /// 使用原始所有者控制及精确入场身份提交队列调用。
-fn queued_call(
+pub(super) fn queued_call(
     capabilities: &CapabilityRegistry,
     registry: &OperationRegistry,
     operation: &OperationHandle,
@@ -242,13 +242,33 @@ fn embedded_effect_intent_native_precedes_execution() {
         );
     }
     assert_eq!(count.load(Ordering::SeqCst), 2);
+    // Returned native evidence is durable before any later phase or terminal snapshot can mask a missing confirmation.
+    // 在任何后续阶段或终态快照能够掩盖缺失确认前，已返回原生证据就已持久化。
+    let confirmed = journal
+        .get(&registry.runtime_id, operation.id())
+        .unwrap()
+        .unwrap();
+    assert!(
+        confirmed
+            .snapshot
+            .host_effects
+            .iter()
+            .all(|record| record.effects == EffectState::Committed)
+    );
+    assert!(
+        confirmed
+            .snapshot
+            .host_effects
+            .iter()
+            .any(|record| record.phase == HostEffectPhase::Running)
+    );
     assert_eq!(
         journal
             .get(&registry.runtime_id, operation.id())
             .unwrap()
             .unwrap()
             .revision,
-        3
+        5
     );
     owner.advance(OperationPhase::Cleaning).unwrap();
     owner
@@ -260,7 +280,7 @@ fn embedded_effect_intent_native_precedes_execution() {
         .get(&registry.runtime_id, operation.id())
         .unwrap()
         .unwrap();
-    assert_eq!(stored.revision, 5);
+    assert_eq!(stored.revision, 7);
     assert_eq!(stored.snapshot.host_effects.len(), 2);
     assert!(
         stored

@@ -4,6 +4,7 @@
 use super::*;
 
 mod intent;
+mod outcome;
 
 /// One bounded fixture observation budget; production storage has its own ownership lifecycle.
 /// 单一有界夹具观测预算；生产存储具有自己的所有权生命周期。
@@ -81,19 +82,21 @@ fn until(mut condition: impl FnMut() -> bool, reason: &str) {
 /// Wait for the scheduler to retain a real checkpoint fault for exact `operation`.
 /// 等待调度器为精确 `operation` 保留真实检查点故障。
 fn failure(runtime: &EmbeddedRuntime, operation: &OperationHandle) -> OperationPersistenceFailure {
+    // Keep the exact successful observation; a second query could race a currently owned checkpoint gate.
+    // 保留精确成功观测；第二次查询可能与当前被拥有的检查点门禁竞争。
+    let mut observed = None;
     until(
-        || {
-            runtime
-                .persistence_failure(operation.id())
-                .unwrap()
-                .is_some()
+        || match runtime.persistence_failure(operation.id()) {
+            Ok(failure) => {
+                observed = failure;
+                observed.is_some()
+            }
+            Err(error) if error.code == EmbeddedErrorCode::Busy => false,
+            Err(error) => panic!("unexpected checkpoint observation error: {error:?}"),
         },
         "scheduler never retained the expected checkpoint failure",
     );
-    runtime
-        .persistence_failure(operation.id())
-        .unwrap()
-        .unwrap()
+    observed.expect("successful fault observation was retained")
 }
 
 /// Close actual scheduler ownership first, then separately close its host-owned disk writer.

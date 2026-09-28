@@ -237,6 +237,7 @@ pub(super) fn execute(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
                     return Ok(());
                 }
                 if state.persistence_failures.is_empty()
+                    && !state.shared_checkpoint_failed
                     && let Some(dispatch) = select(&mut state)?
                 {
                     break dispatch;
@@ -553,6 +554,8 @@ fn complete(
 /// 在全部执行器可能阻塞于宿主回调时监督取消与完成。
 pub(super) fn supervise(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
     loop {
+        center.capabilities.host_requests().maintain_completions()?;
+        center.observe_shared_checkpoint_failures()?;
         sessions::maintain(center)?;
         // Metadata snapshots avoid running pool maintenance under the scheduler lock.
         // 元数据快照避免在调度锁下运行池维护。

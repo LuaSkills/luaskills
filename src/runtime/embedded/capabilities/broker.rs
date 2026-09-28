@@ -10,6 +10,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 
+mod completion;
+
 /// SDK request copied from an admitted, authenticated invocation.
 /// 从已入场、已认证调用复制的 SDK 请求。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +84,9 @@ pub struct HostRequestStatus {
 /// All mutable request metadata belongs to the broker's single short lock.
 /// 全部可变请求元数据归属于代理的单个短时锁。
 struct RequestRecord {
+    /// Original bounded SDK outcome retained while actual admission waits for durable confirmation.
+    /// 真实入场等待持久确认期间保留的原始有界 SDK 结果。
+    pending_outcome: Option<CapabilityOutcome>,
     /// Exact request delivered at most once.
     /// 最多投递一次的精确请求。
     request: HostRequest,
@@ -214,6 +219,7 @@ impl HostRequestBroker {
             state.records.insert(
                 id.clone(),
                 RequestRecord {
+                    pending_outcome: None,
                     request,
                     prepared: Some(prepared),
                     outcome: None,
@@ -236,6 +242,7 @@ impl HostRequestBroker {
         if limit == 0 || limit > self.max_records {
             return Err(EmbeddedError::invalid("invalid host request batch size"));
         }
+        self.maintain_completions()?;
         // Return already-delivered requests even if a later attempt encounters an error.
         // 即使后续尝试遇到错误，也返回已投递请求。
         let mut requests = Vec::new();
@@ -269,6 +276,7 @@ impl HostRequestBroker {
             ));
         }
         let mut output = Vec::new();
+        self.maintain_completions()?;
         output.try_reserve_exact(2).map_err(|_| capacity())?;
         output.push(b'[');
         let mut count = 0;
@@ -388,8 +396,12 @@ impl HostRequestBroker {
 
     /// Complete the exact delivered `id` once with actual `outcome`, preserving committed effects.
     /// 使用真实 `outcome` 单次完成精确已投递 `id`，保留已提交副作用。
+    /// Success transfers the bounded original result to the broker; durable confirmation may still be Completing.
+    /// 成功将有界原始结果转交代理；持久确认仍可能处于完成中。
     pub fn complete(&self, id: &str, outcome: CapabilityOutcome) -> EmbeddedResult<()> {
         self.refresh(id)?;
+        // Transfer actual completion ownership exactly once; later attempts cannot replace the captured result.
+        // 精确转移完成所有权一次；后续尝试不能替换捕获结果。
         let prepared = {
             let mut state = self.state.lock().map_err(|_| poisoned())?;
             if !state.records.contains_key(id) {
@@ -412,12 +424,21 @@ impl HostRequestBroker {
             record.prepared.take().ok_or_else(poisoned)?
         };
         prepared.effect.observe(outcome.effects);
+        // Apply the original registration's output bounds before retaining any result through disk waiting.
+        // 在跨磁盘等待保留任何结果前应用原始注册的输出上限。
         let mut outcome = prepared.entry.validate_outcome(outcome);
         if let Err(error) = prepared.invocation.authorize() {
             outcome.result = Err(error);
         }
-        drop(prepared);
-        self.publish(id, outcome)
+        {
+            let mut state = self.state.lock().map_err(|_| poisoned())?;
+            let record = state.records.get_mut(id).ok_or_else(poisoned)?;
+            record.prepared = Some(prepared);
+            record.pending_outcome = Some(outcome);
+        }
+        // Success accepts the exact original result; durable mode can remain Completing until storage acknowledges.
+        // 成功接纳精确原始结果；持久模式可在存储确认前保持完成中。
+        self.drive_completion(id)
     }
 
     /// Stop admission and request cooperative cancellation; dispatched handlers retain capacity.
@@ -474,6 +495,7 @@ impl HostRequestBroker {
     /// Return whether all retained requests and their result owners have drained.
     /// 返回全部保留请求及其结果所有者是否已排空。
     pub fn is_drained(&self) -> EmbeddedResult<bool> {
+        self.maintain_completions()?;
         Ok(self
             .state
             .lock()
@@ -485,6 +507,7 @@ impl HostRequestBroker {
     /// Refresh a pending request without treating cancellation as handler completion.
     /// 刷新待处理请求，不将取消视作处理器完成。
     fn refresh(&self, id: &str) -> EmbeddedResult<()> {
+        self.drive_completion(id)?;
         let error = {
             let state = self.state.lock().map_err(|_| poisoned())?;
             let record = state.records.get(id).ok_or_else(|| unknown(&state, id))?;
