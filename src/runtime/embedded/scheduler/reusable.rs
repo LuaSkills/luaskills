@@ -131,15 +131,19 @@ pub(super) fn prepare(
 /// The supervisor later transfers marked ownership into actual retirement outside metadata locks.
 /// 监督器随后在元数据锁外将已标记所有权转入真实退役。
 fn expire(state: &mut SchedulerState, pool_id: &str) {
-    let policy = state
-        .pools
-        .get(pool_id)
-        .expect("reusable pool retained")
-        .pool
-        .policy();
+    // Expiration obeys both the immutable module floor and its aggregate capacity floor.
+    // 过期同时遵守不可变模块下限及所属聚合容量下限。
+    let pool = state.pools.get(pool_id).expect("reusable pool retained");
+    // The immutable module policy owns the expiration interval and any independent floor.
+    // 不可变模块策略拥有过期间隔及任何独立下限。
+    let policy = pool.pool.policy();
+    // An absent TTL explicitly disables age-based expiration.
+    // 缺省 TTL 显式禁用按年龄过期。
     let Some(ttl) = policy.idle_ttl_ms.map(Duration::from_millis) else {
         return;
     };
+    // Only reusable instances with physical ownership can satisfy the retained idle floor.
+    // 仅持有物理所有权的可复用实例能满足保留空闲下限。
     let idle = state
         .reusable_instances
         .values()
@@ -150,7 +154,19 @@ fn expire(state: &mut SchedulerState, pool_id: &str) {
                 && instance.lease.is_some()
         })
         .count();
+    // The capacity floor may further narrow this module's eligible surplus.
+    // 容量下限可进一步缩小此模块符合条件的余量。
     let mut removable = idle.saturating_sub(policy.min_resident_vms);
+    if let Some(id) = &pool.capacity_id {
+        // Already closing members no longer protect another member from expiration.
+        // 已关闭中的成员不再保护另一成员免于过期。
+        let capacity = state.capacities.get(id).expect("member retains capacity");
+        removable = removable.min(
+            state
+                .capacity_idle(id)
+                .saturating_sub(capacity.config.resources.min_resident_vms),
+        );
+    }
     for instance in state
         .reusable_instances
         .values_mut()
@@ -168,15 +184,46 @@ fn expire(state: &mut SchedulerState, pool_id: &str) {
     }
 }
 
-/// Request one eligible idle eviction for global pressure or the explicitly constrained plugin.
-/// 为全局容量压力或明确受限插件请求一次符合条件的空闲驱逐。
-/// Return whether ownership was marked; actual capacity remains charged until the retirement receipt completes.
-/// 返回是否已标记所有权；实际容量持续记账到退役回执完成。
-pub(super) fn reclaim(state: &mut SchedulerState, plugin_id: Option<&str>) -> bool {
+/// Request one eligible idle eviction for request_pool_id within its limiting plugin or capacity.
+/// 针对 request_pool_id，在受限插件或容量内请求一次符合条件的空闲驱逐。
+/// Return whether ownership was marked or an accounting failure; physical usage remains until retirement.
+/// 返回是否已标记所有权或记账故障；物理用量保持至退役。
+pub(super) fn reclaim(state: &mut SchedulerState, request_pool_id: &str) -> EmbeddedResult<bool> {
+    // Choose victims from the exact limiting ownership domain; never destroy unrelated guarantees.
+    // 从精确受限归属域选择回收对象；绝不破坏无关保证。
+    let requester = state.pools.get(request_pool_id).ok_or_else(not_found)?;
+    // Plugin pressure cannot be relieved by evicting another plugin's cache.
+    // 驱逐另一插件缓存不能解除插件压力。
+    let plugin_id = requester.plugin_id.clone();
+    // Preserve the exact optional capacity while iterating possible victim modules.
+    // 遍历候选回收模块时保留精确可选容量。
+    let capacity_id = requester.capacity_id.clone();
+    // Unused guarantees of other ownership domains remain non-lendable.
+    // 其他归属域未使用的保证仍不可借用。
+    let plugin_limited = !state.plugin_allows_allocation(request_pool_id)?;
+    // A full capacity needs a victim from its own physical member set.
+    // 已满容量需要从自身物理成员集合选择回收对象。
+    let capacity_limited = match &capacity_id {
+        None => false,
+        Some(id) => {
+            state.capacity_resident(id)?
+                >= state
+                    .capacities
+                    .get(id)
+                    .expect("member retains capacity")
+                    .config
+                    .resources
+                    .max_resident_vms
+        }
+    };
     for (pool_id, pool) in &state.pools {
-        if plugin_id.is_some_and(|plugin| pool.plugin_id != plugin) {
+        if (plugin_limited && pool.plugin_id != plugin_id)
+            || (capacity_limited && pool.capacity_id != capacity_id)
+        {
             continue;
         }
+        // Independent module floors remain authoritative; grouped members declare a zero module floor.
+        // 独立模块下限保持权威；分组成员声明零模块下限。
         let idle = state
             .reusable_instances
             .values()
@@ -190,6 +237,16 @@ pub(super) fn reclaim(state: &mut SchedulerState, plugin_id: Option<&str>) -> bo
         if idle <= pool.pool.policy().min_resident_vms {
             continue;
         }
+        if let Some(id) = &pool.capacity_id
+            && Some(id) != capacity_id.as_ref()
+        {
+            // Same-capacity replacement transfers its reservation; another capacity must keep its floor.
+            // 同容量替换转移其预留；另一容量必须保留下限。
+            let capacity = state.capacities.get(id).expect("member retains capacity");
+            if state.capacity_idle(id) <= capacity.config.resources.min_resident_vms {
+                continue;
+            }
+        }
         if let Some(instance) = state.reusable_instances.values_mut().find(|instance| {
             instance.pool_id == *pool_id
                 && !instance.closing
@@ -197,10 +254,10 @@ pub(super) fn reclaim(state: &mut SchedulerState, plugin_id: Option<&str>) -> bo
                 && instance.lease.is_some()
         }) {
             instance.closing = true;
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 /// Drain closed and expired idle ownership while preserving real VM retirement evidence.

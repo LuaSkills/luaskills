@@ -27,6 +27,7 @@ pub(super) fn schedule(
         .expect("reusable plugin retained");
     if pool.active >= pool.pool.policy().max_running_calls
         || state.plugin_active(&plugin_id) >= plugin.config.max_running_calls
+        || !state.capacity_allows_execution(&instance.pool_id)?
     {
         return Ok(false);
     }

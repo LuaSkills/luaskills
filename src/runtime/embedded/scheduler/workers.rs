@@ -93,6 +93,7 @@ fn select(
             if pool.closed
                 || call.control.check().is_err()
                 || pool.active >= pool.pool.policy().max_running_calls
+                || !state.capacity_allows_execution(call.request.pool_id())?
             {
                 continue;
             }
@@ -135,8 +136,7 @@ fn select(
                     if !reclaimed {
                         // Formal reusable caches have one owner; pressure never retires the low-level cache behind it.
                         // 正式可复用缓存只有一个所有者；容量压力绝不绕过它退役底层缓存。
-                        reclaimed =
-                            reusable::reclaim(state, (!allow_new).then_some(plugin.as_str()));
+                        reclaimed = reusable::reclaim(state, &pool_id)?;
                     }
                     continue;
                 }

@@ -11,6 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+mod capacities;
 mod finalization;
 mod persistence;
 mod plugins;
@@ -19,6 +20,8 @@ mod reusable_finalization;
 mod sessions;
 mod sessions_finalization;
 mod workers;
+use capacities::ScheduledCapacity;
+pub use capacities::{EmbeddedCapacityConfig, EmbeddedCapacitySnapshot};
 use finalization::PendingFinalization;
 
 pub use persistence::{CheckpointRetryState, OperationPersistenceFailure};
@@ -82,6 +85,9 @@ struct ScheduledPool {
     /// Trusted plugin key used for fair round-robin admission.
     /// 公平轮转入场使用的可信插件键。
     plugin_id: String,
+    /// Optional exact capacity identity; absence explicitly preserves independent pool ownership.
+    /// 可选精确容量身份；缺省明确保留独立池归属。
+    capacity_id: Option<String>,
     /// Accepted queued requests for this exact domain.
     /// 此精确域已接纳的排队请求。
     queued: usize,
@@ -178,6 +184,9 @@ struct SchedulerState {
     /// Immutable plugin-wide admission authority spans all of its pool generations.
     /// 不可变插件级入场权威覆盖其全部池代次。
     plugins: BTreeMap<String, ScheduledPlugin>,
+    /// Plugin-owned guarantees survive individual pool generations and retain immutable limits.
+    /// 插件自有保证跨单个池代次存活，并保留不可变限制。
+    capacities: BTreeMap<String, ScheduledCapacity>,
     /// Retained operation ownership survives pool removal and is released only by explicit forgetting.
     /// 保留操作归属在池移除后仍存在，仅通过显式遗忘释放。
     operation_plugins: BTreeMap<String, String>,
@@ -320,6 +329,7 @@ impl EmbeddedRuntime {
                 sequence: 0,
                 pools: BTreeMap::new(),
                 plugins: BTreeMap::new(),
+                capacities: BTreeMap::new(),
                 operation_plugins: BTreeMap::new(),
                 sessions: BTreeMap::new(),
                 queues: BTreeMap::new(),
@@ -412,7 +422,7 @@ impl EmbeddedRuntime {
         permissions: Arc<CapabilityPermissions>,
         revision: String,
     ) -> EmbeddedResult<String> {
-        self.register_pool_internal(definition, policy, permissions, revision, None)
+        self.register_pool_internal(definition, policy, permissions, revision, None, None)
     }
 
     /// Registers the exact module/policy/permission revision while retaining native host `owner` resources.
@@ -427,7 +437,7 @@ impl EmbeddedRuntime {
         revision: String,
         owner: ModuleResourceOwner,
     ) -> EmbeddedResult<String> {
-        self.register_pool_internal(definition, policy, permissions, revision, Some(owner))
+        self.register_pool_internal(definition, policy, permissions, revision, Some(owner), None)
     }
 
     /// Publishes one validated pool with an optional Rust-only generation owner.
@@ -441,6 +451,7 @@ impl EmbeddedRuntime {
         permissions: Arc<CapabilityPermissions>,
         revision: String,
         owner: Option<ModuleResourceOwner>,
+        capacity_id: Option<&str>,
     ) -> EmbeddedResult<String> {
         policy.validate(self.center.pools.config())?;
         if let Some(finalizer) = &definition.finalizer {
@@ -466,6 +477,9 @@ impl EmbeddedRuntime {
         if state.closing {
             return Err(closed());
         }
+        if let Some(id) = capacity_id {
+            state.validate_capacity_member(id, &definition.plugin_id, &policy)?;
+        }
         state.validate_plugin_pool(&definition.plugin_id, &policy)?;
         if state.pools.len() >= self.center.pools.config().max_registered_pools {
             return Err(EmbeddedError::new(
@@ -487,8 +501,17 @@ impl EmbeddedRuntime {
         let plugin_id = definition.plugin_id.clone();
         // Every allocation and resident inherits the same owning registration.
         // 每个分配及常驻实例继承同一个拥有资源的注册。
-        let pool = self.center.pools.create_pool_internal(
-            id.clone(),
+        let placement = match capacity_id {
+            Some(capacity_id) => ModulePoolPlacement::Capacity {
+                group: id.clone(),
+                capacity_id: capacity_id.to_owned(),
+            },
+            None => ModulePoolPlacement::Independent { group: id.clone() },
+        };
+        // The real pool retains its capacity membership through physical teardown.
+        // 真实池跨物理清理保留容量成员关系。
+        let pool = self.center.pools.create_pool_with_placement(
+            placement,
             definition,
             policy,
             Some(binding),
@@ -501,6 +524,7 @@ impl EmbeddedRuntime {
                 inputs,
                 pool,
                 plugin_id,
+                capacity_id: capacity_id.map(str::to_owned),
                 queued: 0,
                 active: 0,
                 closed: false,

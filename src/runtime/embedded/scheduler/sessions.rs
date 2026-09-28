@@ -524,6 +524,7 @@ impl SchedulerCenter {
         }
         // Freeze this pool's authority before publishing the operation or its shared control identity.
         // 发布操作或其共享控制身份前，冻结此池的权威。
+        state.validate_capacity_queue(request.pool_id(), bytes)?;
         let (handle, owner) = self.operations.admit_module(
             Arc::clone(&control),
             &pool.pool,

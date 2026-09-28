@@ -2,6 +2,9 @@
 /// 数字后缀绝不复用的不透明核心身份的唯一权威。
 #[derive(Clone, Copy)]
 pub(crate) enum IdentityKind {
+    /// Plugin-owned capacity shared by isolated module generations.
+    /// 隔离模块代次共享的插件自有容量。
+    Capacity,
     /// Registered immutable pool domain.
     /// 已注册不可变池域。
     Pool,
@@ -21,6 +24,7 @@ impl IdentityKind {
     /// 渲染精确 `runtime_id` 与已检查 `sequence`；消费者不得解析所得不透明字符串。
     pub(crate) fn render(self, runtime_id: &str, sequence: u64) -> String {
         let kind = match self {
+            Self::Capacity => "capacity",
             Self::Pool => "pool",
             Self::Session => "session",
             Self::Operation => "op",

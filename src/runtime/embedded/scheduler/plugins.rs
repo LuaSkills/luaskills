@@ -116,13 +116,12 @@ impl EmbeddedRuntime {
         let state = self.center.lock()?;
         let plugin = state.plugins.get(plugin_id).ok_or_else(plugin_not_found)?;
         let mut resources = PoolUsage::default();
-        let mut committed = 0usize;
         for pool in state
             .pools
             .values()
             .filter(|pool| pool.plugin_id == plugin_id)
         {
-            let (current, guarantee) = pool.pool.accounting()?;
+            let current = pool.pool.usage()?;
             for (total, value) in [
                 (&mut resources.resident, current.resident),
                 (&mut resources.creating, current.creating),
@@ -134,15 +133,12 @@ impl EmbeddedRuntime {
                     .checked_add(value)
                     .ok_or_else(|| internal("plugin resource count overflow"))?;
             }
-            committed = committed
-                .checked_add(guarantee)
-                .ok_or_else(|| internal("plugin commitment overflow"))?;
         }
         Ok(EmbeddedPluginSnapshot {
             plugin_id: plugin_id.to_owned(),
             config: plugin.config.clone(),
             resources,
-            committed_resident_vms: committed,
+            committed_resident_vms: state.plugin_commitment(plugin_id, None)?,
             active_operations: state.plugin_active(plugin_id),
             queued_calls: plugin.queued,
             queued_bytes: plugin.bytes,
@@ -195,8 +191,8 @@ impl EmbeddedRuntime {
         }
     }
 
-    /// Forget closed `plugin_id` only after all pools, sessions and retained operations were removed.
-    /// 仅在全部池、会话和保留操作移除后遗忘已关闭的 `plugin_id`。
+    /// Forget closed `plugin_id` only after capacities, pools, sessions and retained operations were removed.
+    /// 仅在容量、池、会话和保留操作移除后遗忘已关闭的 `plugin_id`。
     /// Return busy while any authoritative ownership or result metadata remains.
     /// 任何权威所有权或结果元数据仍存在时返回忙碌。
     pub fn forget_plugin(&self, plugin_id: &str) -> EmbeddedResult<()> {
@@ -206,6 +202,10 @@ impl EmbeddedRuntime {
             || plugin.operations != 0
             || plugin.reserved_operations != 0
             || state.pools.values().any(|pool| pool.plugin_id == plugin_id)
+            || state
+                .capacities
+                .values()
+                .any(|capacity| capacity.plugin_id == plugin_id)
         {
             return Err(EmbeddedError::new(
                 EmbeddedErrorCode::Busy,
@@ -247,24 +247,58 @@ impl SchedulerState {
     /// 计算保守常驻承诺；可选允许 `requesting_pool` 消费自身保证。
     /// Actual retirement may reduce counts while observed, but allocation is serialized by this scheduler lock.
     /// 实际退役可能在观测期间降低计数，但新分配由此调度锁串行化。
-    fn plugin_commitment(
+    pub(super) fn plugin_commitment(
         &self,
         plugin_id: &str,
         requesting_pool: Option<&str>,
     ) -> EmbeddedResult<usize> {
-        self.pools
+        // Only the requesting pool's declared owner may spend its unused guarantee.
+        // 只有请求池已声明的所有者可以消费其未使用保证。
+        let requesting_capacity = requesting_pool
+            .and_then(|id| self.pools.get(id))
+            .and_then(|pool| pool.capacity_id.as_deref());
+        // Independent domains retain their original commitment and release semantics.
+        // 独立域保留原承诺及释放语义。
+        let mut committed = 0usize;
+        for (id, pool) in self
+            .pools
             .iter()
-            .filter(|(_, pool)| pool.plugin_id == plugin_id)
-            .try_fold(0usize, |sum, (id, pool)| {
-                let (usage, committed) = pool.pool.accounting()?;
-                let value = if requesting_pool == Some(id.as_str()) {
-                    usage.resident
-                } else {
-                    committed
-                };
-                sum.checked_add(value)
-                    .ok_or_else(|| internal("plugin commitment overflow"))
-            })
+            .filter(|(_, pool)| pool.plugin_id == plugin_id && pool.capacity_id.is_none())
+        {
+            // A closing physical registration may already have returned its unused independent guarantee.
+            // 关闭中的物理注册可能已经归还其未使用独立保证。
+            let (usage, guarantee) = pool.pool.accounting()?;
+            // The requester spends only its own still-unused independent guarantee.
+            // 请求方仅消费自身尚未使用的独立保证。
+            let charge = if requesting_pool == Some(id.as_str()) {
+                usage.resident
+            } else {
+                guarantee
+            };
+            committed = committed
+                .checked_add(charge)
+                .ok_or_else(|| internal("plugin commitment overflow"))?;
+        }
+        for (id, capacity) in self
+            .capacities
+            .iter()
+            .filter(|(_, capacity)| capacity.plugin_id == plugin_id)
+        {
+            // Aggregate commitment is charged once even when the capacity currently has no members.
+            // 即使容量当前没有成员，聚合承诺也仅计费一次。
+            let resident = self.capacity_resident(id)?;
+            // One aggregate guarantee remains charged across every member generation.
+            // 单个聚合保证跨全部成员代次保持计费。
+            let charge = if requesting_capacity == Some(id.as_str()) {
+                resident
+            } else {
+                resident.max(capacity.config.resources.min_resident_vms)
+            };
+            committed = committed
+                .checked_add(charge)
+                .ok_or_else(|| internal("plugin commitment overflow"))?;
+        }
+        Ok(committed)
     }
 
     /// Validate new domain `policy` for an explicitly registered plugin before any registration mutation.
