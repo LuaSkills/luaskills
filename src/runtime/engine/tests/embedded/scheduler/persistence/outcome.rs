@@ -5,6 +5,7 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod recovery;
+mod worker_recovery;
 
 /// Register one explicit queued fixture capability and return its real pool identity.
 /// 注册一项显式队列夹具能力并返回其真实池身份。

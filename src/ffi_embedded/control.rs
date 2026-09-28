@@ -50,6 +50,11 @@ pub(super) fn execute(
             || lease.persistence()?.journal.recover_storage(),
             limit,
         ),
+        RuntimeCommand::StorageWorkerRecover {} => mutate::<responses::StorageWorkerRecover>(
+            &false,
+            || lease.persistence()?.writer.recover_worker(),
+            limit,
+        ),
         RuntimeCommand::HistoryGet {
             history_runtime_id,
             operation_id,

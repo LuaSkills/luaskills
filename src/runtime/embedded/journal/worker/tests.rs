@@ -8,6 +8,8 @@ use crate::runtime::embedded::{
 use std::path::PathBuf;
 use std::sync::mpsc;
 
+mod recovery;
+
 /// One deadline for all bounded test observations, independent of production timing.
 /// 全部有界测试观测共用的截止时长，独立于生产时序。
 const OBSERVE: Duration = Duration::from_secs(8);
@@ -19,6 +21,9 @@ pub(super) enum WriteFault {
     /// Fail after dispatch but before touching storage.
     /// 分发后、接触存储前失败。
     BeforeWrite,
+    /// Fail after the actual transaction returns but before its receipt is published.
+    /// 实际事务返回后、回执发布前失败。
+    AfterWrite,
     /// Fail after publishing the acknowledged revision but before releasing active ownership.
     /// 发布确认修订号后、释放活动所有权前失败。
     AfterPublication,

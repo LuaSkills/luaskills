@@ -22,6 +22,7 @@
       "durable_operation_history_v1",
       "historical_effect_reconciliation_v1",
       "live_storage_recovery_v1",
+      "journal_worker_recovery_v1",
       "strict_json_v1"
     ]
   },
@@ -2448,6 +2449,20 @@
           },
           {
             "additionalProperties": false,
+            "description": "Rebuild a failed, actually exited writer without retrying original checkpoints or reopening explicit closure.\n重建已失败且实际退出的写入者，不重试原检查点，也不重新打开显式关闭。",
+            "properties": {
+              "type": {
+                "const": "storage_worker_recover",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
             "description": "Read historical evidence by its original namespace, without adopting it as a live operation.\n按原命名空间读取历史证据，不将其接管为活动操作。",
             "properties": {
               "history_runtime_id": {
@@ -4019,6 +4034,7 @@
     "operation_retry_checkpoint",
     "storage_status",
     "storage_recover",
+    "storage_worker_recover",
     "history_get",
     "history_next",
     "history_reconcile",
@@ -8600,6 +8616,45 @@
         "result": {
           "$ref": "#/$defs/OperationJournalWorkerStatus",
           "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。"
+        },
+        "status": {
+          "$ref": "#/$defs/SuccessStatus",
+          "description": "Exact success discriminator.\n精确成功判别。"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "status",
+        "result"
+      ],
+      "title": "SuccessEnvelope",
+      "type": "object"
+    },
+    "storage_worker_recover": {
+      "$defs": {
+        "SuccessStatus": {
+          "description": "Single legal success discriminator, shared by live encoding and derived contracts.\n实际编码及派生契约共享的唯一合法成功判别。",
+          "oneOf": [
+            {
+              "const": "ok",
+              "description": "Successfully delivered result, including explicit JSON null.\n已成功交付结果，包含显式 JSON 空值。",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Borrowed success envelope avoids cloning application output during native response publication.\n借用成功信封，避免原生响应发布期间克隆应用输出。",
+      "properties": {
+        "protocol_version": {
+          "description": "Single protocol version authority.\n唯一协议版本权威。",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。",
+          "type": "boolean"
         },
         "status": {
           "$ref": "#/$defs/SuccessStatus",

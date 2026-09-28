@@ -226,6 +226,7 @@ fn ffi_embedded_persistence_configuration_and_memory_mode_are_explicit() {
     for operation in [
         json!({"type":"storage_status"}),
         json!({"type":"storage_recover"}),
+        json!({"type":"storage_worker_recover"}),
         json!({"type":"history_next"}),
         json!({"type":"history_get","history_runtime_id":"old","operation_id":"old"}),
         json!({"type":"history_forget","history_runtime_id":"old","operation_id":"old","expected_revision":1}),
@@ -309,6 +310,94 @@ fn ffi_embedded_persistence_disk_wait_preserves_control_and_native_lease() {
     reader.join().unwrap();
     drop(owner);
     finish_native(id, slot);
+}
+
+/// Public worker reconstruction preserves original receipts, checks delivery capacity first and never undoes closure.
+/// 公开写入者重建保留原回执、先检查交付容量，且绝不撤销关闭。
+#[test]
+fn ffi_embedded_persistence_worker_recovery_preserves_original_ownership() {
+    for after_storage in [false, true] {
+        // Every case uses a real separate native runtime and actual SQLite worker.
+        // 每个场景使用真实独立原生运行时及实际 SQLite 工作线程。
+        let directory = Directory::new();
+        // Commands cross the same public C transport as language SDKs.
+        // 命令经过与语言 SDK 相同的公开 C 传输。
+        let id = transport();
+        // Explicit persistence creates the original native storage owner.
+        // 显式持久化创建原原生存储所有者。
+        let slot = native(id, directory.config());
+        assert_eq!(
+            run(id, &slot, json!({"type":"storage_worker_recover"}))["result"],
+            false
+        );
+        // Only fault setup borrows Rust ownership; all administrative recovery uses the dispatcher.
+        // 仅故障设置借用 Rust 所有权；全部管理恢复使用分发器。
+        let owner = Arc::clone(slot.lock().unwrap().persistence.as_ref().unwrap());
+        owner.writer.panic_next_write_for_test(after_storage);
+        // The old receipt remains alive through actual reconstruction and retains its original charge.
+        // 旧回执跨实际重建存活，并保留原费用。
+        let receipt = owner
+            .writer
+            .submit("original-runtime", None, completed())
+            .unwrap();
+        // A completed failure is not a promise that the original transaction rolled back.
+        // 完成失败不是原事务已回滚的保证。
+        let failed = receipt.wait(Duration::from_secs(5)).unwrap();
+        assert!(failed.error.is_some());
+        // Bound only test observation; actual thread exit remains authoritative.
+        // 仅约束测试观察；实际线程退出保持权威。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !owner.writer.status().unwrap().worker_exited {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        // Deliberately reject response allocation before any administrative mutation can occur.
+        // 在任何管理变更发生前，有意拒绝响应分配。
+        assert!(
+            crate::ffi_embedded::control::execute(
+                &slot,
+                crate::ffi_embedded::commands::RuntimeCommand::StorageWorkerRecover {},
+                1
+            )
+            .is_err()
+        );
+        assert!(owner.writer.status().unwrap().failure.is_some());
+        assert!(owner.writer.status().unwrap().worker_exited);
+        // Original receipt quota remains part of the actual writer status exposed through C.
+        // 原回执配额仍属于通过 C 暴露的实际写入者状态。
+        let before = run(id, &slot, json!({"type":"storage_status"}))["result"].clone();
+        assert_eq!(
+            run(id, &slot, json!({"type":"storage_worker_recover"}))["result"],
+            true
+        );
+        assert_eq!(
+            run(id, &slot, json!({"type":"storage_worker_recover"}))["result"],
+            false
+        );
+        // Rebuilding does not rewrite the old receipt or replay its original write.
+        // 重建不改写旧回执，也不重放其原写入。
+        let after = run(id, &slot, json!({"type":"storage_status"}))["result"].clone();
+        assert_eq!(before["pending_writes"], after["pending_writes"]);
+        assert_eq!(before["pending_bytes"], after["pending_bytes"]);
+        assert!(after["failure"].is_null());
+        assert_eq!(receipt.snapshot().unwrap().error, failed.error);
+        assert_eq!(
+            owner
+                .journal
+                .get("original-runtime", "historical-operation")
+                .unwrap()
+                .is_some(),
+            after_storage
+        );
+        drop(receipt);
+        owner.writer.request_close();
+        assert_eq!(
+            run(id, &slot, json!({"type":"storage_worker_recover"}))["error"]["code"],
+            "closed"
+        );
+        drop(owner);
+        finish_native(id, slot);
+    }
 }
 
 /// Explicit native storage recovery preserves committed evidence and stale revisions never erase it.

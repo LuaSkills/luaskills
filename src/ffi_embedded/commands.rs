@@ -34,6 +34,9 @@ pub(super) enum RuntimeCommand {
     /// Reopen and validate failed storage; this synchronous disk command belongs on a work lane.
     /// 重新打开并校验失败存储；此同步磁盘命令归入工作通道。
     StorageRecover {},
+    /// Rebuild a failed, actually exited writer without retrying original checkpoints or reopening explicit closure.
+    /// 重建已失败且实际退出的写入者，不重试原检查点，也不重新打开显式关闭。
+    StorageWorkerRecover {},
     /// Read historical evidence by its original namespace, without adopting it as a live operation.
     /// 按原命名空间读取历史证据，不将其接管为活动操作。
     HistoryGet {
@@ -331,6 +334,7 @@ pub(super) const RUNTIME_COMMAND_NAMES: &[&str] = &[
     "operation_retry_checkpoint",
     "storage_status",
     "storage_recover",
+    "storage_worker_recover",
     "history_get",
     "history_next",
     "history_reconcile",

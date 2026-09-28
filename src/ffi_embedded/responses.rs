@@ -24,6 +24,9 @@ pub(super) type StorageStatus = crate::runtime::embedded::OperationJournalWorker
 /// Whether failed storage was explicitly reopened and validated.
 /// 是否显式重新打开并校验了失败存储。
 pub(super) type StorageRecover = bool;
+/// Whether one supervised failed writer thread was explicitly reconstructed.
+/// 是否显式重建了一个受监督失败写入线程。
+pub(super) type StorageWorkerRecover = bool;
 /// One exact original history record, or explicit absence with no execution inference.
 /// 单个精确原历史记录，或不推断执行状态的明确缺失。
 pub(super) type HistoryGet = Option<crate::runtime::embedded::JournalOperation>;
@@ -148,6 +151,7 @@ pub(super) fn schemas() -> serde_json::Value {
         "operation_retry_checkpoint": super::contract::response::<OperationRetryCheckpoint>(),
         "storage_status": super::contract::response::<StorageStatus>(),
         "storage_recover": super::contract::response::<StorageRecover>(),
+        "storage_worker_recover": super::contract::response::<StorageWorkerRecover>(),
         "history_get": super::contract::response::<HistoryGet>(),
         "history_next": super::contract::response::<HistoryNext>(),
         "history_reconcile": super::contract::response::<HistoryReconcile>(),

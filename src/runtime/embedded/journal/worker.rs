@@ -1,6 +1,7 @@
 //! Bounded disk execution outside runtime control and scheduling locks.
 //! 在运行时控制与调度锁之外执行有界磁盘工作。
 
+mod recovery;
 #[cfg(test)]
 mod tests;
 
@@ -12,7 +13,6 @@ use crate::runtime::embedded::{
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Explicit budgets include queued, executing and caller-retained completed write receipts.
@@ -274,9 +274,9 @@ impl JournalWriteReceipt {
 /// Queue metadata; no serialization, disk access or user callback executes under this lock.
 /// 队列元数据；此锁下不执行序列化、磁盘访问或用户回调。
 struct WriterState {
-    /// Permanent admission closure.
-    /// 永久入场关闭。
-    closing: bool,
+    /// Explicit permanent host closure, independent of recoverable infrastructure failure.
+    /// 显式永久宿主关闭，独立于可恢复基础设施故障。
+    close_requested: bool,
     /// Attempts not yet handed to the single writer.
     /// 尚未交给唯一写入者的尝试。
     queued: VecDeque<Arc<ReceiptState>>,
@@ -292,6 +292,14 @@ struct WriterState {
     /// First infrastructure failure for explicit diagnostic inspection.
     /// 可供显式诊断检查的首个基础设施故障。
     failure: Option<EmbeddedError>,
+}
+
+impl WriterState {
+    /// Return whether host closure or retained infrastructure failure currently forbids new attempts.
+    /// 返回宿主关闭或保留基础设施故障是否当前禁止新尝试。
+    fn admission_closed(&self) -> bool {
+        self.close_requested || self.failure.is_some()
+    }
 }
 
 /// Thread-owned control center independent of the public join-handle owner.
@@ -334,7 +342,6 @@ impl WriterCenter {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.closing = true;
             state.failure.get_or_insert_with(|| error.clone());
             (state.active.take(), std::mem::take(&mut state.queued))
         };
@@ -362,7 +369,7 @@ impl WriterCenter {
                         state.active = Some(Arc::clone(&receipt));
                         break receipt;
                     }
-                    if state.closing {
+                    if state.admission_closed() {
                         return Ok(());
                     }
                     state = self.changed.wait(state).map_err(|_| poisoned())?;
@@ -386,6 +393,8 @@ impl WriterCenter {
                     request.reconcile,
                 )
                 .map(|record| record.revision);
+            #[cfg(test)]
+            tests::inject_fault(self, tests::WriteFault::AfterWrite);
             receipt.complete(result);
             #[cfg(test)]
             tests::inject_fault(self, tests::WriteFault::AfterPublication);
@@ -408,7 +417,7 @@ pub struct OperationJournalWorker {
     center: Arc<WriterCenter>,
     /// Join ownership is serialized independently from disk or queue execution.
     /// 等待所有权独立于磁盘或队列执行进行串行化。
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: Mutex<recovery::ThreadOwner>,
 }
 
 impl OperationJournalWorker {
@@ -425,7 +434,7 @@ impl OperationJournalWorker {
             journal,
             config,
             state: Mutex::new(WriterState {
-                closing: false,
+                close_requested: false,
                 queued: VecDeque::new(),
                 active: None,
                 pending_writes: 0,
@@ -436,36 +445,12 @@ impl OperationJournalWorker {
             #[cfg(test)]
             fault: Mutex::new(None),
         });
-        // The thread retains real work even if the public owner only requests shutdown and drops.
-        // 即使公开所有者仅请求关闭后释放，线程仍保留真实工作。
-        let worker_center = Arc::clone(&center);
-        // Construction fails before any work can be admitted if thread creation is unavailable.
-        // 线程创建不可用时，构造在任何工作入场之前失败。
-        let worker = std::thread::Builder::new()
-            .name("luaskills-journal".into())
-            .spawn(move || {
-                // Supervision retains active and queued receipts after an unexpected worker panic.
-                // 监督在意外工作线程 panic 后保留活动及排队回执。
-                let outcome =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker_center.run()));
-                match outcome {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => worker_center.fail(error),
-                    Err(_) => worker_center.fail(EmbeddedError::new(
-                        EmbeddedErrorCode::Internal,
-                        "journal worker panicked; reconcile the active write before retrying",
-                    )),
-                }
-            })
-            .map_err(|_| {
-                EmbeddedError::new(
-                    EmbeddedErrorCode::Internal,
-                    "journal worker creation failed",
-                )
-            })?;
+        // Initial construction and explicit recovery use the same supervised thread implementation.
+        // 初始构造与显式恢复使用同一个受监督线程实现。
+        let worker = recovery::spawn(Arc::clone(&center))?;
         Ok(Self {
             center,
-            worker: Mutex::new(Some(worker)),
+            worker: Mutex::new(recovery::ThreadOwner::new(worker)),
         })
     }
 
@@ -528,7 +513,7 @@ impl OperationJournalWorker {
         // Count and byte reservation publish atomically with actual queue ownership.
         // 数量与字节预留随真实队列所有权原子发布。
         let mut state = self.center.lock()?;
-        if state.closing {
+        if state.admission_closed() {
             return Err(EmbeddedError::new(
                 EmbeddedErrorCode::Closed,
                 "journal worker is closing",
@@ -577,7 +562,7 @@ impl OperationJournalWorker {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.closing = true;
+        state.close_requested = true;
         self.center.changed.notify_all();
     }
 
@@ -595,8 +580,8 @@ impl OperationJournalWorker {
             pending_bytes: state.pending_bytes,
             queued_writes: state.queued.len(),
             writing: state.active.is_some(),
-            closing: state.closing,
-            worker_exited: worker.as_ref().is_none_or(JoinHandle::is_finished),
+            closing: state.admission_closed(),
+            worker_exited: worker.exited(),
             failure: state.failure.clone(),
         })
     }
@@ -606,26 +591,18 @@ impl OperationJournalWorker {
     /// Closure proves resource drainage, not success of the individual stored operations.
     /// 关闭证明资源排空，而非各个存储操作成功。
     pub fn poll_closed(&self) -> EmbeddedResult<bool> {
-        // Keep join ownership unique even when several observers poll closure concurrently.
-        // 即使多个观测者并发轮询关闭，也保持等待所有权唯一。
+        // Join ownership precedes queue metadata, matching status and explicit recovery.
+        // 等待所有权先于队列元数据，与状态及显式恢复一致。
         let mut worker = self.worker.lock().map_err(|_| poisoned())?;
-        if worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
-            return Ok(false);
+        match worker.join_finished() {
+            Ok(false) => return Ok(false),
+            Ok(true) => {}
+            Err(error) => self.center.fail(error),
         }
-        if let Some(worker) = worker.take()
-            && worker.join().is_err()
-        {
-            // Retain failure before removing final thread ownership; draining and success are distinct.
-            // 移除最终线程所有权前保留故障；排空和成功分别判断。
-            self.center.fail(EmbeddedError::new(
-                EmbeddedErrorCode::Internal,
-                "journal worker terminated outside its supervisor",
-            ));
-        }
-        // Completed receipts still own native bookkeeping until their final actual reference is released.
-        // 已完成回执在最后真实引用释放之前仍拥有原生记账。
+        // Completed receipts continue to own their original quota after the actual thread exits.
+        // 实际线程退出后，完成回执继续拥有原配额。
         let state = self.center.lock()?;
-        Ok(state.closing
+        Ok(state.admission_closed()
             && state.pending_writes == 0
             && state.active.is_none()
             && state.queued.is_empty())

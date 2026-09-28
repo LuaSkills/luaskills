@@ -25,6 +25,7 @@ pub const EMBEDDED_CAPABILITIES: &[&str] = &[
     "durable_operation_history_v1",
     "historical_effect_reconciliation_v1",
     "live_storage_recovery_v1",
+    "journal_worker_recovery_v1",
     "strict_json_v1",
 ];
 
