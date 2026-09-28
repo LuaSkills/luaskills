@@ -71,6 +71,7 @@
 | `session_status` | `session_id` | 核心会话快照 |
 | `session_close`、`session_forget` | `session_id` | `null` |
 | `operation_status` | `operation_id` | `OperationSnapshot` |
+| `operation_list` | 可选 `pool_id`、可选保留游标 `after_operation_id`、正 `limit` | `OperationPage`，包含身份数组、末游标和 `has_more`；控制通道 |
 | `operation_wait` | `operation_id`、`wait_ms` | 终态或本次等待到期时的 `OperationSnapshot` |
 | `operation_cancel` | `operation_id` | 是否首次请求取消的布尔值 |
 | `operation_forget` | `operation_id` | `null` |
@@ -96,6 +97,10 @@ FFI 仅接受显式 `queued` 能力。包含 `native` 的整个注册批次在�
 `effects` 以 `EffectState` 为权威，允许 `not_started`、`not_applicable`、`committed`、`rolled_back`、`unknown`，并继续接受核心对声明和结果的语义校验。判别布尔值与形状冲突时不消费处理器所有权。已分发请求即使被取消、能力被注销或运行时开始关闭，仍须在真实宿主处理结束后完成确认；终态操作保留逐宿主副作用证据，不能把取消解释成回滚。
 
 运行时槽关闭后，新插件、池、会话、操作及能力注册均拒绝入场；查询、撤权、取消、关闭、遗忘和宿主确认继续可用。此关闭门独立于核心初始化完成时机，不能利用「关闭已返回、构造刚完成」的间隙创建新工作。
+
+`operation_list` 发现内存保留操作，按实际入场发布顺序返回身份，不按提前预留的身份字符串排序。`limit` 不得超过核心 `max_operations`；响应仍受 FFI 响应字节预算约束，超出时可缩小查询数量。返回的 `after_operation_id` 为本页最后身份，空页保留输入游标；`has_more` 仅说明本次观测尚有更多记录，后续发布仍可沿保留游标查询。游标已遗忘或来自另一运行时会返回未找到，与池过滤条件不符则拒绝；重新以空游标枚举，不能据缺失推断未执行。精确池过滤使用原操作上下文，池元数据遗忘后仍有效。分页不提供跨多次调用的全局快照，也不包含尚未转换的关闭预留。持久历史继续使用独立 `history_*` 接口。
+
+可复用实例及固定会话的独立关闭操作在模块上下文中包含 `finalization_instance_id`。可复用实例的关闭可由分页发现后用 `operation_status` 查询，原业务结果保持不可变；会话仍可直接从 `session_status.finalization_operation` 取得身份。字段可选以读取早期历史，不得把缺失字段解释为从未关闭。三个 SDK 的类型化运行时提供 `list_operations`／`listOperations`／`ListOperations`，并将该查询送入控制通道。
 
 ## 持久模式与历史访问
 

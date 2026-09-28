@@ -429,6 +429,7 @@ impl ModulePool {
             )
         })?;
         Ok(OperationContext::Module(Box::new(ModuleOperationContext {
+            finalization_instance_id: None,
             pool_id: self.registration.group.clone(),
             caller: binding.caller(
                 &self.definition,

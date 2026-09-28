@@ -2964,6 +2964,41 @@
           },
           {
             "additionalProperties": false,
+            "description": "Discover retained operation identities in actual publication order with bounded pagination.\n按实际发布顺序，通过有界分页发现保留操作身份。",
+            "properties": {
+              "after_operation_id": {
+                "description": "Exact retained cursor from the previous page; omitted to restart enumeration.\n上一页的精确保留游标；省略则重新开始枚举。",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "limit": {
+                "description": "Positive maximum number of IDs, bounded by the runtime operation retention limit.\n正的身份数量上限，受运行时操作保留上限约束。",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "pool_id": {
+                "description": "Optional original pool filter, valid even after that pool was forgotten.\n可选原始池过滤条件，即使该池已遗忘仍有效。",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "operation_list",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "limit"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
             "description": "Read current operation outcome and effect evidence.\n读取当前操作结果及副作用证据。",
             "properties": {
               "operation_id": {
@@ -4091,6 +4126,7 @@
     "session_close",
     "session_forget",
     "operation_status",
+    "operation_list",
     "operation_wait",
     "operation_cancel",
     "operation_forget",
@@ -4945,6 +4981,13 @@
                     "null"
                   ]
                 },
+                "finalization_instance_id": {
+                  "description": "Original VM for an independently admitted finalization; absent for ordinary business and opening work.\n独立入场关闭操作的原 VM；普通业务及开启操作省略。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "kind": {
                   "const": "module",
                   "type": "string"
@@ -5628,6 +5671,13 @@
                 },
                 "export": {
                   "description": "Requested declared export; absent only for a fixed-session opening operation.\n请求的已声明导出；仅固定会话开启操作省略。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "finalization_instance_id": {
+                  "description": "Original VM for an independently admitted finalization; absent for ordinary business and opening work.\n独立入场关闭操作的原 VM；普通业务及开启操作省略。",
                   "type": [
                     "string",
                     "null"
@@ -6467,6 +6517,75 @@
       "title": "SuccessEnvelope",
       "type": "object"
     },
+    "operation_list": {
+      "$defs": {
+        "OperationPage": {
+          "additionalProperties": false,
+          "description": "One page of retained operation identities; status and effects remain queryable by each exact identity.\n一页保留操作身份；状态及副作用继续通过各精确身份查询。",
+          "properties": {
+            "after_operation_id": {
+              "description": "Last returned identity, or the unchanged input cursor for an empty page.\n最后返回的身份；空页保留输入游标。",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "has_more": {
+              "description": "More matching retained records existed during this atomic registry observation.\n此次原子注册表观测期间仍存在更多匹配保留记录。",
+              "type": "boolean"
+            },
+            "operation_ids": {
+              "description": "Identities in admission publication order, independent of reservation and completion order.\n按入场发布顺序排列的身份，独立于预留及完成顺序。",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "operation_ids",
+            "after_operation_id",
+            "has_more"
+          ],
+          "type": "object"
+        },
+        "SuccessStatus": {
+          "description": "Single legal success discriminator, shared by live encoding and derived contracts.\n实际编码及派生契约共享的唯一合法成功判别。",
+          "oneOf": [
+            {
+              "const": "ok",
+              "description": "Successfully delivered result, including explicit JSON null.\n已成功交付结果，包含显式 JSON 空值。",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Borrowed success envelope avoids cloning application output during native response publication.\n借用成功信封，避免原生响应发布期间克隆应用输出。",
+      "properties": {
+        "protocol_version": {
+          "description": "Single protocol version authority.\n唯一协议版本权威。",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/OperationPage",
+          "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。"
+        },
+        "status": {
+          "$ref": "#/$defs/SuccessStatus",
+          "description": "Exact success discriminator.\n精确成功判别。"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "status",
+        "result"
+      ],
+      "title": "SuccessEnvelope",
+      "type": "object"
+    },
     "operation_persistence_failure": {
       "$defs": {
         "CheckpointRetryState": {
@@ -7028,6 +7147,13 @@
                     "null"
                   ]
                 },
+                "finalization_instance_id": {
+                  "description": "Original VM for an independently admitted finalization; absent for ordinary business and opening work.\n独立入场关闭操作的原 VM；普通业务及开启操作省略。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "kind": {
                   "const": "module",
                   "type": "string"
@@ -7560,6 +7686,13 @@
                 },
                 "export": {
                   "description": "Requested declared export; absent only for a fixed-session opening operation.\n请求的已声明导出；仅固定会话开启操作省略。",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "finalization_instance_id": {
+                  "description": "Original VM for an independently admitted finalization; absent for ordinary business and opening work.\n独立入场关闭操作的原 VM；普通业务及开启操作省略。",
                   "type": [
                     "string",
                     "null"

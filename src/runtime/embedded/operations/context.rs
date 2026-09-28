@@ -27,6 +27,10 @@ pub enum OperationContext {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct ModuleOperationContext {
+    /// Original VM for an independently admitted finalization; absent for ordinary business and opening work.
+    /// 独立入场关闭操作的原 VM；普通业务及开启操作省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalization_instance_id: Option<String>,
     /// Exact retained pool identity, not a lookup of the plugin's newest pool.
     /// 精确保留池身份，不查询插件最新的池。
     pub pool_id: String,
@@ -66,6 +70,9 @@ impl OperationContext {
                 .as_ref()
                 .is_some_and(|value| value.trim().is_empty() || value.contains('\0'))
             || (context.export.is_none() && context.caller.session_id.is_none())
+            || context.finalization_instance_id.as_ref().is_some_and(|id| {
+                id.trim().is_empty() || id.contains('\0') || context.export.is_none()
+            })
         {
             return Err(EmbeddedError::invalid(
                 "operation module context is invalid",

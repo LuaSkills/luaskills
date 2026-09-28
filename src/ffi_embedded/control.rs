@@ -235,6 +235,18 @@ pub(super) fn execute(
         RuntimeCommand::SessionForget { session_id } => {
             mutate::<responses::SessionForget>(&(), || runtime.forget_session(&session_id), limit)
         }
+        RuntimeCommand::OperationList {
+            pool_id,
+            after_operation_id,
+            limit: page_limit,
+        } => respond::<responses::OperationList>(
+            runtime.list_operations(
+                pool_id.as_deref(),
+                after_operation_id.as_deref(),
+                page_limit,
+            ),
+            limit,
+        ),
         RuntimeCommand::OperationStatus { operation_id } => respond::<responses::OperationStatus>(
             runtime
                 .operation(&operation_id)

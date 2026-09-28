@@ -221,6 +221,19 @@ pub(super) enum RuntimeCommand {
         /// 精确固定实例会话身份。
         session_id: String,
     },
+    /// Discover retained operation identities in actual publication order with bounded pagination.
+    /// 按实际发布顺序，通过有界分页发现保留操作身份。
+    OperationList {
+        /// Optional original pool filter, valid even after that pool was forgotten.
+        /// 可选原始池过滤条件，即使该池已遗忘仍有效。
+        pool_id: Option<String>,
+        /// Exact retained cursor from the previous page; omitted to restart enumeration.
+        /// 上一页的精确保留游标；省略则重新开始枚举。
+        after_operation_id: Option<String>,
+        /// Positive maximum number of IDs, bounded by the runtime operation retention limit.
+        /// 正的身份数量上限，受运行时操作保留上限约束。
+        limit: usize,
+    },
     /// Read current operation outcome and effect evidence.
     /// 读取当前操作结果及副作用证据。
     OperationStatus {
@@ -355,6 +368,7 @@ pub(super) const RUNTIME_COMMAND_NAMES: &[&str] = &[
     "session_close",
     "session_forget",
     "operation_status",
+    "operation_list",
     "operation_wait",
     "operation_cancel",
     "operation_forget",

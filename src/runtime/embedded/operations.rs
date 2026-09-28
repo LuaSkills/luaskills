@@ -12,6 +12,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 mod admission;
+mod listing;
+pub use listing::OperationPage;
 mod reservation;
 pub(super) use reservation::OperationReservation;
 mod finalization;
@@ -177,6 +179,9 @@ fn advance_snapshot(snapshot: &mut OperationSnapshot, phase: OperationPhase) -> 
 /// State shared by one read/cancel handle and its sole execution owner.
 /// 单个读取与取消句柄和其唯一执行所有者共享的状态。
 pub(super) struct Operation {
+    /// Admission publication order; reserved identities can be allocated long before publication.
+    /// 入场发布顺序；预留身份可能远早于发布时分配。
+    publication_sequence: u64,
     /// Serializes phase and host-intent checkpoints separately from client observation and cancellation.
     /// 将阶段及宿主意图检查点与客户端观测、取消分开串行化。
     transition: Mutex<Option<PendingCheckpoint>>,
@@ -490,6 +495,9 @@ impl OperationOwner {
 /// Private registry state; result retention is explicit and bounded.
 /// 私有注册表状态；结果保留显式且有界。
 struct OperationRegistryState {
+    /// Monotonic public admission order, independent of earlier identity reservations.
+    /// 单调公开入场顺序，独立于更早的身份预留。
+    publication_sequence: u64,
     /// Capacity owned by future lifecycle operations, without starting a deadline or publishing an identity.
     /// 未来生命周期操作拥有的容量，不启动截止时间，也不发布身份。
     reserved: usize,
@@ -543,6 +551,7 @@ impl OperationRegistry {
             max_operations: config.max_operations,
             max_value_bytes: config.max_value_bytes,
             state: Arc::new(Mutex::new(OperationRegistryState {
+                publication_sequence: 0,
                 reserved: 0,
                 sequence: 0,
                 records: BTreeMap::new(),

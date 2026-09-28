@@ -68,6 +68,7 @@ fn embedded_operation_context_rejects_foreign_callback_before_execution() {
     let (operation, mut owner) = operations
         .admit_context(Arc::clone(&control), |id| {
             Ok(OperationContext::Module(Box::new(ModuleOperationContext {
+                finalization_instance_id: None,
                 pool_id: "pool".into(),
                 capability_revision: snapshot.revision(),
                 export: Some("call".into()),

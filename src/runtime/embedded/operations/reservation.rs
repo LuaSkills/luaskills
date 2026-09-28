@@ -74,10 +74,20 @@ impl OperationRegistry {
     pub(in crate::runtime::embedded) fn reserve_module(
         &self,
         pool: &ModulePool,
-        session_id: &str,
+        session_id: Option<&str>,
+        instance_id: &str,
         export: &str,
     ) -> EmbeddedResult<OperationReservation> {
-        self.reserve_context(|id| pool.operation_context(id, Some(session_id), Some(export)))
+        self.reserve_context(|id| {
+            let mut context = pool.operation_context(id, session_id, Some(export))?;
+            let OperationContext::Module(module) = &mut context else {
+                return Err(EmbeddedError::invalid(
+                    "finalization requires module authority",
+                ));
+            };
+            module.finalization_instance_id = Some(instance_id.to_owned());
+            Ok(context)
+        })
     }
 
     /// Convert this registry's reservation using fresh control and immutable module context.

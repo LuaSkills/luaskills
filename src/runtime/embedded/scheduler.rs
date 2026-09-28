@@ -15,6 +15,7 @@ mod finalization;
 mod persistence;
 mod plugins;
 mod reusable;
+mod reusable_finalization;
 mod sessions;
 mod sessions_finalization;
 mod workers;
@@ -443,12 +444,6 @@ impl EmbeddedRuntime {
     ) -> EmbeddedResult<String> {
         policy.validate(self.center.pools.config())?;
         if let Some(finalizer) = &definition.finalizer {
-            if policy.reuse == InstanceReuse::Reusable {
-                return Err(EmbeddedError::new(
-                    EmbeddedErrorCode::Unsupported,
-                    "automatic finalization currently requires single-call or session reuse",
-                ));
-            }
             json_size(finalizer, self.center.pools.config().max_value_bytes)?;
         }
         // Capability membership remains frozen independently from physical resource ownership.
@@ -547,6 +542,21 @@ impl EmbeddedRuntime {
     /// 查询精确 `id`；已遗忘身份绝不表示执行没有发生。
     pub fn operation(&self, id: &str) -> EmbeddedResult<OperationHandle> {
         self.center.operations.get(id)
+    }
+
+    /// Discover at most `limit` retained operations for an optional exact pool after a retained cursor.
+    /// 在保留游标之后，为可选精确池发现至多 `limit` 个保留操作。
+    /// Return publication-ordered IDs, including independently scheduled closing work; forgetting invalidates its cursor.
+    /// 返回按发布顺序排列的身份，包含独立调度的关闭任务；遗忘会使其游标失效。
+    pub fn list_operations(
+        &self,
+        pool_id: Option<&str>,
+        after_operation_id: Option<&str>,
+        limit: usize,
+    ) -> EmbeddedResult<super::OperationPage> {
+        self.center
+            .operations
+            .list(pool_id, after_operation_id, limit)
     }
 
     /// Explicitly forget terminal `id`, leaving active execution evidence intact.

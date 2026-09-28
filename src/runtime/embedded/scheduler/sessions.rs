@@ -133,6 +133,16 @@ impl ScheduledSession {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum ScheduledRequest {
+    /// Independent finalization of one exact scheduler-owned reusable instance.
+    /// 一个精确调度器所有可复用实例的独立关闭。
+    CloseInstance {
+        /// Original registered execution domain.
+        /// 原始已注册执行域。
+        pool_id: String,
+        /// Last actually dispatched host context from this same instance.
+        /// 来自此同一实例最后实际分发的宿主上下文。
+        context: LuaInvocationContext,
+    },
     /// Explicit lifecycle work consumes reserved retention and never invokes a business export.
     /// 显式生命周期任务消费预留保留容量，绝不调用业务导出。
     CloseSession {
@@ -177,7 +187,9 @@ impl ScheduledRequest {
     pub(super) fn pool_id(&self) -> &str {
         match self {
             Self::Invoke(call) | Self::InvokeSession { call, .. } => &call.pool_id,
-            Self::OpenSession { pool_id, .. } | Self::CloseSession { pool_id, .. } => pool_id,
+            Self::OpenSession { pool_id, .. }
+            | Self::CloseSession { pool_id, .. }
+            | Self::CloseInstance { pool_id, .. } => pool_id,
         }
     }
 
@@ -185,7 +197,7 @@ impl ScheduledRequest {
     /// 仅为显式会话请求返回可信会话身份。
     pub(super) fn session_id(&self) -> Option<&str> {
         match self {
-            Self::Invoke(_) => None,
+            Self::Invoke(_) | Self::CloseInstance { .. } => None,
             Self::OpenSession { session_id, .. }
             | Self::InvokeSession { session_id, .. }
             | Self::CloseSession { session_id, .. } => Some(session_id),
@@ -197,7 +209,9 @@ impl ScheduledRequest {
     pub(super) fn invocation(&self) -> Option<&EmbeddedCall> {
         match self {
             Self::Invoke(call) | Self::InvokeSession { call, .. } => Some(call),
-            Self::OpenSession { .. } | Self::CloseSession { .. } => None,
+            Self::OpenSession { .. } | Self::CloseSession { .. } | Self::CloseInstance { .. } => {
+                None
+            }
         }
     }
 
@@ -210,7 +224,9 @@ impl ScheduledRequest {
                 call.context = LuaInvocationContext::default();
             }
             Self::OpenSession { .. } => {}
-            Self::CloseSession { context, .. } => *context = LuaInvocationContext::default(),
+            Self::CloseSession { context, .. } | Self::CloseInstance { context, .. } => {
+                *context = LuaInvocationContext::default()
+            }
         }
     }
 }
@@ -291,7 +307,8 @@ impl EmbeddedRuntime {
             let pool = state.pools.get(pool_id).expect("registered pool");
             let reserved = self.center.operations.reserve_module(
                 &pool.pool,
-                &session_id,
+                Some(&session_id),
+                lease.allocation_id()?,
                 &pool.pool.finalizer().expect("declared finalizer").export,
             )?;
             state

@@ -11,6 +11,7 @@ fn bound() -> OperationSnapshot {
     // 构造器使用明确的宿主自有身份，不从回调记录推断。
     let mut snapshot = snapshot("operation");
     snapshot.context = OperationContext::Module(Box::new(ModuleOperationContext {
+        finalization_instance_id: None,
         pool_id: "original-pool".into(),
         capability_revision: "original-snapshot".into(),
         export: Some("call".into()),

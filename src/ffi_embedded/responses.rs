@@ -100,6 +100,10 @@ pub(super) type SessionForget = ();
 /// `operation_status` 成功结果，在序列化前由原生分发器强制校验。
 pub(super) type OperationStatus = OperationSnapshot;
 
+/// Bounded retained-operation discovery shares the native registry's authoritative page type.
+/// 有界保留操作发现共享原生注册表的权威分页类型。
+pub(super) type OperationList = crate::runtime::embedded::OperationPage;
+
 /// Successful `operation_wait` result, enforced by the native dispatcher before serialization.
 /// `operation_wait` 成功结果，在序列化前由原生分发器强制校验。
 pub(super) type OperationWait = OperationSnapshot;
@@ -172,6 +176,7 @@ pub(super) fn schemas() -> serde_json::Value {
         "session_close": super::contract::response::<SessionClose>(),
         "session_forget": super::contract::response::<SessionForget>(),
         "operation_status": super::contract::response::<OperationStatus>(),
+        "operation_list": super::contract::response::<OperationList>(),
         "operation_wait": super::contract::response::<OperationWait>(),
         "operation_cancel": super::contract::response::<OperationCancel>(),
         "operation_forget": super::contract::response::<OperationForget>(),

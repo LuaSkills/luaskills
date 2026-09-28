@@ -7,6 +7,12 @@ use std::time::Instant;
 /// One exact reusable allocation; metadata never owns a second copy of its actual VM.
 /// 一个精确可复用分配；元数据绝不拥有其实际 VM 的第二份副本。
 pub(super) struct ScheduledReusable {
+    /// Future independent closing capacity, acquired before any initialization can run.
+    /// 未来独立关闭容量，在任何初始化可执行前取得。
+    pub(super) finalization_reservation: Option<super::super::operations::OperationReservation>,
+    /// Last actually dispatched host context, retained only when closing was declared.
+    /// 最后实际分发的宿主上下文，仅声明关闭时保留。
+    pub(super) finalization_context: LuaInvocationContext,
     /// Immutable registered execution domain.
     /// 不可变已注册执行域。
     pub(super) pool_id: String,
@@ -32,34 +38,77 @@ pub(super) struct ScheduledReusable {
 
 /// Claim idle state or reserve a new VM for exact pool and operation identities under the original control.
 /// 在原控制下，为精确池和操作身份认领空闲状态或预留新 VM。
-/// Return exclusive ownership; allocation failures publish no reusable instance metadata.
-/// 返回独占所有权；分配失败不发布可复用实例元数据。
+/// Return exclusive ownership with closing context, or none for physical pressure; reservation errors reject before initialization.
+/// 返回独占所有权及关闭上下文；物理压力返回空值，预留错误在初始化前拒绝。
 pub(super) fn prepare(
+    center: &SchedulerCenter,
     state: &mut SchedulerState,
     pool_id: &str,
     operation_id: &str,
+    context: &LuaInvocationContext,
     control: &CallControl,
-) -> EmbeddedResult<(ModuleLease, String)> {
+) -> EmbeddedResult<Option<(ModuleLease, String)>> {
     control.check()?;
     expire(state, pool_id);
-    // The cache is selected here, so the physical pool must never independently cache these leases.
-    // 缓存在此选择，因此物理池绝不能独立缓存这些租借。
+    // Exactly one owner decides whether confirmed state is reusable.
+    // 恰好一个所有者决定已确认状态是否可复用。
     if let Some((id, instance)) = state.reusable_instances.iter_mut().find(|(_, instance)| {
         instance.pool_id == pool_id
             && !instance.closing
             && instance.active.is_none()
             && instance.lease.is_some()
     }) {
+        if instance.finalization_reservation.is_some() {
+            instance.finalization_context = context.clone();
+        }
         instance.active = Some(operation_id.to_owned());
-        return Ok((
+        return Ok(Some((
             *instance.lease.take().expect("idle reusable lease"),
             id.clone(),
-        ));
+        )));
     }
     let allow_new = state.plugin_allows_allocation(pool_id)?;
     let pool = state.pools.get(pool_id).expect("registered reusable pool");
-    let lease = pool.pool.prepare_with_budget(control, true, allow_new)?;
+    let plugin_id = pool.plugin_id.clone();
+    let plugin = state
+        .plugins
+        .get(&plugin_id)
+        .expect("registered reusable plugin");
+    if pool.pool.finalizer().is_some()
+        && plugin.operations >= plugin.config.max_operations - plugin.reserved_operations
+    {
+        return Err(EmbeddedError::new(
+            EmbeddedErrorCode::CapacityExceeded,
+            "plugin operation capacity cannot reserve reusable finalization",
+        ));
+    }
+    let lease = match pool.pool.prepare_with_budget(control, true, allow_new) {
+        Ok(lease) => lease,
+        Err(error) if error.code == EmbeddedErrorCode::CapacityExceeded => return Ok(None),
+        Err(error) => return Err(error),
+    };
     let id = lease.allocation_id()?.to_owned();
+    // This preparation has executed no source; failed reservation releases only uninitialized capacity.
+    // 此准备尚未执行源码；预留失败仅释放未初始化容量。
+    let finalization_reservation = match pool.pool.finalizer() {
+        Some(plan) => Some(center.operations.reserve_module(
+            &pool.pool,
+            None,
+            &id,
+            &plan.export,
+        )?),
+        None => None,
+    };
+    let finalization_context = if finalization_reservation.is_some() {
+        state
+            .plugins
+            .get_mut(&plugin_id)
+            .expect("registered reusable plugin")
+            .reserved_operations += 1;
+        context.clone()
+    } else {
+        LuaInvocationContext::default()
+    };
     state.reusable_instances.insert(
         id.clone(),
         ScheduledReusable {
@@ -70,9 +119,11 @@ pub(super) fn prepare(
             idle_since: Instant::now(),
             retirement: None,
             retiring: false,
+            finalization_reservation,
+            finalization_context,
         },
     );
-    Ok((lease, id))
+    Ok(Some((lease, id)))
 }
 
 /// Mark expired idle leases without destroying them or consuming the domain's warm minimum.
@@ -171,15 +222,30 @@ pub(super) fn maintain(center: &SchedulerCenter) -> EmbeddedResult<()> {
             .collect::<std::collections::BTreeSet<_>>();
         let closing = state.closing;
         let mut retiring = Vec::new();
+        let mut finalizing = Vec::new();
         for (id, instance) in &mut state.reusable_instances {
             instance.closing |= closing || closing_pools.contains(&instance.pool_id);
-            if instance.closing
-                && instance.active.is_none()
-                && let Some(lease) = instance.lease.take()
-            {
-                instance.retiring = true;
-                retiring.push((id.clone(), lease));
+            if !instance.closing {
+                continue;
             }
+            // Pool generation closure drains admitted calls; only explicit cancellation changes their control.
+            // 池代次关闭排空已入场调用；仅显式取消改变其控制。
+            if instance.active.is_none()
+                && let Some(lease) = &instance.lease
+            {
+                if lease.finalization_plan().is_some() {
+                    finalizing.push(id.clone());
+                } else {
+                    instance.retiring = true;
+                    retiring.push((
+                        id.clone(),
+                        instance.lease.take().expect("idle reusable lease"),
+                    ));
+                }
+            }
+        }
+        for id in finalizing {
+            reusable_finalization::schedule(center, &mut state, &id)?;
         }
         retiring
     };
@@ -225,7 +291,30 @@ pub(super) fn prune(state: &mut SchedulerState) -> EmbeddedResult<()> {
         }
     }
     for id in drained {
-        state.reusable_instances.remove(&id);
+        remove(state, &id);
     }
     Ok(())
+}
+
+/// Release drained metadata and unused closing reservations after failed initialization or completed retirement.
+/// 在初始化失败或退役完成后，释放已排空元数据及未使用关闭预留。
+/// The caller must already own proof that no lease or in-flight completion remains in this record.
+/// 调用方必须已经拥有该记录不再保留租借或执行中完成任务的证据。
+pub(super) fn remove(state: &mut SchedulerState, id: &str) {
+    let instance = state
+        .reusable_instances
+        .remove(id)
+        .expect("drained reusable instance retained");
+    if instance.finalization_reservation.is_some() {
+        let plugin_id = &state
+            .pools
+            .get(&instance.pool_id)
+            .expect("reusable pool retained")
+            .plugin_id;
+        state
+            .plugins
+            .get_mut(plugin_id)
+            .expect("reusable plugin retained")
+            .reserved_operations -= 1;
+    }
 }

@@ -66,9 +66,18 @@ impl OperationRegistry {
         // The ledger checks future callbacks against this exact admission-time identity.
         // 账本对照此精确入场身份检查未来回调。
         let caller = context.caller().cloned();
+        // Publish reserved lifecycle identities after earlier visible records, irrespective of ID allocation order.
+        // 无论身份分配顺序如何，预留生命周期身份都发布在此前可见记录之后。
+        let publication_sequence = state.publication_sequence.checked_add(1).ok_or_else(|| {
+            EmbeddedError::new(
+                EmbeddedErrorCode::Internal,
+                "operation publication sequence exhausted",
+            )
+        })?;
         // Construct the immutable persistence binding before exposing the ledger through shared control.
         // 在通过共享控制对象暴露账本之前构造不可变持久绑定。
         let operation = Arc::new_cyclic(|operation| Operation {
+            publication_sequence,
             transition: Mutex::new(None),
             history: self.journal.as_ref().map(|journal| OperationHistory {
                 backend: journal.clone(),
@@ -111,6 +120,7 @@ impl OperationRegistry {
             owned.active = false;
         }
         state.sequence = sequence;
+        state.publication_sequence = publication_sequence;
         state.records.insert(id, Arc::clone(&operation));
         Ok((
             OperationHandle {

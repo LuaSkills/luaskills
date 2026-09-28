@@ -54,7 +54,10 @@ fn take_call(state: &mut SchedulerState, plugin: &str, index: usize) -> Schedule
 /// 公平选择一个就绪插件，并在每个不可变域内保留先进先出分发。
 /// Capacity exhaustion leaves the request queued without executing initialization or consuming its identity again.
 /// 容量耗尽时请求继续排队，不执行初始化，也不再次消费其身份。
-fn select(state: &mut SchedulerState) -> EmbeddedResult<Option<Dispatch>> {
+fn select(
+    center: &SchedulerCenter,
+    state: &mut SchedulerState,
+) -> EmbeddedResult<Option<Dispatch>> {
     let plugins = state.rotation.iter().cloned().collect::<Vec<_>>();
     let mut reclaimed = false;
     for (rotation_index, plugin) in plugins.iter().enumerate() {
@@ -105,18 +108,25 @@ fn select(state: &mut SchedulerState) -> EmbeddedResult<Option<Dispatch>> {
                 let pool_id = call.request.pool_id().to_owned();
                 let operation_id = call.id.clone();
                 let control = Arc::clone(&call.control);
+                let context = call
+                    .request
+                    .invocation()
+                    .expect("ordinary queued invocation")
+                    .context
+                    .clone();
                 let physical = Arc::clone(&pool.pool);
                 let allow_new = state.plugin_allows_allocation(&pool_id)?;
                 let prepared = if physical.policy().reuse == InstanceReuse::Reusable {
-                    reusable::prepare(state, &pool_id, &operation_id, &control)
-                        .map(|(lease, id)| (lease, Some(id)))
+                    reusable::prepare(center, state, &pool_id, &operation_id, &context, &control)
+                        .map(|prepared| prepared.map(|(lease, id)| (lease, Some(id))))
                 } else {
-                    physical
-                        .prepare_with_budget(&control, false, allow_new)
-                        .map(|lease| (lease, None))
+                    match physical.prepare_with_budget(&control, false, allow_new) {
+                        Ok(lease) => Ok(Some((lease, None))),
+                        Err(error) if error.code == EmbeddedErrorCode::CapacityExceeded => Ok(None),
+                        Err(error) => Err(error),
+                    }
                 };
-                if matches!(&prepared, Err(error) if error.code == EmbeddedErrorCode::CapacityExceeded)
-                {
+                if matches!(&prepared, Ok(None)) {
                     // A full target domain cannot benefit from evicting any other domain's cache.
                     // 目标域自身已满时，驱逐其他域的缓存不能帮助它。
                     if physical.usage()?.resident >= physical.policy().max_resident_vms {
@@ -130,7 +140,10 @@ fn select(state: &mut SchedulerState) -> EmbeddedResult<Option<Dispatch>> {
                     }
                     continue;
                 }
-                Some(prepared)
+                Some(
+                    prepared
+                        .map(|prepared| prepared.expect("physical capacity wait already handled")),
+                )
             };
             state.rotation.rotate_left(rotation_index + 1);
             let mut call = take_call(state, plugin, index);
@@ -282,7 +295,7 @@ pub(super) fn execute(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
                         break Dispatch::Finalizing(Box::new(completion));
                     }
                     if !state.closing
-                        && let Some(dispatch) = select(&mut state)?
+                        && let Some(dispatch) = select(center, &mut state)?
                     {
                         break dispatch;
                     }
@@ -660,10 +673,7 @@ fn complete(
             } else {
                 // Actual teardown was acknowledged before terminal publication, so this metadata can now leave.
                 // 终态发布前已确认实际清理，因此现在可以移除此元数据。
-                state
-                    .reusable_instances
-                    .remove(id)
-                    .expect("completed reusable instance retained");
+                reusable::remove(&mut state, id);
             }
         }
         if let Some(session_id) = completion.call.request.session_id() {

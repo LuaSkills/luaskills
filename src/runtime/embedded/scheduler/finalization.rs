@@ -139,7 +139,8 @@ pub(super) fn execute(mut completion: PendingCompletion, maximum: usize) -> Pend
             .expect("worker owns closing VM");
         let context = match &completion.call.request {
             ScheduledRequest::Invoke(request) => &request.context,
-            ScheduledRequest::CloseSession { context, .. } => context,
+            ScheduledRequest::CloseSession { context, .. }
+            | ScheduledRequest::CloseInstance { context, .. } => context,
             _ => return Err(internal("unsupported automatic finalization request")),
         };
         closing.lease.finalize(ModuleInvocation {

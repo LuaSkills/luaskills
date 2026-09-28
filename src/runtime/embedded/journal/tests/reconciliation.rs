@@ -23,6 +23,7 @@ fn original() -> OperationSnapshot {
     // 保留全部原字段，防止最终证明制造终态结果。
     let mut original = snapshot("operation");
     original.context = OperationContext::Module(Box::new(ModuleOperationContext {
+        finalization_instance_id: None,
         pool_id: "old-pool".into(),
         caller: caller.clone(),
         capability_revision: "old-capabilities".into(),
