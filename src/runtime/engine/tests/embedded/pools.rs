@@ -2,6 +2,7 @@ use super::*;
 use crate::runtime::embedded::EmbeddedResult;
 
 mod cleanup;
+mod resources;
 
 /// Independent VMs on one engine must overlap in a real host wait while keeping both permits charged.
 /// 同一引擎上的独立 VM 必须在真实宿主等待中重叠，同时保持两个许可记账。

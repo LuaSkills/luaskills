@@ -14,6 +14,7 @@ mod module;
 mod operations;
 mod plugin_config;
 mod pool;
+mod resources;
 mod retirement;
 mod scheduler;
 mod schema;
@@ -48,6 +49,7 @@ pub use operations::{
 };
 pub use plugin_config::EmbeddedPluginConfig;
 pub use pool::{EmbeddedPoolManager, ModuleLease, ModulePool};
+pub use resources::ModuleResourceOwner;
 pub use scheduler::{
     CheckpointRetryState, EmbeddedCall, EmbeddedPluginSnapshot, EmbeddedRuntime,
     EmbeddedRuntimeUsage, EmbeddedSessionOpening, EmbeddedSessionPhase, EmbeddedSessionSnapshot,

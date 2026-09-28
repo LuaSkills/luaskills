@@ -3,8 +3,8 @@ use super::retirement::RetirementService;
 use super::{
     CallControl, EmbeddedError, EmbeddedErrorCode, EmbeddedModule, EmbeddedResult,
     EmbeddedRuntimeConfig, InstanceReuse, ModuleAcquireFailure, ModuleDefinition, ModuleInvocation,
-    ModuleOperationContext, ModuleRelease, ModuleRetirement, OperationContext, PluginPoolConfig,
-    PoolGovernor, PoolUsage, VmReservation,
+    ModuleOperationContext, ModuleRelease, ModuleResourceOwner, ModuleRetirement, OperationContext,
+    PluginPoolConfig, PoolGovernor, PoolUsage, VmReservation,
 };
 use crate::runtime::engine::LuaEngine;
 use serde_json::Value;
@@ -74,7 +74,7 @@ impl EmbeddedPoolManager {
         definition: ModuleDefinition,
         policy: PluginPoolConfig,
     ) -> EmbeddedResult<Arc<ModulePool>> {
-        self.create_pool_internal(group, definition, policy, None)
+        self.create_pool_internal(group, definition, policy, None, None)
     }
 
     /// Register a pool with immutable `capabilities` in the same generation and security domain.
@@ -88,19 +88,35 @@ impl EmbeddedPoolManager {
         policy: PluginPoolConfig,
         capabilities: ModuleCapabilities,
     ) -> EmbeddedResult<Arc<ModulePool>> {
-        self.create_pool_internal(group, definition, policy, Some(capabilities))
+        self.create_pool_internal(group, definition, policy, Some(capabilities), None)
+    }
+
+    /// Registers `group`, `definition`, and `policy` with explicit optional capabilities and a real host `owner`.
+    /// 使用显式可选能力及真实宿主 `owner` 注册 `group`、`definition` 和 `policy`。
+    /// Returns a pool retaining the owner through pending allocation, live VMs, and actual retirement.
+    /// 返回跨等待分配、活动 VM 及实际退役保留所有者的池。
+    pub fn create_pool_with_owner(
+        self: &Arc<Self>,
+        group: String,
+        definition: ModuleDefinition,
+        policy: PluginPoolConfig,
+        capabilities: Option<ModuleCapabilities>,
+        owner: ModuleResourceOwner,
+    ) -> EmbeddedResult<Arc<ModulePool>> {
+        self.create_pool_internal(group, definition, policy, capabilities, Some(owner))
     }
 
     /// Register immutable `definition` and `policy` under exact host `group` identity.
     /// 将不可变 `definition` 与 `policy` 注册到精确宿主 `group` 身份。
     /// Each pool has one complete generation and security domain; capacity is shared by the parent.
     /// 每个池具有一个完整代次与安全域；容量由父级共享。
-    fn create_pool_internal(
+    pub(super) fn create_pool_internal(
         self: &Arc<Self>,
         group: String,
         definition: ModuleDefinition,
         policy: PluginPoolConfig,
         capabilities: Option<ModuleCapabilities>,
+        owner: Option<ModuleResourceOwner>,
     ) -> EmbeddedResult<Arc<ModulePool>> {
         definition.validate()?;
         for export in &definition.exports {
@@ -126,6 +142,7 @@ impl EmbeddedPoolManager {
                 lifecycle: Mutex::new(RegistrationLifecycle {
                     closing: false,
                     released: false,
+                    owner,
                 }),
             }),
             definition,
@@ -235,6 +252,9 @@ struct RegistrationLifecycle {
     /// Exact registration was removed; stale handles return their own zero usage.
     /// 精确注册已移除；旧句柄返回自身的零用量。
     released: bool,
+    /// Host resources remain owned until this registration closes and all actual residents are destroyed.
+    /// 此注册关闭且全部真实常驻实例销毁前，持续拥有宿主资源。
+    owner: Option<ModuleResourceOwner>,
 }
 
 impl PoolRegistration {
@@ -263,6 +283,13 @@ impl PoolRegistration {
         match self.governor.unregister_group(&self.group) {
             Ok(()) => {
                 lifecycle.released = true;
+                // Only the closing, fully drained registration may relinquish the real host lease.
+                // 只有正在关闭且已完全排空的注册才可以放弃真实宿主租约。
+                let owner = lifecycle.owner.take();
+                drop(lifecycle);
+                // Drop outside registration metadata; keeping a closed pool handle does not pin old packages.
+                // 在注册元数据之外释放；保留已关闭池句柄不会固定旧插件包。
+                drop(owner);
                 Ok(())
             }
             Err(error) if error.code == EmbeddedErrorCode::Busy => Ok(()),

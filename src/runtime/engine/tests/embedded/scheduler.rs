@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 
 mod persistence;
 mod plugins;
+mod resources;
 mod sessions;
 
 /// Build the real formal runtime with explicit fixture `config` and package trust roots.

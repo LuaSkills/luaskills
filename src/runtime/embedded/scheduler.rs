@@ -392,9 +392,43 @@ impl EmbeddedRuntime {
         permissions: Arc<CapabilityPermissions>,
         revision: String,
     ) -> EmbeddedResult<String> {
+        self.register_pool_internal(definition, policy, permissions, revision, None)
+    }
+
+    /// Registers the exact module/policy/permission revision while retaining native host `owner` resources.
+    /// 注册精确模块、策略及权限修订，同时保留原生宿主 `owner` 资源。
+    /// Returns the scheduled pool id; close releases ownership only after all real VMs and reservations drain.
+    /// 返回调度池标识；关闭仅在全部真实 VM 及预留排空后释放所有权。
+    pub fn register_pool_with_owner(
+        &self,
+        definition: ModuleDefinition,
+        policy: PluginPoolConfig,
+        permissions: Arc<CapabilityPermissions>,
+        revision: String,
+        owner: ModuleResourceOwner,
+    ) -> EmbeddedResult<String> {
+        self.register_pool_internal(definition, policy, permissions, revision, Some(owner))
+    }
+
+    /// Publishes one validated pool with an optional Rust-only generation owner.
+    /// 发布一个已校验池，并可携带仅供 Rust 使用的代次所有者。
+    /// Inputs freeze definition, policy, permissions and revision; errors publish no scheduled pool.
+    /// 输入冻结定义、策略、权限及修订；错误不会发布调度池。
+    fn register_pool_internal(
+        &self,
+        definition: ModuleDefinition,
+        policy: PluginPoolConfig,
+        permissions: Arc<CapabilityPermissions>,
+        revision: String,
+        owner: Option<ModuleResourceOwner>,
+    ) -> EmbeddedResult<String> {
         policy.validate(self.center.pools.config())?;
+        // Capability membership remains frozen independently from physical resource ownership.
+        // 能力成员独立于物理资源所有权保持冻结。
         let binding =
             ModuleCapabilities::new(self.center.capabilities.snapshot()?, permissions, revision)?;
+        // Compile admission contracts before any scheduled pool is published.
+        // 发布任何调度池之前编译入场契约。
         let inputs = definition
             .exports
             .iter()
@@ -403,6 +437,8 @@ impl EmbeddedRuntime {
                     .map(|contract| (export.name.clone(), contract))
             })
             .collect::<EmbeddedResult<BTreeMap<_, _>>>()?;
+        // The scheduler metadata gate makes registration atomic with shutdown.
+        // 调度器元数据门使注册相对关闭保持原子性。
         let mut state = self.center.lock()?;
         if state.closing {
             return Err(closed());
@@ -414,17 +450,26 @@ impl EmbeddedRuntime {
                 "retained pool capacity reached",
             ));
         }
+        // Identity allocation cannot wrap or reuse an earlier pool handle.
+        // 身份分配不能回绕或复用先前池句柄。
         let sequence = state
             .sequence
             .checked_add(1)
             .ok_or_else(|| internal("pool identity exhausted"))?;
+        // Bind both scheduling and physical ownership to the same generated pool id.
+        // 将调度及物理所有权绑定到同一生成池标识。
         let id = IdentityKind::Pool.render(self.id(), sequence);
+        // Copy only identity metadata; the real resource owner moves into the registration.
+        // 仅复制身份元数据；真实资源所有者移动到注册中。
         let plugin_id = definition.plugin_id.clone();
-        let pool = self.center.pools.create_pool_with_capabilities(
+        // Every allocation and resident inherits the same owning registration.
+        // 每个分配及常驻实例继承同一个拥有资源的注册。
+        let pool = self.center.pools.create_pool_internal(
             id.clone(),
             definition,
             policy,
-            binding,
+            Some(binding),
+            owner,
         )?;
         state.sequence = sequence;
         state.pools.insert(
