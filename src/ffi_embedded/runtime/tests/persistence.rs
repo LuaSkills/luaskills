@@ -60,6 +60,7 @@ impl Drop for Directory {
 /// 返回适于真实写入者所有权及删除测试的无副作用终态记录。
 fn completed() -> Arc<OperationSnapshot> {
     Arc::new(OperationSnapshot {
+        finalization: None,
         context: OperationContext::Unbound,
         operation_id: "historical-operation".into(),
         phase: OperationPhase::Succeeded,

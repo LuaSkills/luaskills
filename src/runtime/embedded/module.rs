@@ -11,6 +11,10 @@ use std::sync::Arc;
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct ModuleDefinition {
+    /// Optional host-owned closing declaration for supported scheduled lifecycles.
+    /// 可选的宿主所有关闭声明，用于受支持的调度生命周期。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalizer: Option<ModuleFinalizer>,
     /// Host-assigned stable plugin identity.
     /// 宿主分配的稳定插件身份。
     pub plugin_id: String,
@@ -41,6 +45,23 @@ pub struct ModuleDefinition {
     /// Exact public exports and value contracts validated before invocation.
     /// 调用前校验的精确公开导出及值契约。
     pub exports: Vec<ModuleExport>,
+}
+
+/// Immutable closing export, arguments and independent finite execution budget.
+/// 不可变关闭导出、参数及独立有限执行预算。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
+pub struct ModuleFinalizer {
+    /// Exact name already present in the module's declared exports.
+    /// 已存在于模块声明导出中的精确名称。
+    pub export: String,
+    /// Structured closing input validated at registration and again before execution.
+    /// 在注册时及执行前再次校验的结构化关闭输入。
+    pub arguments: Value,
+    /// Finite milliseconds starting at closing execution admission, independent from business cancellation.
+    /// 从关闭执行入场开始计时的有限毫秒数，独立于业务取消。
+    pub timeout_ms: u64,
 }
 
 /// One named export with explicit input and output schemas.
@@ -107,6 +128,15 @@ impl ModuleDefinition {
                     "module exports must be distinct nonempty names without NUL",
                 ));
             }
+        }
+        if let Some(finalizer) = &self.finalizer {
+            let export = self
+                .exports
+                .iter()
+                .find(|export| export.name == finalizer.export)
+                .ok_or_else(|| EmbeddedError::invalid("closing export must be declared"))?;
+            CallControl::new(std::time::Duration::from_millis(finalizer.timeout_ms))?;
+            export.compile()?.0.validate(&finalizer.arguments)?;
         }
         Ok(())
     }

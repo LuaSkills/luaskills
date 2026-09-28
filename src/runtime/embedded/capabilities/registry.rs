@@ -102,6 +102,9 @@ struct EntryState {
     /// Permanent admission gate for this immutable registration.
     /// 当前不可变注册的永久入场门。
     accepting: bool,
+    /// Runtime shutdown admits only registered finalization controls until actual operation drainage.
+    /// 运行时关闭期间仅接纳已注册关闭控制，直到操作真正排空。
+    finalization_only: bool,
     /// Actual admitted handlers retained until their execution owners finish.
     /// 保留到执行所有者结束的真实入场处理器数。
     running: usize,
@@ -143,6 +146,7 @@ impl CapabilityEntry {
     /// `transition` 不得调用宿主代码；释放门后转发其返回值。
     pub(super) fn with_dispatch_gate<T>(
         &self,
+        finalization: bool,
         transition: impl FnOnce() -> T,
     ) -> EmbeddedResult<T> {
         // Keep unregistration linearized with queued-to-dispatched publication.
@@ -151,7 +155,7 @@ impl CapabilityEntry {
             .state
             .lock()
             .map_err(|_| internal("capability state is poisoned"))?;
-        if !state.accepting {
+        if !state.accepting || (state.finalization_only && !finalization) {
             return Err(EmbeddedError::new(
                 EmbeddedErrorCode::Closed,
                 "capability registration is closed",
@@ -201,7 +205,7 @@ impl CapabilityEntry {
         Ok(CapabilityRegistrationStatus {
             registration_id: self.id.clone(),
             name: self.descriptor.name.clone(),
-            accepting: state.accepting,
+            accepting: state.accepting && !state.finalization_only,
             in_flight: state.running,
             drained: !state.accepting
                 && state.running == 0
@@ -212,7 +216,10 @@ impl CapabilityEntry {
 
     /// Admit against parent and registration budgets atomically, returning exclusive release authority.
     /// 原子地针对父级与注册预算入场，返回独占释放权威。
-    pub(super) fn admit(self: &Arc<Self>) -> EmbeddedResult<AdmittedCapability> {
+    pub(super) fn admit(
+        self: &Arc<Self>,
+        finalization: bool,
+    ) -> EmbeddedResult<AdmittedCapability> {
         // Lock order is parent admission then registration; callbacks never hold either lock.
         // 锁顺序为父级入场后注册；回调绝不持有任一锁。
         let mut running = self
@@ -226,7 +233,7 @@ impl CapabilityEntry {
             .state
             .lock()
             .map_err(|_| internal("capability state is poisoned"))?;
-        if !state.accepting {
+        if !state.accepting || (state.finalization_only && !finalization) {
             return Err(EmbeddedError::new(
                 EmbeddedErrorCode::Closed,
                 "capability registration is closed",
@@ -336,6 +343,9 @@ pub(super) struct AdmittedCapability {
 /// One admitted call retained by either native execution or a reliable SDK request.
 /// 由原生执行或可靠 SDK 请求保留的单个已入场调用。
 pub(super) struct PreparedCapability {
+    /// Immutable execution stage proven by the operation-bound control, never by plugin arguments.
+    /// 由绑定操作的控制证明的不可变执行阶段，绝不由插件参数决定。
+    pub(super) finalization: bool,
     /// Exact immutable registration captured by the module's snapshot.
     /// 模块快照捕获的精确不可变注册。
     pub(super) entry: Arc<CapabilityEntry>,
@@ -512,6 +522,7 @@ impl CapabilityRegistry {
                     admission: Arc::clone(&self.admission),
                     state: Mutex::new(EntryState {
                         accepting: true,
+                        finalization_only: false,
                         running: 0,
                         releasing: false,
                         native: request.native,
@@ -627,10 +638,10 @@ impl CapabilityRegistry {
         Ok(())
     }
 
-    /// Close publication and exact dispatch gates without dropping native closures on the control thread.
-    /// 关闭发布及精确分发门，不在控制线程释放原生闭包。
-    /// Already executing handlers retain ownership and receive normal cooperative cancellation.
-    /// 已执行处理器保留所有权，并接收正常协作取消。
+    /// Close publication and business dispatch while retaining registered closing-stage authority.
+    /// 关闭发布与业务分发，同时保留已注册关闭阶段的执行权。
+    /// Actual drainage closes the broker and releases callbacks; explicit revocation still closes every stage.
+    /// 真正排空后关闭队列并释放回调；显式撤销仍关闭全部阶段。
     pub(crate) fn begin_shutdown(&self) -> EmbeddedResult<()> {
         let entries = {
             let mut state = self
@@ -646,9 +657,8 @@ impl CapabilityRegistry {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .accepting = false;
+                .finalization_only = true;
         }
-        self.broker.close();
         Ok(())
     }
 
@@ -853,7 +863,8 @@ impl CapabilitySnapshot {
         entry.input.validate(&arguments)?;
         // Admission retains capacity across every dispatched native or SDK handler.
         // 入场在全部已分发原生或 SDK 处理器期间保留容量。
-        let admitted = entry.admit()?;
+        let finalization = control.is_finalization()?;
+        let admitted = entry.admit(finalization)?;
         // Retention failure is detected before native execution or SDK publication can produce effects.
         // 在原生执行或 SDK 发布可能产生副作用前检测保留失败。
         let effect = control.reserve_effect(
@@ -874,6 +885,7 @@ impl CapabilitySnapshot {
         };
         invocation.authorize()?;
         Ok(PreparedCapability {
+            finalization,
             entry,
             invocation,
             admitted,
@@ -963,6 +975,7 @@ impl CapabilitySnapshot {
         // Native and queued transports share exactly the same identity, schema and grant checks.
         // 原生与队列传输共享完全相同的身份、Schema 与授权检查。
         let PreparedCapability {
+            finalization,
             entry,
             invocation,
             admitted,
@@ -985,7 +998,7 @@ impl CapabilitySnapshot {
         // 磁盘确认先于分发，等待不能延长原始权限或截止时间。
         effect.checkpoint_start(true)?;
         invocation.authorize()?;
-        entry.with_dispatch_gate(|| effect.begin())??;
+        entry.with_dispatch_gate(finalization, || effect.begin())??;
         // Fixed panic diagnostics do not expose private callback values.
         // 固定 panic 诊断不暴露私有回调值。
         let outcome =

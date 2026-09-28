@@ -102,6 +102,7 @@ impl Drop for Directory {
 /// 返回一个由 `id` 标识的不可变未决检查点。
 fn snapshot(id: &str) -> Arc<OperationSnapshot> {
     Arc::new(OperationSnapshot {
+        finalization: None,
         context: OperationContext::Unbound,
         operation_id: id.into(),
         phase: OperationPhase::Running,

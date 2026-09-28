@@ -8,6 +8,7 @@ use std::time::Duration;
 
 mod delivery;
 mod effects;
+mod finalization;
 mod lifetime;
 mod queued;
 

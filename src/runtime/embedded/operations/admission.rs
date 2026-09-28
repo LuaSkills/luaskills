@@ -80,6 +80,7 @@ impl OperationRegistry {
             ),
             control: Arc::clone(&control),
             snapshot: Mutex::new(OperationSnapshot {
+                finalization: None,
                 context,
                 host_effects: Vec::new(),
                 operation_id: id.clone(),
@@ -94,7 +95,10 @@ impl OperationRegistry {
         });
         // The original control belongs to one operation; failed attachment publishes no registry identity.
         // 原始控制对象只归属于一个操作；绑定失败不发布注册表身份。
-        control.attach_effects(Arc::clone(&operation.effects))?;
+        control.attach_effects(
+            Arc::clone(&operation.effects),
+            super::super::effects::EffectAdmissionStage::Business,
+        )?;
         state.sequence = sequence;
         state.records.insert(id, Arc::clone(&operation));
         Ok((
@@ -102,6 +106,7 @@ impl OperationRegistry {
                 operation: Arc::clone(&operation),
             },
             OperationOwner {
+                finalization: None,
                 operation,
                 pending_completion: None,
                 completion_checkpoint: None,

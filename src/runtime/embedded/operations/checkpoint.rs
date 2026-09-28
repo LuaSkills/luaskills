@@ -145,9 +145,15 @@ enum CheckpointEffect {
 }
 
 impl PendingCheckpoint {
+    /// Identify an owner lifecycle candidate without exposing host-effect checkpoint internals.
+    /// 标识所有者生命周期候选，不暴露宿主副作用检查点内部结构。
+    pub(super) fn is_lifecycle_phase(&self, phase: OperationPhase) -> bool {
+        self.snapshot.phase == phase && self.effect.is_none()
+    }
+
     /// Retain immutable `snapshot` before the first bounded queue admission.
     /// 在首次有界队列入场前保留不可变 `snapshot`。
-    fn new(snapshot: Arc<OperationSnapshot>) -> Self {
+    pub(super) fn new(snapshot: Arc<OperationSnapshot>) -> Self {
         Self {
             effect: None,
             failure: None,
@@ -617,27 +623,9 @@ impl OperationOwner {
                 "operation has a retained phase checkpoint",
             ));
         }
-        // Bound retained application evidence before constructing the immutable completion attempt.
-        // 构造不可变完成尝试前限制保留的应用证据。
-        let encoded = match &result {
-            Ok(value) => json_size(value, self.operation.max_value_bytes),
-            Err(error) => json_size(error, self.operation.max_value_bytes),
-        };
-        // Keep fixed diagnostics rather than retain oversized business values.
-        // 保留固定诊断，不保留超大业务值。
-        let result = match encoded {
-            Ok(_) => result,
-            Err(error) if error.code == EmbeddedErrorCode::CapacityExceeded => {
-                Err(EmbeddedError::new(
-                    EmbeddedErrorCode::CapacityExceeded,
-                    "operation result exceeds the configured byte limit",
-                ))
-            }
-            Err(_) => Err(EmbeddedError::new(
-                EmbeddedErrorCode::Internal,
-                "operation result serialization failed",
-            )),
-        };
+        // Both business and closing outcomes use the same authoritative value-budget normalization.
+        // 业务与关闭结果共用同一个权威值预算规范化规则。
+        let result = OperationOutcome::bounded(result, self.operation.max_value_bytes).result();
         // The public observation remains Cleaning until terminal persistence is acknowledged.
         // 终态持久化确认前，公开观测保持 Cleaning。
         let mut snapshot = self.operation.lock()?.clone();
@@ -647,6 +635,39 @@ impl OperationOwner {
                 "operation completion requires finished execution and cleanup",
             ));
         }
+        // Closing cannot be skipped or replace the frozen original business result.
+        // 不能跳过关闭，也不能替换冻结的原业务结果。
+        let result = match &snapshot.finalization {
+            Some(finalization) => {
+                if !self
+                    .finalization
+                    .as_ref()
+                    .is_some_and(|owner| owner.outcome_prepared)
+                {
+                    return Err(EmbeddedError::new(
+                        EmbeddedErrorCode::Busy,
+                        "closing outcome is not acknowledged",
+                    ));
+                }
+                if finalization.business.result() != result {
+                    return Err(EmbeddedError::invalid(
+                        "completion cannot replace the original business outcome",
+                    ));
+                }
+                match (&finalization.business, &finalization.outcome) {
+                    (_, None) => {
+                        return Err(EmbeddedError::new(
+                            EmbeddedErrorCode::Busy,
+                            "closing outcome is missing",
+                        ));
+                    }
+                    (OperationOutcome::Failed { error }, _) => Err(error.clone()),
+                    (_, Some(OperationOutcome::Failed { error })) => Err(error.clone()),
+                    (_, Some(OperationOutcome::Succeeded { .. })) => result,
+                }
+            }
+            None => result,
+        };
         snapshot.host_effects = self.operation.effects.seal()?;
         snapshot.effects = merge_effects(effects, &snapshot.host_effects);
         snapshot.cancellation_requested = self.operation.control.is_cancelled();

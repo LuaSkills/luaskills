@@ -2061,6 +2061,17 @@
             },
             "type": "array"
           },
+          "finalizer": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ModuleFinalizer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional host-owned closing declaration for supported scheduled lifecycles.\n可选的宿主所有关闭声明，用于受支持的调度生命周期。"
+          },
           "generation": {
             "description": "Host-assigned immutable code and dependency generation.\n宿主分配的不可变代码与依赖代次。",
             "type": "string"
@@ -2123,6 +2134,31 @@
           "name",
           "input_schema",
           "output_schema"
+        ],
+        "type": "object"
+      },
+      "ModuleFinalizer": {
+        "additionalProperties": false,
+        "description": "Immutable closing export, arguments and independent finite execution budget.\n不可变关闭导出、参数及独立有限执行预算。",
+        "properties": {
+          "arguments": {
+            "description": "Structured closing input validated at registration and again before execution.\n在注册时及执行前再次校验的结构化关闭输入。"
+          },
+          "export": {
+            "description": "Exact name already present in the module's declared exports.\n已存在于模块声明导出中的精确名称。",
+            "type": "string"
+          },
+          "timeout_ms": {
+            "description": "Finite milliseconds starting at closing execution admission, independent from business cancellation.\n从关闭执行入场开始计时的有限毫秒数，独立于业务取消。",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "export",
+          "arguments",
+          "timeout_ms"
         ],
         "type": "object"
       },
@@ -4929,6 +4965,85 @@
             }
           ]
         },
+        "OperationFinalization": {
+          "additionalProperties": false,
+          "description": "Durable closing intent and separate outcomes within one original operation identity.\n同一原始操作身份中的持久关闭意图与独立结果。",
+          "properties": {
+            "business": {
+              "$ref": "#/$defs/OperationOutcome",
+              "description": "Bounded original business result retained even if closing fails.\n即使关闭失败也保留的有界原始业务结果。"
+            },
+            "business_effect_count": {
+              "description": "Frozen number of ordered host effects admitted before the closing phase.\n关闭阶段前接纳的有序宿主副作用的冻结数量。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "export": {
+              "description": "Exact host-selected declared export; absence of an outcome is not proof it never ran.\n宿主选择的精确声明导出；缺少结果不能证明其从未运行。",
+              "type": "string"
+            },
+            "outcome": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/OperationOutcome"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Actual closing result; omitted until the owner records a returned outcome.\n实际关闭结果；所有者记录已返回结果前省略。"
+            }
+          },
+          "required": [
+            "export",
+            "business",
+            "business_effect_count"
+          ],
+          "type": "object"
+        },
+        "OperationOutcome": {
+          "description": "One bounded execution outcome; explicit JSON null remains a successful value.\n一项有界执行结果；显式 JSON 空值仍为成功值。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "description": "The stage returned its validated application value.\n该阶段返回经过校验的应用值。",
+              "properties": {
+                "status": {
+                  "const": "succeeded",
+                  "type": "string"
+                },
+                "value": {
+                  "description": "Exact successful JSON value, including explicit null.\n精确成功 JSON 值，包含显式空值。"
+                }
+              },
+              "required": [
+                "status",
+                "value"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "The stage failed without discarding the other stage's result.\n该阶段失败，但不丢弃另一阶段的结果。",
+              "properties": {
+                "error": {
+                  "$ref": "#/$defs/EmbeddedError",
+                  "description": "Structured stage error independent of side-effect evidence.\n独立于副作用证据的结构化阶段错误。"
+                },
+                "status": {
+                  "const": "failed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "error"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "OperationPhase": {
           "description": "Execution phase; cancellation intent is reported separately from actual termination.\n执行阶段；取消意图与实际终止分开报告。",
           "oneOf": [
@@ -5042,6 +5157,17 @@
                 }
               ],
               "description": "Structured terminal error; absent while execution is still in progress.\n结构化终态错误；执行仍在进行时省略。"
+            },
+            "finalization": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/OperationFinalization"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Closing intent and separate stage results, absent when no explicit finalization was prepared.\n关闭意图及独立阶段结果；未准备显式关闭时省略。"
             },
             "host_effects": {
               "description": "Exact host callback evidence retained even after Lua failure, cancellation or output rejection.\n即使 Lua 失败、取消或输出被拒绝也保留的精确宿主回调证据。",
@@ -5527,6 +5653,85 @@
             }
           ]
         },
+        "OperationFinalization": {
+          "additionalProperties": false,
+          "description": "Durable closing intent and separate outcomes within one original operation identity.\n同一原始操作身份中的持久关闭意图与独立结果。",
+          "properties": {
+            "business": {
+              "$ref": "#/$defs/OperationOutcome",
+              "description": "Bounded original business result retained even if closing fails.\n即使关闭失败也保留的有界原始业务结果。"
+            },
+            "business_effect_count": {
+              "description": "Frozen number of ordered host effects admitted before the closing phase.\n关闭阶段前接纳的有序宿主副作用的冻结数量。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "export": {
+              "description": "Exact host-selected declared export; absence of an outcome is not proof it never ran.\n宿主选择的精确声明导出；缺少结果不能证明其从未运行。",
+              "type": "string"
+            },
+            "outcome": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/OperationOutcome"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Actual closing result; omitted until the owner records a returned outcome.\n实际关闭结果；所有者记录已返回结果前省略。"
+            }
+          },
+          "required": [
+            "export",
+            "business",
+            "business_effect_count"
+          ],
+          "type": "object"
+        },
+        "OperationOutcome": {
+          "description": "One bounded execution outcome; explicit JSON null remains a successful value.\n一项有界执行结果；显式 JSON 空值仍为成功值。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "description": "The stage returned its validated application value.\n该阶段返回经过校验的应用值。",
+              "properties": {
+                "status": {
+                  "const": "succeeded",
+                  "type": "string"
+                },
+                "value": {
+                  "description": "Exact successful JSON value, including explicit null.\n精确成功 JSON 值，包含显式空值。"
+                }
+              },
+              "required": [
+                "status",
+                "value"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "The stage failed without discarding the other stage's result.\n该阶段失败，但不丢弃另一阶段的结果。",
+              "properties": {
+                "error": {
+                  "$ref": "#/$defs/EmbeddedError",
+                  "description": "Structured stage error independent of side-effect evidence.\n独立于副作用证据的结构化阶段错误。"
+                },
+                "status": {
+                  "const": "failed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "error"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "OperationPhase": {
           "description": "Execution phase; cancellation intent is reported separately from actual termination.\n执行阶段；取消意图与实际终止分开报告。",
           "oneOf": [
@@ -5640,6 +5845,17 @@
                 }
               ],
               "description": "Structured terminal error; absent while execution is still in progress.\n结构化终态错误；执行仍在进行时省略。"
+            },
+            "finalization": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/OperationFinalization"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Closing intent and separate stage results, absent when no explicit finalization was prepared.\n关闭意图及独立阶段结果；未准备显式关闭时省略。"
             },
             "host_effects": {
               "description": "Exact host callback evidence retained even after Lua failure, cancellation or output rejection.\n即使 Lua 失败、取消或输出被拒绝也保留的精确宿主回调证据。",
@@ -6832,6 +7048,85 @@
             }
           ]
         },
+        "OperationFinalization": {
+          "additionalProperties": false,
+          "description": "Durable closing intent and separate outcomes within one original operation identity.\n同一原始操作身份中的持久关闭意图与独立结果。",
+          "properties": {
+            "business": {
+              "$ref": "#/$defs/OperationOutcome",
+              "description": "Bounded original business result retained even if closing fails.\n即使关闭失败也保留的有界原始业务结果。"
+            },
+            "business_effect_count": {
+              "description": "Frozen number of ordered host effects admitted before the closing phase.\n关闭阶段前接纳的有序宿主副作用的冻结数量。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "export": {
+              "description": "Exact host-selected declared export; absence of an outcome is not proof it never ran.\n宿主选择的精确声明导出；缺少结果不能证明其从未运行。",
+              "type": "string"
+            },
+            "outcome": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/OperationOutcome"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Actual closing result; omitted until the owner records a returned outcome.\n实际关闭结果；所有者记录已返回结果前省略。"
+            }
+          },
+          "required": [
+            "export",
+            "business",
+            "business_effect_count"
+          ],
+          "type": "object"
+        },
+        "OperationOutcome": {
+          "description": "One bounded execution outcome; explicit JSON null remains a successful value.\n一项有界执行结果；显式 JSON 空值仍为成功值。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "description": "The stage returned its validated application value.\n该阶段返回经过校验的应用值。",
+              "properties": {
+                "status": {
+                  "const": "succeeded",
+                  "type": "string"
+                },
+                "value": {
+                  "description": "Exact successful JSON value, including explicit null.\n精确成功 JSON 值，包含显式空值。"
+                }
+              },
+              "required": [
+                "status",
+                "value"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "The stage failed without discarding the other stage's result.\n该阶段失败，但不丢弃另一阶段的结果。",
+              "properties": {
+                "error": {
+                  "$ref": "#/$defs/EmbeddedError",
+                  "description": "Structured stage error independent of side-effect evidence.\n独立于副作用证据的结构化阶段错误。"
+                },
+                "status": {
+                  "const": "failed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "error"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "OperationPhase": {
           "description": "Execution phase; cancellation intent is reported separately from actual termination.\n执行阶段；取消意图与实际终止分开报告。",
           "oneOf": [
@@ -6903,6 +7198,17 @@
                 }
               ],
               "description": "Structured terminal error; absent while execution is still in progress.\n结构化终态错误；执行仍在进行时省略。"
+            },
+            "finalization": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/OperationFinalization"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Closing intent and separate stage results, absent when no explicit finalization was prepared.\n关闭意图及独立阶段结果；未准备显式关闭时省略。"
             },
             "host_effects": {
               "description": "Exact host callback evidence retained even after Lua failure, cancellation or output rejection.\n即使 Lua 失败、取消或输出被拒绝也保留的精确宿主回调证据。",
@@ -7279,6 +7585,85 @@
             }
           ]
         },
+        "OperationFinalization": {
+          "additionalProperties": false,
+          "description": "Durable closing intent and separate outcomes within one original operation identity.\n同一原始操作身份中的持久关闭意图与独立结果。",
+          "properties": {
+            "business": {
+              "$ref": "#/$defs/OperationOutcome",
+              "description": "Bounded original business result retained even if closing fails.\n即使关闭失败也保留的有界原始业务结果。"
+            },
+            "business_effect_count": {
+              "description": "Frozen number of ordered host effects admitted before the closing phase.\n关闭阶段前接纳的有序宿主副作用的冻结数量。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "export": {
+              "description": "Exact host-selected declared export; absence of an outcome is not proof it never ran.\n宿主选择的精确声明导出；缺少结果不能证明其从未运行。",
+              "type": "string"
+            },
+            "outcome": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/OperationOutcome"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Actual closing result; omitted until the owner records a returned outcome.\n实际关闭结果；所有者记录已返回结果前省略。"
+            }
+          },
+          "required": [
+            "export",
+            "business",
+            "business_effect_count"
+          ],
+          "type": "object"
+        },
+        "OperationOutcome": {
+          "description": "One bounded execution outcome; explicit JSON null remains a successful value.\n一项有界执行结果；显式 JSON 空值仍为成功值。",
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "description": "The stage returned its validated application value.\n该阶段返回经过校验的应用值。",
+              "properties": {
+                "status": {
+                  "const": "succeeded",
+                  "type": "string"
+                },
+                "value": {
+                  "description": "Exact successful JSON value, including explicit null.\n精确成功 JSON 值，包含显式空值。"
+                }
+              },
+              "required": [
+                "status",
+                "value"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "The stage failed without discarding the other stage's result.\n该阶段失败，但不丢弃另一阶段的结果。",
+              "properties": {
+                "error": {
+                  "$ref": "#/$defs/EmbeddedError",
+                  "description": "Structured stage error independent of side-effect evidence.\n独立于副作用证据的结构化阶段错误。"
+                },
+                "status": {
+                  "const": "failed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "error"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "OperationPhase": {
           "description": "Execution phase; cancellation intent is reported separately from actual termination.\n执行阶段；取消意图与实际终止分开报告。",
           "oneOf": [
@@ -7350,6 +7735,17 @@
                 }
               ],
               "description": "Structured terminal error; absent while execution is still in progress.\n结构化终态错误；执行仍在进行时省略。"
+            },
+            "finalization": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/OperationFinalization"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Closing intent and separate stage results, absent when no explicit finalization was prepared.\n关闭意图及独立阶段结果；未准备显式关闭时省略。"
             },
             "host_effects": {
               "description": "Exact host callback evidence retained even after Lua failure, cancellation or output rejection.\n即使 Lua 失败、取消或输出被拒绝也保留的精确宿主回调证据。",

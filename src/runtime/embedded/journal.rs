@@ -414,6 +414,7 @@ impl OperationJournal {
 /// Return an explicit identity error; no current plugin registration supplies missing historical fields.
 /// 返回明确身份错误；不从当前插件注册补充缺失的历史字段。
 fn validate_callers(runtime_id: &str, snapshot: &OperationSnapshot) -> EmbeddedResult<()> {
+    snapshot.validate_finalization()?;
     snapshot
         .context
         .validate(runtime_id, &snapshot.operation_id)?;

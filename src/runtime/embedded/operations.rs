@@ -12,6 +12,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 mod admission;
+mod finalization;
+use finalization::FinalizationOwnership;
+pub use finalization::{OperationFinalization, OperationOutcome};
 mod context;
 pub use context::{ModuleOperationContext, OperationContext};
 mod checkpoint;
@@ -89,6 +92,10 @@ pub enum EffectState {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct OperationSnapshot {
+    /// Closing intent and separate stage results, absent when no explicit finalization was prepared.
+    /// 关闭意图及独立阶段结果；未准备显式关闭时省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalization: Option<OperationFinalization>,
     /// Admission-time module authority, or an explicit unbound low-level origin; never reconstructed from effects.
     /// 入场时模块权威，或明确未绑定的低层来源；绝不从副作用重建。
     pub context: OperationContext,
@@ -356,6 +363,9 @@ impl OperationHandle {
 /// Non-cloneable execution authority retained until real execution and cleanup finish.
 /// 保留到真实执行与清理结束的不可克隆执行权威。
 pub struct OperationOwner {
+    /// Exclusive closing-budget and outcome ownership across persistence retries.
+    /// 跨持久化重试的独占关闭预算与结果所有权。
+    finalization: Option<FinalizationOwnership>,
     /// Exact state shared with client views and the bounded registry.
     /// 与客户端视图及有界注册表共享的精确状态。
     operation: Arc<Operation>,

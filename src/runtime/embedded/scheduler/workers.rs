@@ -10,6 +10,9 @@ enum Dispatch {
     /// Metadata admission failed without running plugin code.
     /// 元数据入场失败，未运行插件代码。
     Rejected(ScheduledCall, EmbeddedError),
+    /// Durable closing intent keeps the original VM and admission for one finalizer execution.
+    /// 持久关闭意图保留原始 VM 与入场，只执行一次关闭回调。
+    Finalizing(Box<PendingCompletion>),
 }
 
 /// Remove exact queued ownership and all queue charges while preserving unrelated plugin rotation.
@@ -195,6 +198,20 @@ fn invoke(
     if let Err(error) = retained_size {
         result = Err(error);
     }
+    // A declared finalizer retains this exact VM until both closing checkpoints are acknowledged.
+    // 声明的关闭回调保留此精确 VM，直到两个关闭检查点都已确认。
+    if let Some(plan) = lease.finalization_plan() {
+        return PendingCompletion {
+            finalization: Some(PendingFinalization::new(lease, plan)),
+            call,
+            result,
+            retirement: None,
+            effects: EffectState::Unknown,
+            session_lease: None,
+            dispatched: true,
+            cleaning_started: false,
+        };
+    }
     // A successful pinned lease stays exclusive through operation evidence sealing.
     // 成功的固定租借在操作证据封存前保持独占。
     let keep_session =
@@ -216,6 +233,7 @@ fn invoke(
     };
     call.request.release_values();
     PendingCompletion {
+        finalization: None,
         call,
         result,
         retirement,
@@ -233,14 +251,20 @@ pub(super) fn execute(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
         let dispatch = {
             let mut state = center.lock()?;
             loop {
-                if state.closing {
+                if state.closing && state.live.is_empty() {
                     return Ok(());
                 }
-                if state.persistence_failures.is_empty()
-                    && !state.shared_checkpoint_failed
-                    && let Some(dispatch) = select(&mut state)?
-                {
-                    break dispatch;
+                if state.persistence_failures.is_empty() && !state.shared_checkpoint_failed {
+                    // Closing continuations keep their original admission, even during runtime shutdown.
+                    // 关闭续执行保留原始入场，即使运行时正在关闭。
+                    if let Some(completion) = state.finalizing.pop_front() {
+                        break Dispatch::Finalizing(Box::new(completion));
+                    }
+                    if !state.closing
+                        && let Some(dispatch) = select(&mut state)?
+                    {
+                        break dispatch;
+                    }
                 }
                 state = center
                     .changed
@@ -249,19 +273,28 @@ pub(super) fn execute(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
                     .0;
             }
         };
-        let completion = match dispatch {
-            Dispatch::Ready(call, lease) => {
-                invoke(call, *lease, center.pools.config().max_value_bytes)
-            }
-            Dispatch::Rejected(call, error) => PendingCompletion {
-                session_lease: None,
-                call,
-                result: Err(error),
-                retirement: None,
-                effects: EffectState::NotStarted,
-                dispatched: false,
-                cleaning_started: false,
-            },
+        let (completion, newly_dispatched) = match dispatch {
+            Dispatch::Ready(call, lease) => (
+                invoke(call, *lease, center.pools.config().max_value_bytes),
+                true,
+            ),
+            Dispatch::Rejected(call, error) => (
+                PendingCompletion {
+                    finalization: None,
+                    session_lease: None,
+                    call,
+                    result: Err(error),
+                    retirement: None,
+                    effects: EffectState::NotStarted,
+                    dispatched: false,
+                    cleaning_started: false,
+                },
+                true,
+            ),
+            Dispatch::Finalizing(completion) => (
+                finalization::execute(*completion, center.pools.config().max_value_bytes),
+                false,
+            ),
         };
         {
             let mut state = center.lock()?;
@@ -279,7 +312,9 @@ pub(super) fn execute(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
                     session.error.get_or_insert_with(|| error.clone());
                 }
             }
-            state.cleaning_count += 1;
+            if newly_dispatched {
+                state.cleaning_count += 1;
+            }
             state.cleaning.push(completion);
         }
         center.changed.notify_all();
@@ -330,6 +365,7 @@ fn reject_expired(state: &mut SchedulerState) {
                     };
                 state.cleaning_count += 1;
                 state.cleaning.push(PendingCompletion {
+                    finalization: None,
                     session_lease,
                     call,
                     result: Err(error),
@@ -408,6 +444,30 @@ fn complete(
             },
             None => false,
         };
+        if completion.finalization.is_some() {
+            drop(state);
+            match finalization::advance(center, &mut completion, retry) {
+                Ok(finalization::Progress::Ready) => {
+                    let mut state = match center.lock() {
+                        Ok(state) => state,
+                        Err(error) => {
+                            center.fail(error);
+                            return Some(completion);
+                        }
+                    };
+                    state.finalizing.push_back(completion);
+                    center.changed.notify_all();
+                    return None;
+                }
+                Ok(finalization::Progress::Pending) => return Some(completion),
+                Ok(finalization::Progress::Retiring) => continue,
+                Err(error) if error.code == EmbeddedErrorCode::Busy => return Some(completion),
+                Err(error) => {
+                    center.fail(error);
+                    return Some(completion);
+                }
+            }
+        }
         if !completion.cleaning_started {
             drop(state);
             // A failed execution-stage checkpoint remains owned and must be resolved before cleaning advances.

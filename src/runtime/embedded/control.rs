@@ -1,6 +1,6 @@
 use super::HostEffectRecord;
 use super::capabilities::CapabilityCaller;
-use super::effects::{EffectAttempt, EffectLedger};
+use super::effects::{EffectAdmissionStage, EffectAttempt, EffectLedger};
 use super::{EmbeddedError, EmbeddedErrorCode, EmbeddedResult};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,13 +42,27 @@ enum ControlEvidence {
     Untracked,
     /// All subsequent calls belong to this exact registered operation.
     /// 全部后续调用归属于此精确注册操作。
-    Registered(Arc<EffectLedger>),
+    Registered(Arc<EffectLedger>, EffectAdmissionStage),
 }
 
 impl CallControl {
+    /// Return whether this control was issued for a registered closing stage.
+    /// 返回此控制对象是否为已注册关闭阶段签发。
+    pub(crate) fn is_finalization(&self) -> EmbeddedResult<bool> {
+        let evidence = self.effects.lock().map_err(|_| evidence_poisoned())?;
+        Ok(matches!(
+            &*evidence,
+            ControlEvidence::Registered(_, EffectAdmissionStage::Finalization)
+        ))
+    }
+
     /// Attach `ledger` once; reusing a control across registered operations is rejected.
     /// 仅附加一次 `ledger`；拒绝跨注册操作复用控制对象。
-    pub(super) fn attach_effects(&self, ledger: Arc<EffectLedger>) -> EmbeddedResult<()> {
+    pub(super) fn attach_effects(
+        &self,
+        ledger: Arc<EffectLedger>,
+        stage: EffectAdmissionStage,
+    ) -> EmbeddedResult<()> {
         // Registration cannot race past an untracked callback and lose its evidence.
         // 注册不能越过并发未跟踪回调并丢失其证据。
         let mut evidence = self.effects.lock().map_err(|_| evidence_poisoned())?;
@@ -58,7 +72,7 @@ impl CallControl {
                 "operation control is already registered or used",
             ));
         }
-        *evidence = ControlEvidence::Registered(ledger);
+        *evidence = ControlEvidence::Registered(ledger, stage);
         Ok(())
     }
 
@@ -69,7 +83,7 @@ impl CallControl {
         // 返回拥有所有权的身份，避免控制状态锁跨越模块初始化。
         let evidence = self.effects.lock().map_err(|_| evidence_poisoned())?;
         Ok(match &*evidence {
-            ControlEvidence::Registered(ledger) => Some(ledger.operation_id().to_owned()),
+            ControlEvidence::Registered(ledger, _) => Some(ledger.operation_id().to_owned()),
             ControlEvidence::Fresh | ControlEvidence::Untracked => None,
         })
     }
@@ -82,7 +96,7 @@ impl CallControl {
         let ledger = {
             let evidence = self.effects.lock().map_err(|_| evidence_poisoned())?;
             match &*evidence {
-                ControlEvidence::Registered(ledger) => Some(Arc::clone(ledger)),
+                ControlEvidence::Registered(ledger, _) => Some(Arc::clone(ledger)),
                 ControlEvidence::Fresh | ControlEvidence::Untracked => None,
             }
         };
@@ -103,7 +117,7 @@ impl CallControl {
         let ledger = {
             let mut evidence = self.effects.lock().map_err(|_| evidence_poisoned())?;
             match &*evidence {
-                ControlEvidence::Registered(ledger) => Some(Arc::clone(ledger)),
+                ControlEvidence::Registered(ledger, stage) => Some((Arc::clone(ledger), *stage)),
                 ControlEvidence::Fresh | ControlEvidence::Untracked => {
                     *evidence = ControlEvidence::Untracked;
                     None
@@ -111,7 +125,7 @@ impl CallControl {
             }
         };
         match ledger {
-            Some(ledger) => ledger.prepare(caller, registration_id, name, version),
+            Some((ledger, stage)) => ledger.prepare(stage, caller, registration_id, name, version),
             None => Ok(EffectAttempt::untracked()),
         }
     }

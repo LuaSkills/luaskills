@@ -4,6 +4,7 @@ use crate::runtime::embedded::capabilities::*;
 use crate::runtime::embedded::*;
 use std::collections::BTreeSet;
 
+mod finalization;
 mod persistence;
 mod plugins;
 mod resources;

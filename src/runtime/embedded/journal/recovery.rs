@@ -156,6 +156,7 @@ impl OperationJournal {
                     if current.snapshot.context != snapshot.context {
                         return Err(EmbeddedError::invalid("operation history context is immutable"));
                     }
+                    snapshot.validate_finalization_successor(&current.snapshot)?;
                     if current.reconciliation.is_some() {
                         return Err(EmbeddedError::new(EmbeddedErrorCode::AlreadyCompleted, "reconciled operation history is immutable"));
                     }

@@ -57,6 +57,7 @@ fn config() -> OperationJournalConfig {
 /// 为 `id` 构造尚未结束且副作用未知的检查点，不编造终态证据。
 fn snapshot(id: &str) -> OperationSnapshot {
     OperationSnapshot {
+        finalization: None,
         context: OperationContext::Unbound,
         operation_id: id.into(),
         phase: OperationPhase::Running,

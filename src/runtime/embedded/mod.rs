@@ -42,10 +42,10 @@ pub use journal::{
     OperationJournalWorkerConfig, OperationJournalWorkerStatus, OperationReconciliation,
     ReconciledExecution, ResolvedEffectState,
 };
-pub use module::{ModuleDefinition, ModuleExport, ModuleInvocation};
+pub use module::{ModuleDefinition, ModuleExport, ModuleFinalizer, ModuleInvocation};
 pub use operations::{
-    EffectState, ModuleOperationContext, OperationContext, OperationHandle, OperationOwner,
-    OperationPhase, OperationRegistry, OperationSnapshot,
+    EffectState, ModuleOperationContext, OperationContext, OperationFinalization, OperationHandle,
+    OperationOutcome, OperationOwner, OperationPhase, OperationRegistry, OperationSnapshot,
 };
 pub use plugin_config::EmbeddedPluginConfig;
 pub use pool::{EmbeddedPoolManager, ModuleLease, ModulePool};

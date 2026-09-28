@@ -11,10 +11,12 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+mod finalization;
 mod persistence;
 mod plugins;
 mod sessions;
 mod workers;
+use finalization::PendingFinalization;
 
 pub use persistence::{CheckpointRetryState, OperationPersistenceFailure};
 pub use plugins::EmbeddedPluginSnapshot;
@@ -110,6 +112,9 @@ struct ScheduledCall {
 /// Retained completion cannot become terminal before VM retirement and host evidence sealing.
 /// 保留的完成记录在 VM 退役与宿主证据封存前不能成为终态。
 struct PendingCompletion {
+    /// Same-VM closing work retained through its intent, actual execution and durable outcome.
+    /// 跨意图、真实执行及持久结果保留的同 VM 关闭工作。
+    finalization: Option<PendingFinalization>,
     /// Successful session ownership remains exclusive until operation evidence is sealed.
     /// 成功会话的所有权保持独占，直到操作证据封存。
     session_lease: Option<Box<ModuleLease>>,
@@ -136,6 +141,9 @@ struct PendingCompletion {
 /// Short-lock scheduling metadata contains no Lua execution or native destructor work.
 /// 短时锁调度元数据不包含 Lua 执行或原生析构工作。
 struct SchedulerState {
+    /// Closing continuations use existing workers and retain the original active-operation charge.
+    /// 关闭续行使用既有工作线程，并保留原活动操作记账。
+    finalizing: VecDeque<PendingCompletion>,
     /// Last supervised shared-checkpoint observation pauses dispatch while an active callback awaits repair.
     /// 上次监督得到的共享检查点观测，在活动回调等待修复时暂停分发。
     shared_checkpoint_failed: bool,
@@ -295,6 +303,7 @@ impl EmbeddedRuntime {
             operations,
             pools: EmbeddedPoolManager::new(engine, config.clone())?,
             state: Mutex::new(SchedulerState {
+                finalizing: VecDeque::new(),
                 closing: false,
                 failure: None,
                 sequence: 0,
@@ -423,6 +432,15 @@ impl EmbeddedRuntime {
         owner: Option<ModuleResourceOwner>,
     ) -> EmbeddedResult<String> {
         policy.validate(self.center.pools.config())?;
+        if let Some(finalizer) = &definition.finalizer {
+            if policy.reuse != InstanceReuse::SingleCall {
+                return Err(EmbeddedError::new(
+                    EmbeddedErrorCode::Unsupported,
+                    "automatic finalization currently requires single-call reuse",
+                ));
+            }
+            json_size(finalizer, self.center.pools.config().max_value_bytes)?;
+        }
         // Capability membership remains frozen independently from physical resource ownership.
         // 能力成员独立于物理资源所有权保持冻结。
         let binding =

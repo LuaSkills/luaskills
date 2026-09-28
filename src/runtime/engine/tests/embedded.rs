@@ -20,6 +20,7 @@ mod scheduler;
 /// 返回的模块只暴露 `call` 导出。
 fn definition(layout: &SystemRuntimeTestLayout, source: &str) -> ModuleDefinition {
     ModuleDefinition {
+        finalizer: None,
         plugin_id: layout.package_id.clone(),
         generation: "generation-one".to_owned(),
         package_root: render_host_visible_path(&layout.package_root),

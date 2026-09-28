@@ -77,6 +77,7 @@ fn admit(registry: &OperationRegistry) -> (OperationHandle, OperationOwner) {
 /// 构造可信终态填充证据，以验证真实 SQLite 页耗尽。
 fn filler() -> OperationSnapshot {
     OperationSnapshot {
+        finalization: None,
         context: OperationContext::Unbound,
         operation_id: "filler".into(),
         phase: OperationPhase::Succeeded,

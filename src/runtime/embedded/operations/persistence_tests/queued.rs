@@ -3,6 +3,8 @@
 
 use super::*;
 
+mod finalization;
+
 mod intent;
 mod outcome;
 use crate::runtime::embedded::{OperationJournalWorker, OperationJournalWorkerConfig};

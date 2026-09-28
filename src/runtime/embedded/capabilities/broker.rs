@@ -213,7 +213,7 @@ impl HostRequestBroker {
         // Publish under the exact entry gate so unregister cannot miss a previously admitted request.
         // 在精确条目门内发布，使注销不能遗漏此前已入场请求。
         let entry = Arc::clone(&prepared.entry);
-        entry.with_dispatch_gate(|| {
+        entry.with_dispatch_gate(prepared.finalization, || {
             state.bytes = total;
             state.ready.push_back(id.clone());
             state.records.insert(
@@ -354,7 +354,7 @@ impl HostRequestBroker {
             // Encoding may take time, so recheck the original authority immediately before dispatch.
             // 编码可能耗时，因此在分发前立即重新检查原始权威。
             let delivery = prepared.invocation.authorize().and_then(|()| {
-                entry.with_dispatch_gate(|| {
+                entry.with_dispatch_gate(prepared.finalization, || {
                     // Queue consumers only submit or observe; pending disk intent leaves the request queued.
                     // 队列消费者仅提交或观测；磁盘意图待完成时请求继续排队。
                     if !prepared.effect.checkpoint_start(false)? {
@@ -516,10 +516,10 @@ impl HostRequestBroker {
                     .invocation
                     .authorize()
                     .and_then(|()| {
-                        if record.phase == HostRequestPhase::Queued
-                            && !prepared.entry.status()?.accepting
-                        {
-                            Err(closed())
+                        if record.phase == HostRequestPhase::Queued {
+                            prepared
+                                .entry
+                                .with_dispatch_gate(prepared.finalization, || ())
                         } else {
                             Ok(())
                         }

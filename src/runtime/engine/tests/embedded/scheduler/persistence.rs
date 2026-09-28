@@ -4,6 +4,7 @@
 use super::*;
 
 mod context;
+mod finalization;
 mod intent;
 mod outcome;
 
@@ -119,6 +120,7 @@ fn shutdown_durable(runtime: &EmbeddedRuntime, writer: &OperationJournalWorker) 
 /// 返回已对账终态填充项，其 `bytes` 载荷故意消费真实存储。
 fn filler(bytes: usize) -> OperationSnapshot {
     OperationSnapshot {
+        finalization: None,
         context: OperationContext::Unbound,
         operation_id: "filler".into(),
         phase: OperationPhase::Succeeded,

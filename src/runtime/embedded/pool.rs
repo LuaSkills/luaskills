@@ -2,9 +2,9 @@ use super::capabilities::ModuleCapabilities;
 use super::retirement::RetirementService;
 use super::{
     CallControl, EmbeddedError, EmbeddedErrorCode, EmbeddedModule, EmbeddedResult,
-    EmbeddedRuntimeConfig, InstanceReuse, ModuleAcquireFailure, ModuleDefinition, ModuleInvocation,
-    ModuleOperationContext, ModuleRelease, ModuleResourceOwner, ModuleRetirement, OperationContext,
-    PluginPoolConfig, PoolGovernor, PoolUsage, VmReservation,
+    EmbeddedRuntimeConfig, InstanceReuse, ModuleAcquireFailure, ModuleDefinition, ModuleFinalizer,
+    ModuleInvocation, ModuleOperationContext, ModuleRelease, ModuleResourceOwner, ModuleRetirement,
+    OperationContext, PluginPoolConfig, PoolGovernor, PoolUsage, VmReservation,
 };
 use crate::runtime::engine::LuaEngine;
 use serde_json::Value;
@@ -854,6 +854,15 @@ pub struct ModuleLease {
 }
 
 impl ModuleLease {
+    /// Clone an eligible initialized module's immutable closing declaration for the scheduler.
+    /// 为调度器克隆符合条件的已初始化模块的不可变关闭声明。
+    pub(crate) fn finalization_plan(&self) -> Option<ModuleFinalizer> {
+        self.resident
+            .as_ref()
+            .filter(|resident| resident.module.can_finalize())
+            .and_then(|resident| resident.module.definition().finalizer.clone())
+    }
+
     /// Construct and initialize prepared ownership under original `control`, without renewing its budget.
     /// 在原始 `control` 下构造并初始化已准备所有权，不续期预算。
     /// The caller retains this lease across errors and panic recovery so cleanup remains observable.

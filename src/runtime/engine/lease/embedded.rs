@@ -221,6 +221,12 @@ impl LuaEngine {
 }
 
 impl EmbeddedModule {
+    /// Report whether captured initialized exports still permit the sole explicit closing attempt.
+    /// 报告已捕获的初始化导出是否仍允许唯一显式关闭尝试。
+    pub(crate) fn can_finalize(&self) -> bool {
+        !self.closed && !self.finalization_started && !self.exports.is_empty()
+    }
+
     /// Bind `capabilities` exactly once before initialization; reject replacing a live VM's authority.
     /// 在初始化前精确绑定一次 `capabilities`；拒绝替换活动 VM 权威。
     pub(crate) fn bind_capabilities(
@@ -316,7 +322,7 @@ impl EmbeddedModule {
     /// Return only the closing result; failures remain terminal and never authorize source replay or reuse.
     /// 只返回关闭结果；失败仍是终态，不授权重放源码或复用实例。
     pub(crate) fn finalize(&mut self, invocation: ModuleInvocation<'_>) -> EmbeddedResult<Value> {
-        if self.closed || self.finalization_started || self.exports.is_empty() {
+        if !self.can_finalize() {
             return Err(EmbeddedError::new(
                 EmbeddedErrorCode::Closed,
                 "module is not initialized or finalization was already attempted",

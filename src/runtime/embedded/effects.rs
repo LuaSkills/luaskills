@@ -54,10 +54,25 @@ pub struct HostEffectRecord {
     pub effects: EffectState,
 }
 
+/// Internal admission stage bound to a control, never supplied by Lua or capability arguments.
+/// 绑定到控制对象的内部入场阶段，绝不由 Lua 或能力参数提供。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EffectAdmissionStage {
+    /// Original initialization and business execution.
+    /// 原始初始化与业务执行。
+    Business,
+    /// The sole separately budgeted closing execution.
+    /// 唯一使用独立预算的关闭执行。
+    Finalization,
+}
+
 /// Private retention metadata; no user implementation runs under this lock.
 /// 私有保留元数据；此锁内不运行用户实现。
 #[derive(Debug)]
 struct LedgerState {
+    /// Only controls for this owner-selected stage may admit new effects.
+    /// 只有匹配所有者所选阶段的控制对象可以接纳新副作用。
+    stage: EffectAdmissionStage,
     /// Permanent terminal admission gate.
     /// 永久终态入场门。
     sealed: bool,
@@ -100,6 +115,34 @@ pub(super) struct EffectLedger {
 }
 
 impl EffectLedger {
+    /// Close business admission only after all original handlers returned and release their ownership.
+    /// 仅在全部原处理器返回并释放所有权后关闭业务入场。
+    /// Return the frozen business-effect count; only owner-issued closing controls may enter afterward.
+    /// 返回冻结的业务副作用数量；之后仅所有者签发的关闭控制可以入场。
+    pub(super) fn begin_finalization(&self) -> EmbeddedResult<usize> {
+        // Stage publication and callback admission share this one metadata transaction.
+        // 阶段发布和回调入场共用这一次元数据事务。
+        let mut state = self.state.lock().map_err(|_| poisoned())?;
+        if state.sealed || state.stage != EffectAdmissionStage::Business {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::Closed,
+                "operation finalization was already prepared or sealed",
+            ));
+        }
+        if state
+            .records
+            .values()
+            .any(|record| record.phase != HostEffectPhase::Completed)
+        {
+            return Err(EmbeddedError::new(
+                EmbeddedErrorCode::Busy,
+                "business host handlers have not finished execution and cleanup",
+            ));
+        }
+        state.stage = EffectAdmissionStage::Finalization;
+        Ok(state.records.len())
+    }
+
     /// Create empty evidence for exact runtime/operation identities and explicit retention budgets.
     /// 为精确运行时及操作身份和显式保留预算创建空证据。
     /// `operation` binds persistent dispatch to its exact owner; None explicitly selects memory-only evidence.
@@ -125,6 +168,7 @@ impl EffectLedger {
             max_records,
             max_bytes,
             state: Mutex::new(LedgerState {
+                stage: EffectAdmissionStage::Business,
                 sealed: false,
                 sequence: 0,
                 bytes: context_bytes,
@@ -143,6 +187,7 @@ impl EffectLedger {
     /// 宿主执行前预留精确注册证据；拒绝错误调用方或耗尽容量。
     pub(super) fn prepare(
         self: &Arc<Self>,
+        stage: EffectAdmissionStage,
         caller: &CapabilityCaller,
         registration_id: &str,
         name: &str,
@@ -161,10 +206,10 @@ impl EffectLedger {
         // Reserve count, bytes and identity atomically before any handler can start.
         // 在任何处理器可以开始前原子预留数量、字节与身份。
         let mut state = self.state.lock().map_err(|_| poisoned())?;
-        if state.sealed {
+        if state.sealed || state.stage != stage {
             return Err(EmbeddedError::new(
                 EmbeddedErrorCode::Closed,
-                "operation effect journal is sealed",
+                "operation effect journal is sealed for this execution stage",
             ));
         }
         if state.records.len() >= self.max_records {
