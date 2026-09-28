@@ -79,7 +79,7 @@ impl OperationRegistry {
         export: &str,
     ) -> EmbeddedResult<OperationReservation> {
         self.reserve_context(|id| {
-            let mut context = pool.operation_context(id, session_id, Some(export))?;
+            let mut context = pool.operation_context(id, session_id, Some(export), None)?;
             let OperationContext::Module(module) = &mut context else {
                 return Err(EmbeddedError::invalid(
                     "finalization requires module authority",

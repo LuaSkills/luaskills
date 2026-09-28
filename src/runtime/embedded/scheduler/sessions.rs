@@ -529,6 +529,10 @@ impl SchedulerCenter {
             &pool.pool,
             request.session_id(),
             request.invocation().map(|call| call.export.as_str()),
+            request
+                .invocation()
+                .and_then(|call| call.context.request_context.as_ref())
+                .and_then(|context| context.request_id.as_deref()),
         )?;
         let id = handle.id().to_owned();
         let plugin_state = state

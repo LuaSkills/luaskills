@@ -39,6 +39,7 @@ fn embedded_effect_failed_queue_publication_never_reuses_observed_request_identi
         .unwrap()
         .remove(0);
     let caller = CapabilityCaller {
+        request_id: None,
         runtime_id: "runtime".into(),
         plugin_id: "plugin".into(),
         package_generation: "generation".into(),

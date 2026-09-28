@@ -34,6 +34,7 @@ fn original() -> OperationSnapshot {
     let mut record = snapshot("operation");
     record.host_effects.push(HostEffectRecord {
         caller: CapabilityCaller {
+            request_id: None,
             runtime_id: "runtime".into(),
             operation_id: "operation".into(),
             plugin_id: "original-plugin".into(),

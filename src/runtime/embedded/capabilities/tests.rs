@@ -43,6 +43,7 @@ fn grants() -> Arc<CapabilityPermissions> {
 /// 构造具有操作身份的固定宿主认证调用方。
 fn caller() -> CapabilityCaller {
     CapabilityCaller {
+        request_id: None,
         runtime_id: "runtime-a".into(),
         plugin_id: "trusted-plugin".into(),
         package_generation: "package-a".into(),

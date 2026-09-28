@@ -183,6 +183,16 @@ impl EffectLedger {
         &self.operation_id
     }
 
+    /// Borrow the admitted host request correlation; unbound operations have no request authority.
+    /// 借用入场宿主请求关联；未绑定操作没有请求权威。
+    /// Returns the original optional value without reading mutable Lua context.
+    /// 返回原始可选值，不读取可变 Lua 上下文。
+    pub(super) fn request_id(&self) -> Option<&str> {
+        self.caller
+            .as_ref()
+            .and_then(|caller| caller.request_id.as_deref())
+    }
+
     /// Reserve exact registration evidence before host execution; reject wrong callers or exhausted capacity.
     /// 宿主执行前预留精确注册证据；拒绝错误调用方或耗尽容量。
     pub(super) fn prepare(

@@ -73,6 +73,7 @@ fn embedded_operation_context_rejects_foreign_callback_before_execution() {
                 capability_revision: snapshot.revision(),
                 export: Some("call".into()),
                 caller: CapabilityCaller {
+                    request_id: None,
                     runtime_id: "runtime".into(),
                     operation_id: id.into(),
                     plugin_id: "plugin".into(),

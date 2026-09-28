@@ -189,6 +189,12 @@ pub struct CapabilityCaller {
     /// Exact operation whose original budget applies.
     /// 适用原始预算的精确操作。
     pub operation_id: String,
+    /// Optional host request correlation frozen at admission, distinct from a queued capability request ID.
+    /// 入场时冻结的可选宿主请求关联，区别于排队能力请求 ID。
+    /// Lua-visible request context and business arguments cannot replace this value.
+    /// Lua 可见请求上下文及业务参数不能替换此值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     /// Optional fixed session required by session-scoped capabilities.
     /// 会话作用域能力要求的可选固定会话。
     pub session_id: Option<String>,
@@ -213,6 +219,10 @@ impl CapabilityCaller {
             .any(|value| value.trim().is_empty() || value.contains('\0'))
             || self
                 .session_id
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty() || value.contains('\0'))
+            || self
+                .request_id
                 .as_ref()
                 .is_some_and(|value| value.trim().is_empty() || value.contains('\0'))
         {

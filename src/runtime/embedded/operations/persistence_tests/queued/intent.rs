@@ -122,6 +122,7 @@ pub(super) fn capabilities(
 /// 根据精确注册表及已入场操作构造可信夹具上下文。
 fn identity(registry: &OperationRegistry, operation: &OperationHandle) -> CapabilityCaller {
     CapabilityCaller {
+        request_id: None,
         runtime_id: registry.runtime_id.clone(),
         plugin_id: "trusted-plugin".into(),
         package_generation: "package-a".into(),

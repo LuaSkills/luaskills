@@ -16,6 +16,7 @@ fn bound() -> OperationSnapshot {
         capability_revision: "original-snapshot".into(),
         export: Some("call".into()),
         caller: CapabilityCaller {
+            request_id: None,
             runtime_id: "runtime".into(),
             operation_id: "operation".into(),
             plugin_id: "plugin".into(),
@@ -35,7 +36,14 @@ fn bound() -> OperationSnapshot {
 fn embedded_operation_context_journal_rejects_retargeting() {
     // All variants are individually valid documents; refusal must come from immutable context ownership.
     // 每个分支单独都是有效文档；拒绝必须来自不可变上下文归属。
-    for field in ["pool", "capabilities", "export", "generation", "unbound"] {
+    for field in [
+        "pool",
+        "capabilities",
+        "export",
+        "generation",
+        "request",
+        "unbound",
+    ] {
         // Isolate each storage mutation and preserve its original exact revision.
         // 隔离每个存储变更，并保留其原始精确修订。
         let directory = Directory::new();
@@ -56,6 +64,7 @@ fn embedded_operation_context_journal_rejects_retargeting() {
                 "capabilities" => context.capability_revision = "replacement-snapshot".into(),
                 "export" => context.export = Some("other".into()),
                 "generation" => context.caller.package_generation = "replacement-generation".into(),
+                "request" => context.caller.request_id = Some("replacement-request".into()),
                 _ => unreachable!(),
             }
         }

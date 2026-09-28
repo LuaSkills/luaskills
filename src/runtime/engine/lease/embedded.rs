@@ -449,6 +449,7 @@ impl EmbeddedModule {
                     &self.definition,
                     operation_id.to_owned(),
                     session_id.map(str::to_owned),
+                    control.request_id()?,
                 )
             })
             .transpose()?;

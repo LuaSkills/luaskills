@@ -4652,6 +4652,13 @@
               "description": "Exact activated plugin identity.\n精确激活的插件身份。",
               "type": "string"
             },
+            "request_id": {
+              "description": "Optional host request correlation frozen at admission, distinct from a queued capability request ID.\n入场时冻结的可选宿主请求关联，区别于排队能力请求 ID。\nLua-visible request context and business arguments cannot replace this value.\nLua 可见请求上下文及业务参数不能替换此值。",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "runtime_id": {
               "description": "Runtime namespace that owns the registration and operation.\n拥有注册及操作的运行时命名空间。",
               "type": "string"
@@ -5346,6 +5353,13 @@
             "plugin_id": {
               "description": "Exact activated plugin identity.\n精确激活的插件身份。",
               "type": "string"
+            },
+            "request_id": {
+              "description": "Optional host request correlation frozen at admission, distinct from a queued capability request ID.\n入场时冻结的可选宿主请求关联，区别于排队能力请求 ID。\nLua-visible request context and business arguments cannot replace this value.\nLua 可见请求上下文及业务参数不能替换此值。",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "runtime_id": {
               "description": "Runtime namespace that owns the registration and operation.\n拥有注册及操作的运行时命名空间。",
@@ -6311,6 +6325,13 @@
               "description": "Exact activated plugin identity.\n精确激活的插件身份。",
               "type": "string"
             },
+            "request_id": {
+              "description": "Optional host request correlation frozen at admission, distinct from a queued capability request ID.\n入场时冻结的可选宿主请求关联，区别于排队能力请求 ID。\nLua-visible request context and business arguments cannot replace this value.\nLua 可见请求上下文及业务参数不能替换此值。",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "runtime_id": {
               "description": "Runtime namespace that owns the registration and operation.\n拥有注册及操作的运行时命名空间。",
               "type": "string"
@@ -6880,6 +6901,13 @@
               "description": "Exact activated plugin identity.\n精确激活的插件身份。",
               "type": "string"
             },
+            "request_id": {
+              "description": "Optional host request correlation frozen at admission, distinct from a queued capability request ID.\n入场时冻结的可选宿主请求关联，区别于排队能力请求 ID。\nLua-visible request context and business arguments cannot replace this value.\nLua 可见请求上下文及业务参数不能替换此值。",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "runtime_id": {
               "description": "Runtime namespace that owns the registration and operation.\n拥有注册及操作的运行时命名空间。",
               "type": "string"
@@ -7423,6 +7451,13 @@
             "plugin_id": {
               "description": "Exact activated plugin identity.\n精确激活的插件身份。",
               "type": "string"
+            },
+            "request_id": {
+              "description": "Optional host request correlation frozen at admission, distinct from a queued capability request ID.\n入场时冻结的可选宿主请求关联，区别于排队能力请求 ID。\nLua-visible request context and business arguments cannot replace this value.\nLua 可见请求上下文及业务参数不能替换此值。",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "runtime_id": {
               "description": "Runtime namespace that owns the registration and operation.\n拥有注册及操作的运行时命名空间。",

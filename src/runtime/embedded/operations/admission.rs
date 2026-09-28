@@ -147,8 +147,11 @@ impl OperationRegistry {
         pool: &ModulePool,
         session_id: Option<&str>,
         export: Option<&str>,
+        request_id: Option<&str>,
     ) -> EmbeddedResult<(OperationHandle, OperationOwner)> {
-        self.admit_context(control, |id| pool.operation_context(id, session_id, export))
+        self.admit_context(control, |id| {
+            pool.operation_context(id, session_id, export, request_id)
+        })
     }
 
     /// Allocate one identity and derive its context using a private metadata-only factory before control publication.

@@ -58,6 +58,7 @@ impl ModuleCapabilities {
         definition: &ModuleDefinition,
         operation_id: String,
         session_id: Option<String>,
+        request_id: Option<String>,
     ) -> EmbeddedResult<CapabilityCaller> {
         // Clone only trusted identity fields; module source and application arguments are excluded.
         // 仅克隆可信身份字段；不包含模块源码与应用参数。
@@ -69,6 +70,7 @@ impl ModuleCapabilities {
             security_partition: definition.security_partition.clone(),
             operation_id,
             session_id,
+            request_id,
             workspace_root: definition.workspace_root.clone(),
         };
         caller.validate(self.snapshot.runtime_id())?;

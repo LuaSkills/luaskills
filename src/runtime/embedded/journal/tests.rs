@@ -223,6 +223,7 @@ fn embedded_journal_capacity_and_unresolved_retention() {
     record.effects = EffectState::Committed;
     record.host_effects.push(HostEffectRecord {
         caller: super::super::capabilities::CapabilityCaller {
+            request_id: None,
             runtime_id: "runtime".into(),
             operation_id: "first".into(),
             plugin_id: "journal-plugin".into(),

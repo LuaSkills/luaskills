@@ -419,6 +419,7 @@ impl ModulePool {
         operation_id: &str,
         session_id: Option<&str>,
         export: Option<&str>,
+        request_id: Option<&str>,
     ) -> EmbeddedResult<OperationContext> {
         // Formal scheduler pools always own a binding; low-level unbound pools cannot impersonate them.
         // 正式调度器的池始终拥有绑定；低层未绑定池不能冒充它们。
@@ -435,6 +436,7 @@ impl ModulePool {
                 &self.definition,
                 operation_id.to_owned(),
                 session_id.map(str::to_owned),
+                request_id.map(str::to_owned),
             )?,
             capability_revision: binding.snapshot_revision(),
             export: export.map(str::to_owned),

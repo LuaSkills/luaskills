@@ -88,6 +88,20 @@ impl CallControl {
         })
     }
 
+    /// Clone the request correlation frozen by the original operation admission.
+    /// 克隆原操作入场时冻结的请求关联。
+    /// Returns no correlation for explicit untracked controls and reports poisoned ownership.
+    /// 明确未跟踪控制返回无关联，并报告所有权中毒故障。
+    pub(crate) fn request_id(&self) -> EmbeddedResult<Option<String>> {
+        // Read the original ledger while holding its ownership lock.
+        // 持有所有权锁期间读取原始账本。
+        let evidence = self.effects.lock().map_err(|_| evidence_poisoned())?;
+        Ok(match &*evidence {
+            ControlEvidence::Registered(ledger, _) => ledger.request_id().map(str::to_owned),
+            ControlEvidence::Fresh | ControlEvidence::Untracked => None,
+        })
+    }
+
     /// Read retained host evidence; none means no journal was attached, not proof of no effects.
     /// 读取保留宿主证据；省略表示未附加日志，不证明没有副作用。
     pub fn host_effects(&self) -> EmbeddedResult<Option<Vec<HostEffectRecord>>> {

@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 mod finalization;
 mod persistence;
 mod plugins;
+mod requests;
 mod resources;
 mod sessions;
 

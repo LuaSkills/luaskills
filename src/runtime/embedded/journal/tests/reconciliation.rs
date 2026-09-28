@@ -10,6 +10,7 @@ fn original() -> OperationSnapshot {
     // One authority supplies both operation admission and its original callback.
     // 同一权威同时提供操作入场及其原回调身份。
     let caller = CapabilityCaller {
+        request_id: None,
         runtime_id: "runtime".into(),
         operation_id: "operation".into(),
         plugin_id: "plugin".into(),
