@@ -6,6 +6,7 @@ use crate::runtime::embedded::capabilities::{CapabilityEffects, CapabilityExecut
 use crate::runtime::embedded::{EmbeddedPluginConfig, InstanceReuse, OperationSnapshot};
 
 mod capacities;
+mod initialization;
 mod persistence;
 mod prewarm;
 

@@ -8,6 +8,7 @@ use super::wire::{
 use super::{EMBEDDED_FFI_PROTOCOL_VERSION, EmbeddedFfiStatus};
 use crate::runtime::embedded::capabilities::{
     CapabilityExecution, CapabilityPermissions, CapabilityRegistrationRequest, HostRequestBroker,
+    ModuleCapabilities,
 };
 use crate::runtime::embedded::{
     EmbeddedError, EmbeddedErrorCode, EmbeddedResult, EmbeddedRuntime, IdentityKind,
@@ -176,6 +177,7 @@ pub(super) fn execute(
             definition,
             policy,
             permissions,
+            initialization_capabilities,
             execution_revision,
         } => {
             let sample = PoolReceipt {
@@ -185,21 +187,26 @@ pub(super) fn execute(
                 &sample,
                 || {
                     let grants = CapabilityPermissions::new(permissions)?;
-                    // Explicit optional placement preserves legacy independence without lookup fallbacks.
-                    // 显式可选归属保留旧独立行为，不采用查找回退。
-                    let registered = match capacity_id {
-                        Some(capacity_id) => runtime.register_pool_in_capacity(
-                            &capacity_id,
+                    // Freeze the same exact snapshot for policy validation and actual pool registration.
+                    // 为策略校验及实际池注册冻结同一精确快照。
+                    let binding = ModuleCapabilities::new(
+                        runtime.capabilities().snapshot()?,
+                        grants,
+                        execution_revision,
+                    )?;
+                    let binding = match initialization_capabilities {
+                        Some(names) => binding.with_initialization_capabilities(names)?,
+                        None => binding,
+                    };
+                    runtime
+                        .register_pool_with_binding(
                             *definition,
                             policy,
-                            grants,
-                            execution_revision,
-                        ),
-                        None => {
-                            runtime.register_pool(*definition, policy, grants, execution_revision)
-                        }
-                    };
-                    registered.map(|pool_id| PoolReceipt { pool_id })
+                            binding,
+                            None,
+                            capacity_id.as_deref(),
+                        )
+                        .map(|pool_id| PoolReceipt { pool_id })
                 },
                 limit,
             )

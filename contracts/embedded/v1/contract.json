@@ -20,6 +20,7 @@
       "dedicated_pools_v1",
       "explicit_instance_prewarm_v1",
       "reusable_pool_readiness_v1",
+      "initialization_capability_policy_v1",
       "fixed_sessions_v1",
       "host_request_queue_v1",
       "in_memory_effect_evidence_v1",
@@ -2892,6 +2893,17 @@
               "execution_revision": {
                 "description": "Immutable host initialization and configuration revision.\n不可变宿主初始化及配置修订。",
                 "type": "string"
+              },
+              "initialization_capabilities": {
+                "description": "Exact initialization callback subset; absent or null inherits grants, while an empty set denies all.\n精确初始化回调子集；省略或空值继承授权，空集合则全部拒绝。\nNames only narrow existing authority and are frozen before any VM is allocated.\n名称仅收窄既有权威，并在分配任何 VM 前冻结。",
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "uniqueItems": true
               },
               "permissions": {
                 "description": "Explicit host grants for this binding or discovery request.\n此绑定或发现请求的显式宿主授权。",

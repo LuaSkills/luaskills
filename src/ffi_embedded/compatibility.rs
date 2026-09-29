@@ -23,6 +23,7 @@ pub const EMBEDDED_CAPABILITIES: &[&str] = &[
     "dedicated_pools_v1",
     "explicit_instance_prewarm_v1",
     "reusable_pool_readiness_v1",
+    "initialization_capability_policy_v1",
     "fixed_sessions_v1",
     "host_request_queue_v1",
     "in_memory_effect_evidence_v1",

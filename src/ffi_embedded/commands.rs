@@ -180,6 +180,11 @@ pub(super) enum RuntimeCommand {
         /// Explicit host grants for this binding or discovery request.
         /// 此绑定或发现请求的显式宿主授权。
         permissions: BTreeSet<String>,
+        /// Exact initialization callback subset; absent or null inherits grants, while an empty set denies all.
+        /// 精确初始化回调子集；省略或空值继承授权，空集合则全部拒绝。
+        /// Names only narrow existing authority and are frozen before any VM is allocated.
+        /// 名称仅收窄既有权威，并在分配任何 VM 前冻结。
+        initialization_capabilities: Option<BTreeSet<String>>,
         /// Immutable host initialization and configuration revision.
         /// 不可变宿主初始化及配置修订。
         execution_revision: String,

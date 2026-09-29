@@ -8,7 +8,7 @@ use crate::runtime::embedded::{
 
 /// Return a capacity declaration and matching member policy using the existing parent fixture limits.
 /// 使用既有父级夹具限制，返回容量声明及匹配成员策略。
-fn policies() -> (
+pub(super) fn policies() -> (
     EmbeddedCapacityConfig,
     crate::runtime::embedded::PluginPoolConfig,
 ) {

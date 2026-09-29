@@ -66,7 +66,7 @@
 | `capacity_policy` | `capacity_id` | 原子策略快照，包含不透明字符串 `revision`、当前 `capacity` 和 `pending_convergence` |
 | `capacity_revise` | `capacity_id`、`expected_revision`、完整 `config: EmbeddedCapacityConfig` | 已提交的不透明字符串修订令牌 |
 | `capacity_close`、`capacity_forget` | `capacity_id` | `null` |
-| `pool_register` | `definition: ModuleDefinition`、`policy: PluginPoolConfig`、`permissions: string[]`、`execution_revision`、可选 `capacity_id` | `{pool_id}` |
+| `pool_register` | `definition: ModuleDefinition`、`policy: PluginPoolConfig`、`permissions: string[]`、`execution_revision`、可选 `capacity_id` 与 `initialization_capabilities` | `{pool_id}` |
 | `pool_status` | `pool_id` | `PoolUsage`，来自实际资源计数 |
 | `pool_reusable_status` | `pool_id` | `EmbeddedReusablePoolSnapshot`，来自正式调度器的精确可复用池观测；非复用池明确拒绝 |
 | `pool_close`、`pool_forget` | `pool_id` | `null` |
@@ -117,6 +117,8 @@ SDK 必须同步包内契约后才能消费候选库，不能仅依据包版本�
 常驻或队列缩至低于真实占用则允许提交并报告待收敛；原固定会话保留状态，常驻缩容沿原路径退役
 可复用缓存。两项命令均走 SDK 短时控制通道，但修订仍受原生关闭屏障约束。命令回执需要显式保留、
 观察及遗忘；观察超时或交付失败不授权重放变更。完整原生语义见[容量策略修订](embedded-runtime.md#原生容量策略修订)。
+
+`pool_register.initialization_capabilities` 为可选精确名称集合：省略或空值继承业务授权，空数组拒绝全部初始化回调，非空数组只收窄已授权快照。缺失或未授权能力返回 `permission_denied`，不能通过名单创建授予。独立池及容量组成员在同一冻结快照中完成校验与注册；冷启动、固定会话初始化及显式预热遵守同一模块策略，之后业务及关闭导出使用原权限。初始化允许的回调仍可能产生副作用，实时撤权、取消、回执及真实排空规则继续生效。这不是完整 Lua 沙箱。语义能力标识为 `initialization_capability_policy_v1`；当前仅为本地开发实现，尚未发布。
 
 `pool_register.capacity_id` 省略或显式空值表示原独立归属；提供字符串则必须是当前运行时中、
 归属同一插件且未关闭的精确容量。未知、外来或关闭身份直接失败，不回退独立池。成员局部最小值为零，
