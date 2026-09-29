@@ -71,6 +71,7 @@
 | `pool_close`、`pool_forget` | `pool_id` | `null` |
 | `pool_revoke_permission` | `pool_id`、`permission` | 是否实际移除了授权的布尔值 |
 | `call_submit` | `call: EmbeddedCall`、`timeout_ms` | `{operation_id}` |
+| `instance_prewarm` | `request: EmbeddedPrewarm`（精确 `pool_id`、可信 `context`）、`timeout_ms` | `{operation_id}`；成功操作值为 `{instance_id}`，一次创建一个额外可复用实例，不执行业务导出 |
 | `session_open` | `pool_id`、`timeout_ms` | `{session_id, operation_id}`；操作表示实际初始化 |
 | `session_submit` | `session_id`、`export`、`arguments`、`context`、`timeout_ms` | `{operation_id}` |
 | `session_status` | `session_id` | 核心会话快照 |
@@ -88,7 +89,7 @@
 | `host_request_status` | `request_id` | `HostRequestStatus`，含实时取消原因 |
 | `host_request_complete` | `request_id`、`outcome` | `null` |
 
-`call_submit` 与 `session_submit` 的回执只证明已入场，不证明执行成功。`timeout_ms` 是原始执行预算；`wait_ms` 仅是观察者本次等待预算，不延长或取消执行。取消、关闭、注销只是请求生命周期推进，实际释放依据核心终态及排空证据。`forget` 只允许移除已满足对应释放条件的记录。
+`call_submit`、`session_submit` 与 `instance_prewarm` 的回执只证明已入场，不证明执行成功。`timeout_ms` 是原始执行预算；`wait_ms` 仅是观察者本次等待预算，不延长或取消执行。取消、关闭、注销只是请求生命周期推进，实际释放依据核心终态及排空证据。`forget` 只允许移除已满足对应释放条件的记录。
 
 池持有不可变模块、代际、权限绑定和执行修订；同一 VM 可以复用本次绑定，不能在运行中按名称切换到其他代际。`pool_revoke_permission` 修改的就是该池现有绑定的权限权威，已经创建的 VM 也受其约束。`capabilities_list` 是显式宿主授权下的注册表发现；池内 Lua 的可见成员仍来自注册池时冻结的能力快照，不能将两者混用。
 

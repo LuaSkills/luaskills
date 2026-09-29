@@ -8,6 +8,71 @@ use serde_json::json;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Explicit prewarm authority round-trips, while contradictory modes and missing authority remain invalid.
+/// 明确预热权威可往返序列化；矛盾模式及缺失权威仍然非法。
+#[test]
+fn embedded_operation_context_prewarm_requires_explicit_consistent_authority() {
+    // Construct one valid original prewarm origin without a business export or fixed session.
+    // 构造一个有效原预热来源，不包含业务导出或固定会话。
+    let module = ModuleOperationContext {
+        prewarm: true,
+        finalization_instance_id: None,
+        pool_id: "pool".into(),
+        capability_revision: "capabilities".into(),
+        export: None,
+        caller: CapabilityCaller {
+            runtime_id: "runtime".into(),
+            operation_id: "operation".into(),
+            plugin_id: "plugin".into(),
+            package_generation: "generation".into(),
+            execution_revision: "revision".into(),
+            security_partition: "partition".into(),
+            session_id: None,
+            workspace_root: None,
+            request_id: None,
+        },
+    };
+    let context = OperationContext::Module(Box::new(module.clone()));
+    context.validate("runtime", "operation").unwrap();
+    let wire = serde_json::to_value(&context).unwrap();
+    assert_eq!(wire["prewarm"], json!(true));
+    assert_eq!(
+        serde_json::from_value::<OperationContext>(wire).unwrap(),
+        context
+    );
+    for contradiction in ["export", "session", "finalization", "absent-mode"] {
+        // Each mutation isolates one forbidden combination of authority fields.
+        // 每个变更隔离一种禁止的权威字段组合。
+        let mut invalid = module.clone();
+        match contradiction {
+            "export" => invalid.export = Some("call".into()),
+            "session" => invalid.caller.session_id = Some("session".into()),
+            "finalization" => invalid.finalization_instance_id = Some("instance".into()),
+            "absent-mode" => invalid.prewarm = false,
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            OperationContext::Module(Box::new(invalid))
+                .validate("runtime", "operation")
+                .unwrap_err()
+                .code,
+            EmbeddedErrorCode::InvalidArgument,
+            "{contradiction}"
+        );
+    }
+    // Ordinary legacy documents omit the new false flag and deserialize with unchanged meaning.
+    // 普通旧文档省略新增假值标志，反序列化后含义不变。
+    let mut ordinary = module;
+    ordinary.prewarm = false;
+    ordinary.export = Some("call".into());
+    let ordinary = OperationContext::Module(Box::new(ordinary));
+    let wire = serde_json::to_value(&ordinary).unwrap();
+    assert!(wire.get("prewarm").is_none());
+    let restored: OperationContext = serde_json::from_value(wire).unwrap();
+    assert_eq!(restored, ordinary);
+    restored.validate("runtime", "operation").unwrap();
+}
+
 /// Reusing an exact operation ID with another module's authority fails before invoking native host code.
 /// 复用精确操作 ID 却携带另一模块权威时，在调用原生宿主代码前失败。
 #[test]
@@ -68,6 +133,7 @@ fn embedded_operation_context_rejects_foreign_callback_before_execution() {
     let (operation, mut owner) = operations
         .admit_context(Arc::clone(&control), |id| {
             Ok(OperationContext::Module(Box::new(ModuleOperationContext {
+                prewarm: false,
                 finalization_instance_id: None,
                 pool_id: "pool".into(),
                 capability_revision: snapshot.revision(),

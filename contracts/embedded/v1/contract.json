@@ -18,6 +18,7 @@
       "capacity_policy_revisions_v1",
       "shared_pools_v1",
       "dedicated_pools_v1",
+      "explicit_instance_prewarm_v1",
       "fixed_sessions_v1",
       "host_request_queue_v1",
       "in_memory_effect_evidence_v1",
@@ -1247,6 +1248,25 @@
           "max_queued_calls",
           "max_queued_bytes",
           "max_operations"
+        ],
+        "type": "object"
+      },
+      "EmbeddedPrewarm": {
+        "additionalProperties": false,
+        "description": "Explicitly initialize one additional reusable VM without invoking any business export.\n明确初始化一个额外可复用 VM，不调用任何业务导出。",
+        "properties": {
+          "context": {
+            "$ref": "#/$defs/LuaInvocationContext",
+            "description": "Trusted context retained for caller attribution and this instance's eventual finalization.\n为调用方归属及此实例最终关闭保留的可信上下文。"
+          },
+          "pool_id": {
+            "description": "Exact immutable reusable pool identity; an existing idle VM never satisfies this request.\n精确不可变可复用池身份；已有空闲 VM 绝不抵充此请求。",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pool_id",
+          "context"
         ],
         "type": "object"
       },
@@ -3007,6 +3027,32 @@
           },
           {
             "additionalProperties": false,
+            "description": "Initialize one additional reusable VM without invoking a business export.\n初始化一个额外可复用 VM，不调用业务导出。",
+            "properties": {
+              "request": {
+                "$ref": "#/$defs/EmbeddedPrewarm",
+                "description": "Exact pool and trusted initialization/finalization context.\n精确池及可信初始化／关闭上下文。"
+              },
+              "timeout_ms": {
+                "description": "Original end-to-end execution budget in milliseconds.\n原始端到端执行预算毫秒数。",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": {
+                "const": "instance_prewarm",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "request",
+              "timeout_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
             "description": "Reserve a fixed instance and submit initialization.\n预留固定实例并提交初始化。",
             "properties": {
               "pool_id": {
@@ -4327,6 +4373,7 @@
     "pool_forget",
     "pool_revoke_permission",
     "call_submit",
+    "instance_prewarm",
     "session_open",
     "session_submit",
     "session_status",
@@ -5837,7 +5884,7 @@
                   "type": "string"
                 },
                 "export": {
-                  "description": "Requested declared export; absent only for a fixed-session opening operation.\n请求的已声明导出；仅固定会话开启操作省略。",
+                  "description": "Requested declared export; absent for explicit prewarming or fixed-session opening only.\n请求的已声明导出；仅明确预热或固定会话开启操作省略。",
                   "type": [
                     "string",
                     "null"
@@ -5857,6 +5904,10 @@
                 "pool_id": {
                   "description": "Exact retained pool identity, not a lookup of the plugin's newest pool.\n精确保留池身份，不查询插件最新的池。",
                   "type": "string"
+                },
+                "prewarm": {
+                  "description": "Explicit additional-instance initialization, never inferred from a missing export.\n明确额外实例初始化，绝不根据缺失导出推断。",
+                  "type": "boolean"
                 }
               },
               "required": [
@@ -6539,7 +6590,7 @@
                   "type": "string"
                 },
                 "export": {
-                  "description": "Requested declared export; absent only for a fixed-session opening operation.\n请求的已声明导出；仅固定会话开启操作省略。",
+                  "description": "Requested declared export; absent for explicit prewarming or fixed-session opening only.\n请求的已声明导出；仅明确预热或固定会话开启操作省略。",
                   "type": [
                     "string",
                     "null"
@@ -6559,6 +6610,10 @@
                 "pool_id": {
                   "description": "Exact retained pool identity, not a lookup of the plugin's newest pool.\n精确保留池身份，不查询插件最新的池。",
                   "type": "string"
+                },
+                "prewarm": {
+                  "description": "Explicit additional-instance initialization, never inferred from a missing export.\n明确额外实例初始化，绝不根据缺失导出推断。",
+                  "type": "boolean"
                 }
               },
               "required": [
@@ -7315,6 +7370,58 @@
       "title": "SuccessEnvelope",
       "type": "object"
     },
+    "instance_prewarm": {
+      "$defs": {
+        "OperationReceipt": {
+          "description": "Actual operation admission acknowledgement; it does not imply execution completion.\n实际操作入场确认；不代表执行完成。",
+          "properties": {
+            "operation_id": {
+              "description": "Retained queryable operation identity.\n保留且可查询的操作身份。",
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation_id"
+          ],
+          "type": "object"
+        },
+        "SuccessStatus": {
+          "description": "Single legal success discriminator, shared by live encoding and derived contracts.\n实际编码及派生契约共享的唯一合法成功判别。",
+          "oneOf": [
+            {
+              "const": "ok",
+              "description": "Successfully delivered result, including explicit JSON null.\n已成功交付结果，包含显式 JSON 空值。",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Borrowed success envelope avoids cloning application output during native response publication.\n借用成功信封，避免原生响应发布期间克隆应用输出。",
+      "properties": {
+        "protocol_version": {
+          "description": "Single protocol version authority.\n唯一协议版本权威。",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/OperationReceipt",
+          "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。"
+        },
+        "status": {
+          "$ref": "#/$defs/SuccessStatus",
+          "description": "Exact success discriminator.\n精确成功判别。"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "status",
+        "result"
+      ],
+      "title": "SuccessEnvelope",
+      "type": "object"
+    },
     "operation_cancel": {
       "$defs": {
         "SuccessStatus": {
@@ -8024,7 +8131,7 @@
                   "type": "string"
                 },
                 "export": {
-                  "description": "Requested declared export; absent only for a fixed-session opening operation.\n请求的已声明导出；仅固定会话开启操作省略。",
+                  "description": "Requested declared export; absent for explicit prewarming or fixed-session opening only.\n请求的已声明导出；仅明确预热或固定会话开启操作省略。",
                   "type": [
                     "string",
                     "null"
@@ -8044,6 +8151,10 @@
                 "pool_id": {
                   "description": "Exact retained pool identity, not a lookup of the plugin's newest pool.\n精确保留池身份，不查询插件最新的池。",
                   "type": "string"
+                },
+                "prewarm": {
+                  "description": "Explicit additional-instance initialization, never inferred from a missing export.\n明确额外实例初始化，绝不根据缺失导出推断。",
+                  "type": "boolean"
                 }
               },
               "required": [
@@ -8575,7 +8686,7 @@
                   "type": "string"
                 },
                 "export": {
-                  "description": "Requested declared export; absent only for a fixed-session opening operation.\n请求的已声明导出；仅固定会话开启操作省略。",
+                  "description": "Requested declared export; absent for explicit prewarming or fixed-session opening only.\n请求的已声明导出；仅明确预热或固定会话开启操作省略。",
                   "type": [
                     "string",
                     "null"
@@ -8595,6 +8706,10 @@
                 "pool_id": {
                   "description": "Exact retained pool identity, not a lookup of the plugin's newest pool.\n精确保留池身份，不查询插件最新的池。",
                   "type": "string"
+                },
+                "prewarm": {
+                  "description": "Explicit additional-instance initialization, never inferred from a missing export.\n明确额外实例初始化，绝不根据缺失导出推断。",
+                  "type": "boolean"
                 }
               },
               "required": [

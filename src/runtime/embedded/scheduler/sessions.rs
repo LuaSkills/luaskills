@@ -159,6 +159,9 @@ pub(super) enum ScheduledRequest {
     /// An ordinary invocation governed by the registered pool policy.
     /// 受已注册池策略治理的普通调用。
     Invoke(EmbeddedCall),
+    /// Explicit initialization allocates an additional reusable instance without a business invocation.
+    /// 明确初始化分配额外可复用实例，不执行业务调用。
+    Prewarm(EmbeddedPrewarm),
     /// Creation initializes the reserved VM without invoking a business export.
     /// 创建初始化预留 VM，不调用业务导出。
     OpenSession {
@@ -187,6 +190,7 @@ impl ScheduledRequest {
     pub(super) fn pool_id(&self) -> &str {
         match self {
             Self::Invoke(call) | Self::InvokeSession { call, .. } => &call.pool_id,
+            Self::Prewarm(request) => &request.pool_id,
             Self::OpenSession { pool_id, .. }
             | Self::CloseSession { pool_id, .. }
             | Self::CloseInstance { pool_id, .. } => pool_id,
@@ -197,7 +201,7 @@ impl ScheduledRequest {
     /// 仅为显式会话请求返回可信会话身份。
     pub(super) fn session_id(&self) -> Option<&str> {
         match self {
-            Self::Invoke(_) | Self::CloseInstance { .. } => None,
+            Self::Invoke(_) | Self::Prewarm(_) | Self::CloseInstance { .. } => None,
             Self::OpenSession { session_id, .. }
             | Self::InvokeSession { session_id, .. }
             | Self::CloseSession { session_id, .. } => Some(session_id),
@@ -209,9 +213,23 @@ impl ScheduledRequest {
     pub(super) fn invocation(&self) -> Option<&EmbeddedCall> {
         match self {
             Self::Invoke(call) | Self::InvokeSession { call, .. } => Some(call),
-            Self::OpenSession { .. } | Self::CloseSession { .. } | Self::CloseInstance { .. } => {
-                None
+            Self::Prewarm(_)
+            | Self::OpenSession { .. }
+            | Self::CloseSession { .. }
+            | Self::CloseInstance { .. } => None,
+        }
+    }
+
+    /// Borrow the explicit trusted context when the request carries one; session opening has none.
+    /// 请求携带明确可信上下文时借用它；开启会话不携带上下文。
+    pub(super) fn context(&self) -> Option<&LuaInvocationContext> {
+        match self {
+            Self::Invoke(call) | Self::InvokeSession { call, .. } => Some(&call.context),
+            Self::Prewarm(request) => Some(&request.context),
+            Self::CloseSession { context, .. } | Self::CloseInstance { context, .. } => {
+                Some(context)
             }
+            Self::OpenSession { .. } => None,
         }
     }
 
@@ -224,6 +242,7 @@ impl ScheduledRequest {
                 call.context = LuaInvocationContext::default();
             }
             Self::OpenSession { .. } => {}
+            Self::Prewarm(request) => request.context = LuaInvocationContext::default(),
             Self::CloseSession { context, .. } | Self::CloseInstance { context, .. } => {
                 *context = LuaInvocationContext::default()
             }
@@ -525,16 +544,24 @@ impl SchedulerCenter {
         // Freeze this pool's authority before publishing the operation or its shared control identity.
         // 发布操作或其共享控制身份前，冻结此池的权威。
         state.validate_capacity_queue(request.pool_id(), bytes)?;
-        let (handle, owner) = self.operations.admit_module(
-            Arc::clone(&control),
-            &pool.pool,
-            request.session_id(),
-            request.invocation().map(|call| call.export.as_str()),
-            request
-                .invocation()
-                .and_then(|call| call.context.request_context.as_ref())
-                .and_then(|context| context.request_id.as_deref()),
-        )?;
+        // Admission names prewarming explicitly instead of treating a missing business export as authorization.
+        // 入场明确指定预热，不把缺失业务导出当作授权。
+        let request_id = request
+            .context()
+            .and_then(|context| context.request_context.as_ref())
+            .and_then(|context| context.request_id.as_deref());
+        let (handle, owner) = if matches!(request, ScheduledRequest::Prewarm(_)) {
+            self.operations
+                .admit_prewarm(Arc::clone(&control), &pool.pool, request_id)?
+        } else {
+            self.operations.admit_module(
+                Arc::clone(&control),
+                &pool.pool,
+                request.session_id(),
+                request.invocation().map(|call| call.export.as_str()),
+                request_id,
+            )?
+        };
         let id = handle.id().to_owned();
         let plugin_state = state
             .plugins

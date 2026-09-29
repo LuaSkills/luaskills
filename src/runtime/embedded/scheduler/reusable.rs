@@ -19,14 +19,14 @@ pub(super) struct ScheduledReusable {
     /// Idle exclusive lease; absent while one operation or the retirement supervisor owns it.
     /// 空闲独占租借；一个操作或退役监督器拥有它时省略。
     pub(super) lease: Option<Box<ModuleLease>>,
-    /// Business operation retaining the exact VM through terminal publication.
-    /// 持续拥有精确 VM 到终态发布的业务操作。
+    /// Business or prewarm operation retaining the exact VM through terminal publication.
+    /// 持续拥有精确 VM 到终态发布的业务或预热操作。
     pub(super) active: Option<String>,
     /// Permanent retirement request; the allocation cannot return to reusable admission.
     /// 永久退役请求；分配不能重新进入复用入场。
     pub(super) closing: bool,
-    /// Last acknowledged business completion, used only by the explicitly declared idle TTL.
-    /// 最后已确认业务完成时刻，仅用于明确声明的空闲期限。
+    /// Last acknowledged business or prewarm completion, used only by the explicitly declared idle TTL.
+    /// 最后已确认业务或预热完成时刻，仅用于明确声明的空闲期限。
     pub(super) idle_since: Instant,
     /// Real retirement evidence retained independently of its original business operation.
     /// 独立于原业务操作保留的真实退役证据。
@@ -40,6 +40,8 @@ pub(super) struct ScheduledReusable {
 /// 在原控制下，为精确池和操作身份认领空闲状态或预留新 VM。
 /// Return exclusive ownership with closing context, or none for physical pressure; reservation errors reject before initialization.
 /// 返回独占所有权及关闭上下文；物理压力返回空值，预留错误在初始化前拒绝。
+/// allow_cached is false for explicit prewarming so each successful operation owns one newly allocated VM.
+/// 明确预热时 allow_cached 为假，使每个成功操作拥有一个新分配 VM。
 pub(super) fn prepare(
     center: &SchedulerCenter,
     state: &mut SchedulerState,
@@ -47,17 +49,22 @@ pub(super) fn prepare(
     operation_id: &str,
     context: &LuaInvocationContext,
     control: &CallControl,
+    allow_cached: bool,
 ) -> EmbeddedResult<Option<(ModuleLease, String)>> {
     control.check()?;
     expire(state, pool_id);
     // Exactly one owner decides whether confirmed state is reusable.
     // 恰好一个所有者决定已确认状态是否可复用。
-    if let Some((id, instance)) = state.reusable_instances.iter_mut().find(|(_, instance)| {
-        instance.pool_id == pool_id
-            && !instance.closing
-            && instance.active.is_none()
-            && instance.lease.is_some()
-    }) {
+    // Ordinary calls borrow confirmed idle state; explicit prewarming always creates one additional instance.
+    // 普通调用借用已确认空闲状态；明确预热始终创建一个额外实例。
+    if allow_cached
+        && let Some((id, instance)) = state.reusable_instances.iter_mut().find(|(_, instance)| {
+            instance.pool_id == pool_id
+                && !instance.closing
+                && instance.active.is_none()
+                && instance.lease.is_some()
+        })
+    {
         if instance.finalization_reservation.is_some() {
             instance.finalization_context = context.clone();
         }

@@ -103,6 +103,10 @@ pub(super) type PoolRevokePermission = bool;
 /// `call_submit` 成功结果，在序列化前由原生分发器强制校验。
 pub(super) type CallSubmit = OperationReceipt;
 
+/// Successful instance_prewarm receipt; the original operation publishes its eventual instance identity.
+/// instance_prewarm 成功回执；原操作发布最终实例身份。
+pub(super) type InstancePrewarm = OperationReceipt;
+
 /// Successful `session_open` result, enforced by the native dispatcher before serialization.
 /// `session_open` 成功结果，在序列化前由原生分发器强制校验。
 pub(super) type SessionOpen = SessionReceipt;
@@ -205,6 +209,7 @@ pub(super) fn schemas() -> serde_json::Value {
         ("pool_forget", super::contract::response::<PoolForget>()),
         ("pool_revoke_permission", super::contract::response::<PoolRevokePermission>()),
         ("call_submit", super::contract::response::<CallSubmit>()),
+        ("instance_prewarm", super::contract::response::<InstancePrewarm>()),
         ("session_open", super::contract::response::<SessionOpen>()),
         ("session_submit", super::contract::response::<SessionSubmit>()),
         ("session_status", super::contract::response::<SessionStatus>()),

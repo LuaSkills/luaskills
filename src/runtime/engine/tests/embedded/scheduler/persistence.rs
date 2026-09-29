@@ -7,6 +7,7 @@ mod context;
 mod finalization;
 mod intent;
 mod outcome;
+mod prewarm;
 mod reusable;
 mod reusable_finalization;
 

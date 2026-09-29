@@ -56,8 +56,8 @@ pub use pool::{EmbeddedPoolManager, ModuleLease, ModulePool, ModulePoolPlacement
 pub use resources::ModuleResourceOwner;
 pub use scheduler::{
     CheckpointRetryState, EmbeddedCall, EmbeddedCapacityConfig, EmbeddedCapacityPolicySnapshot,
-    EmbeddedCapacitySnapshot, EmbeddedPluginSnapshot, EmbeddedRuntime, EmbeddedRuntimeUsage,
-    EmbeddedSessionOpening, EmbeddedSessionPhase, EmbeddedSessionSnapshot,
+    EmbeddedCapacitySnapshot, EmbeddedPluginSnapshot, EmbeddedPrewarm, EmbeddedRuntime,
+    EmbeddedRuntimeUsage, EmbeddedSessionOpening, EmbeddedSessionPhase, EmbeddedSessionSnapshot,
     OperationPersistenceFailure,
 };
 pub use schema::{EMBEDDED_SCHEMA_DIALECT, JsonContract};

@@ -53,6 +53,20 @@ pub struct EmbeddedCall {
     pub context: LuaInvocationContext,
 }
 
+/// Explicitly initialize one additional reusable VM without invoking any business export.
+/// 明确初始化一个额外可复用 VM，不调用任何业务导出。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
+pub struct EmbeddedPrewarm {
+    /// Exact immutable reusable pool identity; an existing idle VM never satisfies this request.
+    /// 精确不可变可复用池身份；已有空闲 VM 绝不抵充此请求。
+    pub pool_id: String,
+    /// Trusted context retained for caller attribution and this instance's eventual finalization.
+    /// 为调用方归属及此实例最终关闭保留的可信上下文。
+    pub context: LuaInvocationContext,
+}
+
 /// Live scheduler observations; queue bytes exclude already-dispatched request values.
 /// 实时调度观测；队列字节不包含已分发的请求值。
 #[derive(Debug, Clone, Serialize)]
@@ -581,6 +595,37 @@ impl EmbeddedRuntime {
         self.center.enqueue(
             &mut state,
             ScheduledRequest::Invoke(request),
+            control,
+            bytes,
+        )
+    }
+
+    /// Admit one additional reusable-instance initialization under the original finite timeout.
+    /// 在原始有限超时下接纳一个额外可复用实例的初始化。
+    /// request selects the exact pool and trusted context; returns a queryable operation whose success contains instance_id.
+    /// request 选择精确池及可信上下文；返回可查询操作，成功结果包含 instance_id。
+    /// Initialization uses normal queue, plugin, capacity, persistence and cleanup ownership; it does not execute an export.
+    /// 初始化使用普通队列、插件、用途容量、持久化及清理归属；不执行业务导出。
+    pub fn prewarm_instance(
+        &self,
+        request: EmbeddedPrewarm,
+        timeout: Duration,
+    ) -> EmbeddedResult<OperationHandle> {
+        self.center.capabilities.check_submission()?;
+        // Validate and charge the complete context before admitting any initialization work.
+        // 接纳任何初始化工作之前，校验并计费完整上下文。
+        let control = Arc::new(CallControl::new(timeout)?);
+        let bytes = json_size(&request, self.center.pools.config().max_queued_bytes)?;
+        let mut state = self.center.lock()?;
+        let pool = state.pools.get(&request.pool_id).ok_or_else(not_found)?;
+        if pool.pool.policy().reuse != InstanceReuse::Reusable {
+            return Err(EmbeddedError::invalid(
+                "prewarm requires an explicitly reusable pool",
+            ));
+        }
+        self.center.enqueue(
+            &mut state,
+            ScheduledRequest::Prewarm(request),
             control,
             bytes,
         )

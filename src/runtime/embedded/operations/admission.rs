@@ -154,6 +154,30 @@ impl OperationRegistry {
         })
     }
 
+    /// Admit explicit no-export initialization for pool, preserving its request correlation and operation authority.
+    /// 为 pool 接纳明确的无导出初始化，保留其请求关联及操作权威。
+    /// control carries the original deadline; returns the same handle/owner pair as ordinary formal admission.
+    /// control 携带原始截止时间；返回与普通正式入场相同的句柄及所有者对。
+    pub(in crate::runtime::embedded) fn admit_prewarm(
+        &self,
+        control: Arc<CallControl>,
+        pool: &ModulePool,
+        request_id: Option<&str>,
+    ) -> EmbeddedResult<(OperationHandle, OperationOwner)> {
+        self.admit_context(control, |id| {
+            // Only this explicit entrypoint marks prewarming; missing exports remain invalid for ordinary calls.
+            // 仅此明确入口标记预热；普通调用缺失导出仍然非法。
+            let mut context = pool.operation_context(id, None, None, request_id)?;
+            let OperationContext::Module(module) = &mut context else {
+                return Err(EmbeddedError::invalid(
+                    "prewarm requires a bound module context",
+                ));
+            };
+            module.prewarm = true;
+            Ok(context)
+        })
+    }
+
     /// Allocate one identity and derive its context using a private metadata-only factory before control publication.
     /// 分配单个身份，并在控制发布前使用私有纯元数据构造器派生其上下文。
     /// Return owned observation/execution handles or a rejection that publishes no identity or context.

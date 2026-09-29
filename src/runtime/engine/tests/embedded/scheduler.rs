@@ -9,6 +9,7 @@ mod capacities;
 mod finalization;
 mod persistence;
 mod plugins;
+mod prewarm;
 mod requests;
 mod resources;
 mod sessions;

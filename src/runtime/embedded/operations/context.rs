@@ -27,6 +27,10 @@ pub enum OperationContext {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
 pub struct ModuleOperationContext {
+    /// Explicit additional-instance initialization, never inferred from a missing export.
+    /// 明确额外实例初始化，绝不根据缺失导出推断。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub prewarm: bool,
     /// Original VM for an independently admitted finalization; absent for ordinary business and opening work.
     /// 独立入场关闭操作的原 VM；普通业务及开启操作省略。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,8 +44,8 @@ pub struct ModuleOperationContext {
     /// Exact capability membership snapshot frozen when the pool was registered.
     /// 注册池时冻结的精确能力成员快照。
     pub capability_revision: String,
-    /// Requested declared export; absent only for a fixed-session opening operation.
-    /// 请求的已声明导出；仅固定会话开启操作省略。
+    /// Requested declared export; absent for explicit prewarming or fixed-session opening only.
+    /// 请求的已声明导出；仅明确预热或固定会话开启操作省略。
     pub export: Option<String>,
 }
 
@@ -69,7 +73,9 @@ impl OperationContext {
                 .export
                 .as_ref()
                 .is_some_and(|value| value.trim().is_empty() || value.contains('\0'))
-            || (context.export.is_none() && context.caller.session_id.is_none())
+            || (context.prewarm
+                && (context.export.is_some() || context.caller.session_id.is_some()))
+            || (!context.prewarm && context.export.is_none() && context.caller.session_id.is_none())
             || context.finalization_instance_id.as_ref().is_some_and(|id| {
                 id.trim().is_empty() || id.contains('\0') || context.export.is_none()
             })
@@ -89,4 +95,12 @@ impl OperationContext {
             Self::Module(context) => Some(&context.caller),
         }
     }
+}
+
+/// Omit the historical false default while serializing explicit prewarm authority as true.
+/// 序列化时省略历史假值默认项，但将明确预热权威序列化为真。
+/// value is the original flag; returns true only when it is absent from legacy wire projections.
+/// value 为原标志；仅其不出现在历史线协议投影时返回真。
+fn is_false(value: &bool) -> bool {
+    !*value
 }

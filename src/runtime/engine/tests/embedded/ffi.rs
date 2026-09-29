@@ -7,6 +7,7 @@ use crate::runtime::embedded::{EmbeddedPluginConfig, InstanceReuse, OperationSna
 
 mod capacities;
 mod persistence;
+mod prewarm;
 
 /// The public C transport executes a real module from the exact host-authorized external generation.
 /// 公开 C 传输从宿主精确授权的外部代次执行真实模块。

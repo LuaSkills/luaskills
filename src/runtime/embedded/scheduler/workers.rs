@@ -109,17 +109,36 @@ fn select(
                 let pool_id = call.request.pool_id().to_owned();
                 let operation_id = call.id.clone();
                 let control = Arc::clone(&call.control);
+                // Explicit prewarm has a context but no business export and cannot consume an existing idle VM.
+                // 明确预热有上下文但无业务导出，不能消费已有空闲 VM。
+                let prewarm = matches!(call.request, ScheduledRequest::Prewarm(_));
                 let context = call
                     .request
-                    .invocation()
-                    .expect("ordinary queued invocation")
-                    .context
+                    .context()
+                    .expect("queued invocation or explicit prewarm")
                     .clone();
                 let physical = Arc::clone(&pool.pool);
                 let allow_new = state.plugin_allows_allocation(&pool_id)?;
                 let prepared = if physical.policy().reuse == InstanceReuse::Reusable {
-                    reusable::prepare(center, state, &pool_id, &operation_id, &context, &control)
+                    if prewarm && physical.usage()?.resident >= physical.policy().max_resident_vms {
+                        // An additional VM cannot fit in this full domain; do not block its ordinary cache borrowers.
+                        // 额外 VM 无法放入已满域；不得阻塞其普通缓存借用者。
+                        Err(EmbeddedError::new(
+                            EmbeddedErrorCode::CapacityExceeded,
+                            "prewarm cannot add a resident to a full pool",
+                        ))
+                    } else {
+                        reusable::prepare(
+                            center,
+                            state,
+                            &pool_id,
+                            &operation_id,
+                            &context,
+                            &control,
+                            !prewarm,
+                        )
                         .map(|prepared| prepared.map(|(lease, id)| (lease, Some(id))))
+                    }
                 } else {
                     match physical.prepare_with_budget(&control, false, allow_new) {
                         Ok(lease) => Ok(Some((lease, None))),
@@ -208,6 +227,8 @@ fn invoke(
                 context: &request.context,
                 control: Arc::clone(&call.control),
             })
+        } else if matches!(call.request, ScheduledRequest::Prewarm(_)) {
+            Ok(serde_json::json!({ "instance_id": lease.instance_id()? }))
         } else {
             Ok(
                 serde_json::json!({ "session_id": call.request.session_id().expect("creation has identity") }),

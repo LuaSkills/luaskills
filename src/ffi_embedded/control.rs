@@ -237,6 +237,27 @@ pub(super) fn execute(
                 limit,
             )
         }
+        RuntimeCommand::InstancePrewarm {
+            request,
+            timeout_ms,
+        } => {
+            // Reserve reply capacity before accepting any source execution or operation ownership.
+            // 接纳任何源码执行或操作归属前预留回复容量。
+            let sample = OperationReceipt {
+                operation_id: IdentityKind::Operation.longest(runtime.id()),
+            };
+            mutate::<responses::InstancePrewarm>(
+                &sample,
+                || {
+                    runtime
+                        .prewarm_instance(*request, Duration::from_millis(timeout_ms))
+                        .map(|operation| OperationReceipt {
+                            operation_id: operation.id().to_owned(),
+                        })
+                },
+                limit,
+            )
+        }
         RuntimeCommand::SessionOpen {
             pool_id,
             timeout_ms,

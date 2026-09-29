@@ -1,7 +1,7 @@
 use crate::LuaInvocationContext;
 use crate::runtime::embedded::{
     EffectState, EmbeddedCall, EmbeddedCapacityConfig, EmbeddedError, EmbeddedPluginConfig,
-    EmbeddedResult, ModuleDefinition, OperationReconciliation, PluginPoolConfig,
+    EmbeddedPrewarm, EmbeddedResult, ModuleDefinition, OperationReconciliation, PluginPoolConfig,
     capabilities::{CapabilityDescriptor, CapabilityOutcome},
 };
 use serde::Deserialize;
@@ -225,6 +225,16 @@ pub(super) enum RuntimeCommand {
         /// 原始端到端执行预算毫秒数。
         timeout_ms: u64,
     },
+    /// Initialize one additional reusable VM without invoking a business export.
+    /// 初始化一个额外可复用 VM，不调用业务导出。
+    InstancePrewarm {
+        /// Exact pool and trusted initialization/finalization context.
+        /// 精确池及可信初始化／关闭上下文。
+        request: Box<EmbeddedPrewarm>,
+        /// Original end-to-end execution budget in milliseconds.
+        /// 原始端到端执行预算毫秒数。
+        timeout_ms: u64,
+    },
     /// Reserve a fixed instance and submit initialization.
     /// 预留固定实例并提交初始化。
     SessionOpen {
@@ -422,6 +432,7 @@ pub(super) const RUNTIME_COMMAND_NAMES: &[&str] = &[
     "pool_forget",
     "pool_revoke_permission",
     "call_submit",
+    "instance_prewarm",
     "session_open",
     "session_submit",
     "session_status",
@@ -453,6 +464,7 @@ impl RuntimeCommand {
                 | Self::CapacityRevise { .. }
                 | Self::PoolRegister { .. }
                 | Self::CallSubmit { .. }
+                | Self::InstancePrewarm { .. }
                 | Self::SessionOpen { .. }
                 | Self::SessionSubmit { .. }
                 | Self::CapabilitiesRegister { .. }
