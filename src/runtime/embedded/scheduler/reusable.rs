@@ -137,7 +137,7 @@ pub(super) fn prepare(
 /// 标记过期空闲租借，不销毁它们，也不消耗执行域的最小预热数量。
 /// The supervisor later transfers marked ownership into actual retirement outside metadata locks.
 /// 监督器随后在元数据锁外将已标记所有权转入真实退役。
-fn expire(state: &mut SchedulerState, pool_id: &str) {
+pub(super) fn expire(state: &mut SchedulerState, pool_id: &str) {
     // Expiration obeys both the immutable module floor and its aggregate capacity floor.
     // 过期同时遵守不可变模块下限及所属聚合容量下限。
     let pool = state.pools.get(pool_id).expect("reusable pool retained");

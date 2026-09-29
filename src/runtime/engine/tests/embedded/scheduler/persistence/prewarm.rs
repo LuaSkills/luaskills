@@ -80,6 +80,12 @@ fn embedded_prewarm_persistence_failure_blocks_reuse_until_explicit_recovery() {
             OperationPhase::Initializing
         );
         assert_eq!(runtime.pool_resources(&pool).unwrap().resident, 1);
+        // Physical residency cannot substitute for confirmed scheduler readiness after a failed checkpoint.
+        // 检查点失败后，物理常驻不能替代已确认调度器就绪。
+        let readiness = runtime.reusable_pool_status(&pool).unwrap();
+        assert_eq!(readiness.ready, 0);
+        assert_eq!(readiness.unavailable, 1);
+        assert!(readiness.admission_blocked);
         // A later real business call cannot take ownership while the original checkpoint is unresolved.
         // 原检查点未解决时，后续真实业务调用不能取得归属。
         assert_eq!(
@@ -110,6 +116,16 @@ fn embedded_prewarm_persistence_failure_blocks_reuse_until_explicit_recovery() {
                 .is_some()
         );
         assert_eq!(business.wait(OBSERVE).unwrap().value, Some(json!(true)));
+        until(
+            || runtime.reusable_pool_status(&pool).unwrap().ready == 1,
+            "confirmed original instance did not become borrowable",
+        );
+        assert!(
+            !runtime
+                .reusable_pool_status(&pool)
+                .unwrap()
+                .admission_blocked
+        );
         assert_eq!(
             fs::read_to_string(layout.package_root.join("prewarm-count")).unwrap(),
             "x"

@@ -18,6 +18,7 @@ mod persistence;
 mod plugins;
 mod reusable;
 mod reusable_finalization;
+mod reusable_status;
 mod sessions;
 mod sessions_finalization;
 mod workers;
@@ -30,6 +31,7 @@ pub use persistence::{CheckpointRetryState, OperationPersistenceFailure};
 pub use plugins::EmbeddedPluginSnapshot;
 use plugins::ScheduledPlugin;
 use reusable::ScheduledReusable;
+pub use reusable_status::EmbeddedReusablePoolSnapshot;
 pub use sessions::{EmbeddedSessionOpening, EmbeddedSessionPhase, EmbeddedSessionSnapshot};
 use sessions::{ScheduledRequest, ScheduledSession};
 

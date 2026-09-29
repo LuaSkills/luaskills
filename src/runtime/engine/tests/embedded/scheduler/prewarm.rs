@@ -2,6 +2,63 @@
 //! 明确额外实例预热的真实初始化、取消及归属证据。
 
 use super::*;
+
+/// Ready snapshots apply expiration without consuming the original declared warm floor.
+/// 就绪快照应用过期规则，且不消耗原声明预热下限。
+#[test]
+fn embedded_prewarm_readiness_expires_surplus_and_preserves_floor() {
+    // Real module state is retained by the formal scheduler, with one protected idle instance.
+    // 正式调度器保留真实模块状态，其中一个空闲实例受保护。
+    let layout = SystemRuntimeTestLayout::new("formal readiness expiration");
+    let runtime = runtime(&layout, pool_config());
+    let mut policy = pool_policy(InstanceReuse::Reusable);
+    policy.kind = PoolKind::Dedicated;
+    policy.min_resident_vms = 1;
+    policy.max_resident_vms = 2;
+    policy.idle_ttl_ms = Some(50);
+    let pool = runtime
+        .register_pool(
+            definition(&layout, "return {call=function() return true end}"),
+            policy,
+            permissions(),
+            "readiness-expiration".into(),
+        )
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            runtime
+                .prewarm_instance(request(&pool), OBSERVE)
+                .unwrap()
+                .wait(OBSERVE)
+                .unwrap()
+                .phase,
+            OperationPhase::Succeeded
+        );
+    }
+    // The existing test observation budget bounds physical retirement independently of the short idle TTL.
+    // 既有测试观测预算独立于短空闲时长，约束物理退役。
+    let deadline = std::time::Instant::now() + OBSERVE;
+    while runtime.reusable_pool_status(&pool).unwrap().ready != 1
+        || runtime.pool_resources(&pool).unwrap().resident != 1
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "surplus did not retire"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(runtime.reusable_pool_status(&pool).unwrap().ready, 1);
+    runtime.close_pool(&pool).unwrap();
+    assert_eq!(runtime.reusable_pool_status(&pool).unwrap().ready, 0);
+    assert_eq!(
+        runtime
+            .reusable_pool_status("unknown-pool")
+            .unwrap_err()
+            .code,
+        EmbeddedErrorCode::NotFound
+    );
+    shutdown(&runtime);
+}
 use crate::RuntimeRequestContext;
 
 /// Bound fixture observation and execution; production budgets remain runtime-owned.
@@ -95,6 +152,11 @@ fn embedded_prewarm_creates_distinct_instances_without_business_execution() {
         let operation = runtime.prewarm_instance(request(&pool), OBSERVE).unwrap();
         let callback = host_request(&runtime);
         let snapshot = operation.snapshot().unwrap();
+        // A real initialization callback owns one unavailable instance while prior confirmed instances remain ready.
+        // 真实初始化回调拥有一个不可用实例，同时先前已确认实例保持就绪。
+        let readiness = runtime.reusable_pool_status(&pool).unwrap();
+        assert_eq!(readiness.ready, instances.len());
+        assert_eq!(readiness.unavailable, 1);
         assert_eq!(snapshot.phase, OperationPhase::WaitingForHost);
         let OperationContext::Module(context) = &snapshot.context else {
             panic!("prewarm must retain a bound module context");
@@ -127,6 +189,10 @@ fn embedded_prewarm_creates_distinct_instances_without_business_execution() {
     }
     assert_eq!(
         runtime.pool_resources(&pool).unwrap().resident,
+        instances.len()
+    );
+    assert_eq!(
+        runtime.reusable_pool_status(&pool).unwrap().ready,
         instances.len()
     );
     // An impossible additional allocation must fail without blocking a later ordinary borrower.
@@ -220,6 +286,9 @@ fn embedded_prewarm_queue_cancel_timeout_and_close_preserve_ownership() {
             .is_empty()
     );
     runtime.request_close().unwrap();
+    let readiness = runtime.reusable_pool_status(&pool).unwrap();
+    assert!(readiness.closing);
+    assert_eq!(readiness.ready, 0);
     assert!(!runtime.poll_closed().unwrap());
     assert!(!running.snapshot().unwrap().phase.is_terminal());
     acknowledge(&runtime, &callback);
@@ -248,6 +317,10 @@ fn embedded_prewarm_rejects_other_reuse_modes_before_initialization() {
                 "ineligible".into(),
             )
             .unwrap();
+        assert_eq!(
+            runtime.reusable_pool_status(&pool).unwrap_err().code,
+            EmbeddedErrorCode::InvalidArgument
+        );
         assert_eq!(
             runtime
                 .prewarm_instance(request(&pool), OBSERVE)
