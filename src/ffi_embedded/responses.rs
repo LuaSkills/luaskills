@@ -87,6 +87,10 @@ pub(super) type PoolRegister = PoolReceipt;
 /// `pool_status` 成功结果，在序列化前由原生分发器强制校验。
 pub(super) type PoolStatus = PoolUsage;
 
+/// Confirmed scheduler readiness is separate from physical pool allocator usage.
+/// 已确认调度器就绪与物理池分配器用量分离。
+pub(super) type PoolReusableStatus = crate::runtime::embedded::EmbeddedReusablePoolSnapshot;
+
 /// Successful `pool_close` result, enforced by the native dispatcher before serialization.
 /// `pool_close` 成功结果，在序列化前由原生分发器强制校验。
 pub(super) type PoolClose = ();
@@ -210,6 +214,7 @@ pub(super) fn schemas() -> serde_json::Value {
         ("pool_revoke_permission", super::contract::response::<PoolRevokePermission>()),
         ("call_submit", super::contract::response::<CallSubmit>()),
         ("instance_prewarm", super::contract::response::<InstancePrewarm>()),
+        ("pool_reusable_status", super::contract::response::<PoolReusableStatus>()),
         ("session_open", super::contract::response::<SessionOpen>()),
         ("session_submit", super::contract::response::<SessionSubmit>()),
         ("session_status", super::contract::response::<SessionStatus>()),

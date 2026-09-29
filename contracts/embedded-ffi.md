@@ -68,6 +68,7 @@
 | `capacity_close`、`capacity_forget` | `capacity_id` | `null` |
 | `pool_register` | `definition: ModuleDefinition`、`policy: PluginPoolConfig`、`permissions: string[]`、`execution_revision`、可选 `capacity_id` | `{pool_id}` |
 | `pool_status` | `pool_id` | `PoolUsage`，来自实际资源计数 |
+| `pool_reusable_status` | `pool_id` | `EmbeddedReusablePoolSnapshot`，来自正式调度器的精确可复用池观测；非复用池明确拒绝 |
 | `pool_close`、`pool_forget` | `pool_id` | `null` |
 | `pool_revoke_permission` | `pool_id`、`permission` | 是否实际移除了授权的布尔值 |
 | `call_submit` | `call: EmbeddedCall`、`timeout_ms` | `{operation_id}` |

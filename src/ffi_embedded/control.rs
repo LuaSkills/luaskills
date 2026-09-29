@@ -207,6 +207,9 @@ pub(super) fn execute(
         RuntimeCommand::PoolStatus { pool_id } => {
             respond::<responses::PoolStatus>(runtime.pool_resources(&pool_id), limit)
         }
+        RuntimeCommand::PoolReusableStatus { pool_id } => {
+            respond::<responses::PoolReusableStatus>(runtime.reusable_pool_status(&pool_id), limit)
+        }
         RuntimeCommand::PoolClose { pool_id } => {
             mutate::<responses::PoolClose>(&(), || runtime.close_pool(&pool_id), limit)
         }

@@ -19,6 +19,7 @@
       "shared_pools_v1",
       "dedicated_pools_v1",
       "explicit_instance_prewarm_v1",
+      "reusable_pool_readiness_v1",
       "fixed_sessions_v1",
       "host_request_queue_v1",
       "in_memory_effect_evidence_v1",
@@ -2958,6 +2959,25 @@
           },
           {
             "additionalProperties": false,
+            "description": "Observe confirmed reusable readiness for one exact pool without admitting new work.\n观测单个精确池的已确认可复用就绪状态，不接纳新工作。",
+            "properties": {
+              "pool_id": {
+                "description": "Exact immutable reusable pool identity.\n精确不可变可复用池身份。",
+                "type": "string"
+              },
+              "type": {
+                "const": "pool_reusable_status",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "pool_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
             "description": "Forget only a pool whose ownership has drained.\n仅遗忘所有权已排空的池。",
             "properties": {
               "pool_id": {
@@ -4369,6 +4389,7 @@
     "capacity_forget",
     "pool_register",
     "pool_status",
+    "pool_reusable_status",
     "pool_close",
     "pool_forget",
     "pool_revoke_permission",
@@ -9407,6 +9428,137 @@
         },
         "result": {
           "$ref": "#/$defs/PoolReceipt",
+          "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。"
+        },
+        "status": {
+          "$ref": "#/$defs/SuccessStatus",
+          "description": "Exact success discriminator.\n精确成功判别。"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "status",
+        "result"
+      ],
+      "title": "SuccessEnvelope",
+      "type": "object"
+    },
+    "pool_reusable_status": {
+      "$defs": {
+        "EmbeddedReusablePoolSnapshot": {
+          "description": "One exact reusable pool observation under the scheduler lock, not a future residency guarantee.\n在调度器锁下对单个精确可复用池的观测，不是未来驻留保证。",
+          "properties": {
+            "admission_blocked": {
+              "description": "Retained infrastructure or checkpoint failure currently fences new work.\n保留基础设施或检查点故障当前阻止新工作。",
+              "type": "boolean"
+            },
+            "closing": {
+              "description": "Permanent runtime or pool admission closure.\n永久运行时或池入场关闭。",
+              "type": "boolean"
+            },
+            "max_resident_vms": {
+              "description": "Immutable module resident ceiling; aggregate resource admission may still reject allocation.\n不可变模块常驻上限；聚合资源入场仍可能拒绝分配。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "physical": {
+              "$ref": "#/$defs/PoolUsage",
+              "description": "Actual allocator occupancy, including creating and retiring allocations.\n真实分配器占用，包含创建及退役中的分配。"
+            },
+            "pool_id": {
+              "description": "Original registered pool identity.\n原始已登记池身份。",
+              "type": "string"
+            },
+            "ready": {
+              "description": "Confirmed idle leases eligible for borrowing after applying declared idle expiration.\n应用声明空闲过期规则后，已确认且符合借用条件的空闲租借数。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "unavailable": {
+              "description": "Existing allocations still owned by initialization, business, checkpointing or retirement.\n仍由初始化、业务、检查点或退役拥有的现有分配数。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "pool_id",
+            "ready",
+            "unavailable",
+            "physical",
+            "max_resident_vms",
+            "closing",
+            "admission_blocked"
+          ],
+          "type": "object"
+        },
+        "PoolUsage": {
+          "description": "Current counters for one governor or one execution group.\n单个治理器或执行分组的当前计数。",
+          "properties": {
+            "creating": {
+              "description": "Allocations that have not finished initialization.\n尚未完成初始化的分配。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "idle": {
+              "description": "Initialized allocations that do not currently execute.\n已初始化且当前未执行的分配。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "resident": {
+              "description": "All allocated slots, including creating and retiring instances.\n全部分配槽位，包含正在创建与退役的实例。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "retiring": {
+              "description": "Allocations retained until teardown has genuinely completed.\n保留到清理真正完成的分配。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "running": {
+              "description": "Allocations holding a parent and group execution permit together.\n同时持有父级与分组执行许可的分配。",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "resident",
+            "creating",
+            "idle",
+            "running",
+            "retiring"
+          ],
+          "type": "object"
+        },
+        "SuccessStatus": {
+          "description": "Single legal success discriminator, shared by live encoding and derived contracts.\n实际编码及派生契约共享的唯一合法成功判别。",
+          "oneOf": [
+            {
+              "const": "ok",
+              "description": "Successfully delivered result, including explicit JSON null.\n已成功交付结果，包含显式 JSON 空值。",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Borrowed success envelope avoids cloning application output during native response publication.\n借用成功信封，避免原生响应发布期间克隆应用输出。",
+      "properties": {
+        "protocol_version": {
+          "description": "Single protocol version authority.\n唯一协议版本权威。",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "$ref": "#/$defs/EmbeddedReusablePoolSnapshot",
           "description": "Borrowed result whose owner lives through serialization.\n借用结果，其所有者跨序列化存活。"
         },
         "status": {

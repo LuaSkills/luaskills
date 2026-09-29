@@ -67,7 +67,7 @@ Rust 的 `EmbeddedRuntime::reusable_pool_status(pool_id)` 查询精确可复用�
 未知身份和单次／固定会话池明确拒绝，不自动选取另一池或代际。观测不预留空闲租借，
 不承诺后续普通业务、空闲回收或压力退役之后仍保持同一数量。
 宿主目标流程必须冻结执行域、限制初始化次数并保留实际操作，不能用物理空闲差值并发补齐。
-该查询当前只完成 Rust API；C JSON 命令、机器契约与各 SDK 查询接口仍待同步，不应从旧版能力标识推断其可用性。
+版本一 C JSON 命令为 `pool_reusable_status`，能力标识为 `reusable_pool_readiness_v1`，返回同一正式快照。TypeScript、Python、Go 分别提供池上的 `reusableStatus()`、`reusable_status()`、`ReusableStatus(ctx)`；均使用预留控制通道，保留原池身份、错误及待确认回执。机器契约与 SDK 必须使用匹配生成产物和原生库，不能从旧版预热能力标识推断此查询可用。当前属于开发接口，尚未正式发布。
 
 ## 资源治理基础
 

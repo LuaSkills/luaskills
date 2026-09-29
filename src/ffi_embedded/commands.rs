@@ -198,6 +198,13 @@ pub(super) enum RuntimeCommand {
         /// 精确不可变池身份。
         pool_id: String,
     },
+    /// Observe confirmed reusable readiness for one exact pool without admitting new work.
+    /// 观测单个精确池的已确认可复用就绪状态，不接纳新工作。
+    PoolReusableStatus {
+        /// Exact immutable reusable pool identity.
+        /// 精确不可变可复用池身份。
+        pool_id: String,
+    },
     /// Forget only a pool whose ownership has drained.
     /// 仅遗忘所有权已排空的池。
     PoolForget {
@@ -428,6 +435,7 @@ pub(super) const RUNTIME_COMMAND_NAMES: &[&str] = &[
     "capacity_forget",
     "pool_register",
     "pool_status",
+    "pool_reusable_status",
     "pool_close",
     "pool_forget",
     "pool_revoke_permission",
