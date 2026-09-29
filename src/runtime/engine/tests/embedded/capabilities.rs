@@ -5,6 +5,7 @@ use crate::runtime::embedded::{EffectState, InstanceReuse};
 use std::collections::BTreeSet;
 
 mod effects;
+mod initialization;
 
 /// Forward structured module input through the real native boundary without losing empty container kinds.
 /// 经真实原生边界转发结构化模块输入，且不丢失空容器类型。

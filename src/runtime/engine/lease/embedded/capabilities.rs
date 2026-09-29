@@ -4,6 +4,31 @@ use crate::runtime::embedded::capabilities::{
     CapabilityCaller, CapabilityOutcome, ModuleCapabilities,
 };
 
+/// Actual host-selected Lua execution stage; source and arguments cannot choose callback authority.
+/// 真实宿主选择的 Lua 执行阶段；源码和参数不能选择回调权威。
+#[derive(Clone, Copy)]
+pub(super) enum CapabilityCallPhase {
+    /// Evaluate the module source before any export is captured.
+    /// 在捕获任何导出之前求值模块源码。
+    Initialization,
+    /// Invoke one captured business or closing export.
+    /// 调用单个已捕获业务或关闭导出。
+    Export,
+}
+
+impl CapabilityCallPhase {
+    /// Check exact `name` against `binding` for this actual stage; grants remain checked by the registry.
+    /// 针对此真实阶段的 `binding` 检查精确 `name`；注册表仍检查授权。
+    /// Return whether the stage permits discovery or dispatch, without running a callback.
+    /// 返回此阶段是否允许发现或分发，不执行回调。
+    fn permits(self, binding: &ModuleCapabilities, name: &str) -> bool {
+        match self {
+            Self::Initialization => binding.allows_initialization(name),
+            Self::Export => true,
+        }
+    }
+}
+
 /// Host-only per-invocation authority; Lua receives results, never a mutable reference to this slot.
 /// 仅宿主可写的逐调用权威；Lua 仅接收结果，绝不获得此槽位的可变引用。
 #[derive(Clone)]
@@ -14,6 +39,9 @@ pub(super) struct CapabilityCallContext {
     /// Original operation deadline and cancellation authority.
     /// 原始操作截止时间与取消权威。
     pub(super) control: Arc<CallControl>,
+    /// Actual execution stage installed immediately before Lua runs and cleared by the same budget guard.
+    /// 在 Lua 运行前立即安装并由同一预算保护对象清除的真实执行阶段。
+    pub(super) phase: CapabilityCallPhase,
 }
 
 /// Install the module's capability facade before any plugin source can retain legacy global callbacks.
@@ -35,12 +63,18 @@ pub(super) fn install(lua: &Lua, binding: Option<ModuleCapabilities>) -> mlua::R
         lua.create_function(move |lua, ()| {
             // Unbound modules expose an empty capability set, never process-global callback state.
             // 未绑定模块暴露空能力集合，绝不暴露进程全局回调状态。
-            let descriptors = match &discovery {
-                Some(binding) => binding
+            let context = lua
+                .app_data_ref::<CapabilityCallContext>()
+                .map(|context| context.clone());
+            let descriptors = match (&discovery, context) {
+                (Some(binding), Some(context)) => binding
                     .snapshot
                     .list(&binding.permissions)
-                    .map_err(mlua::Error::external)?,
-                None => Vec::new(),
+                    .map_err(mlua::Error::external)?
+                    .into_iter()
+                    .filter(|descriptor| context.phase.permits(binding, &descriptor.name))
+                    .collect(),
+                _ => Vec::new(),
             };
             lua.to_value(&descriptors)
         })?,
@@ -48,12 +82,19 @@ pub(super) fn install(lua: &Lua, binding: Option<ModuleCapabilities>) -> mlua::R
     // Existence checks are permission-filtered through the same registry authority.
     // 存在性检查通过相同注册表权威进行权限过滤。
     let existence = binding.clone();
-    let has = lua.create_function(move |_, name: String| match &existence {
-        Some(binding) => binding
-            .snapshot
-            .has(&name, &binding.permissions)
-            .map_err(mlua::Error::external),
-        None => Ok(false),
+    let has = lua.create_function(move |lua, name: String| {
+        // A retained Lua closure reads the current host stage on every use, not the stage when it was captured.
+        // 保留的 Lua 闭包在每次使用时读取当前宿主阶段，而非其被捕获时的阶段。
+        let context = lua
+            .app_data_ref::<CapabilityCallContext>()
+            .map(|context| context.clone());
+        match (&existence, context) {
+            (Some(binding), Some(context)) if context.phase.permits(binding, &name) => binding
+                .snapshot
+                .has(&name, &binding.permissions)
+                .map_err(mlua::Error::external),
+            _ => Ok(false),
+        }
     })?;
     capabilities.set("has", has.clone())?;
     capabilities.set("has_tool", has)?;
@@ -69,6 +110,10 @@ pub(super) fn install(lua: &Lua, binding: Option<ModuleCapabilities>) -> mlua::R
             // 分发前失败可以确定未产生宿主副作用。
             let result = match (&binding, context) {
                 (Some(binding), Some(context)) => match context.caller {
+                    Some(_) if !context.phase.permits(binding, &name) => Err(EmbeddedError::new(
+                        EmbeddedErrorCode::PermissionDenied,
+                        "capability is not authorized during module initialization",
+                    )),
                     Some(caller) => lua_value_to_json(&arguments)
                         .map_err(|_| {
                             EmbeddedError::invalid("capability arguments must be JSON values")

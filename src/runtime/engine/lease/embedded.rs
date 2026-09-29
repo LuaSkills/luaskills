@@ -279,26 +279,33 @@ impl EmbeddedModule {
             Some(operation_id) => operation_id,
             None => self.initialization_id.clone(),
         };
-        let exports = self.run(&context, control, &initialization_id, session_id, |lua| {
-            // The module return shape is fixed by the declared runtime protocol.
-            // 模块返回形状由声明的运行时协议固定。
-            let table: Table = lua.load(&source).set_name("embedded_module").eval()?;
-            contracts
-                .into_iter()
-                .map(|(name, (input, output))| {
-                    table.raw_get::<Function>(name.as_str()).map(|function| {
-                        (
-                            name,
-                            CompiledModuleExport {
-                                function,
-                                input,
-                                output,
-                            },
-                        )
+        let exports = self.run(
+            &context,
+            control,
+            &initialization_id,
+            session_id,
+            capabilities::CapabilityCallPhase::Initialization,
+            |lua| {
+                // The module return shape is fixed by the declared runtime protocol.
+                // 模块返回形状由声明的运行时协议固定。
+                let table: Table = lua.load(&source).set_name("embedded_module").eval()?;
+                contracts
+                    .into_iter()
+                    .map(|(name, (input, output))| {
+                        table.raw_get::<Function>(name.as_str()).map(|function| {
+                            (
+                                name,
+                                CompiledModuleExport {
+                                    function,
+                                    input,
+                                    output,
+                                },
+                            )
+                        })
                     })
-                })
-                .collect::<mlua::Result<BTreeMap<_, _>>>()
-        })?;
+                    .collect::<mlua::Result<BTreeMap<_, _>>>()
+            },
+        )?;
         self.exports = exports;
         Ok(())
     }
@@ -359,6 +366,7 @@ impl EmbeddedModule {
             invocation.control,
             invocation.operation_id,
             invocation.session_id,
+            capabilities::CapabilityCallPhase::Export,
             |lua| {
                 // Use the same protected container identities as native capability conversion.
                 // 使用与原生能力转换相同的受保护容器身份。
@@ -388,6 +396,7 @@ impl EmbeddedModule {
         control: Arc<CallControl>,
         operation_id: &str,
         session_id: Option<&str>,
+        phase: capabilities::CapabilityCallPhase,
         execute: impl FnOnce(&Lua) -> mlua::Result<T>,
     ) -> EmbeddedResult<T> {
         self.reusable = false;
@@ -458,6 +467,7 @@ impl EmbeddedModule {
             .set_app_data(capabilities::CapabilityCallContext {
                 caller,
                 control: Arc::clone(&control),
+                phase,
             });
         // Save the result before unconditional request-context cleanup.
         // 在无条件清理请求上下文前保存执行结果。
