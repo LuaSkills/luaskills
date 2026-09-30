@@ -114,30 +114,38 @@ pub(super) fn install(lua: &Lua, binding: Option<ModuleCapabilities>) -> mlua::R
                         EmbeddedErrorCode::PermissionDenied,
                         "capability is not authorized during module initialization",
                     )),
-                    Some(caller) => lua_value_to_json(&arguments)
-                        .map_err(|_| {
-                            EmbeddedError::invalid("capability arguments must be JSON values")
-                        })
-                        .and_then(|arguments| {
-                            binding.snapshot.invoke(
-                                &name,
-                                caller,
-                                Arc::clone(&binding.permissions),
-                                arguments,
-                                context.control,
-                            )
-                        }),
+                    Some(caller) => values::callback_arguments(&arguments).and_then(|arguments| {
+                        binding.snapshot.invoke(
+                            &name,
+                            caller,
+                            Arc::clone(&binding.permissions),
+                            arguments,
+                            context.control,
+                        )
+                    }),
                     None => Err(unbound()),
                 },
                 _ => Err(unbound()),
             };
             // The shared envelope preserves effect evidence even when the result is an error.
             // 共享信封即使在结果为错误时也保留副作用证据。
-            let outcome = result.unwrap_or_else(|error| CapabilityOutcome {
+            let mut outcome = result.unwrap_or_else(|error| CapabilityOutcome {
                 result: Err(error),
                 effects: EffectState::NotStarted,
             });
-            json_value_to_lua(lua, &outcome.to_json())
+            // Reject an unsafe host JSON integer only after the registry has retained real effect evidence.
+            // 仅在注册表保留真实副作用证据后拒绝不安全宿主 JSON 整数。
+            // A failed Lua representation changes the response, never the host's confirmed effect state.
+            // Lua 表示失败改变响应，绝不改变宿主确认的副作用状态。
+            // This fixed host root keeps the diagnostic bounded after the registry's output-budget check.
+            // 此固定宿主根确保注册表输出预算检查后的诊断保持有界。
+            if let Ok(value) = &outcome.result
+                && let Err(error) =
+                    LuaEngine::validate_embedded_json_value(value, "capability/value")
+            {
+                outcome.result = Err(error);
+            }
+            values::to_lua(lua, &outcome.to_json(), "capability")
         })?,
     )?;
     vulcan.raw_set("capabilities", capabilities.clone())?;

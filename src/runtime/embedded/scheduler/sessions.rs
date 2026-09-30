@@ -508,6 +508,17 @@ impl SchedulerCenter {
                 .get(&call.export)
                 .ok_or_else(|| EmbeddedError::invalid("module export is not declared"))?
                 .validate(&call.arguments)?;
+            // Reject unsafe application integers before operation admission and cold VM initialization.
+            // 在操作入场及冷 VM 初始化前拒绝不安全应用整数。
+            crate::runtime::engine::LuaEngine::validate_embedded_json_value(
+                &call.arguments,
+                "arguments",
+            )?;
+        }
+        // The request's exact context will use the same shared JSON projector during dispatch.
+        // 分发时请求的精确上下文将使用同一共享 JSON 投影器。
+        if let Some(context) = request.context() {
+            crate::runtime::engine::LuaEngine::validate_embedded_context(context)?;
         }
         let config = self.pools.config();
         if pool.queued >= pool.pool.policy().max_queued_calls

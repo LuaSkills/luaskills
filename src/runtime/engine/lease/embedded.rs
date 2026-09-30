@@ -7,6 +7,7 @@ use crate::runtime::embedded::{
 
 mod capabilities;
 mod paths;
+mod values;
 
 /// One exclusively borrowed VM with immutable, validated function exports.
 /// 单个被独占借用且具有不可变已校验函数导出的 VM。
@@ -361,6 +362,9 @@ impl EmbeddedModule {
                 EmbeddedError::new(EmbeddedErrorCode::NotFound, "module export is not declared")
             })?;
         export.input.validate(invocation.arguments)?;
+        // Reject unsafe integer arguments before request setup or any business Lua can execute.
+        // 在请求准备及任何业务 Lua 执行前拒绝不安全整数参数。
+        LuaEngine::validate_embedded_json_value(invocation.arguments, "arguments")?;
         self.run(
             invocation.context,
             invocation.control,
@@ -370,13 +374,16 @@ impl EmbeddedModule {
             |lua| {
                 // Use the same protected container identities as native capability conversion.
                 // 使用与原生能力转换相同的受保护容器身份。
-                let argument = json_value_to_lua(lua, invocation.arguments)?;
+                let argument = values::to_lua(lua, invocation.arguments, "arguments")?;
                 // Direct function calls do not compile a new wrapper for every request.
                 // 直接函数调用不为每次请求编译新包装。
                 let result = export.function.call::<LuaValue>(argument)?;
                 // Output contract validation happens before request-owned resources commit.
                 // 输出契约在请求所属资源提交前校验。
-                let value = lua.from_value(result)?;
+                let mut value = lua.from_value(result)?;
+                // LuaJIT inferred integers outside the continuous exact domain are explicitly floating JSON.
+                // LuaJIT 推断的连续精确域外整数明确编码为 JSON 浮点数。
+                values::normalize_lua_json(&mut value);
                 export
                     .output
                     .validate(&value)
@@ -401,6 +408,9 @@ impl EmbeddedModule {
     ) -> EmbeddedResult<T> {
         self.reusable = false;
         control.check()?;
+        // Context projection also crosses the JSON-to-Lua boundary before module initialization or exports.
+        // 上下文投影也在模块初始化或导出前穿过 JSON 到 Lua 边界。
+        LuaEngine::validate_embedded_context(context)?;
         self.paths
             .validate_live_system_directory_identities()
             .map_err(execution_error)?;

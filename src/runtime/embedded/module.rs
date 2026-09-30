@@ -116,6 +116,9 @@ impl ModuleDefinition {
                 "module mounts must be a JSON object",
             ));
         }
+        // Mount primitives enter Lua through the shared readonly context projector.
+        // 挂载基础值通过共享只读上下文投影器进入 Lua。
+        crate::runtime::engine::LuaEngine::validate_embedded_json_value(&self.mounts, "mounts")?;
         // Reject duplicate declarations instead of silently shadowing functions.
         // 拒绝重复声明，避免静默遮蔽函数。
         let mut names = BTreeSet::new();
@@ -137,6 +140,12 @@ impl ModuleDefinition {
                 .ok_or_else(|| EmbeddedError::invalid("closing export must be declared"))?;
             CallControl::new(std::time::Duration::from_millis(finalizer.timeout_ms))?;
             export.compile()?.0.validate(&finalizer.arguments)?;
+            // Closing arguments must be representable before activation, not first at teardown.
+            // 关闭参数必须在激活前可表示，不能等到清理时才发现。
+            crate::runtime::engine::LuaEngine::validate_embedded_json_value(
+                &finalizer.arguments,
+                "finalizer/arguments",
+            )?;
         }
         Ok(())
     }

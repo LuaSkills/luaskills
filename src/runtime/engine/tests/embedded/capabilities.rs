@@ -56,6 +56,10 @@ fn embedded_capability_forwarded_arguments_preserve_json_container_types() {
     for arguments in [
         json!({}),
         json!({"object":{},"array":[],"nested":[{},[],null],"text":"中文\u{0}","fraction":1.25}),
+        // Safe endpoints and explicit large floats traverse both real callback value boundaries.
+        // 安全端点及显式大浮点数经过两个真实回调值边界。
+        json!({"min":-LuaEngine::EMBEDDED_MAX_SAFE_INTEGER,"max":LuaEngine::EMBEDDED_MAX_SAFE_INTEGER,
+            "float":(LuaEngine::EMBEDDED_MAX_SAFE_INTEGER + 1) as f64}),
     ] {
         // Assert on the complete envelope so a schema rejection is visible as a failed round trip.
         // 对完整信封断言，使 Schema 拒绝作为往返失败可见。

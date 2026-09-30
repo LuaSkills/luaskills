@@ -13,6 +13,7 @@ mod finalization;
 mod paths;
 mod pools;
 mod scheduler;
+mod values;
 
 /// Build a declaration using the established System fixture and exact `source`.
 /// 使用既有 System 测试夹具与精确 `source` 构造声明。
