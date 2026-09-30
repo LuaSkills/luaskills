@@ -21,6 +21,14 @@ OUTPUT_DIR="${4:-${OUTPUT_DIR:-target/release-packages}}"
 # ReleaseTag 保存发布 Rust 与 FFI demo 资产使用的 Git 标签。
 RELEASE_TAG="${3:-${RELEASE_TAG:-}}"
 
+# Optional SourceCommit freezes candidate Rust demos; existing tagged invocations may omit it.
+# 可选 SourceCommit 冻结候选 Rust demo；既有标签调用可以省略。
+SOURCE_COMMIT="${5:-}"
+if [ -n "$SOURCE_COMMIT" ] && [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "Candidate SourceCommit must be a full lowercase Git SHA." >&2
+  exit 1
+fi
+
 normalize_output_dir() {
   # Convert Windows drive paths into shell-native paths before tar sees a colon.
   # 在 tar 看到冒号前，将 Windows 盘符路径转换为 shell 原生路径。
@@ -416,14 +424,22 @@ if [ "$MODE" = "ffi" ]; then
   find target/release -maxdepth 1 -type f \( -name '*.dll' -o -name '*.lib' -o -name '*.so' -o -name '*.dylib' -o -name '*.a' \) -exec cp -f {} "$PACKAGE_ROOT/lib/" \; 2>/dev/null || true
 else
   if [ -f "$PACKAGE_ROOT/Cargo.toml" ]; then
-    python3 - "$PACKAGE_ROOT/Cargo.toml" "$RELEASE_TAG" <<'PY'
+    python3 - "$PACKAGE_ROOT/Cargo.toml" "$RELEASE_TAG" "$SOURCE_COMMIT" <<'PY'
 from pathlib import Path
 import sys
+# Path identifies the packaged Rust dependency manifest, never the repository's root manifest.
+# Path 标识已打包 Rust 依赖清单，绝不是仓库根清单。
 path = Path(sys.argv[1])
+# Text preserves the existing example's actual dependency declaration.
+# Text 保留既有示例实际依赖声明。
 text = path.read_text(encoding="utf-8")
+# RevisionKind and Revision use the explicit candidate SHA when requested by the frozen workflow.
+# RevisionKind 及 Revision 使用冻结工作流请求的显式候选 SHA。
+revision_kind = "rev" if sys.argv[3] else "tag"
+revision = sys.argv[3] if sys.argv[3] else sys.argv[2]
 text = text.replace(
     'luaskills = { path = "../.." }',
-    f'luaskills = {{ git = "https://github.com/LuaSkills/luaskills.git", tag = "{sys.argv[2]}" }}',
+    f'luaskills = {{ git = "https://github.com/LuaSkills/luaskills.git", {revision_kind} = "{revision}" }}',
 )
 path.write_text(text, encoding="utf-8")
 PY

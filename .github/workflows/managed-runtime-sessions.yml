@@ -7,13 +7,21 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  # Reusable candidate acceptance checks the same frozen full commit on all five native platforms.
+  # 可复用候选验收在全部五个原生平台检查同一冻结完整提交。
+  workflow_call:
+    inputs:
+      source_sha:
+        description: "Full source commit SHA supplied by the candidate freeze gate"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: managed-runtime-sessions-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: managed-runtime-sessions-${{ github.workflow }}-${{ inputs.source_sha || github.ref }}
+  cancel-in-progress: false
 
 env:
   PYTHON_VERSION: "3.14.6"
@@ -51,7 +59,23 @@ jobs:
       # EnvironmentRoot 在 runtime_root 外保存可写依赖环境。
       MANAGED_RUNTIME_ENVIRONMENT_ROOT: ${{ github.workspace }}/target/managed-runtime-ci-environments
     steps:
+      - name: Preserve exact tracked source bytes
+        shell: pwsh
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify frozen candidate checkout
+        if: inputs.source_sha != ''
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          if ($env:SOURCE_SHA -notmatch '^[0-9a-f]{40}$' -or (git rev-parse HEAD) -ne $env:SOURCE_SHA) {
+            throw "Native acceptance checkout differs from the frozen full source SHA"
+          }
 
       - name: Setup Rust 1.94
         uses: dtolnay/rust-toolchain@master
@@ -202,7 +226,12 @@ jobs:
     name: FFI examples on Python 3.14 and Node 24
     runs-on: ubuntu-24.04
     steps:
+      - name: Preserve exact tracked source bytes
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
 
       - name: Setup Python 3.14
         uses: actions/setup-python@v6

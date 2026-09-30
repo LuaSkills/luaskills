@@ -110,15 +110,14 @@ fn source_demo_launchers_reference_existing_dependency_fetchers() {
     );
 }
 
-/// Verify every PowerShell packager imports one checked archive helper without local copies.
-/// 验证每个 PowerShell 打包器导入同一个受检归档辅助脚本且不保留本地副本。
+/// Verify the three tar-based PowerShell packagers share the checked helper; FFI candidates use offline behavioral tests.
+/// 验证三个基于 tar 的 PowerShell 打包器共享受检辅助脚本；FFI 候选由离线行为测试覆盖。
 #[test]
 fn powershell_packagers_share_checked_archive_helper() {
-    // Complete PowerShell packager set covered by the shared archive contract.
-    // 共享归档契约覆盖的完整 PowerShell 打包器集合。
-    const PACKAGERS: [&str; 4] = [
+    // Exact tar-based packager set; scripts/release/test_candidate.py covers the cross-platform FFI archiver.
+    // 精确基于 tar 的打包器集合；scripts/release/test_candidate.py 覆盖跨平台 FFI 归档器。
+    const PACKAGERS: [&str; 3] = [
         "scripts/build/package_demo.ps1",
-        "scripts/build/package_ffi_sdk.ps1",
         "scripts/build/package_lua_runtime.ps1",
         "scripts/build/package_debug_tool.ps1",
     ];

@@ -1,293 +1,230 @@
-name: Build FFI SDK and Demo Packages
+name: Build Verified Core Candidates
 
-# This workflow publishes only the main-repo release artifacts that still belong to luaskills.
-# 该工作流仅发布仍然属于 luaskills 主仓库的发布资产。
+# Candidates remain workflow artifacts unless an independent aggregate draft step is explicitly requested.
+# 候选默认保留为工作流产物，只有显式请求时才执行独立汇总草稿步骤。
 on:
   workflow_dispatch:
     inputs:
+      source_sha:
+        description: "Full source commit SHA (must equal the workflow dispatch commit)"
+        required: true
+        type: string
       version:
-        description: "Release tag (e.g. v0.3.1)"
-        required: false
-        default: ""
-      linux_x64_runner:
-        description: "Linux x64 runner (off to disable)"
+        description: "Exact Cargo package version, without v prefix"
         required: true
-        default: "ubuntu-24.04"
-        type: choice
-        options: ["off", "ubuntu-24.04"]
-      linux_arm64_runner:
-        description: "Linux ARM64 runner (off to disable)"
+        type: string
+      mode:
+        description: "Candidate artifacts only, or create a new immutable GitHub draft after all gates"
         required: true
-        default: "ubuntu-24.04-arm"
+        default: candidate
         type: choice
-        options: ["off", "ubuntu-24.04-arm"]
-      macos_arm64_runner:
-        description: "macOS ARM64 runner (off to disable)"
-        required: true
-        default: "macos-15"
-        type: choice
-        options: ["off", "macos-15"]
-      macos_x64_runner:
-        description: "macOS x64 runner (off to disable)"
-        required: true
-        default: "macos-15-intel"
-        type: choice
-        options: ["off", "macos-15-intel"]
-      windows_x64_runner:
-        description: "Windows x64 runner (off to disable)"
-        required: true
-        default: "windows-latest"
-        type: choice
-        options: ["off", "windows-latest"]
+        options: [candidate, draft]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: release-packages-${{ github.workflow }}-${{ inputs.version || github.run_id }}
-  cancel-in-progress: true
+  group: core-candidate-${{ inputs.version }}
+  cancel-in-progress: false
 
 jobs:
-  prepare-matrix:
-    name: Prepare Matrix
-    runs-on: ubuntu-latest
+  freeze:
+    runs-on: ubuntu-24.04
     outputs:
-      matrix: ${{ steps.build-matrix.outputs.matrix }}
-      has_targets: ${{ steps.build-matrix.outputs.has_targets }}
-      release_tag: ${{ steps.resolve-version.outputs.release_tag }}
+      source_sha: ${{ steps.identity.outputs.source_sha }}
+      version: ${{ steps.identity.outputs.version }}
     steps:
+      - name: Preserve exact tracked source bytes
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v6
-
-      - name: Resolve release tag
-        id: resolve-version
-        shell: pwsh
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          # ReleaseTag prefers the manual input and falls back to Cargo.toml version when left blank.
-          # ReleaseTag 优先使用手动输入；若留空，则回退到 Cargo.toml 中的版本号。
-          $releaseTag = $env:INPUT_VERSION
-          if ([string]::IsNullOrWhiteSpace($releaseTag)) {
-            $cargoToml = Get-Content -Raw -LiteralPath "Cargo.toml"
-            $versionMatch = [regex]::Match($cargoToml, '(?m)^version\s*=\s*"([^"]+)"')
-            if (-not $versionMatch.Success) {
-              throw "Unable to resolve version from Cargo.toml"
-            }
-            $releaseTag = "v$($versionMatch.Groups[1].Value)"
-          }
-
-          if ($releaseTag -notmatch '^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z\.-]+)?$') {
-            throw "Resolved release tag is invalid: $releaseTag"
-          }
-
-          "release_tag=$releaseTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-      - name: Build matrix from manual runner inputs
-        id: build-matrix
-        shell: pwsh
-        env:
-          INPUT_LINUX_X64_RUNNER: ${{ inputs.linux_x64_runner }}
-          INPUT_LINUX_ARM64_RUNNER: ${{ inputs.linux_arm64_runner }}
-          INPUT_MACOS_ARM64_RUNNER: ${{ inputs.macos_arm64_runner }}
-          INPUT_MACOS_X64_RUNNER: ${{ inputs.macos_x64_runner }}
-          INPUT_WINDOWS_X64_RUNNER: ${{ inputs.windows_x64_runner }}
-        run: |
-          # Add-Target appends one enabled platform entry and ignores the explicit "off" state.
-          # Add-Target 用于追加启用的平台条目，并忽略显式关闭的 "off" 状态。
-          function Add-Target {
-            param(
-              [System.Collections.Generic.List[object]]$Targets,
-              [string]$Platform,
-              [string]$Runner,
-              [string]$OperatingSystem
-            )
-
-            if ([string]::IsNullOrWhiteSpace($Runner) -or $Runner -eq "off") {
-              return
-            }
-
-            $Targets.Add([ordered]@{
-              platform = $Platform
-              runner = $Runner
-              os = $OperatingSystem
-            })
-          }
-
-          $targets = [System.Collections.Generic.List[object]]::new()
-          Add-Target -Targets $targets -Platform "linux-x64" -Runner $env:INPUT_LINUX_X64_RUNNER -OperatingSystem "Linux"
-          Add-Target -Targets $targets -Platform "linux-arm64" -Runner $env:INPUT_LINUX_ARM64_RUNNER -OperatingSystem "Linux"
-          Add-Target -Targets $targets -Platform "macos-arm64" -Runner $env:INPUT_MACOS_ARM64_RUNNER -OperatingSystem "macOS"
-          Add-Target -Targets $targets -Platform "macos-x64" -Runner $env:INPUT_MACOS_X64_RUNNER -OperatingSystem "macOS"
-          Add-Target -Targets $targets -Platform "windows-x64" -Runner $env:INPUT_WINDOWS_X64_RUNNER -OperatingSystem "Windows"
-
-          $matrixJson = @{ include = @($targets) } | ConvertTo-Json -Compress -Depth 4
-          $hasTargets = if ($targets.Count -gt 0) { "true" } else { "false" }
-
-          "matrix=$matrixJson" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "has_targets=$hasTargets" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-  no-targets:
-    name: No Enabled Targets
-    needs: prepare-matrix
-    if: needs.prepare-matrix.outputs.has_targets != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Report skipped build
-        shell: bash
-        run: |
-          echo "All platform runners are set to off. Nothing to build."
-
-  build:
-    name: ${{ matrix.platform }} @ ${{ matrix.runner }}
-    needs: prepare-matrix
-    if: needs.prepare-matrix.outputs.has_targets == 'true'
-    runs-on: >-
-      ${{
-        (startsWith(matrix.runner, 'ubuntu') || startsWith(matrix.runner, 'macos') || startsWith(matrix.runner, 'windows'))
-        && fromJSON(format('["{0}"]', matrix.runner))
-        || fromJSON(format('["self-hosted", "{0}"]', matrix.runner))
-      }}
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare-matrix.outputs.matrix) }}
-    env:
-      RELEASE_PACKAGE_DIR: target/release-packages
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Setup Rust 1.94
-        shell: pwsh
-        run: |
-          # InstallRustToolchain pins the compiler to the minimum version required by vldb-controller-client.
-          # InstallRustToolchain 将编译器固定到 vldb-controller-client 要求的最低版本。
-          rustup toolchain install 1.94.0 --profile minimal
-          rustup default 1.94.0
-          rustc --version
-          cargo --version
-
-      - name: Setup MSVC (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Build LuaSkills library and debug tool (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          cargo build --release --lib --bins
-
-      - name: Build LuaSkills library and debug tool (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo build --release --lib --bins
-
-      - name: Package release assets (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          powershell -ExecutionPolicy Bypass -File scripts/build/package_ffi_sdk.ps1 -Platform "${{ matrix.platform }}" -OutputDir "$env:RELEASE_PACKAGE_DIR"
-          powershell -ExecutionPolicy Bypass -File scripts/build/package_demo.ps1 -Mode ffi -Platform "${{ matrix.platform }}" -OutputDir "$env:RELEASE_PACKAGE_DIR" -ReleaseTag "${{ needs.prepare-matrix.outputs.release_tag }}"
-          powershell -ExecutionPolicy Bypass -File scripts/build/package_demo.ps1 -Mode rust -Platform "${{ matrix.platform }}" -OutputDir "$env:RELEASE_PACKAGE_DIR" -ReleaseTag "${{ needs.prepare-matrix.outputs.release_tag }}"
-          powershell -ExecutionPolicy Bypass -File scripts/build/package_debug_tool.ps1 -Platform "${{ matrix.platform }}" -OutputDir "$env:RELEASE_PACKAGE_DIR" -ReleaseTag "${{ needs.prepare-matrix.outputs.release_tag }}"
-          # ExpectedAssets prevents the release step from silently publishing an incomplete platform set.
-          # ExpectedAssets 防止发布步骤静默上传缺少关键文件的平台产物集合。
-          $expectedAssets = @(
-            "luaskills-ffi-sdk-${{ matrix.platform }}.tar.gz",
-            "luaskills-demo-ffi-${{ matrix.platform }}.tar.gz",
-            "luaskills-demo-rust-${{ matrix.platform }}.tar.gz",
-            "luaskills-debug-tool-${{ matrix.platform }}.tar.gz"
-          )
-          $releasePackageDir = Join-Path $env:GITHUB_WORKSPACE $env:RELEASE_PACKAGE_DIR
-          foreach ($asset in $expectedAssets) {
-            $assetPath = Join-Path $releasePackageDir $asset
-            if (-not (Test-Path -LiteralPath $assetPath)) {
-              throw "Missing expected release asset: $assetPath"
-            }
-          }
-
-      - name: Package release assets (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash scripts/build/package_ffi_sdk.sh "${{ matrix.platform }}" "$RELEASE_PACKAGE_DIR"
-          bash scripts/build/package_demo.sh ffi "${{ matrix.platform }}" "${{ needs.prepare-matrix.outputs.release_tag }}" "$RELEASE_PACKAGE_DIR"
-          bash scripts/build/package_demo.sh rust "${{ matrix.platform }}" "${{ needs.prepare-matrix.outputs.release_tag }}" "$RELEASE_PACKAGE_DIR"
-          bash scripts/build/package_debug_tool.sh "${{ matrix.platform }}" "${{ needs.prepare-matrix.outputs.release_tag }}" "$RELEASE_PACKAGE_DIR"
-          # ExpectedAssets prevents the release step from silently publishing an incomplete platform set.
-          # ExpectedAssets 防止发布步骤静默上传缺少关键文件的平台产物集合。
-          for asset in \
-            "luaskills-ffi-sdk-${{ matrix.platform }}.tar.gz" \
-            "luaskills-demo-ffi-${{ matrix.platform }}.tar.gz" \
-            "luaskills-demo-rust-${{ matrix.platform }}.tar.gz" \
-            "luaskills-debug-tool-${{ matrix.platform }}.tar.gz"; do
-            test -f "$GITHUB_WORKSPACE/$RELEASE_PACKAGE_DIR/$asset" || {
-              echo "Missing expected release asset: $GITHUB_WORKSPACE/$RELEASE_PACKAGE_DIR/$asset" >&2
-              exit 1
-            }
-          done
-
-      - name: Write release description (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path $env:RELEASE_PACKAGE_DIR | Out-Null
-          Copy-Item -Force -LiteralPath "docs\lua-runtime-release-notes.md" -Destination (Join-Path $env:RELEASE_PACKAGE_DIR "RELEASE_NOTES.md")
-
-      - name: Write release description (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RELEASE_PACKAGE_DIR"
-          cp docs/lua-runtime-release-notes.md "$RELEASE_PACKAGE_DIR/RELEASE_NOTES.md"
-
-      - name: Write SHA-256 sidecars
-        shell: pwsh
-        run: |
-          # ErrorActionPreference makes checksum failures terminating outside GitHub's pwsh wrapper too.
-          # ErrorActionPreference 让校验和失败在 GitHub 的 pwsh 包装器之外也成为终止错误。
-          $ErrorActionPreference = "Stop"
-          # ReleasePackageDir is the verified platform-local release asset directory.
-          # ReleasePackageDir 是已经验证的平台本地发布资产目录。
-          $releasePackageDir = Join-Path $env:GITHUB_WORKSPACE $env:RELEASE_PACKAGE_DIR
-          # Archives is the exact four-archive platform set consumed by SDK installers.
-          # Archives 是 SDK 安装器消费的精确四项平台归档集合。
-          $archives = @(Get-ChildItem -LiteralPath $releasePackageDir -Filter "*.tar.gz" -File)
-          if ($archives.Count -ne 4) {
-            throw "Expected exactly four release archives, found $($archives.Count): $releasePackageDir"
-          }
-
-          foreach ($archive in $archives) {
-            # Digest is the lowercase SHA-256 value written as the first sidecar token.
-            # Digest 是作为 sidecar 首个字段写入的小写 SHA-256 值。
-            $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive.FullName).Hash.ToLowerInvariant()
-            # SidecarPath is the stable archive-name-plus-.sha256 release asset path.
-            # SidecarPath 是稳定的“归档名称加 .sha256”发布资产路径。
-            $sidecarPath = "$($archive.FullName).sha256"
-            # SidecarText follows the sha256sum-compatible format accepted by every SDK.
-            # SidecarText 使用所有 SDK 均接受的 sha256sum 兼容格式。
-            $sidecarText = "$digest  $($archive.Name)$([Environment]::NewLine)"
-            [System.IO.File]::WriteAllText(
-              $sidecarPath,
-              $sidecarText,
-              [System.Text.UTF8Encoding]::new($false)
-            )
-            if (-not (Test-Path -LiteralPath $sidecarPath -PathType Leaf)) {
-              throw "Missing generated SHA-256 sidecar: $sidecarPath"
-            }
-          }
-
-      - name: Upload to Release
-        uses: softprops/action-gh-release@v2
         with:
-          files: |
-            ${{ env.RELEASE_PACKAGE_DIR }}/*.tar.gz
-            ${{ env.RELEASE_PACKAGE_DIR }}/*.tar.gz.sha256
-          tag_name: ${{ needs.prepare-matrix.outputs.release_tag }}
-          body_path: ${{ env.RELEASE_PACKAGE_DIR }}/RELEASE_NOTES.md
-          fail_on_unmatched_files: true
-          overwrite_files: true
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14.6"
+      - name: Freeze full commit and current package version
+        id: identity
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CORE_VERSION: ${{ inputs.version }}
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, "scripts/release")
+          from candidate import source_identity
+          # Commit includes the workflow definition and every candidate script as one frozen source.
+          # 提交将工作流定义及每个候选脚本纳入同一冻结源码。
+          if os.environ["SOURCE_SHA"] != os.environ["DISPATCH_SHA"]:
+              raise SystemExit("Source SHA must equal the workflow dispatch commit")
+          source_identity(Path.cwd(), os.environ["SOURCE_SHA"], os.environ["CORE_VERSION"])
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"source_sha={os.environ['SOURCE_SHA']}\nversion={os.environ['CORE_VERSION']}\n")
+          PY
+      # GITHUB_TOKEN cannot receive workflows-write permission; draft source must match the actual default workflows tree.
+      # GITHUB_TOKEN 不能获得工作流写权限；草稿源码必须匹配实际默认工作流树。
+      - name: Freeze actual default-branch workflow evidence for draft mode
+        if: inputs.mode == 'draft'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          python scripts/release/freeze_draft_source.py --source-commit "$SOURCE_SHA" --output target/draft-source-evidence.json
+      - uses: actions/upload-artifact@v4
+        if: inputs.mode == 'draft'
+        with:
+          name: draft-source-evidence-${{ inputs.source_sha }}
+          path: target/draft-source-evidence.json
+          if-no-files-found: error
+          overwrite: false
+
+  native-acceptance:
+    needs: freeze
+    uses: ./.github/workflows/managed-runtime-sessions.yml
+    with:
+      source_sha: ${{ needs.freeze.outputs.source_sha }}
+
+  build:
+    needs: [freeze, native-acceptance]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: macos-x64
+            runner: macos-15-intel
+          - platform: macos-arm64
+            runner: macos-15
+          - platform: windows-x64
+            runner: windows-latest
+    env:
+      SOURCE_SHA: ${{ needs.freeze.outputs.source_sha }}
+      CORE_VERSION: ${{ needs.freeze.outputs.version }}
+      PLATFORM: ${{ matrix.platform }}
+      RELEASE_PACKAGE_DIR: target/release-packages
+    steps:
+      - name: Preserve exact tracked source bytes
+        shell: pwsh
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.freeze.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14.6"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+      - name: Setup MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Build exact locked release and capture authoritative Cargo messages
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Path target -Force | Out-Null
+          cargo --version --verbose > target/candidate-cargo-version.txt
+          if ($LASTEXITCODE -ne 0) { throw "Actual release Cargo identity capture failed" }
+          cargo build --locked --release --lib --bins -j 4 --message-format=json > target/candidate-build.jsonl
+          if ($LASTEXITCODE -ne 0) { throw "Locked release build failed" }
+          cargo metadata --locked --format-version=1 > target/candidate-metadata.json
+          if ($LASTEXITCODE -ne 0) { throw "Locked dependency metadata failed" }
+      - name: Package FFI core and complete existing archive set on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/build/package_ffi_sdk.ps1 -Platform $env:PLATFORM -OutputDir $env:RELEASE_PACKAGE_DIR -SourceCommit $env:SOURCE_SHA -Version $env:CORE_VERSION -BuildLog target/candidate-build.jsonl -Metadata target/candidate-metadata.json -CargoVersion target/candidate-cargo-version.txt
+          ./scripts/build/package_demo.ps1 -Mode ffi -Platform $env:PLATFORM -OutputDir $env:RELEASE_PACKAGE_DIR -ReleaseTag "v$env:CORE_VERSION" -SourceCommit $env:SOURCE_SHA
+          ./scripts/build/package_demo.ps1 -Mode rust -Platform $env:PLATFORM -OutputDir $env:RELEASE_PACKAGE_DIR -ReleaseTag "v$env:CORE_VERSION" -SourceCommit $env:SOURCE_SHA
+          ./scripts/build/package_debug_tool.ps1 -Platform $env:PLATFORM -OutputDir $env:RELEASE_PACKAGE_DIR -ReleaseTag "v$env:CORE_VERSION"
+      - name: Package FFI core and complete existing archive set on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/build/package_ffi_sdk.sh --platform "$PLATFORM" --output "$RELEASE_PACKAGE_DIR" --source-commit "$SOURCE_SHA" --version "$CORE_VERSION" --build-log target/candidate-build.jsonl --metadata target/candidate-metadata.json --cargo-version target/candidate-cargo-version.txt
+          bash scripts/build/package_demo.sh ffi "$PLATFORM" "v$CORE_VERSION" "$RELEASE_PACKAGE_DIR" "$SOURCE_SHA"
+          bash scripts/build/package_demo.sh rust "$PLATFORM" "v$CORE_VERSION" "$RELEASE_PACKAGE_DIR" "$SOURCE_SHA"
+          bash scripts/build/package_debug_tool.sh "$PLATFORM" "v$CORE_VERSION" "$RELEASE_PACKAGE_DIR"
+      - name: Verify complete platform archives and write immutable checksums
+        shell: pwsh
+        run: |
+          python scripts/release/candidate.py collect --platform $env:PLATFORM --output $env:RELEASE_PACKAGE_DIR --source-commit $env:SOURCE_SHA --version $env:CORE_VERSION
+          if ($LASTEXITCODE -ne 0) { throw "Platform candidate verification failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-candidate-${{ matrix.platform }}-${{ needs.freeze.outputs.source_sha }}
+          path: target/release-packages/
+          if-no-files-found: error
+          overwrite: false
+
+  aggregate:
+    needs: [freeze, native-acceptance, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Preserve exact tracked source bytes
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.freeze.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14.6"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: core-candidate-*-${{ needs.freeze.outputs.source_sha }}
+          path: target/platform-candidates
+          merge-multiple: false
+      - name: Verify all five platforms against one frozen source identity
+        env:
+          SOURCE_SHA: ${{ needs.freeze.outputs.source_sha }}
+          CORE_VERSION: ${{ needs.freeze.outputs.version }}
+        run: |
+          python scripts/release/candidate.py aggregate --input target/platform-candidates --output target/verified-candidate --source-commit "$SOURCE_SHA" --version "$CORE_VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-core-candidate-${{ needs.freeze.outputs.source_sha }}
+          path: target/verified-candidate/
+          if-no-files-found: error
+          overwrite: false
+
+  draft:
+    if: inputs.mode == 'draft'
+    needs: [freeze, aggregate]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.freeze.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14.6"
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-core-candidate-${{ needs.freeze.outputs.source_sha }}
+          path: target/verified-candidate
+      - uses: actions/download-artifact@v4
+        with:
+          name: draft-source-evidence-${{ needs.freeze.outputs.source_sha }}
+          path: target/draft-source-evidence
+      # This independent stage creates only a new draft; it never updates or replaces a release asset.
+      # 此独立阶段仅创建新草稿；绝不更新或替换发布资产。
+      - name: Create new immutable draft after aggregate acceptance
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_SHA: ${{ needs.freeze.outputs.source_sha }}
+          CORE_VERSION: ${{ needs.freeze.outputs.version }}
+        run: |
+          python scripts/release/create_draft.py --candidate target/verified-candidate --source-commit "$SOURCE_SHA" --version "$CORE_VERSION" --source-evidence target/draft-source-evidence/draft-source-evidence.json

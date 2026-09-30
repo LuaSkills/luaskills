@@ -2,7 +2,13 @@
     [string]$Mode = "ffi",
     [string]$Platform = "",
     [string]$OutputDir = "target\release-packages",
-    [string]$ReleaseTag = ""
+    [string]$ReleaseTag = "",
+    # Optional frozen candidate commit; when supplied the Rust demo uses rev instead of a future tag.
+    # 可选冻结候选提交；提供时 Rust demo 使用 rev 而非未来标签。
+    [string]$SourceCommit = "",
+    # Validate candidate dependency identity and print the selected declaration without creating package files.
+    # 验证候选依赖身份并打印选定声明，不创建打包文件。
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,6 +35,9 @@ Set-Location $ProjectRoot
 if ($Mode -ne "ffi" -and $Mode -ne "rust") {
     throw "Mode must be 'ffi' or 'rust'."
 }
+if ($SourceCommit -ne "" -and $SourceCommit -notmatch '^[0-9a-f]{40}$') {
+    throw "Candidate SourceCommit must be a full lowercase Git SHA."
+}
 
 if ([string]::IsNullOrWhiteSpace($ReleaseTag)) {
     $CargoTomlText = Get-Content -Raw -LiteralPath "Cargo.toml"
@@ -37,6 +46,33 @@ if ([string]::IsNullOrWhiteSpace($ReleaseTag)) {
         throw "Unable to resolve fallback release tag from Cargo.toml."
     }
     $ReleaseTag = "v$($CargoVersionMatch.Groups[1].Value)"
+}
+
+function Get-RustDemoDependencyDeclaration {
+    <#
+    .SYNOPSIS
+    Return the Rust demo dependency declaration for an explicit candidate commit or the existing tagged mode.
+    为显式候选提交或既有标签模式返回 Rust demo 依赖声明。
+    .PARAMETER Commit
+    Validated full candidate SHA, or empty only for the existing tagged packaging mode.
+    已验证完整候选 SHA；仅在既有标签打包模式中为空。
+    .PARAMETER Tag
+    Resolved release tag used by the existing non-candidate mode.
+    既有非候选模式使用的已解析发布标签。
+    .OUTPUTS
+    One exact Cargo dependency declaration; no filesystem write is performed.
+    一个精确 Cargo 依赖声明；不执行文件系统写入。
+    #>
+    param([string]$Commit, [string]$Tag)
+    if ($Commit -ne "") {
+        return ('luaskills = {{ git = "https://github.com/LuaSkills/luaskills.git", rev = "{0}" }}' -f $Commit)
+    }
+    return ('luaskills = {{ git = "https://github.com/LuaSkills/luaskills.git", tag = "{0}" }}' -f $Tag)
+}
+
+if ($DryRun) {
+    Write-Output (Get-RustDemoDependencyDeclaration -Commit $SourceCommit -Tag $ReleaseTag)
+    return
 }
 
 function Ensure-Dir {
@@ -491,7 +527,10 @@ if ($Mode -eq "ffi") {
 } else {
     $CargoTomlPath = Join-Path $PackageRoot "Cargo.toml"
     if (Test-Path -LiteralPath $CargoTomlPath) {
-        (Get-Content -Raw -Path $CargoTomlPath).Replace('luaskills = { path = "../.." }', ('luaskills = {{ git = "https://github.com/LuaSkills/luaskills.git", tag = "{0}" }}' -f $ReleaseTag)) |
+        # DependencyDeclaration freezes candidates to the same source commit while retaining the existing tagged packaging mode.
+        # DependencyDeclaration 将候选冻结到同一源码提交，同时保留既有标签打包模式。
+        $DependencyDeclaration = Get-RustDemoDependencyDeclaration -Commit $SourceCommit -Tag $ReleaseTag
+        (Get-Content -Raw -Path $CargoTomlPath).Replace('luaskills = { path = "../.." }', $DependencyDeclaration) |
             Set-Content -Path $CargoTomlPath -Encoding UTF8
     }
 }
