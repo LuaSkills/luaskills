@@ -120,7 +120,9 @@ def source_identity(root, commit, version):
         raise ValueError("Checkout HEAD does not match the frozen source commit")
     if git(root, "status", "--porcelain", "--untracked-files=all"):
         raise ValueError("Dirty candidates cannot claim a source commit; commit changes before packaging")
-    if tomllib.loads((root / "Cargo.toml").read_text())["package"]["version"] != version:
+    # Cargo TOML is UTF-8 regardless of the Windows process locale.
+    # Cargo 配置始终使用 UTF-8，不依赖 Windows 进程区域编码。
+    if tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"] != version:
         raise ValueError("Candidate version does not match Cargo.toml package.version")
     # git archive preserves tracked input bytes, including lockfile and build identity sources.
     # git archive 保留受跟踪输入字节，包括锁文件及构建身份源码。
@@ -133,7 +135,7 @@ def source_files(root):
     """
     # The Rust declaration is authoritative; no second independent root list is maintained.
     # Rust 声明是权威；不维护第二份独立根列表。
-    declaration = re.search(r"pub const INPUT_ROOTS: &\[&str\] = &\[(.*?)\];", (root / "build_support/identity.rs").read_text(), re.S)
+    declaration = re.search(r"pub const INPUT_ROOTS: &\[&str\] = &\[(.*?)\];", (root / "build_support/identity.rs").read_text(encoding="utf-8"), re.S)
     if declaration is None:
         raise ValueError("Cannot read authoritative INPUT_ROOTS declaration")
     # Roots come only from the confirmed Rust string-literal declaration.

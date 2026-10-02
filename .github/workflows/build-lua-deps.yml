@@ -115,7 +115,9 @@ jobs:
     env:
       SOURCE_SHA: ${{ needs.freeze.outputs.source_sha }}
       CORE_VERSION: ${{ needs.freeze.outputs.version }}
-      PLATFORM: ${{ matrix.platform }}
+      # MSVC setup exports PLATFORM=x64; keep the candidate protocol key in a dedicated variable.
+      # MSVC 初始化会导出 PLATFORM=x64；候选协议平台键使用独立变量。
+      LUASKILLS_CANDIDATE_PLATFORM: ${{ matrix.platform }}
       RELEASE_PACKAGE_DIR: target/release-packages
     steps:
       - name: Preserve exact tracked source bytes
@@ -149,23 +151,23 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          ./scripts/build/package_ffi_sdk.ps1 -Platform $env:PLATFORM -OutputDir $env:RELEASE_PACKAGE_DIR -SourceCommit $env:SOURCE_SHA -Version $env:CORE_VERSION -BuildLog target/candidate-build.jsonl -Metadata target/candidate-metadata.json -CargoVersion target/candidate-cargo-version.txt
-          ./scripts/build/package_demo.ps1 -Mode ffi -Platform $env:PLATFORM -OutputDir $env:RELEASE_PACKAGE_DIR -ReleaseTag "v$env:CORE_VERSION" -SourceCommit $env:SOURCE_SHA
-          ./scripts/build/package_demo.ps1 -Mode rust -Platform $env:PLATFORM -OutputDir $env:RELEASE_PACKAGE_DIR -ReleaseTag "v$env:CORE_VERSION" -SourceCommit $env:SOURCE_SHA
-          ./scripts/build/package_debug_tool.ps1 -Platform $env:PLATFORM -OutputDir $env:RELEASE_PACKAGE_DIR -ReleaseTag "v$env:CORE_VERSION"
+          ./scripts/build/package_ffi_sdk.ps1 -Platform $env:LUASKILLS_CANDIDATE_PLATFORM -OutputDir $env:RELEASE_PACKAGE_DIR -SourceCommit $env:SOURCE_SHA -Version $env:CORE_VERSION -BuildLog target/candidate-build.jsonl -Metadata target/candidate-metadata.json -CargoVersion target/candidate-cargo-version.txt
+          ./scripts/build/package_demo.ps1 -Mode ffi -Platform $env:LUASKILLS_CANDIDATE_PLATFORM -OutputDir $env:RELEASE_PACKAGE_DIR -ReleaseTag "v$env:CORE_VERSION" -SourceCommit $env:SOURCE_SHA
+          ./scripts/build/package_demo.ps1 -Mode rust -Platform $env:LUASKILLS_CANDIDATE_PLATFORM -OutputDir $env:RELEASE_PACKAGE_DIR -ReleaseTag "v$env:CORE_VERSION" -SourceCommit $env:SOURCE_SHA
+          ./scripts/build/package_debug_tool.ps1 -Platform $env:LUASKILLS_CANDIDATE_PLATFORM -OutputDir $env:RELEASE_PACKAGE_DIR -ReleaseTag "v$env:CORE_VERSION"
       - name: Package FFI core and complete existing archive set on Unix
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          bash scripts/build/package_ffi_sdk.sh --platform "$PLATFORM" --output "$RELEASE_PACKAGE_DIR" --source-commit "$SOURCE_SHA" --version "$CORE_VERSION" --build-log target/candidate-build.jsonl --metadata target/candidate-metadata.json --cargo-version target/candidate-cargo-version.txt
-          bash scripts/build/package_demo.sh ffi "$PLATFORM" "v$CORE_VERSION" "$RELEASE_PACKAGE_DIR" "$SOURCE_SHA"
-          bash scripts/build/package_demo.sh rust "$PLATFORM" "v$CORE_VERSION" "$RELEASE_PACKAGE_DIR" "$SOURCE_SHA"
-          bash scripts/build/package_debug_tool.sh "$PLATFORM" "v$CORE_VERSION" "$RELEASE_PACKAGE_DIR"
+          bash scripts/build/package_ffi_sdk.sh --platform "$LUASKILLS_CANDIDATE_PLATFORM" --output "$RELEASE_PACKAGE_DIR" --source-commit "$SOURCE_SHA" --version "$CORE_VERSION" --build-log target/candidate-build.jsonl --metadata target/candidate-metadata.json --cargo-version target/candidate-cargo-version.txt
+          bash scripts/build/package_demo.sh ffi "$LUASKILLS_CANDIDATE_PLATFORM" "v$CORE_VERSION" "$RELEASE_PACKAGE_DIR" "$SOURCE_SHA"
+          bash scripts/build/package_demo.sh rust "$LUASKILLS_CANDIDATE_PLATFORM" "v$CORE_VERSION" "$RELEASE_PACKAGE_DIR" "$SOURCE_SHA"
+          bash scripts/build/package_debug_tool.sh "$LUASKILLS_CANDIDATE_PLATFORM" "v$CORE_VERSION" "$RELEASE_PACKAGE_DIR"
       - name: Verify complete platform archives and write immutable checksums
         shell: pwsh
         run: |
-          python scripts/release/candidate.py collect --platform $env:PLATFORM --output $env:RELEASE_PACKAGE_DIR --source-commit $env:SOURCE_SHA --version $env:CORE_VERSION
+          python scripts/release/candidate.py collect --platform $env:LUASKILLS_CANDIDATE_PLATFORM --output $env:RELEASE_PACKAGE_DIR --source-commit $env:SOURCE_SHA --version $env:CORE_VERSION
           if ($LASTEXITCODE -ne 0) { throw "Platform candidate verification failed" }
       - uses: actions/upload-artifact@v4
         with:
