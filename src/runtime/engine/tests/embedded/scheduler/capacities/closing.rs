@@ -351,15 +351,19 @@ return {call=function() return 2 end}
     let running = runtime
         .submit(call(&first, Value::Null), Duration::from_secs(5))
         .unwrap();
-    // Bound the wait for observable ownership transitions.
-    // 为可观察归属转换设置等待边界。
+    // Physical retirement and public cleanup are separate transitions; observe both within the original budget.
+    // 物理退役与公开清理是独立转换；在原预算内同时观测二者。
     let deadline = Instant::now() + Duration::from_secs(3);
     while !layout
         .package_root
         .join("capacity-retirement-entered")
         .exists()
+        || running.snapshot().unwrap().phase != OperationPhase::Cleaning
     {
-        assert!(Instant::now() < deadline, "real destructor must start");
+        assert!(
+            Instant::now() < deadline,
+            "real destructor and scheduler cleanup must both be observed"
+        );
         std::thread::yield_now();
     }
     // Retain the waiting operation to observe cancellation and precise capacity recovery.
