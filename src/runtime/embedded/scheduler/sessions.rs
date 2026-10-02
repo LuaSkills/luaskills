@@ -262,6 +262,9 @@ impl EmbeddedRuntime {
     ) -> EmbeddedResult<EmbeddedSessionOpening> {
         self.center.capabilities.check_submission()?;
         let control = Arc::new(CallControl::new(timeout)?);
+        // Snapshot the weak logger subscriber before entering scheduler ownership.
+        // 在进入调度器所有权前快照弱日志订阅者。
+        let diagnostics = diagnostic_subscriber();
         let mut state = self.center.lock()?;
         if state.closing {
             return Err(closed());
@@ -358,7 +361,10 @@ impl EmbeddedRuntime {
                 error: None,
             },
         );
-        match self.center.enqueue(&mut state, request, control, bytes) {
+        match self
+            .center
+            .enqueue(&mut state, request, control, bytes, diagnostics)
+        {
             Ok(operation) => Ok(EmbeddedSessionOpening {
                 session_id,
                 operation,
@@ -394,6 +400,9 @@ impl EmbeddedRuntime {
         self.center.capabilities.check_submission()?;
         let control = Arc::new(CallControl::new(timeout)?);
         json_size(&arguments, self.center.pools.config().max_value_bytes)?;
+        // Snapshot the weak logger subscriber before entering scheduler ownership.
+        // 在进入调度器所有权前快照弱日志订阅者。
+        let diagnostics = diagnostic_subscriber();
         let mut state = self.center.lock()?;
         let session = state
             .sessions
@@ -418,7 +427,8 @@ impl EmbeddedRuntime {
             },
         };
         let bytes = json_size(&request, self.center.pools.config().max_queued_bytes)?;
-        self.center.enqueue(&mut state, request, control, bytes)
+        self.center
+            .enqueue(&mut state, request, control, bytes, diagnostics)
     }
 
     /// Permanently reject new work for `session_id` and request cancellation of its actual owner.
@@ -485,6 +495,8 @@ impl EmbeddedRuntime {
 impl SchedulerCenter {
     /// Admit `request` atomically with all queue and operation budgets under authoritative `state`.
     /// 在权威 `state` 下，结合全部队列与操作预算原子接纳 `request`。
+    /// diagnostics is the weak subscriber captured before the caller acquired state.
+    /// diagnostics 为调用方获取 state 前捕获的弱订阅者。
     /// Keep the supplied original `control` and exact serialized `bytes`; return a queryable handle.
     /// 保留传入的原始 `control` 与精确序列化 `bytes`；返回可查询句柄。
     pub(super) fn enqueue(
@@ -493,6 +505,7 @@ impl SchedulerCenter {
         request: ScheduledRequest,
         control: Arc<CallControl>,
         bytes: usize,
+        diagnostics: Option<DiagnosticSubscriber>,
     ) -> EmbeddedResult<OperationHandle> {
         control.check()?;
         if state.closing {
@@ -606,6 +619,9 @@ impl SchedulerCenter {
             .entry(plugin)
             .or_default()
             .push_back(ScheduledCall {
+                diagnostics: diagnostics.map(|subscriber| {
+                    OperationDiagnostics::new(subscriber, &self.id, request.pool_id(), &id)
+                }),
                 reusable_instance: None,
                 id,
                 owner,

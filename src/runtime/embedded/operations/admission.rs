@@ -107,6 +107,7 @@ impl OperationRegistry {
                 error: None,
             }),
             changed: Condvar::new(),
+            terminal_changed: tokio::sync::Notify::new(),
             max_value_bytes: self.max_value_bytes,
         });
         // The original control belongs to one operation; failed attachment publishes no registry identity.

@@ -86,10 +86,27 @@ impl EmbeddedPoolManager {
         capabilities: Option<ModuleCapabilities>,
         owner: Option<ModuleResourceOwner>,
     ) -> EmbeddedResult<Arc<ModulePool>> {
-        definition.validate()?;
-        for export in &definition.exports {
-            export.compile()?;
-        }
+        self.create_pool_with_prepared_placement(
+            placement,
+            PreparedModuleDefinition::new(definition)?,
+            policy,
+            capabilities,
+            owner,
+        )
+    }
+
+    /// Publish placement with its original prepared declaration, policy, capabilities and optional owner.
+    /// 使用原已准备声明、策略、能力及可选所有者发布 placement。
+    /// Return the pool without recompiling contracts; live capacity and closure checks remain mandatory.
+    /// 返回池且不重新编译契约；实时容量及关闭检查仍为强制要求。
+    pub(crate) fn create_pool_with_prepared_placement(
+        self: &Arc<Self>,
+        placement: ModulePoolPlacement,
+        prepared: Arc<PreparedModuleDefinition>,
+        policy: PluginPoolConfig,
+        capabilities: Option<ModuleCapabilities>,
+        owner: Option<ModuleResourceOwner>,
+    ) -> EmbeddedResult<Arc<ModulePool>> {
         // Parent admission closes atomically with publication of all reachable pools.
         // 父级入场相对全部可访问池的发布原子关闭。
         let mut state = self.state.lock().map_err(|_| {
@@ -125,7 +142,7 @@ impl EmbeddedPoolManager {
                     owner,
                 }),
             }),
-            definition,
+            prepared,
             policy,
             state: Mutex::new(ModulePoolState {
                 closed: false,

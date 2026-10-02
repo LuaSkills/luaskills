@@ -1,6 +1,6 @@
 [package]
 name = "luaskills"
-version = "0.5.9"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -70,7 +70,9 @@ schemars = { version = "=1.2.2", optional = true }
 serde_yaml = "0.9"
 sha2 = "0.10"
 tar = "0.4.46"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+# Enable runtime-independent terminal observation without introducing another executor.
+# 启用不依赖运行时的终态观测，不引入另一执行器。
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 vldb-controller-client = "0.2.3"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 

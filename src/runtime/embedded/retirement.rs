@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Shared maintenance cadence for bounded retirement retries and live control refresh.
 /// 有界退役重试与实时控制刷新共享的维护间隔。
@@ -178,7 +178,11 @@ impl Drop for RetirementService {
         if (idle || worker.as_ref().is_some_and(JoinHandle::is_finished))
             && let Some(worker) = worker.take()
         {
-            let _ = worker.join();
+            // An in-flight callback may release the final owner on this worker; its handle must detach instead of self-joining.
+            // 进行中回调可能在此工作线程释放最后所有者；其句柄必须脱离而非自等待。
+            if worker.thread().id() != std::thread::current().id() {
+                let _ = worker.join();
+            }
         }
     }
 }
@@ -215,22 +219,54 @@ fn run_retirement(center: Arc<RetirementCenter>) {
         module
             .retirement
             .publish(ModuleRetirementPhase::Running, None);
+        // Query the original weak subscriber only after all retirement and receipt locks are released.
+        // 仅在全部退役及回执锁释放后查询原弱订阅者。
+        let diagnostics = module
+            .diagnostics
+            .take()
+            .filter(|diagnostics| diagnostics.enabled());
+        // Read the real live heap before close, never fabricating memory after the VM disappears.
+        // 在关闭前读取真实存活堆，绝不在 VM 消失后虚构内存。
+        let heap_before_close = diagnostics
+            .as_ref()
+            .map(|_| module.module.diagnostic_lua_heap_bytes());
+        // Unsubscribed retirement starts no diagnostic clock and performs no diagnostic heap read.
+        // 未订阅退役不启动诊断时钟，也不进行诊断堆读取。
+        let close_started = diagnostics.as_ref().map(|_| Instant::now());
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| module.module.close()));
+        // Freeze the actual close interval before receipt publication or diagnostic callback work.
+        // 在回执发布或诊断回调工作前冻结实际关闭区间。
+        let close_elapsed = close_started.map(|started| started.elapsed());
         match result {
             Ok(Ok(())) => {
                 // Completion must follow actual VM destruction, not only resource close.
                 // 完成必须晚于真实 VM 销毁，而不只是资源关闭。
                 let retirement = module.retirement.clone();
+                // Resident destruction includes real Lua GC, VM destruction and original capacity release.
+                // 常驻对象销毁包含真实 Lua GC、VM 销毁及原容量释放。
+                let destruction_started = diagnostics.as_ref().map(|_| Instant::now());
                 drop(module);
+                // Retain only scalar timing and identity metadata after actual destruction.
+                // 实际销毁后仅保留标量计时及身份元数据。
+                let destruction_elapsed = destruction_started.map(|started| started.elapsed());
                 retirement.publish(ModuleRetirementPhase::Completed, None);
                 center
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .running = false;
+                if let Some(diagnostics) = diagnostics
+                    && let (Some(close), Some(destruction), Some(heap)) =
+                        (close_elapsed, destruction_elapsed, heap_before_close)
+                {
+                    diagnostics.retired(close, destruction, heap);
+                }
             }
             failure => {
+                // Preserve optional original observation identity alongside the exact failed resident owner.
+                // 与精确失败常驻所有者一并保留可选原观测身份。
+                module.diagnostics = diagnostics;
                 // Preserve a bounded diagnostic while retaining failed resource ownership.
                 // 保留有界诊断，同时保留失败资源所有权。
                 let code = match failure {
@@ -257,5 +293,62 @@ fn run_retirement(center: Arc<RetirementCenter>) {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Last-owner destruction on the actual owned worker must return without self-joining or retaining metadata.
+    /// 实际所属工作线程上的最后所有者析构必须返回，不自等待且不保留元数据。
+    /// No parameters or return value; the real thread and idle service reproduce the diagnostic ownership boundary.
+    /// 无参数或返回值；真实线程及空闲服务复现诊断所有权边界。
+    #[test]
+    fn embedded_retirement_last_owner_on_own_thread_drops_without_self_join() {
+        // Transfer the actual service only after its worker identity is available.
+        // 仅在工作线程身份可用后转移实际服务。
+        let (ownership_tx, ownership_rx) = std::sync::mpsc::sync_channel::<RetirementService>(0);
+        // Report successful destruction independently from the handle that the service owns.
+        // 独立于服务拥有的句柄报告成功析构。
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        // The service owns precisely this live thread, rather than a guessed worker identity.
+        // 服务精确拥有此存活线程，而非猜测的工作线程身份。
+        let worker = std::thread::spawn(move || {
+            // Receiving establishes the same last-owner destructor location as the in-flight callback.
+            // 接收建立与进行中回调相同的最后所有者析构位置。
+            let service = ownership_rx.recv().unwrap();
+            // Observe an actual destructor panic without converting it into a passed cleanup result.
+            // 观测实际析构 panic，不将其转换为清理通过结果。
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(service)));
+            finished_tx.send(result.is_ok()).unwrap();
+        });
+        // Empty, nonrunning state is exactly the original idle join branch.
+        // 空且未运行的状态精确对应原空闲等待分支。
+        let center = Arc::new(RetirementCenter {
+            state: Mutex::new(RetirementState {
+                pending: VecDeque::new(),
+                running: false,
+                closing: false,
+            }),
+            changed: Condvar::new(),
+        });
+        // The weak witness must expire after real service destruction, without a residual owner.
+        // 真实服务析构后弱见证必须失效，不残留所有者。
+        let witness = Arc::downgrade(&center);
+        ownership_tx
+            .send(RetirementService {
+                center,
+                worker: Mutex::new(Some(worker)),
+                failed: AtomicBool::new(false),
+            })
+            .unwrap_or_else(|_| panic!("owned retirement worker stopped before service transfer"));
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("owned retirement thread must finish destruction without self-join"),
+            "owned retirement thread must not panic while destroying its service"
+        );
+        assert!(witness.upgrade().is_none());
     }
 }

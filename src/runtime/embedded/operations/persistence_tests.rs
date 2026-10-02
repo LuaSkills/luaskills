@@ -221,6 +221,16 @@ fn embedded_operation_history_terminal_failure_retains_original_outcome() {
     // The same owner retries persistence only; business execution is not replayed.
     // 同一所有者仅重试持久化；不重放业务执行。
     let (handle, mut owner) = admit(&registry);
+    // Register an async observer before storage failure; it must remain pending through unacknowledged retries.
+    // 存储失败前登记异步观察者；未确认重试期间必须保持待完成。
+    let mut terminal_waiter = std::pin::pin!(handle.wait_terminal());
+    assert!(
+        std::future::Future::poll(
+            terminal_waiter.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        )
+        .is_pending()
+    );
     owner.advance(OperationPhase::Running).unwrap();
     owner.advance(OperationPhase::Cleaning).unwrap();
     journal.insert("other-runtime", &filler()).unwrap();
@@ -239,6 +249,13 @@ fn embedded_operation_history_terminal_failure_retains_original_outcome() {
         OperationPhase::Cleaning
     );
     assert_eq!(handle.snapshot().unwrap().value, None);
+    assert!(
+        std::future::Future::poll(
+            terminal_waiter.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        )
+        .is_pending()
+    );
     assert_eq!(
         journal
             .get("checkpoint-runtime", handle.id())
@@ -270,6 +287,15 @@ fn embedded_operation_history_terminal_failure_retains_original_outcome() {
     assert!(handle.cancel().unwrap());
     journal.forget("other-runtime", "filler", 1).unwrap();
     owner.retry_completion().unwrap();
+    // Only the acknowledged original terminal value resolves the async observer.
+    // 仅已确认的原始终态值才解析异步观察者。
+    let std::task::Poll::Ready(Ok(observed)) = std::future::Future::poll(
+        terminal_waiter.as_mut(),
+        &mut std::task::Context::from_waker(std::task::Waker::noop()),
+    ) else {
+        panic!("acknowledged storage retry must resolve terminal observation");
+    };
+    assert_eq!(observed.value, Some(actual_value.clone()));
     assert!(owner.pending_completion().is_none());
     assert_eq!(handle.snapshot().unwrap().value, Some(actual_value.clone()));
     assert_eq!(handle.snapshot().unwrap().effects, EffectState::Committed);

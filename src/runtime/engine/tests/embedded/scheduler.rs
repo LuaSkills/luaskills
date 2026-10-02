@@ -4,11 +4,14 @@ use crate::runtime::embedded::capabilities::*;
 use crate::runtime::embedded::*;
 use std::collections::BTreeSet;
 
+mod async_observation;
 mod bindings;
 mod capacities;
+mod diagnostics;
 mod finalization;
 mod persistence;
 mod plugins;
+mod prepared;
 mod prewarm;
 mod requests;
 mod resources;

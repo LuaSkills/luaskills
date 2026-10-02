@@ -1,4 +1,6 @@
+use super::PreparedModuleDefinition;
 use super::capabilities::ModuleCapabilities;
+use super::diagnostics::{InstanceDiagnostics, OperationDiagnostics, PhaseObservation};
 use super::retirement::RetirementService;
 use super::{
     CallControl, EmbeddedError, EmbeddedErrorCode, EmbeddedModule, EmbeddedResult,
@@ -308,6 +310,9 @@ impl Drop for PoolRegistration {
 /// Exclusive resident ownership; declaration order makes the VM die before its capacity token.
 /// 独占常驻所有权；声明顺序使 VM 先于其容量令牌销毁。
 pub(super) struct ResidentModule {
+    /// Optional weak subscriber and immutable instance metadata, never strong runtime or VM ownership.
+    /// 可选弱订阅者及不可变实例元数据，绝不拥有强运行时或 VM 所有权。
+    pub(super) diagnostics: Option<InstanceDiagnostics>,
     /// Actual VM and native resources, always destroyed first.
     /// 真实 VM 与原生资源，始终最先销毁。
     pub(super) module: EmbeddedModule,
@@ -354,9 +359,9 @@ pub struct ModulePool {
     /// Lifetime registration also retained by every resident.
     /// 同时由全部常驻实例保留的生命周期注册。
     registration: Arc<PoolRegistration>,
-    /// Fixed code, package identity, mounts, workspace and security partition.
-    /// 固定代码、包身份、挂载、工作区及安全分区。
-    definition: ModuleDefinition,
+    /// Original fixed declaration and compiled contracts shared by every fresh VM in this pool.
+    /// 此池每个新 VM 共享的原固定声明及已编译契约。
+    prepared: Arc<PreparedModuleDefinition>,
     /// Explicit capacity and reuse declaration, never normalized implicitly.
     /// 显式容量与复用声明，绝不隐式归一化。
     policy: PluginPoolConfig,
@@ -371,7 +376,7 @@ impl ModulePool {
     /// Return none only when the registered module declares no automatic closing export.
     /// 仅已注册模块未声明自动关闭导出时返回空值。
     pub(super) fn finalizer(&self) -> Option<&ModuleFinalizer> {
-        self.definition.finalizer.as_ref()
+        self.prepared.definition().finalizer.as_ref()
     }
 
     /// Derive immutable authority for `operation_id`, optional `session_id` and declared `export` from this exact pool.
@@ -398,7 +403,7 @@ impl ModulePool {
             finalization_instance_id: None,
             pool_id: self.registration.group.clone(),
             caller: binding.caller(
-                &self.definition,
+                self.prepared.definition(),
                 operation_id.to_owned(),
                 session_id.map(str::to_owned),
                 request_id.map(str::to_owned),
@@ -848,11 +853,31 @@ impl ModuleLease {
         control: Arc<CallControl>,
         session_id: Option<&str>,
     ) -> EmbeddedResult<()> {
+        self.initialize_with_diagnostics(control, session_id, None)
+    }
+
+    /// Initialize under original control and session_id, optionally reporting diagnostics outside runtime locks.
+    /// 在原 control 及 session_id 下初始化，可选在运行时锁外报告 diagnostics。
+    /// Return the original result; ready reused VMs report a skipped stage without an initialization timer.
+    /// 返回原结果；已就绪复用 VM 报告跳过阶段，不创建初始化计时器。
+    pub(super) fn initialize_with_diagnostics(
+        &mut self,
+        control: Arc<CallControl>,
+        session_id: Option<&str>,
+        diagnostics: Option<&OperationDiagnostics>,
+    ) -> EmbeddedResult<()> {
         control.check()?;
         if self.pool.lock()?.closed {
             return Err(closed());
         }
         if self.ready {
+            if let Some(diagnostics) = diagnostics.filter(|diagnostics| diagnostics.enabled()) {
+                diagnostics.emit(
+                    "initialization_skipped",
+                    Some(self.instance_id()?),
+                    PhaseObservation::default(),
+                );
+            }
             return Ok(());
         }
         if self.initialization_attempted {
@@ -866,15 +891,55 @@ impl ModuleLease {
             instance_id,
         } = self.pending.take().ok_or_else(closed)?;
         let permit = reservation.begin_execution()?;
-        let module = self
+        // Resolve subscription after all original ownership guards are released, before optional sampling.
+        // 全部原所有权保护对象释放后解析订阅，再进行可选采样。
+        let diagnostics = diagnostics.filter(|diagnostics| diagnostics.enabled());
+        // Real allocation includes path validation and runtime setup, not callback emission.
+        // 真实分配包含路径校验及运行时准备，不包含回调发送。
+        let allocation_started = diagnostics.map(|_| Instant::now());
+        let allocation = self
             .pool
             .manager
             .engine
-            .allocate_embedded_module(self.pool.definition.clone(), &instance_id)?;
+            .allocate_prepared_embedded_module_measured(
+                Arc::clone(&self.pool.prepared),
+                &instance_id,
+                diagnostics.is_some(),
+            );
+        // Capture before samples and emission, keeping instrumentation outside the allocation interval.
+        // 在采样及发送前捕获，使监测位于分配区间之外。
+        let allocation_elapsed = allocation_started.map(|started| started.elapsed());
         drop(permit);
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.emit(
+                "allocation",
+                allocation.as_ref().ok().map(|_| instance_id.as_str()),
+                PhaseObservation {
+                    elapsed: allocation_elapsed,
+                    lua_heap_bytes: allocation
+                        .as_ref()
+                        .ok()
+                        .map(|module| module.diagnostic_lua_heap_bytes()),
+                    succeeded: Some(allocation.is_ok()),
+                    ..PhaseObservation::default()
+                },
+            );
+            if let Ok(module) = &allocation {
+                diagnostics.emit(
+                    "vm_creation",
+                    Some(&instance_id),
+                    PhaseObservation {
+                        elapsed: module.diagnostic_vm_creation_elapsed(),
+                        ..PhaseObservation::default()
+                    },
+                );
+            }
+        }
+        let module = allocation?;
         let receipt = ModuleRetirement::new(instance_id.clone());
         self.retirement = Some(receipt.clone());
         self.resident = Some(ResidentModule {
+            diagnostics: diagnostics.map(|diagnostics| diagnostics.instance(&instance_id)),
             retirement: receipt,
             module,
             reservation,
@@ -896,9 +961,63 @@ impl ModuleLease {
             if let Some(capabilities) = &self.pool.capabilities {
                 resident.module.bind_capabilities(capabilities.clone())?;
             }
+            // Recheck current subscription at the actual initialization boundary, after allocation observations.
+            // 在实际初始化边界重新检查当前订阅，位于分配观测之后。
+            let diagnostics = diagnostics.filter(|diagnostics| diagnostics.enabled());
             resident
                 .module
-                .initialize_for_session(control, session_id)?;
+                .begin_diagnostic_stage(diagnostics.is_some());
+            // Fixed counters span only this actual initialization and its nested host calls.
+            // 固定计数仅覆盖此实际初始化及其嵌套宿主调用。
+            control.enable_diagnostic_host_wait(diagnostics.is_some());
+            // Counter snapshot precedes the measured Lua initialization boundary.
+            // 计数快照先于被测 Lua 初始化边界。
+            let host_wait_before = diagnostics.map(|_| control.diagnostic_host_wait());
+            // Do not start a timer for a reused ready VM or an unsubscribed initialization.
+            // 不为复用就绪 VM 或未订阅初始化启动计时器。
+            let initialization_started = diagnostics.map(|_| Instant::now());
+            // Retain the actual result before observational work, including original initialization errors.
+            // 在观测工作前保留实际结果，包括原初始化错误。
+            let initialization = resident
+                .module
+                .initialize_for_session(Arc::clone(&control), session_id);
+            // End the real interval before touching heap samples or constructing diagnostic JSON.
+            // 在接触堆采样或构造诊断 JSON 前结束真实区间。
+            let initialization_elapsed = initialization_started.map(|started| started.elapsed());
+            if let Some(diagnostics) = diagnostics {
+                diagnostics.emit(
+                    "initialization",
+                    Some(&resident.instance_id),
+                    PhaseObservation {
+                        elapsed: initialization_elapsed,
+                        lua_heap_bytes: Some(resident.module.diagnostic_lua_heap_bytes()),
+                        host_wait: host_wait_before
+                            .map(|before| control.diagnostic_host_wait().since(before)),
+                        succeeded: Some(initialization.is_ok()),
+                    },
+                );
+                if let Some(elapsed) = resident.module.diagnostic_bundle_evaluation_elapsed() {
+                    diagnostics.emit(
+                        "bundle_compile_and_evaluate",
+                        Some(&resident.instance_id),
+                        PhaseObservation {
+                            elapsed: Some(elapsed),
+                            ..PhaseObservation::default()
+                        },
+                    );
+                }
+                if let Some(elapsed) = resident.module.diagnostic_request_cleanup_elapsed() {
+                    diagnostics.emit(
+                        "initialization_request_cleanup",
+                        Some(&resident.instance_id),
+                        PhaseObservation {
+                            elapsed: Some(elapsed),
+                            ..PhaseObservation::default()
+                        },
+                    );
+                }
+            }
+            initialization?;
         }
         resident.reservation.mark_ready()?;
         if self.pool.lock()?.closed {
@@ -934,6 +1053,18 @@ impl ModuleLease {
     /// Invoke `invocation` under exact parent and group permits; no whole-engine lock is held.
     /// 在精确父级与分组许可下执行 `invocation`；不持有整个引擎锁。
     pub fn invoke(&mut self, invocation: ModuleInvocation<'_>) -> EmbeddedResult<Value> {
+        self.invoke_with_diagnostics(invocation, None)
+    }
+
+    /// Invoke original invocation with optional diagnostics, preserving public execution and permit semantics.
+    /// 使用可选 diagnostics 执行原 invocation，保持公开执行及许可语义。
+    /// Return the original business result; heap reads and synchronous log callbacks are outside its measured interval.
+    /// 返回原业务结果；堆读取及同步日志回调位于其被测区间之外。
+    pub(super) fn invoke_with_diagnostics(
+        &mut self,
+        invocation: ModuleInvocation<'_>,
+        diagnostics: Option<&OperationDiagnostics>,
+    ) -> EmbeddedResult<Value> {
         invocation.control.check()?;
         if !self.ready {
             return Err(closed());
@@ -968,9 +1099,70 @@ impl ModuleLease {
         let _permit = resident.reservation.begin_execution()?;
         drop(state);
         self.invocation_attempted = true;
+        // The logger is consulted only after the actual pool ownership lock has been released.
+        // 仅在实际池所有权锁释放后查询日志器。
+        let diagnostics = diagnostics.filter(|diagnostics| diagnostics.enabled());
+        resident
+            .module
+            .begin_diagnostic_stage(diagnostics.is_some());
+        invocation
+            .control
+            .enable_diagnostic_host_wait(diagnostics.is_some());
+        // Keep original control alive to read fixed counters after Lua returns.
+        // 保持原控制存活，在 Lua 返回后读取固定计数。
+        let diagnostic_control = diagnostics.map(|_| Arc::clone(&invocation.control));
+        // Snapshot the true pre-invocation heap outside the measured business interval.
+        // 在被测业务区间外采样真实调用前堆。
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.emit(
+                "invocation_before",
+                Some(&resident.instance_id),
+                PhaseObservation {
+                    lua_heap_bytes: Some(resident.module.diagnostic_lua_heap_bytes()),
+                    ..PhaseObservation::default()
+                },
+            );
+        }
+        // Fixed totals give the actual nested host interval delta for this business invocation.
+        // 固定总值提供此次业务调用的实际嵌套宿主区间差值。
+        let host_wait_before = diagnostic_control
+            .as_ref()
+            .map(|control| control.diagnostic_host_wait());
+        // Start only after optional pre-invocation observation has finished.
+        // 仅在可选调用前观测结束后开始。
+        let business_started = diagnostics.map(|_| Instant::now());
         // Actual structured invocation, without eval-generated wrappers.
         // 真实结构化调用，不生成 eval 包装。
-        let value = resident.module.invoke(invocation)?;
+        let business = resident.module.invoke(invocation);
+        // Close the interval before reading the heap or executing the subscriber.
+        // 在读取堆或执行订阅者前关闭区间。
+        let business_elapsed = business_started.map(|started| started.elapsed());
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.emit(
+                "business",
+                Some(&resident.instance_id),
+                PhaseObservation {
+                    elapsed: business_elapsed,
+                    lua_heap_bytes: Some(resident.module.diagnostic_lua_heap_bytes()),
+                    host_wait: diagnostic_control
+                        .as_ref()
+                        .zip(host_wait_before)
+                        .map(|(control, before)| control.diagnostic_host_wait().since(before)),
+                    succeeded: Some(business.is_ok()),
+                },
+            );
+            if let Some(elapsed) = resident.module.diagnostic_request_cleanup_elapsed() {
+                diagnostics.emit(
+                    "business_request_cleanup",
+                    Some(&resident.instance_id),
+                    PhaseObservation {
+                        elapsed: Some(elapsed),
+                        ..PhaseObservation::default()
+                    },
+                );
+            }
+        }
+        let value = business?;
         resident.uses = next_use;
         Ok(value)
     }
@@ -989,6 +1181,9 @@ impl ModuleLease {
         let resident = self.resident.as_mut().ok_or_else(closed)?;
         let _permit = resident.reservation.begin_execution()?;
         self.ready = false;
+        // Explicit closing is not a subscribed business stage and cannot retain the prior request's measurements.
+        // 显式关闭不是已订阅业务阶段，不能保留之前请求的测量。
+        resident.module.begin_diagnostic_stage(false);
         resident.module.finalize(invocation)
     }
 

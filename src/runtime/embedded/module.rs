@@ -2,7 +2,7 @@ use super::{CallControl, EmbeddedError, EmbeddedResult, JsonContract};
 use crate::LuaInvocationContext;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Immutable source and trusted path declaration supplied during module activation.
@@ -98,6 +98,25 @@ impl ModuleDefinition {
     /// Return a structured argument error; filesystem checks run in the package loader.
     /// 返回结构化参数错误；文件系统检查在包加载器中执行。
     pub fn validate(&self) -> EmbeddedResult<()> {
+        self.validate_declarations()?;
+        if let Some(finalizer) = &self.finalizer {
+            // Public declaration validation preserves its original closing-contract checks.
+            // 公开声明校验保留原有关闭契约检查。
+            let export = self
+                .exports
+                .iter()
+                .find(|export| export.name == finalizer.export)
+                .ok_or_else(|| EmbeddedError::invalid("closing export must be declared"))?;
+            validate_finalizer_arguments(finalizer, &export.compile()?.0)?;
+        }
+        Ok(())
+    }
+
+    /// Check this definition's immutable names, source, mount values and closing declaration without compiling contracts.
+    /// 检查此定义的不可变名称、源码、挂载值及关闭声明，不编译契约。
+    /// Return a declaration error; filesystem and live authority remain separate admission checks.
+    /// 返回声明错误；文件系统及实时权威保持为独立入场检查。
+    fn validate_declarations(&self) -> EmbeddedResult<()> {
         if self.plugin_id.trim().is_empty()
             || self.generation.trim().is_empty()
             || self.security_partition.trim().is_empty()
@@ -133,22 +152,90 @@ impl ModuleDefinition {
             }
         }
         if let Some(finalizer) = &self.finalizer {
-            let export = self
+            // Preserve the original declared-export and timeout checks before schema compilation.
+            // 在 Schema 编译前保留原有已声明导出及超时检查。
+            if !self
                 .exports
                 .iter()
-                .find(|export| export.name == finalizer.export)
-                .ok_or_else(|| EmbeddedError::invalid("closing export must be declared"))?;
+                .any(|export| export.name == finalizer.export)
+            {
+                return Err(EmbeddedError::invalid("closing export must be declared"));
+            }
             CallControl::new(std::time::Duration::from_millis(finalizer.timeout_ms))?;
-            export.compile()?.0.validate(&finalizer.arguments)?;
-            // Closing arguments must be representable before activation, not first at teardown.
-            // 关闭参数必须在激活前可表示，不能等到清理时才发现。
-            crate::runtime::engine::LuaEngine::validate_embedded_json_value(
-                &finalizer.arguments,
-                "finalizer/arguments",
-            )?;
         }
         Ok(())
     }
+}
+
+/// Immutable original declaration and the contracts compiled exactly once before pool publication.
+/// 池发布前恰好编译一次的契约与不可变原声明。
+/// Private fields prevent a caller from pairing compiled validators with a different declaration.
+/// 私有字段防止调用方将已编译校验器与不同声明配对。
+pub(crate) struct PreparedModuleDefinition {
+    /// Exact source, paths, exports and finalizer supplying these compiled contracts.
+    /// 提供这些已编译契约的精确源码、路径、导出及关闭器。
+    definition: ModuleDefinition,
+    /// Original export names mapped to shared immutable input and output validators.
+    /// 原导出名称映射到共享不可变输入及输出校验器。
+    contracts: BTreeMap<String, (JsonContract, JsonContract)>,
+}
+
+impl PreparedModuleDefinition {
+    /// Prepare definition without allocating a VM, reading paths or executing source.
+    /// 准备 definition，不分配 VM、不读取路径、不执行源码。
+    /// Return one shared owner only after every contract and the exact finalizer input are valid.
+    /// 仅全部契约及精确关闭器输入有效后，返回单个共享所有者。
+    pub(crate) fn new(definition: ModuleDefinition) -> EmbeddedResult<Arc<Self>> {
+        definition.validate_declarations()?;
+        // This single compilation serves scheduled admission and every fresh VM from this pool.
+        // 此单次编译供调度入场及此池每个新 VM 使用。
+        let contracts = definition
+            .exports
+            .iter()
+            .map(|export| export.compile().map(|pair| (export.name.clone(), pair)))
+            .collect::<EmbeddedResult<BTreeMap<_, _>>>()?;
+        if let Some(finalizer) = &definition.finalizer {
+            // Match the exact already-compiled export, without compiling closing schemas again.
+            // 匹配精确已编译导出，不再次编译关闭 Schema。
+            let (input, _) = contracts
+                .get(&finalizer.export)
+                .ok_or_else(|| EmbeddedError::invalid("closing export must be declared"))?;
+            validate_finalizer_arguments(finalizer, input)?;
+        }
+        Ok(Arc::new(Self {
+            definition,
+            contracts,
+        }))
+    }
+
+    /// Borrow the original declaration; callers cannot mutate it or replace its authority.
+    /// 借用原声明；调用方不能修改它或替换其权威。
+    pub(crate) fn definition(&self) -> &ModuleDefinition {
+        &self.definition
+    }
+
+    /// Borrow original compiled pairs; cloning a JsonContract shares its existing validator Arc.
+    /// 借用原已编译契约对；克隆 JsonContract 共享其既有校验器 Arc。
+    pub(crate) fn contracts(&self) -> &BTreeMap<String, (JsonContract, JsonContract)> {
+        &self.contracts
+    }
+}
+
+/// Validate finalizer's structured arguments and Lua representation with its exact input after declaration checks.
+/// 声明检查后使用精确 input 校验 finalizer 的结构化参数及 Lua 表示。
+/// Return the existing argument error without allocating a VM or executing shutdown.
+/// 返回既有参数错误，不分配 VM 或执行关闭。
+fn validate_finalizer_arguments(
+    finalizer: &ModuleFinalizer,
+    input: &JsonContract,
+) -> EmbeddedResult<()> {
+    input.validate(&finalizer.arguments)?;
+    // Closing arguments must be representable before activation, not first at teardown.
+    // 关闭参数必须在激活前可表示，不能等到清理时才发现。
+    crate::runtime::engine::LuaEngine::validate_embedded_json_value(
+        &finalizer.arguments,
+        "finalizer/arguments",
+    )
 }
 
 /// Host-owned invocation values; Lua receives no writable identity authority.

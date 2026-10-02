@@ -433,6 +433,18 @@ fn embedded_operation_queued_terminal_failure_does_not_retry_on_poll() {
     // Only the original owner may retry persistence of the original result.
     // 仅原始所有者可以重试原始结果的持久化。
     let (handle, mut owner) = admit(&registry);
+    // Observe the original queued owner with an actual registered waker throughout failure and repair.
+    // 故障及修复全过程通过真实已登记唤醒器观测原始队列所有者。
+    let wake_count = Arc::new(super::super::terminal_wait_tests::CountWake::default());
+    let terminal_waker = std::task::Waker::from(Arc::clone(&wake_count));
+    let mut terminal_waiter = std::pin::pin!(handle.wait_terminal());
+    assert!(
+        std::future::Future::poll(
+            terminal_waiter.as_mut(),
+            &mut std::task::Context::from_waker(&terminal_waker),
+        )
+        .is_pending()
+    );
     owner.advance(OperationPhase::Running).unwrap();
     owner.advance(OperationPhase::Cleaning).unwrap();
     journal.insert("other-runtime", &filler()).unwrap();
@@ -473,9 +485,27 @@ fn embedded_operation_queued_terminal_failure_does_not_retry_on_poll() {
         EmbeddedErrorCode::Busy
     );
     assert_eq!(handle.snapshot().unwrap().phase, OperationPhase::Cleaning);
+    assert_eq!(wake_count.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        std::future::Future::poll(
+            terminal_waiter.as_mut(),
+            &mut std::task::Context::from_waker(&terminal_waker),
+        )
+        .is_pending()
+    );
     if !owner.retry_completion_nonblocking().unwrap() {
         poll(|| owner.poll_completion()).unwrap();
     }
+    // A real durable receipt releases the queued owner's handoff exactly once, without replaying business.
+    // 真实持久回执恰好释放一次队列所有者交接，不重放业务。
+    assert_eq!(wake_count.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let std::task::Poll::Ready(Ok(observed)) = std::future::Future::poll(
+        terminal_waiter.as_mut(),
+        &mut std::task::Context::from_waker(&terminal_waker),
+    ) else {
+        panic!("acknowledged queued retry must wake and resolve terminal observation");
+    };
+    assert_eq!(observed.value, Some(original.clone()));
     assert_eq!(handle.snapshot().unwrap().value, Some(original.clone()));
     assert_eq!(
         journal

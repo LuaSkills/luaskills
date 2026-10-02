@@ -235,6 +235,22 @@ fn embedded_prewarm_creates_distinct_instances_without_business_execution() {
 /// 队列取消及截止时间释放字节；运行时关闭仍等待真实在途宿主确认。
 #[test]
 fn embedded_prewarm_queue_cancel_timeout_and_close_preserve_ownership() {
+    // Restore the process logger after this real queue cancellation and deadline fixture finishes.
+    // 此真实排队取消及截止夹具结束后恢复进程日志器。
+    let _logger = super::diagnostics::RestoreLogger::capture();
+    // Keep exact phase evidence for admitted calls, including requests that never receive a VM.
+    // 保留已入场调用的精确阶段证据，包含从未取得 VM 的请求。
+    let observations = Arc::new(Mutex::new(Vec::<Value>::new()));
+    // Capture only this existing private event protocol; ordinary runtime log messages are unrelated.
+    // 仅捕获此既有私有事件协议；普通运行时日志消息无关。
+    let captured = Arc::clone(&observations);
+    crate::runtime::logging::set_log_callback(Some(Arc::new(move |event| {
+        if let Ok(value) = serde_json::from_str::<Value>(&event.message)
+            && value["luaskills_embedded_diagnostic"] == 1
+        {
+            captured.lock().unwrap().push(value);
+        }
+    })));
     // One execution slot makes the remaining prewarm requests deterministically queued.
     // 单个执行槽使剩余预热请求确定地排队。
     let layout = SystemRuntimeTestLayout::new("formal prewarm queue and close");
@@ -298,6 +314,34 @@ fn embedded_prewarm_queue_cancel_timeout_and_close_preserve_ownership() {
     );
     shutdown(&runtime);
     assert_eq!(runtime.resources().unwrap().resident, 0);
+    // Every actual queue removal is emitted once; cancelled and expired requests claim no allocated VM.
+    // 每次真实队列移除仅发送一次；取消及过期请求不声称已分配 VM。
+    let observed = observations.lock().unwrap();
+    for operation in [&running, &cancelled, &expired] {
+        // Select immutable identity and semantic phase rather than an evolving observation position.
+        // 选择不可变身份及语义阶段，而非演进中的观测位置。
+        let queue = observed
+            .iter()
+            .filter(|value| value["operation_id"] == operation.id() && value["phase"] == "queue")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            queue.len(),
+            1,
+            "exactly one real queue interval is required"
+        );
+        assert!(queue[0]["elapsed_ns"].as_u64().is_some());
+        assert!(queue[0]["instance_id"].is_null());
+    }
+    // Requests rejected while queued must never produce allocation, initialization or business observations.
+    // 排队时被拒绝的请求绝不产生分配、初始化或业务观测。
+    for operation in [&cancelled, &expired] {
+        assert!(
+            observed
+                .iter()
+                .filter(|value| value["operation_id"] == operation.id())
+                .all(|value| value["phase"] == "queue")
+        );
+    }
 }
 
 /// Single-use and fixed-session pools cannot be implicitly converted into reusable prewarm pools.

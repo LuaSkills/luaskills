@@ -440,7 +440,9 @@ impl OperationOwner {
 
     /// Publish an already acknowledged terminal result with no storage work, allowing atomic scheduler bookkeeping.
     /// 不执行存储工作地发布已确认终态结果，使调度记账可以保持原子性。
-    pub(crate) fn publish_completion(&mut self) -> EmbeddedResult<()> {
+    /// Return the notification handoff; the caller must consume it only after releasing all bookkeeping locks.
+    /// 返回通知交接；调用方必须在释放全部记账锁后消费它。
+    pub(crate) fn publish_completion(&mut self) -> EmbeddedResult<TerminalNotification> {
         if self.operation.history.is_some()
             && !self
                 .completion_checkpoint
@@ -468,7 +470,9 @@ impl OperationOwner {
                 .expect("validated original terminal candidate"),
         );
         self.operation.changed.notify_all();
-        Ok(())
+        Ok(TerminalNotification {
+            operation: Arc::clone(&self.operation),
+        })
     }
 
     /// Start or observe nonterminal `phase` without waiting for disk or a competing owner transition.
@@ -625,7 +629,12 @@ impl OperationOwner {
         }
         // Both business and closing outcomes use the same authoritative value-budget normalization.
         // 业务与关闭结果共用同一个权威值预算规范化规则。
-        let result = OperationOutcome::bounded(result, self.operation.max_value_bytes).result();
+        // Move the already-owned bounded outcome instead of cloning its complete value or error.
+        // 移动已拥有的有界结果，避免克隆其完整值或错误。
+        let result = match OperationOutcome::bounded(result, self.operation.max_value_bytes) {
+            OperationOutcome::Succeeded { value } => Ok(value),
+            OperationOutcome::Failed { error } => Err(error),
+        };
         // The public observation remains Cleaning until terminal persistence is acknowledged.
         // 终态持久化确认前，公开观测保持 Cleaning。
         let mut snapshot = self.operation.lock()?.clone();
@@ -715,7 +724,9 @@ impl OperationOwner {
         if !self.drive_completion_checkpoint(wait, retry)? {
             return Ok(false);
         }
-        self.publish_completion()?;
+        // This direct owner path holds no scheduler metadata when consuming terminal notification.
+        // 此直接所有者路径消费终态通知时不持有调度元数据。
+        self.publish_completion()?.notify();
         Ok(true)
     }
 }

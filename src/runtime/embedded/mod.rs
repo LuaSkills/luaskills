@@ -6,6 +6,7 @@ mod capacity;
 mod cleanup;
 mod config;
 mod control;
+pub(crate) mod diagnostics;
 mod effects;
 mod error;
 mod governor;
@@ -45,6 +46,7 @@ pub use journal::{
     OperationJournalWorkerConfig, OperationJournalWorkerStatus, OperationReconciliation,
     ReconciledExecution, ResolvedEffectState,
 };
+pub(crate) use module::PreparedModuleDefinition;
 pub use module::{ModuleDefinition, ModuleExport, ModuleFinalizer, ModuleInvocation};
 pub use operations::{
     EffectState, ModuleOperationContext, OperationContext, OperationFinalization, OperationHandle,

@@ -827,6 +827,9 @@ impl CapabilitySnapshot {
             .ok_or_else(not_found)?
             .descriptor
             .execution;
+        // Keep only scalar timing on the VM stack; diagnostics are emitted after Lua returns.
+        // VM 栈内仅保留标量计时；诊断在 Lua 返回后发送。
+        let _diagnostic_wait = control.measure_diagnostic_host_wait();
         match execution {
             CapabilityExecution::Native => {
                 self.invoke_native(name, caller, permissions, arguments, control)

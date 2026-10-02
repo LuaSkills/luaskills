@@ -55,73 +55,98 @@ pub(super) enum Progress {
 /// 推进存储与所有权，不运行 Lua，也不让监督器阻塞于磁盘。
 /// Return readiness, pending ownership, or actual retirement; retries only touch retained checkpoints.
 /// 返回就绪、待完成所有权或真实退役；重试仅操作保留检查点。
+/// center supervises completion's original checkpoints; retry authorizes one retained attempt, never a new closing execution.
+/// center 监督 completion 原检查点；retry 授权一次保留尝试，绝不授权新的关闭执行。
 pub(super) fn advance(
     center: &SchedulerCenter,
     completion: &mut PendingCompletion,
     retry: bool,
 ) -> EmbeddedResult<Progress> {
-    // Resolve the exact older phase or closing checkpoint before any new lifecycle decision.
-    // 在任何新生命周期决定前解决精确较早阶段或关闭检查点。
-    let pending = match completion.call.owner.pending_phase() {
-        Ok(phase) => phase,
-        Err(error) if error.code == EmbeddedErrorCode::Busy => return Ok(Progress::Pending),
-        Err(error) => return Err(error),
-    };
-    if let Some(phase) = pending {
-        let progress = if retry {
-            completion.call.owner.retry_advance()
-        } else {
-            completion.call.owner.poll_advance(phase)
+    // Consume recovery permission only for its retained checkpoint, so subsequent new checkpoints cannot auto-retry.
+    // 仅为保留检查点消费恢复许可，避免后续新检查点自动重试。
+    let mut retry_available = retry;
+    // Each continuation consumes an acknowledged original checkpoint or sets one preparation flag exactly once.
+    // 每次续行都消费已确认原检查点，或精确一次设置一个准备标记。
+    // The exclusively owned predecessor, intent and outcome form a finite sequence; pending work always yields immediately.
+    // 独占拥有的前驱、意图及结果构成有限序列；待完成工作始终立即让出。
+    loop {
+        // Re-read the real mutation gate even after preparation; successful preparation alone cannot prove disk acknowledgement.
+        // 即使准备后也重读真实变更门；仅准备成功不能证明磁盘确认。
+        let pending = match completion.call.owner.pending_phase() {
+            Ok(phase) => phase,
+            Err(error) if error.code == EmbeddedErrorCode::Busy => return Ok(Progress::Pending),
+            Err(error) => return Err(error),
         };
-        match progress {
-            Ok(true) => center.checkpoint_recovered(&completion.call.id)?,
-            Ok(false) => {}
-            Err(error) => center.checkpoint_failed(&completion.call.id, phase, error),
+        if let Some(phase) = pending {
+            // Only this exact receipt may consume the one explicit recovery authorization.
+            // 仅此精确回执可以消费单次明确恢复授权。
+            let progress = if std::mem::take(&mut retry_available) {
+                completion.call.owner.retry_advance()
+            } else {
+                completion.call.owner.poll_advance(phase)
+            };
+            match progress {
+                Ok(true) => {
+                    center.checkpoint_recovered(&completion.call.id)?;
+                    continue;
+                }
+                Ok(false) => return Ok(Progress::Pending),
+                Err(error) => {
+                    center.checkpoint_failed(&completion.call.id, phase, error);
+                    return Ok(Progress::Pending);
+                }
+            }
         }
-        return Ok(Progress::Pending);
+        // An already-cleared predecessor cannot transfer its recovery authorization to a newly prepared checkpoint.
+        // 已清除前驱不能把其恢复授权转交给新准备检查点。
+        retry_available = false;
+        // Borrow the sole original closing owner without constructing a second lease or control.
+        // 借用唯一原关闭所有者，不构造第二个租借或控制。
+        let closing = completion
+            .finalization
+            .as_mut()
+            .expect("closing continuation exists");
+        if !closing.intent_prepared {
+            completion.call.owner.prepare_finalization(
+                closing.plan.export.clone(),
+                completion.result.clone(),
+                Duration::from_millis(closing.plan.timeout_ms),
+            )?;
+            closing.intent_prepared = true;
+            completion.cleaning_started = true;
+            continue;
+        }
+        if closing.outcome.is_none() {
+            return Ok(Progress::Ready);
+        }
+        if !closing.outcome_prepared {
+            completion.call.owner.prepare_finalization_outcome(
+                closing
+                    .outcome
+                    .as_ref()
+                    .expect("returned closing outcome")
+                    .clone(),
+            )?;
+            closing.outcome_prepared = true;
+            continue;
+        }
+        // Take physical ownership only after the loop rechecked the acknowledged original outcome checkpoint.
+        // 仅循环重新检查已确认原结果检查点之后，才取出物理所有权。
+        let mut closing = completion
+            .finalization
+            .take()
+            .expect("acknowledged closing owner");
+        closing.lease.close();
+        completion.retirement = match closing.lease.finish()? {
+            ModuleRelease::Retiring(receipt) => Some(receipt),
+            ModuleRelease::NoInstance => None,
+            ModuleRelease::ReturnedToPool => {
+                return Err(internal("finalized VM returned to reuse"));
+            }
+        };
+        completion.call.request.release_values();
+        return Ok(Progress::Retiring);
     }
-    let closing = completion
-        .finalization
-        .as_mut()
-        .expect("closing continuation exists");
-    if !closing.intent_prepared {
-        completion.call.owner.prepare_finalization(
-            closing.plan.export.clone(),
-            completion.result.clone(),
-            Duration::from_millis(closing.plan.timeout_ms),
-        )?;
-        closing.intent_prepared = true;
-        completion.cleaning_started = true;
-        return Ok(Progress::Pending);
-    }
-    if closing.outcome.is_none() {
-        return Ok(Progress::Ready);
-    }
-    if !closing.outcome_prepared {
-        completion.call.owner.prepare_finalization_outcome(
-            closing
-                .outcome
-                .as_ref()
-                .expect("returned closing outcome")
-                .clone(),
-        )?;
-        closing.outcome_prepared = true;
-        return Ok(Progress::Pending);
-    }
-    // The outcome is durable before resource cleanup can destroy the last copy of VM-local state.
-    // 资源清理销毁最后一份 VM 局部状态前，结果已经持久确认。
-    let mut closing = completion
-        .finalization
-        .take()
-        .expect("acknowledged closing owner");
-    closing.lease.close();
-    completion.retirement = match closing.lease.finish()? {
-        ModuleRelease::Retiring(receipt) => Some(receipt),
-        ModuleRelease::NoInstance => None,
-        ModuleRelease::ReturnedToPool => return Err(internal("finalized VM returned to reuse")),
-    };
-    completion.call.request.release_values();
-    Ok(Progress::Retiring)
 }
 
 /// Execute the already-acknowledged closing intent on one ordinary runtime worker.

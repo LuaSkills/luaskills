@@ -1,9 +1,11 @@
 use super::capabilities::{CapabilityPermissions, CapabilityRegistry, ModuleCapabilities};
+use super::diagnostics::OperationDiagnostics;
 use super::retirement::MAINTENANCE_INTERVAL;
 use super::value_size::json_size;
 use super::*;
 use crate::LuaInvocationContext;
 use crate::runtime::engine::LuaEngine;
+use crate::runtime::logging::{DiagnosticSubscriber, diagnostic_subscriber};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
@@ -120,6 +122,9 @@ struct ScheduledPool {
 /// Unique operation ownership moves from the queue to one worker and then the cleanup supervisor.
 /// 唯一操作所有权从队列转移到一个工作线程，再转移至清理监督器。
 struct ScheduledCall {
+    /// Optional original queue timing and weak subscriber captured outside scheduler locks.
+    /// 可选原队列计时及在调度锁外捕获的弱订阅者。
+    diagnostics: Option<OperationDiagnostics>,
     /// Exact scheduler-owned reusable instance selected at dispatch, absent for queued and session work.
     /// 分发时选定的调度器所有可复用实例；排队及会话任务省略。
     reusable_instance: Option<String>,
@@ -158,8 +163,8 @@ struct PendingCompletion {
     /// Actual invocation outcome retained without replaying execution.
     /// 保留的实际调用结果，不重放执行。
     result: EmbeddedResult<Value>,
-    /// Exact retirement evidence; absent means no outstanding VM teardown.
-    /// 精确退役证据；省略表示没有未完成 VM 清理。
+    /// Exact unconsumed retirement barrier; actual completion consumes it without discarding operation checkpoints.
+    /// 精确未消费退役屏障；真实完成后消费，不丢弃操作检查点。
     retirement: Option<ModuleRetirement>,
     /// Conservative outer evidence; host callback records retain stronger individual facts.
     /// 保守的外层证据；宿主回调记录保留更强的逐项事实。
@@ -483,14 +488,19 @@ impl EmbeddedRuntime {
             .validate_snapshot(&binding.snapshot)?;
         // Compile admission contracts before any scheduled pool is published.
         // 发布任何调度池之前编译入场契约。
-        let inputs = definition
-            .exports
+        // One original prepared owner binds the declaration to its contracts before the metadata gate.
+        // 在元数据闸门前，单个原已准备所有者将声明绑定到其契约。
+        let prepared = super::PreparedModuleDefinition::new(definition)?;
+        // Admission borrows the same validators used later by every new VM, without recompilation.
+        // 入场借用后续每个新 VM 使用的相同校验器，不重新编译。
+        let inputs = prepared
+            .contracts()
             .iter()
-            .map(|export| {
-                JsonContract::compile(&export.input_schema)
-                    .map(|contract| (export.name.clone(), contract))
-            })
-            .collect::<EmbeddedResult<BTreeMap<_, _>>>()?;
+            .map(|(name, (input, _))| (name.clone(), input.clone()))
+            .collect();
+        // All later identity and capacity checks still use the exact immutable original declaration.
+        // 后续全部身份及容量检查仍使用精确不可变原声明。
+        let definition = prepared.definition();
         // The scheduler metadata gate makes registration atomic with shutdown.
         // 调度器元数据门使注册相对关闭保持原子性。
         let mut state = self.center.lock()?;
@@ -530,9 +540,9 @@ impl EmbeddedRuntime {
         };
         // The real pool retains its capacity membership through physical teardown.
         // 真实池跨物理清理保留容量成员关系。
-        let pool = self.center.pools.create_pool_with_placement(
+        let pool = self.center.pools.create_pool_with_prepared_placement(
             placement,
-            definition,
+            prepared,
             policy,
             Some(binding),
             owner,
@@ -587,6 +597,9 @@ impl EmbeddedRuntime {
         let config = self.center.pools.config();
         json_size(&request.arguments, config.max_value_bytes)?;
         let bytes = json_size(&request, config.max_queued_bytes)?;
+        // Capture only the weak subscriber before acquiring scheduler ownership.
+        // 在获取调度器所有权前，仅捕获弱订阅者。
+        let diagnostics = diagnostic_subscriber();
         let mut state = self.center.lock()?;
         let pool = state.pools.get(&request.pool_id).ok_or_else(not_found)?;
         if pool.pool.policy().reuse == InstanceReuse::Session {
@@ -599,6 +612,7 @@ impl EmbeddedRuntime {
             ScheduledRequest::Invoke(request),
             control,
             bytes,
+            diagnostics,
         )
     }
 
@@ -618,6 +632,9 @@ impl EmbeddedRuntime {
         // 接纳任何初始化工作之前，校验并计费完整上下文。
         let control = Arc::new(CallControl::new(timeout)?);
         let bytes = json_size(&request, self.center.pools.config().max_queued_bytes)?;
+        // Capture only the weak subscriber before acquiring scheduler ownership.
+        // 在获取调度器所有权前，仅捕获弱订阅者。
+        let diagnostics = diagnostic_subscriber();
         let mut state = self.center.lock()?;
         let pool = state.pools.get(&request.pool_id).ok_or_else(not_found)?;
         if pool.pool.policy().reuse != InstanceReuse::Reusable {
@@ -630,6 +647,7 @@ impl EmbeddedRuntime {
             ScheduledRequest::Prewarm(request),
             control,
             bytes,
+            diagnostics,
         )
     }
 

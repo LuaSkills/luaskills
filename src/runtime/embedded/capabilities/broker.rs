@@ -634,10 +634,19 @@ impl HostRequestHandle {
     /// 在已有执行线程等待真实完成，包含取消排空。
     pub fn wait(&self) -> EmbeddedResult<CapabilityOutcome> {
         loop {
-            if let Some(outcome) = self.poll()? {
+            self.broker.refresh(&self.id)?;
+            // Keep the completion predicate locked until the condition wait atomically releases it.
+            // 保持完成条件锁定，直至条件等待原子释放它。
+            let state = self.broker.state.lock().map_err(|_| poisoned())?;
+            if let Some(outcome) = state
+                .records
+                .get(&self.id)
+                .ok_or_else(|| unknown(&state, &self.id))?
+                .outcome
+                .clone()
+            {
                 return Ok(outcome);
             }
-            let state = self.broker.state.lock().map_err(|_| poisoned())?;
             // Periodic refresh observes external permission and deadline changes without one thread per callback.
             // 周期刷新观察外部权限与截止时间变化，无需每个回调独占线程。
             drop(

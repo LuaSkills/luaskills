@@ -222,6 +222,12 @@ jobs:
         shell: pwsh
         run: cargo test --locked --all-targets -j 4 -- --test-threads=1
 
+      # All-targets acceptance excludes doctests; run them separately on the same frozen native source.
+      # 全目标验收不包含文档测试；在相同冻结原生源码上独立运行。
+      - name: Run native documentation tests
+        shell: pwsh
+        run: cargo test --locked --doc -j 4 -- --test-threads=1
+
   ffi-examples:
     name: FFI examples on Python 3.14 and Node 24
     runs-on: ubuntu-24.04

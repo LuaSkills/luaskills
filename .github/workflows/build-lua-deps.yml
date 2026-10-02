@@ -64,6 +64,14 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"source_sha={os.environ['SOURCE_SHA']}\nversion={os.environ['CORE_VERSION']}\n")
           PY
+      # Offline regressions use the verified source checkout before any candidate build or draft operation.
+      # 离线回归在任何候选构建或草稿操作前使用已核验的源码检出。
+      - name: Verify release helper offline regressions
+        shell: bash
+        run: |
+          python -X utf8 -m unittest discover -s scripts/release -p test_candidate.py -v
+          python -X utf8 -m unittest discover -s scripts/release -p test_sdk_prerequisites.py -v
+          python -X utf8 -m unittest discover -s scripts/release -p test_sdk_recovery.py -v
       # GITHUB_TOKEN cannot receive workflows-write permission; draft source must match the actual default workflows tree.
       # GITHUB_TOKEN 不能获得工作流写权限；草稿源码必须匹配实际默认工作流树。
       - name: Freeze actual default-branch workflow evidence for draft mode

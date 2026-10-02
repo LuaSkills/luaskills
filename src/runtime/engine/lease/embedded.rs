@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::embedded::PreparedModuleDefinition;
 use crate::runtime::embedded::capabilities::ModuleCapabilities;
 use crate::runtime::embedded::{
     CallControl, EmbeddedError, EmbeddedErrorCode, EmbeddedResult, JsonContract, ModuleDefinition,
@@ -12,6 +13,18 @@ mod values;
 /// One exclusively borrowed VM with immutable, validated function exports.
 /// 单个被独占借用且具有不可变已校验函数导出的 VM。
 pub struct EmbeddedModule {
+    /// Stage-local measurement flag set by its exclusive lease outside runtime locks.
+    /// 由其独占租借在运行时锁外设置的阶段局部测量标志。
+    diagnostic_measurement_enabled: bool,
+    /// Actual Lua compilation and source evaluation interval for this initialization attempt only.
+    /// 仅此初始化尝试的实际 Lua 编译及源码求值区间。
+    diagnostic_bundle_evaluation_elapsed: Option<std::time::Duration>,
+    /// Actual post-execution request-scope reset call interval, absent when that cleanup never entered.
+    /// 实际执行后请求作用域重置调用区间；未进入该清理时省略。
+    diagnostic_request_cleanup_elapsed: Option<std::time::Duration>,
+    /// Optional actual VM creation interval, captured only for the subscribed formal allocation.
+    /// 可选实际 VM 创建区间，仅为已订阅正式分配捕获。
+    diagnostic_vm_creation_elapsed: Option<std::time::Duration>,
     /// Immutable per-module registry snapshot and live permission authority.
     /// 不可变逐模块注册表快照与实时权限权威。
     capabilities: Option<ModuleCapabilities>,
@@ -30,9 +43,9 @@ pub struct EmbeddedModule {
     /// Validated contracts consumed by exactly one initialization attempt.
     /// 仅由一次初始化尝试消费的已校验契约。
     pending_contracts: Option<BTreeMap<String, (JsonContract, JsonContract)>>,
-    /// Frozen host declaration retained for diagnostics and partition validation.
-    /// 为诊断与分区校验保留的冻结宿主声明。
-    definition: ModuleDefinition,
+    /// Original declaration and compiled contracts retained for diagnostics and partition validation.
+    /// 为诊断与分区校验保留的原声明及已编译契约。
+    prepared: Arc<PreparedModuleDefinition>,
     /// Only successful execution and cleanup restore reusability.
     /// 只有执行及清理成功后才恢复可复用状态。
     reusable: bool,
@@ -159,29 +172,51 @@ impl LuaEngine {
         definition: ModuleDefinition,
         instance_id: &str,
     ) -> EmbeddedResult<EmbeddedModule> {
-        definition.validate()?;
-        // Compile value contracts before allocating the VM or running plugin initialization.
-        // 在分配 VM 或运行插件初始化前编译值契约。
-        let contracts = definition
-            .exports
-            .iter()
-            .map(|export| {
-                export
-                    .compile()
-                    .map(|contracts| (export.name.clone(), contracts))
-            })
-            .collect::<EmbeddedResult<BTreeMap<_, _>>>()?;
+        self.allocate_prepared_embedded_module(
+            PreparedModuleDefinition::new(definition)?,
+            instance_id,
+        )
+    }
+
+    /// Allocate prepared's exact declaration with fresh instance_id and unchanged live path validation.
+    /// 使用新 instance_id 分配 prepared 的精确声明，保持实时路径校验不变。
+    /// Return real VM ownership before initialization; shared contracts grant no filesystem or capability authority.
+    /// 初始化前返回真实 VM 所有权；共享契约不授予文件系统或能力权威。
+    pub(crate) fn allocate_prepared_embedded_module(
+        self: &Arc<Self>,
+        prepared: Arc<PreparedModuleDefinition>,
+        instance_id: &str,
+    ) -> EmbeddedResult<EmbeddedModule> {
+        self.allocate_prepared_embedded_module_measured(prepared, instance_id, false)
+    }
+
+    /// Allocate prepared for instance_id, optionally measuring only the actual VM construction call.
+    /// 为 instance_id 分配 prepared，可选仅测量实际 VM 构造调用。
+    /// measure_vm_creation was resolved outside runtime locks; return ownership without logging on the VM stack.
+    /// measure_vm_creation 在运行时锁外解析；返回所有权，不在 VM 栈内记录日志。
+    pub(crate) fn allocate_prepared_embedded_module_measured(
+        self: &Arc<Self>,
+        prepared: Arc<PreparedModuleDefinition>,
+        instance_id: &str,
+        measure_vm_creation: bool,
+    ) -> EmbeddedResult<EmbeddedModule> {
         if instance_id.trim().is_empty() {
             return Err(EmbeddedError::invalid("instance identity must be nonempty"));
         }
         // No VM or callback is allocated until path identities have been established.
         // 在路径身份确立前不分配 VM 或回调。
         let paths = self
-            .resolve_embedded_module_paths(&definition, instance_id)
+            .resolve_embedded_module_paths(prepared.definition(), instance_id)
             .map_err(execution_error)?;
         // Each instance has one immutable incarnation; package generation is tracked separately.
         // 每个实例只有一个不可变生命周期；包代次独立记录。
+        // Disabled diagnostics never read a clock for this construction interval.
+        // 关闭诊断时绝不为此构造区间读取时钟。
+        let vm_creation_started = measure_vm_creation.then(std::time::Instant::now);
         let vm = self.create_system_runtime_vm().map_err(execution_error)?;
+        // Keep the scalar for emission after the surrounding allocation has returned and all locks are released.
+        // 保留标量，在外围分配返回且全部锁释放后发送。
+        let diagnostic_vm_creation_elapsed = vm_creation_started.map(|started| started.elapsed());
         // LuaJIT traces can bypass instruction hooks; disable the engine before any plugin code loads.
         // LuaJIT 跟踪代码可能绕过指令钩子；在任何插件源码加载前禁用编译引擎。
         vm.lua
@@ -206,14 +241,18 @@ impl LuaEngine {
         // 在运行源码前构造所有者，确保所有失败路径退役已创建资源。
         capabilities::install(&vm.lua, None).map_err(execution_error)?;
         Ok(EmbeddedModule {
+            diagnostic_measurement_enabled: false,
+            diagnostic_bundle_evaluation_elapsed: None,
+            diagnostic_request_cleanup_elapsed: None,
+            diagnostic_vm_creation_elapsed,
             capabilities: None,
             initialization_id: format!("{instance_id}:initialize"),
             engine: Arc::clone(self),
             paths,
             vm,
             exports: BTreeMap::new(),
-            pending_contracts: Some(contracts),
-            definition,
+            pending_contracts: Some(prepared.contracts().clone()),
+            prepared,
             reusable: false,
             finalization_started: false,
             closed: false,
@@ -222,6 +261,40 @@ impl LuaEngine {
 }
 
 impl EmbeddedModule {
+    /// Begin an optional measured stage and clear previous observations before reused invocation.
+    /// 开始可选被测阶段，并在复用调用前清除之前的观测。
+    /// enabled was resolved outside runtime locks; this method does not query logging or Lua.
+    /// enabled 在运行时锁外解析；此方法不查询日志或 Lua。
+    pub(crate) fn begin_diagnostic_stage(&mut self, enabled: bool) {
+        self.diagnostic_measurement_enabled = enabled;
+        self.diagnostic_bundle_evaluation_elapsed = None;
+        self.diagnostic_request_cleanup_elapsed = None;
+    }
+
+    /// Return this stage's real compilation and evaluation interval, absent when source was not entered.
+    /// 返回此阶段的真实编译及求值区间；未进入源码时省略。
+    pub(crate) fn diagnostic_bundle_evaluation_elapsed(&self) -> Option<std::time::Duration> {
+        self.diagnostic_bundle_evaluation_elapsed
+    }
+
+    /// Return this stage's actual post-execution request reset interval, including returned cleanup errors.
+    /// 返回此阶段的实际执行后请求重置区间，包括返回的清理错误。
+    pub(crate) fn diagnostic_request_cleanup_elapsed(&self) -> Option<std::time::Duration> {
+        self.diagnostic_request_cleanup_elapsed
+    }
+    /// Read the measured allocation scalar without calling the logger or executing Lua.
+    /// 读取已测分配标量，不调用日志器或执行 Lua。
+    pub(crate) fn diagnostic_vm_creation_elapsed(&self) -> Option<std::time::Duration> {
+        self.diagnostic_vm_creation_elapsed
+    }
+
+    /// Sample the live Lua allocator for optional diagnostics, without claiming peak or post-destruction memory.
+    /// 为可选诊断采样存活 Lua 分配器，不声称峰值或销毁后的内存。
+    /// Return bytes while this module exclusively owns the actual VM; the caller emits after this read returns.
+    /// 在此模块独占实际 VM 时返回字节；调用方在此读取返回后发送。
+    pub(crate) fn diagnostic_lua_heap_bytes(&self) -> usize {
+        self.vm.lua.used_memory()
+    }
     /// Report whether captured initialized exports still permit the sole explicit closing attempt.
     /// 报告已捕获的初始化导出是否仍允许唯一显式关闭尝试。
     pub(crate) fn can_finalize(&self) -> bool {
@@ -273,13 +346,19 @@ impl EmbeddedModule {
         let context = LuaInvocationContext::default();
         // Capture immutable source so execution does not borrow mutable module metadata.
         // 捕获不可变源码，避免执行借用可变模块元数据。
-        let source = self.definition.source.clone();
+        let source = self.prepared.definition().source.clone();
         // Resolve exact functions only after every value contract has compiled successfully.
         // 仅在全部值契约编译成功后解析精确函数。
         let initialization_id = match control.operation_id()? {
             Some(operation_id) => operation_id,
             None => self.initialization_id.clone(),
         };
+        // Source evaluation measurement is fixed local metadata, never a callback from the Lua stack.
+        // 源码求值测量是固定局部元数据，绝不是从 Lua 栈发起回调。
+        let measure_bundle_evaluation = self.diagnostic_measurement_enabled;
+        // No interval exists until the original source evaluation actually starts.
+        // 原源码求值实际开始前不存在区间。
+        let mut bundle_evaluation_elapsed = None;
         let exports = self.run(
             &context,
             control,
@@ -289,7 +368,17 @@ impl EmbeddedModule {
             |lua| {
                 // The module return shape is fixed by the declared runtime protocol.
                 // 模块返回形状由声明的运行时协议固定。
-                let table: Table = lua.load(&source).set_name("embedded_module").eval()?;
+                // This interval contains both Lua compilation and actual source execution, including nested host work.
+                // 此区间包含 Lua 编译及实际源码执行，包括嵌套宿主工作。
+                let evaluation_started = measure_bundle_evaluation.then(std::time::Instant::now);
+                // Preserve returned Lua errors while retaining only the interval actually entered.
+                // 保留返回的 Lua 错误，同时仅保留实际进入的区间。
+                let evaluated = lua
+                    .load(&source)
+                    .set_name("embedded_module")
+                    .eval::<Table>();
+                bundle_evaluation_elapsed = evaluation_started.map(|started| started.elapsed());
+                let table = evaluated?;
                 contracts
                     .into_iter()
                     .map(|(name, (input, output))| {
@@ -306,8 +395,9 @@ impl EmbeddedModule {
                     })
                     .collect::<mlua::Result<BTreeMap<_, _>>>()
             },
-        )?;
-        self.exports = exports;
+        );
+        self.diagnostic_bundle_evaluation_elapsed = bundle_evaluation_elapsed;
+        self.exports = exports?;
         Ok(())
     }
 
@@ -406,6 +496,9 @@ impl EmbeddedModule {
         phase: capabilities::CapabilityCallPhase,
         execute: impl FnOnce(&Lua) -> mlua::Result<T>,
     ) -> EmbeddedResult<T> {
+        // Each execution owns only its actual cleanup observation, never the prior reused request's scalar.
+        // 每次执行仅拥有实际清理观测，绝不使用之前复用请求的标量。
+        self.diagnostic_request_cleanup_elapsed = None;
         self.reusable = false;
         control.check()?;
         // Context projection also crosses the JSON-to-Lua boundary before module initialization or exports.
@@ -465,7 +558,7 @@ impl EmbeddedModule {
             .as_ref()
             .map(|binding| {
                 binding.caller(
-                    &self.definition,
+                    self.prepared.definition(),
                     operation_id.to_owned(),
                     session_id.map(str::to_owned),
                     control.request_id()?,
@@ -483,8 +576,17 @@ impl EmbeddedModule {
         // 在无条件清理请求上下文前保存执行结果。
         let result = execute(&self.vm.lua);
         drop(guard);
-        reset_pooled_vm_request_scope(&self.vm.lua, self.engine.host_options.as_ref())
-            .map_err(execution_error)?;
+        // Measure only the real post-execution reset call, not automatic GC or transaction publication.
+        // 仅测量真实执行后重置调用，不测量自动 GC 或事务发布。
+        let cleanup_started = self
+            .diagnostic_measurement_enabled
+            .then(std::time::Instant::now);
+        // Preserve the original cleanup result before any later budget or transaction decisions.
+        // 在后续任何预算或事务决策前保留原清理结果。
+        let cleanup =
+            reset_pooled_vm_request_scope(&self.vm.lua, self.engine.host_options.as_ref());
+        self.diagnostic_request_cleanup_elapsed = cleanup_started.map(|started| started.elapsed());
+        cleanup.map_err(execution_error)?;
         control.check()?;
         // Preserve execution failure before committing invocation-owned child resources.
         // 在提交调用拥有的子资源前保留执行失败。
@@ -497,7 +599,7 @@ impl EmbeddedModule {
     /// Return the immutable activation declaration for host-side identity checks.
     /// 返回不可变激活声明，供宿主侧身份检查使用。
     pub fn definition(&self) -> &ModuleDefinition {
-        &self.definition
+        self.prepared.definition()
     }
 
     /// Report whether successful execution and cleanup permit another call.

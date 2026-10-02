@@ -26,6 +26,8 @@ use checkpoint::{HistoryBackend, PendingCheckpoint};
 
 #[cfg(test)]
 mod persistence_tests;
+#[cfg(test)]
+mod terminal_wait_tests;
 
 /// Execution phase; cancellation intent is reported separately from actual termination.
 /// 执行阶段；取消意图与实际终止分开报告。
@@ -203,6 +205,9 @@ pub(super) struct Operation {
     /// Completion notification; query state remains authoritative.
     /// 完成通知；查询状态仍为权威。
     changed: Condvar,
+    /// Async terminal observation only; the original snapshot remains the lifecycle authority.
+    /// 仅用于异步终态观测；原始快照继续作为生命周期权威。
+    terminal_changed: tokio::sync::Notify,
     /// Result-size budget copied from the runtime's single validated configuration.
     /// 从运行时唯一已校验配置复制的结果大小预算。
     max_value_bytes: usize,
@@ -297,6 +302,25 @@ pub struct OperationHandle {
     operation: Arc<Operation>,
 }
 
+/// Hand off an acknowledged terminal publication until its caller releases scheduler bookkeeping locks.
+/// 交接已确认终态发布，直至调用方释放调度记账锁。
+#[must_use = "terminal observation must be notified after releasing internal locks"]
+pub(crate) struct TerminalNotification {
+    /// Exact terminal operation; this token carries no execution or cancellation authority.
+    /// 精确终态操作；此令牌不携带执行或取消权威。
+    operation: Arc<Operation>,
+}
+
+impl TerminalNotification {
+    /// Consume this publication token and wake every registered terminal observer after all caller locks leave.
+    /// 消费此发布令牌，在调用方全部锁释放后唤醒每个已登记终态观察者。
+    /// Returns no value; custom waker panics propagate according to Tokio's existing notification behavior.
+    /// 不返回值；自定义唤醒器 panic 按 Tokio 既有通知行为传播。
+    pub(crate) fn notify(self) {
+        self.operation.terminal_changed.notify_waiters();
+    }
+}
+
 impl OperationHandle {
     /// Borrow the exact immutable identity without querying execution or effect state.
     /// 借用精确不可变身份，不查询执行或副作用状态。
@@ -311,6 +335,29 @@ impl OperationHandle {
         // 在读取独立实时宿主证据前克隆阶段所有权。
         let snapshot = self.operation.lock()?.clone();
         self.operation.project(snapshot)
+    }
+
+    /// Observe this handle until its original snapshot is terminal, returning that snapshot or a query error.
+    /// 观测此句柄直至原始快照达到终态，返回该快照或查询错误。
+    /// No timer or ambient runtime is required; dropping this observer never cancels the owned operation.
+    /// 不要求计时器或环境运行时；丢弃此观察者绝不取消已拥有的操作。
+    pub async fn wait_terminal(&self) -> EmbeddedResult<OperationSnapshot> {
+        loop {
+            // Register before querying so publication between the query and await cannot be lost.
+            // 查询前登记，避免查询与等待之间的发布被遗漏。
+            let notified = self.operation.terminal_changed.notified();
+            // Pin the exact registered waiter; no operation or effect lock crosses the await.
+            // 固定精确已登记等待者；等待期间不持有操作或副作用锁。
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            // Read the original authority rather than treating a wake as an invented terminal result.
+            // 读取原始权威，不将唤醒视为编造的终态结果。
+            let snapshot = self.snapshot()?;
+            if snapshot.phase.is_terminal() {
+                return Ok(snapshot);
+            }
+            notified.await;
+        }
     }
 
     /// Request cancellation if still active; return whether this request changed intent.
@@ -430,6 +477,13 @@ impl OperationOwner {
                 .expect("owned completion retained through checkpoint"),
         );
         self.operation.changed.notify_all();
+        // Custom async wakers can reenter this operation; release the publication lock first.
+        // 自定义异步唤醒器可以重入此操作；先释放发布锁。
+        drop(current);
+        TerminalNotification {
+            operation: Arc::clone(&self.operation),
+        }
+        .notify();
         Ok(())
     }
 

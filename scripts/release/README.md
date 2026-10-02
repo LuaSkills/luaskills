@@ -26,7 +26,14 @@ GitHub 的 `GITHUB_TOKEN` 不能获得工作流写权限；来源提交相对实
 `lookup` 可以注入公共门禁已有的受检只读 HTTP 客户端，不能跳过对象身份验证，也不会额外创建 `Bearer None` 请求。
 
 `source_sha` 必须是包含本流程修改的最终完整提交，并与工作流触发提交完全相等；`version` 必须等于该提交的
-`Cargo.toml` 中 `package.version`。脚本不会把当前脏工作树冒充为 HEAD 对应源码。当前修改尚未提交，因此本轮本地验证不产生带发布身份的候选。
+`Cargo.toml` 中 `package.version`。脚本不会把当前脏工作树冒充为 HEAD 对应源码。本地功能通过仅证明当前字节；发布候选仍须以实际干净的完整提交及对应构建证据为准。
+
+冻结阶段在完整提交及包版本核验通过后，复用既有 Python 环境，依次运行 `test_candidate.py`、
+`test_sdk_prerequisites.py`、`test_sdk_recovery.py` 三个现有离线回归入口；任一失败均使冻结作业失败，
+阻止依赖它的原生验收、候选构建、汇总与草稿创建。脚本与工作流来自同一个已核验完整 SHA。
+五平台原生验收在既有 `cargo test --locked --all-targets -j 4 -- --test-threads=1` 之后，独立执行
+`cargo test --locked --doc -j 4 -- --test-threads=1`，覆盖前者不运行的文档测试，并保留编译并发 4、共享测试串行的限制。
+这两项仅补齐既有候选 CI 的前置检查，不执行 SDK 发布，也不改变候选资产、草稿权限或性能门槛。
 
 ## 构建与打包输入
 
@@ -101,9 +108,11 @@ rtk proxy python scripts/release/candidate.py sdk-inputs --input target/verified
 
 ```powershell
 rtk proxy python -X utf8 -m unittest discover -s scripts/release -p test_candidate.py -v
+rtk proxy python -X utf8 -m unittest discover -s scripts/release -p test_sdk_prerequisites.py -v
+rtk proxy python -X utf8 -m unittest discover -s scripts/release -p test_sdk_recovery.py -v
 rtk proxy python -X utf8 -m py_compile scripts/release/candidate.py scripts/release/create_draft.py scripts/release/freeze_draft_source.py scripts/release/test_candidate.py
 ```
 
 离线测试使用真实冻结源码归档与明确合成的库字节，运行真实临时 tar 写入、sidecar、汇总和 SDK 输入派生。
 Windows 另外实际运行临时目录内的 PowerShell Rust demo 打包器。测试不运行 Cargo、不触发远端工作流、不写 release、
-不执行 `cargo publish`、不提交或推送 Git。远端五平台真实构建与草稿 API 尚需单独授权执行；离线通过不能代替它们。
+不执行 `cargo publish`、不提交或推送 Git。远端五平台真实构建与草稿 API 属于单独发布阶段；离线通过不能代替它们。

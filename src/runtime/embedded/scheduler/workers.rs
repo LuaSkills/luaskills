@@ -22,7 +22,10 @@ fn take_call(state: &mut SchedulerState, plugin: &str, index: usize) -> Schedule
         .queues
         .get_mut(plugin)
         .expect("selected plugin queue exists");
-    let call = queue.remove(index).expect("selected request exists");
+    let mut call = queue.remove(index).expect("selected request exists");
+    if let Some(diagnostics) = &mut call.diagnostics {
+        diagnostics.dequeued();
+    }
     if queue.is_empty() {
         state.queues.remove(plugin);
         state.rotation.retain(|candidate| candidate != plugin);
@@ -212,21 +215,33 @@ fn invoke(
     mut lease: ModuleLease,
     max_value_bytes: usize,
 ) -> PendingCompletion {
+    // Emit only after dispatch released the original scheduler lock.
+    // 仅在分发释放原调度器锁之后发送。
+    if let Some(diagnostics) = &mut call.diagnostics {
+        diagnostics.emit_queue();
+    }
     // Execution keeps the exact leased VM and original control across initialization and host calls.
     // 执行在初始化与宿主调用之间保留精确租借 VM 与原始控制。
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         call.owner.advance(OperationPhase::Initializing)?;
-        lease.initialize_for_session(Arc::clone(&call.control), call.request.session_id())?;
+        lease.initialize_with_diagnostics(
+            Arc::clone(&call.control),
+            call.request.session_id(),
+            call.diagnostics.as_ref(),
+        )?;
         if let Some(request) = call.request.invocation() {
             call.owner.advance(OperationPhase::Running)?;
-            lease.invoke(ModuleInvocation {
-                operation_id: &call.id,
-                session_id: call.request.session_id(),
-                export: &request.export,
-                arguments: &request.arguments,
-                context: &request.context,
-                control: Arc::clone(&call.control),
-            })
+            lease.invoke_with_diagnostics(
+                ModuleInvocation {
+                    operation_id: &call.id,
+                    session_id: call.request.session_id(),
+                    export: &request.export,
+                    arguments: &request.arguments,
+                    context: &request.context,
+                    control: Arc::clone(&call.control),
+                },
+                call.diagnostics.as_ref(),
+            )
         } else if matches!(call.request, ScheduledRequest::Prewarm(_)) {
             Ok(serde_json::json!({ "instance_id": lease.instance_id()? }))
         } else {
@@ -333,19 +348,26 @@ pub(super) fn execute(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
                 invoke(call, *lease, center.pools.config().max_value_bytes),
                 true,
             ),
-            Dispatch::Rejected(call, error) => (
-                PendingCompletion {
-                    finalization: None,
-                    retained_lease: None,
-                    call,
-                    result: Err(error),
-                    retirement: None,
-                    effects: EffectState::NotStarted,
-                    dispatched: false,
-                    cleaning_started: false,
-                },
-                true,
-            ),
+            Dispatch::Rejected(mut call, error) => {
+                // Rejection has no allocated VM; preserve that absence in queue evidence.
+                // 拒绝没有已分配 VM；在队列证据中保留该缺失。
+                if let Some(diagnostics) = &mut call.diagnostics {
+                    diagnostics.emit_queue();
+                }
+                (
+                    PendingCompletion {
+                        finalization: None,
+                        retained_lease: None,
+                        call,
+                        result: Err(error),
+                        retirement: None,
+                        effects: EffectState::NotStarted,
+                        dispatched: false,
+                        cleaning_started: false,
+                    },
+                    true,
+                )
+            }
             Dispatch::Finalizing(completion) => (
                 finalization::execute(*completion, center.pools.config().max_value_bytes),
                 false,
@@ -458,10 +480,34 @@ fn reject_expired(state: &mut SchedulerState) {
 /// Finalize ready cleanup evidence without releasing still-owned VM or host callback state.
 /// 完成就绪清理证据，且不释放仍被拥有的 VM 或宿主回调状态。
 fn complete(
-    center: &SchedulerCenter,
+    center: &Arc<SchedulerCenter>,
     mut completion: PendingCompletion,
 ) -> Option<PendingCompletion> {
+    // Expired queued calls bypass executors; emit their exact queue interval before taking metadata locks.
+    // 过期排队调用绕过执行器；获取元数据锁前发送其精确队列区间。
+    if let Some(diagnostics) = &mut completion.call.diagnostics {
+        diagnostics.emit_queue();
+    }
     loop {
+        if let Some(retirement) = &completion.retirement {
+            // The receipt must not keep a runtime alive, and registration must occur outside scheduler metadata.
+            // 回执不能使运行时持续存活，登记必须在调度元数据之外进行。
+            let observer = Arc::downgrade(center);
+            if let Err(error) = retirement.wake_on_completion(Arc::new(move || {
+                if let Some(center) = observer.upgrade() {
+                    // Pair notification with the original wait mutex after receipt publication has released its lock.
+                    // 在回执发布释放自身锁后，将通知配对原等待互斥锁。
+                    let _state = center
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    center.changed.notify_all();
+                }
+            })) {
+                center.fail(error);
+                return Some(completion);
+            }
+        }
         // Completion preparation serializes with close requests; no filesystem work occurs under metadata.
         // 完成准备与关闭请求串行化；元数据锁下不执行文件系统工作。
         let mut state = match center.lock() {
@@ -611,7 +657,11 @@ fn complete(
                 Ok(snapshot) if snapshot.phase != ModuleRetirementPhase::Completed => {
                     return Some(completion);
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    // Consume only the proven physical barrier; a later pending or failed terminal write remains owned.
+                    // 仅消费已证明物理屏障；后续待完成或失败的终态写仍具有归属。
+                    completion.retirement.take();
+                }
                 Err(error) => {
                     drop(state);
                     center.fail(error);
@@ -667,11 +717,16 @@ fn complete(
             .owner
             .pending_completion()
             .and_then(|snapshot| snapshot.error.clone());
-        if let Err(error) = completion.call.owner.publish_completion() {
-            drop(state);
-            center.fail(error);
-            return Some(completion);
-        }
+        // Retain notification until terminal publication and original resource accounting finish atomically.
+        // 保留通知，直至终态发布及原始资源记账原子完成。
+        let terminal_notification = match completion.call.owner.publish_completion() {
+            Ok(notification) => notification,
+            Err(error) => {
+                drop(state);
+                center.fail(error);
+                return Some(completion);
+            }
+        };
         state.persistence_failures.remove(&completion.call.id);
         state.live.remove(&completion.call.id);
         state.cleaning_count -= 1;
@@ -726,8 +781,33 @@ fn complete(
             }
         }
         center.changed.notify_all();
+        // Wakers may synchronously query the real scheduler, so release its original metadata lock first.
+        // 唤醒器可能同步查询真实调度器，因此先释放原始元数据锁。
+        drop(state);
+        terminal_notification.notify();
         return None;
     }
+}
+
+/// Inspect `state` under its original wait mutex; return true only for a newly consumable real retirement barrier.
+/// 在 state 原等待互斥锁下检查；仅对新可消费真实退役屏障返回真。
+/// Pending storage or explicit recovery keeps its existing budget instead of spinning on a completed receipt.
+/// 待完成存储或明确恢复保持既有预算，不围绕已完成回执忙循环。
+fn retirement_ready(state: &SchedulerState) -> EmbeddedResult<bool> {
+    for completion in &state.cleaning {
+        if !completion.cleaning_started
+            || completion.finalization.is_some()
+            || state.persistence_failures.contains_key(&completion.call.id)
+        {
+            continue;
+        }
+        if let Some(retirement) = &completion.retirement
+            && retirement.snapshot()?.phase == ModuleRetirementPhase::Completed
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Supervise cancellation and completion while every executor may be blocked in host callbacks.
@@ -748,6 +828,9 @@ pub(super) fn supervise(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
             .filter_map(|completion| complete(center, completion))
             .collect::<Vec<_>>();
         let mut state = center.lock()?;
+        // The unique container now contains only worker arrivals not examined in this supervision pass.
+        // 此时唯一容器仅包含本轮监督尚未检查的工作线程新到达记录。
+        let arrived = !state.cleaning.is_empty();
         state.cleaning.extend(pending);
         if state.closing
             && state.live.is_empty()
@@ -760,6 +843,11 @@ pub(super) fn supervise(center: &Arc<SchedulerCenter>) -> EmbeddedResult<()> {
                 return Ok(());
             }
             state = center.lock()?;
+        }
+        // Re-read the original unconsumed barriers before sleeping, serialized with completion notification.
+        // 入睡之前重读原未消费屏障，与完成通知串行化。
+        if arrived || retirement_ready(&state)? {
+            continue;
         }
         center.changed.notify_all();
         let _ = center

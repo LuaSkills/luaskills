@@ -147,7 +147,7 @@ Rust hosts can depend on the crate directly:
 
 ```toml
 [dependencies]
-luaskills = "0.5.9"
+luaskills = "0.6.0"
 ```
 
 Repository development uses the normal Rust workflow:
@@ -250,24 +250,24 @@ examples/
 
 ## Ecosystem Release Order
 
-For one unified ecosystem release such as `0.5.5`, publish in this order:
+This source targets the `0.6.0` release line. Publication and artifact verification follow the [release workflow](scripts/release/README.md), in this order:
 
-1. Release `LuaSkills/luaskills-packages` first so `lua-runtime-packages-*` and `lua-deps-*` already exist for the new compatible series.
-2. Release `LuaSkills/luaskills` next, including the crate version plus the main-repo `luaskills-ffi-sdk-*` and demo assets under tag `v0.5.5`.
-3. Publish the TypeScript SDK `@luaskills/sdk@0.5.5`.
-4. Publish the Python SDK `luaskills-sdk==0.5.5`.
-5. Publish the Go SDK module tag `v0.5.5`.
-6. Run the **Examples Release** workflow for each SDK only after its package or module tag is already visible upstream.
+1. Verify that the declared compatible `LuaSkills/luaskills-packages` runtime and dependency assets already exist; publish that repository first only when changing its compatible series.
+2. Complete local validation, then build and verify the five-platform Core GitHub candidate, including `luaskills-ffi-sdk-*` and demo assets, before publishing the `v0.6.0` GitHub release.
+3. Publish the `luaskills` crate at `0.6.0` only after the Core GitHub release and its complete assets pass verification.
+4. Publish the TypeScript SDK `@luaskills/sdk@0.6.0` and Python SDK `luaskills-sdk==0.6.0` after verifying the Core release and crate prerequisites; complete each SDK's formal candidate/completion chain and cold registry consumer verification.
+5. Publish the Go SDK module tag `v0.6.0` only after both TypeScript and Python formal publication chains pass the Go prerequisite checks.
+6. Run the **Examples Release** workflow for each SDK only after its successful SDK completion chain is verified and its package or module tag is visible upstream.
 
 This order keeps every installer and examples workflow pointed at already-published packages assets, core assets, and SDK packages.
 
-## Current Version Matrix
+## Source and Release Line Matrix
 
-| Component | Current version |
+| Component | Declared source or release line |
 | --- | --- |
-| LuaSkills core | `0.5.9` |
-| Latest packaged FFI SDK | `0.5.7` |
-| TypeScript, Python, and Go SDK line | `0.5.5` |
+| LuaSkills core | `0.6.0` |
+| Packaged FFI SDK release line | `0.6.0` |
+| TypeScript, Python, and Go SDK line | `0.6.0` |
 | Lua runtime packages compatible series | `0.1` |
 | Managed Python / uv | `3.14.6` / `0.11.28` |
 | Managed Node.js / pnpm | `24.18.0` / `11.11.0` |

@@ -1,6 +1,6 @@
 use super::{EmbeddedError, EmbeddedErrorCode, EmbeddedResult};
 use serde::Serialize;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Observable stages of one exact VM lifetime, independent of pool-wide usage.
@@ -52,6 +52,9 @@ struct RetirementEvidence {
     /// Notification of lifecycle changes, paired only with the snapshot mutex.
     /// 生命周期变更通知，仅配合快照互斥锁使用。
     changed: Condvar,
+    /// One internal completion signal; its original scheduler registration captures only weak ownership.
+    /// 单个内部完成信号；其原调度器登记仅捕获弱所有权。
+    completion_wake: OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Read-only completion receipt for one VM; cloning does not retain executable ownership.
@@ -76,6 +79,7 @@ impl ModuleRetirement {
                     last_error_code: None,
                 }),
                 changed: Condvar::new(),
+                completion_wake: OnceLock::new(),
             }),
         }
     }
@@ -84,6 +88,25 @@ impl ModuleRetirement {
     /// 返回当前精确实例快照，明确报告元数据中毒。
     pub fn snapshot(&self) -> EmbeddedResult<ModuleRetirementSnapshot> {
         Ok(self.lock()?.clone())
+    }
+
+    /// Register the original observer's `wake` once, including completion before registration; return metadata failures.
+    /// 精确一次登记原观察者的 wake，包含登记前完成；返回元数据故障。
+    /// Invoke only after releasing receipt metadata; notification grants no execution or resource-release authority.
+    /// 仅在释放回执元数据之后调用；通知不授予执行或资源释放权威。
+    pub(super) fn wake_on_completion(
+        &self,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> EmbeddedResult<()> {
+        if self.evidence.completion_wake.set(Arc::clone(&wake)).is_ok() {
+            // Re-read real evidence after registration to close the publish-before-registration window.
+            // 登记之后重读真实证据，闭合发布先于登记的窗口。
+            let completed = self.snapshot()?.phase == ModuleRetirementPhase::Completed;
+            if completed {
+                wake();
+            }
+        }
+        Ok(())
     }
 
     /// Wait up to `timeout` for actual completion and return the current snapshot.
@@ -136,6 +159,14 @@ impl ModuleRetirement {
         }
         snapshot.phase = phase;
         self.evidence.changed.notify_all();
+        // Scheduler observation takes its own metadata before this receipt; never invert that lock order.
+        // 调度观察先取得自身元数据再取得此回执；绝不反转该锁序。
+        drop(snapshot);
+        if phase == ModuleRetirementPhase::Completed
+            && let Some(wake) = self.evidence.completion_wake.get()
+        {
+            wake();
+        }
     }
 
     /// Acquire the receipt's metadata without inferring progress after poisoning.
@@ -206,3 +237,8 @@ impl std::error::Error for ModuleAcquireFailure {
         Some(&self.error)
     }
 }
+
+// Verify internal notification ordering separately from the existing real VM cleanup regressions.
+// 与既有真实 VM 清理回归分开验证内部通知顺序。
+#[cfg(test)]
+mod tests;

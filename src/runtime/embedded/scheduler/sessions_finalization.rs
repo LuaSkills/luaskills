@@ -82,6 +82,7 @@ pub(super) fn schedule(
         retained_lease: None,
         cleaning_started: false,
         call: ScheduledCall {
+            diagnostics: None,
             reusable_instance: None,
             id,
             owner,
