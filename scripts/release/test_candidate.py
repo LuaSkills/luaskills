@@ -35,8 +35,8 @@ class CandidateTests(unittest.TestCase):
         # Root is the current repository, used only for read-only source evidence.
         # 根是当前仓库，仅用于只读源码证据。
         cls.root = Path(__file__).resolve().parents[2]
-        # Commit identifies the real source archive; tests never create commits or publish artifacts.
-        # 提交标识真实源码归档；测试绝不创建提交或发布产物。
+        # Commit identifies the real source archive; workflow-history tests create commits only in disposable repositories.
+        # 提交标识真实源码归档；工作流历史测试仅在可丢弃仓库中创建提交。
         cls.commit = candidate.git(cls.root, "rev-parse", "HEAD").decode().strip()
         # Archive is the exact committed source snapshot rather than a dirty-worktree SHA claim.
         # 归档是精确已提交源码快照，而非脏工作树的 SHA 声明。
@@ -429,6 +429,72 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(candidate.tomllib.loads(files["Cargo.toml"].decode("utf-8-sig"))["dependencies"]["luaskills"], {"git": "https://github.com/LuaSkills/luaskills.git", "rev": self.commit})
         self.assertEqual(json.loads(files["demo-manifest.json"])["release_tag"], f"v{self.version}")
 
+    def isolated_workflow_history(self):
+        """Create disposable real source/equal/changed Git commits; return the advancing equal and changed default SHAs.
+        创建可丢弃的真实源码、同树及异树 Git 提交；返回前进的同树及异树默认提交 SHA。
+
+        No arguments are required; replace only this test's root, commit and source archive with the isolated source snapshot.
+        无需参数；仅将当前测试的根目录、提交及源码归档替换为隔离源码快照。
+        """
+        # Root is owned by setUp's cleanup, with no shared Git objects, refs, index or checkout mutations.
+        # 根目录由 setUp 的清理逻辑拥有，不共享 Git 对象、引用或索引，也不修改原检出。
+        self.root = self.base / "workflow-history"
+        self.root.mkdir()
+        with tarfile.open(fileobj=io.BytesIO(self.source), mode="r:gz") as archive:
+            archive.extractall(self.root, filter="data")
+
+        def fixture_git(*arguments):
+            """Run explicit Git arguments only in the fixture; return stdout, propagating failures without global configuration changes.
+            仅在夹具内运行显式 Git 参数；返回标准输出并传播失败，不修改全局配置。
+
+            Arguments are Git subcommand tokens; invocation-local identity and byte preservation make commits independent of user settings.
+            参数是 Git 子命令词元；仅当前调用使用的身份及字节保留配置使提交不依赖用户设置。
+            """
+            return subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Release history fixture", "-c", "user.email=release-fixture@example.invalid", "-c", "core.autocrlf=false", *arguments], check=True, capture_output=True).stdout
+
+        def snapshot(message, parent=None):
+            """Commit the fixture's complete staged tree; return its real immutable SHA with the optional explicit parent.
+            提交夹具完整暂存树；返回带有可选显式父提交的真实不可变 SHA。
+
+            Message describes the snapshot; parent is a fixture SHA or None for the isolated root commit.
+            message 描述快照；parent 是夹具 SHA，隔离根提交时为 None。
+            """
+            fixture_git("add", "--force", "--all")
+            # Tree is written from fixture bytes; commit-tree bypasses hooks and publication without mocking Git.
+            # 树从夹具字节写入；commit-tree 绕过钩子及发布，无需模拟 Git。
+            tree = fixture_git("write-tree").decode().strip()
+            return fixture_git("commit-tree", tree, "-m", message, *(["-p", parent] if parent is not None else [])).decode().strip()
+
+        fixture_git("init", "--template=", "--object-format=sha1")
+        self.commit = snapshot("Frozen release source fixture")
+        # Advance changes only a non-workflow file, proving a distinct commit with identical workflow objects.
+        # 前进仅改变非工作流文件，证明不同提交具有相同工作流对象。
+        advance = self.root / "release-history-fixture.txt"
+        self.assertFalse(advance.exists(), "Release history fixture path must remain distinct from source files")
+        advance.write_bytes(b"Explicit default-branch advance fixture\n")
+        # EqualCommit is a real descendant of the frozen source, with a distinct root tree.
+        # EqualCommit 是冻结源码的真实后代，具有不同根树。
+        equal_commit = snapshot("Default advances without workflow changes", self.commit)
+        # Workflow is an explicit extra fixture file, so existing production workflow bytes remain untouched.
+        # Workflow 是显式额外夹具文件，因此现有生产工作流字节保持原样。
+        workflow = self.root / ".github/workflows/release-history-fixture.yml"
+        self.assertFalse(workflow.exists(), "Workflow fixture path must remain distinct from source workflows")
+        workflow.write_bytes(b"name: Explicit changed workflow fixture\n")
+        # ChangedCommit advances again while changing the actual workflow tree object.
+        # ChangedCommit 再次前进，并改变实际工作流树对象。
+        changed_commit = snapshot("Default advances with workflow changes", equal_commit)
+        fixture_git("update-ref", "HEAD", self.commit)
+        self.source = gzip.compress(candidate.git(self.root, "archive", "--format=tar", self.commit), mtime=0)
+        # Validate ancestry and immutable tree identity before exercising the production evidence gate.
+        # 在运行生产证据门禁前，验证祖先关系及不可变树身份。
+        fixture_git("merge-base", "--is-ancestor", self.commit, equal_commit)
+        fixture_git("merge-base", "--is-ancestor", equal_commit, changed_commit)
+        self.assertNotEqual(self.commit, equal_commit)
+        self.assertNotEqual(candidate.git(self.root, "rev-parse", f"{self.commit}^{{tree}}"), candidate.git(self.root, "rev-parse", f"{equal_commit}^{{tree}}"))
+        self.assertEqual(candidate.git(self.root, "rev-parse", f"{self.commit}:.github/workflows"), candidate.git(self.root, "rev-parse", f"{equal_commit}:.github/workflows"))
+        self.assertNotEqual(candidate.git(self.root, "rev-parse", f"{self.commit}:.github/workflows"), candidate.git(self.root, "rev-parse", f"{changed_commit}:.github/workflows"))
+        return equal_commit, changed_commit
+
     def actual_default_api(self, default_commit):
         """Model authenticated GitHub responses from real local immutable Git objects; return the read-only API fixture.
         使用真实本地不可变 Git 对象模拟认证 GitHub 响应；返回只读 API 夹具。
@@ -496,20 +562,13 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(create_draft.verify_frozen_source_evidence(evidence, self.root, self.commit, "Fixture/luaskills"), evidence["source_workflows_tree"])
 
     def test_draft_source_rejects_real_different_git_trees(self):
-        """Compare real historical workflow Git trees and reject a source/default mismatch without any POST.
-        比较真实历史工作流 Git 树，并拒绝源码与默认分支差异，不执行任何 POST。
+        """Compare isolated real workflow Git trees and reject a source/default mismatch without any POST.
+        比较隔离的真实工作流 Git 树，并拒绝源码与默认分支差异，不执行任何 POST。
         """
-        # CurrentTree belongs to the actual source commit used by this candidate fixture.
-        # CurrentTree 属于此候选夹具使用的实际源码提交。
-        current_tree = create_draft.source_workflows_tree(self.root, self.commit)
-        # History consists only of real existing commits; the test creates no commits or refs.
-        # 历史仅由真实已有提交组成；测试不创建提交或引用。
-        history = candidate.git(self.root, "log", "-n", "20", "--format=%H", "--", ".github/workflows").decode().splitlines()
-        # Different commits are selected by exact tree identity rather than an evolving historical index.
-        # 不同提交按精确树身份选择，不依赖会变化的历史下标。
-        different = [commit for commit in history if candidate.git(self.root, "rev-parse", f"{commit}:.github/workflows").decode().strip() != current_tree]
-        self.assertTrue(different, "Expected real workflow-tree history may be absent in a shallow checkout")
-        with patch.object(create_draft, "request", side_effect=self.actual_default_api(different[0])) as request:
+        # ChangedCommit comes from an isolated real descendant with a verified different workflow tree.
+        # ChangedCommit 来自隔离的真实后代，具有已验证的不同工作流树。
+        _, changed_commit = self.isolated_workflow_history()
+        with patch.object(create_draft, "request", side_effect=self.actual_default_api(changed_commit)) as request:
             with self.assertRaisesRegex(ValueError, "merge workflow changes first"):
                 create_draft.draft_source_evidence(self.root, self.commit, "Fixture/luaskills", "https://fixture.invalid", "fixture-token")
             self.assertTrue(all(len(call.args) < 3 or call.args[2] == "GET" for call in request.call_args_list))
@@ -587,18 +646,13 @@ class CandidateTests(unittest.TestCase):
         """Accept real default commit advancement only after equal workflows are re-read, and preserve both observed snapshots.
         仅在重读确认工作流相同时接受真实默认提交前进，并保留两个观察快照。
         """
+        # EqualCommit is a real advancing default commit with the same immutable workflow tree as the source.
+        # EqualCommit 是真实前进的默认提交，其不可变工作流树与源码相同。
+        equal_commit, _ = self.isolated_workflow_history()
         candidate.aggregate(self.all_platforms())
-        # CurrentTree and history come from actual Git objects without creating source or default commits.
-        # CurrentTree 及历史来自实际 Git 对象，不创建源码或默认提交。
-        current_tree = create_draft.source_workflows_tree(self.root, self.commit)
-        history = candidate.git(self.root, "log", "-n", "20", "--format=%H").decode().splitlines()
-        # Older candidates are selected by workflow tree equality rather than a fixed historical position.
-        # 更早候选按工作流树相同选择，不依赖固定历史位置。
-        older = [commit for commit in history if commit != self.commit and candidate.git(self.root, "rev-parse", f"{commit}:.github/workflows").decode().strip() == current_tree]
-        self.assertTrue(older, "Expected equal-workflow Git history may be absent in a shallow checkout")
-        with patch.object(create_draft, "request", side_effect=self.actual_default_api(older[0])):
-            # FrozenEvidence records the actual older default SHA reached during source freeze.
-            # FrozenEvidence 记录源码冻结时到达的实际较早默认 SHA。
+        with patch.object(create_draft, "request", side_effect=self.actual_default_api(self.commit)):
+            # FrozenEvidence records the isolated source commit before the real default advancement.
+            # FrozenEvidence 记录真实默认分支前进之前的隔离源码提交。
             frozen_evidence = create_draft.draft_source_evidence(self.root, self.commit, "Fixture/luaskills", "https://fixture.invalid", "fixture-token")
         # Evidence path contains the older snapshot and remains unchanged by live revalidation.
         # 证据路径包含较早快照，并在实时复核中保持不变。
@@ -606,7 +660,7 @@ class CandidateTests(unittest.TestCase):
         evidence.write_bytes(candidate.encode(frozen_evidence))
         # LiveApi serves real newer default commit objects for the final pre-POST permission gate.
         # LiveApi 为最终 POST 前权限门禁提供真实较新默认提交对象。
-        live_api = self.actual_default_api(self.commit)
+        live_api = self.actual_default_api(equal_commit)
 
         def publication_fixture(url, token, method="GET", content=None, content_type="application/json"):
             """Model a permitted draft creation and uploads entirely offline after authenticated default-tree revalidation.
@@ -639,7 +693,7 @@ class CandidateTests(unittest.TestCase):
         # CurrentEvidence retains the actual new default SHA and equal workflow tree, independently from the frozen snapshot.
         # CurrentEvidence 保留实际新默认 SHA 及相同工作流树，与冻结快照独立。
         current_evidence = candidate.read_json(self.output / "draft-source-current-evidence.json")
-        self.assertEqual(current_evidence["default_commit"], self.commit)
+        self.assertEqual(current_evidence["default_commit"], equal_commit)
         self.assertNotEqual(current_evidence["default_commit"], frozen_evidence["default_commit"])
         self.assertEqual(current_evidence["default_workflows_tree"], frozen_evidence["source_workflows_tree"])
 
@@ -647,22 +701,17 @@ class CandidateTests(unittest.TestCase):
         """Reject real changed default workflow trees after freeze even when tag/ref/listing report no conflicts.
         即使标签、引用及列表均无冲突，也在冻结后拒绝实际变化的默认工作流树。
         """
+        # ChangedCommit is a real advancing default commit with different immutable workflow objects.
+        # ChangedCommit 是真实前进的默认提交，具有不同不可变工作流对象。
+        _, changed_commit = self.isolated_workflow_history()
         candidate.aggregate(self.all_platforms())
         # Evidence is the accepted matching tree snapshot before the modeled long-running platform build.
         # 证据是模拟长时间平台构建前已接受的匹配树快照。
         evidence = self.base / "draft-source-evidence.json"
         evidence.write_bytes(candidate.encode(self.frozen_default_evidence()))
-        # History provides a real different workflows tree for the modeled current default branch state.
-        # 历史为模拟的当前默认分支状态提供真实不同工作流树。
-        current_tree = create_draft.source_workflows_tree(self.root, self.commit)
-        history = candidate.git(self.root, "log", "-n", "20", "--format=%H", "--", ".github/workflows").decode().splitlines()
-        # Changed candidates are identified by tree content, avoiding fixed historical indices.
-        # 变化候选按树内容标识，避免固定历史下标。
-        changed = [commit for commit in history if candidate.git(self.root, "rev-parse", f"{commit}:.github/workflows").decode().strip() != current_tree]
-        self.assertTrue(changed, "Expected changed-workflow Git history may be absent in a shallow checkout")
-        # LiveApi reaches actual changed tree objects through the actual historical commit root.
-        # LiveApi 通过实际历史提交根到达实际变化树对象。
-        live_api = self.actual_default_api(changed[0])
+        # LiveApi reaches actual changed tree objects through the isolated advancing commit root.
+        # LiveApi 通过隔离前进提交根到达实际变化树对象。
+        live_api = self.actual_default_api(changed_commit)
 
         def failure_fixture(url, token, method="GET", content=None, content_type="application/json"):
             """Allow only read-only absence and current-source checks; any POST is a test failure.
