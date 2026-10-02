@@ -30,7 +30,11 @@ impl Directory {
         // 仅此新创建目录可由夹具清理。
         let path = std::env::temp_dir().join(format!("luaskills-ffi-history-{name}"));
         std::fs::create_dir(&path).unwrap();
-        Self(path)
+        // Retain the sole cleanup owner before resolving symlinked temporary parents for SQLite NOFOLLOW.
+        // 在为 SQLite NOFOLLOW 解析含符号链接的临时父目录前，保留唯一清理所有者。
+        let mut owner = Self(path);
+        owner.0 = std::fs::canonicalize(&owner.0).unwrap();
+        owner
     }
 
     /// Return complete explicit wire budgets and a host-owned absolute database path.

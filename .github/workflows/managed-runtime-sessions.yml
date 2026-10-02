@@ -214,6 +214,12 @@ jobs:
         shell: pwsh
         run: cargo clippy --locked --all-targets --features contract-generation -j 4 -- -D warnings
 
+      # Capture actual temporary paths and SQLite NOFOLLOW errors on native runners before the complete acceptance suite.
+      # 在完整验收前，于原生运行器记录真实临时路径及 SQLite NOFOLLOW 错误。
+      - name: Capture native journal path-policy evidence
+        shell: pwsh
+        run: cargo test --locked --features contract-generation --lib embedded_journal_ -j 4 -- --test-threads=1 --nocapture
+
       - name: Verify embedded contract against actual native execution
         shell: pwsh
         run: cargo test --locked --features contract-generation --lib embedded_ -j 4 -- --test-threads=1

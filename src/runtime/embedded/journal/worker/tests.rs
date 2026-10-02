@@ -70,7 +70,11 @@ impl Directory {
         // 此夹具只删除实际创建的精确目录。
         let directory = std::env::temp_dir().join(format!("luaskills-writer-{name}"));
         std::fs::create_dir(&directory).unwrap();
-        Self(directory)
+        // Retain the sole cleanup owner before resolving symlinked temporary parents for SQLite NOFOLLOW.
+        // 在为 SQLite NOFOLLOW 解析含符号链接的临时父目录前，保留唯一清理所有者。
+        let mut owner = Self(directory);
+        owner.0 = std::fs::canonicalize(&owner.0).unwrap();
+        owner
     }
 
     /// Open this fixture's database with enough disk capacity to isolate writer admission tests.

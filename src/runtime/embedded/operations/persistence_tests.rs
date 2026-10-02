@@ -26,7 +26,11 @@ impl Directory {
         // 新建而非复用候选目录。
         let path = std::env::temp_dir().join(format!("luaskills-checkpoint-{suffix}"));
         std::fs::create_dir(&path).unwrap();
-        Self(path)
+        // Retain the sole cleanup owner before resolving symlinked temporary parents for SQLite NOFOLLOW.
+        // 在为 SQLite NOFOLLOW 解析含符号链接的临时父目录前，保留唯一清理所有者。
+        let mut owner = Self(path);
+        owner.0 = std::fs::canonicalize(&owner.0).unwrap();
+        owner
     }
 
     /// Open the same exact database using explicit test budgets.

@@ -25,7 +25,11 @@ impl Directory {
             .collect::<String>();
         let path = std::env::temp_dir().join(format!("luaskills-journal-{name}"));
         std::fs::create_dir(&path).unwrap();
-        Self(path)
+        // Retain the sole cleanup owner before resolving symlinked temporary parents for SQLite NOFOLLOW.
+        // 在为 SQLite NOFOLLOW 解析含符号链接的临时父目录前，保留唯一清理所有者。
+        let mut owner = Self(path);
+        owner.0 = std::fs::canonicalize(&owner.0).unwrap();
+        owner
     }
 
     /// Return the database path within this uniquely owned directory.
@@ -53,6 +57,100 @@ fn config() -> OperationJournalConfig {
     }
 }
 
+/// Compare ordinary and NOFOLLOW SQLite opens through an owned parent symlink; verify canonical journal persistence.
+/// 对照经自有父目录符号链接的普通及 NOFOLLOW SQLite 打开；验证规范路径日志持久化。
+/// No arguments are required; assertions retain raw SQLite failure evidence and return no value.
+/// 无需参数；断言保留原始 SQLite 失败证据，无返回值。
+#[cfg(unix)]
+#[test]
+fn embedded_journal_parent_symlink_nofollow_and_canonical_path() {
+    // The sole fixture owner encloses the physical directory, link and every SQLite connection.
+    // 唯一夹具所有者包围物理目录、链接及每个 SQLite 连接。
+    let directory = Directory::new();
+    // Use a real child directory so the test introduces no symlinks into host-owned temporary roots.
+    // 使用真实子目录，使测试不会向宿主拥有的临时根目录引入符号链接。
+    let physical = directory.0.join("physical");
+    std::fs::create_dir(&physical).unwrap();
+    // This parent alias is owned and removed by the fixture, independently of macOS temp-directory aliases.
+    // 此父目录别名由夹具拥有并清理，独立于 macOS 临时目录别名。
+    let alias = directory.0.join("parent-alias");
+    std::os::unix::fs::symlink(&physical, &alias).unwrap();
+    // The rejected and canonical paths identify the same absent database before either open is attempted.
+    // 尝试打开前，被拒路径及规范路径标识同一个尚不存在的数据库。
+    let rejected_path = alias.join("operations.db");
+    // Canonicalize the existing directory only; the database itself must remain absent until accepted creation.
+    // 仅规范化现有目录；数据库本身须保持不存在，直到被接纳后创建。
+    let canonical_path = std::fs::canonicalize(&physical)
+        .unwrap()
+        .join("operations.db");
+    eprintln!(
+        "SQLite path evidence: temp_dir={:?}; canonical_fixture={:?}; parent_symlink={rejected_path:?}; canonical_database={canonical_path:?}",
+        std::env::temp_dir(),
+        directory.0
+    );
+    // Ordinary SQLite opens follow the same parent link, isolating NOFOLLOW from general access failures.
+    // 普通 SQLite 打开跟随同一父链接，将 NOFOLLOW 与一般访问故障隔离。
+    let ordinary = Connection::open(alias.join("ordinary.db")).unwrap();
+    drop(ordinary);
+    assert!(physical.join("ordinary.db").exists());
+    // Match storage::open_controlled's shared flags and its exact new-database read/write/create branch.
+    // 对齐 storage::open_controlled 的共享标志及精确新数据库读写创建分支。
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | rusqlite::OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
+        | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW
+        | rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+    // Preserve the original rusqlite error before the production boundary maps it to an embedded error.
+    // 在生产边界映射为嵌入式错误前，保留原始 rusqlite 错误。
+    let failure = Connection::open_with_flags(&rejected_path, flags).unwrap_err();
+    eprintln!("SQLite NOFOLLOW parent-symlink failure: {failure:?}");
+    // Read the actual extended code from the locked binding rather than infer a cause from generic CANTOPEN.
+    // 从锁定绑定读取实际扩展错误码，不从一般 CANTOPEN 推断原因。
+    let sqlite = failure.sqlite_error().unwrap();
+    assert_eq!(sqlite.code, rusqlite::ErrorCode::CannotOpen);
+    assert_eq!(sqlite.extended_code, rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK);
+    assert!(!canonical_path.exists());
+    assert!(!rejected_path.exists());
+    assert_eq!(
+        OperationJournal::open(&rejected_path, config())
+            .err()
+            .unwrap()
+            .code,
+        EmbeddedErrorCode::Internal
+    );
+    assert!(!canonical_path.exists());
+    // The actual production journal must still create, commit and reopen the same database via its physical parent.
+    // 实际生产日志仍须经物理父目录创建、提交及重新打开同一数据库。
+    let journal = OperationJournal::open(&canonical_path, config()).unwrap();
+    journal.insert("runtime", &snapshot("operation")).unwrap();
+    drop(journal);
+    let reopened = OperationJournal::open(&canonical_path, config()).unwrap();
+    assert_eq!(
+        reopened
+            .get("runtime", "operation")
+            .unwrap()
+            .unwrap()
+            .revision,
+        1
+    );
+    drop(reopened);
+    // A leaf alias also remains invalid; rejecting it cannot modify the canonical committed bytes.
+    // 叶子别名也保持无效；拒绝它不得修改规范路径已提交字节。
+    let leaf_alias = directory.0.join("leaf-alias.db");
+    std::os::unix::fs::symlink(&canonical_path, &leaf_alias).unwrap();
+    // Capture exact persisted bytes before exercising the original regular-file requirement.
+    // 验证原有普通文件要求前，捕获精确持久化字节。
+    let original = std::fs::read(&canonical_path).unwrap();
+    assert_eq!(
+        OperationJournal::open(&leaf_alias, config())
+            .err()
+            .unwrap()
+            .code,
+        EmbeddedErrorCode::InvalidArgument
+    );
+    assert_eq!(std::fs::read(&canonical_path).unwrap(), original);
+}
+
 /// Build an unfinished unknown-effect checkpoint for `id`, without inventing terminal evidence.
 /// 为 `id` 构造尚未结束且副作用未知的检查点，不编造终态证据。
 fn snapshot(id: &str) -> OperationSnapshot {
@@ -74,6 +172,14 @@ fn snapshot(id: &str) -> OperationSnapshot {
 #[test]
 fn embedded_journal_reopen_preserves_null_and_original_identity() {
     let directory = Directory::new();
+    // Retain native path evidence while actual creation and reopen exercise Windows canonical extended paths too.
+    // 保留原生路径证据，同时以真实创建及重新打开也验证 Windows 规范扩展路径。
+    eprintln!(
+        "Journal fixture path evidence: temp_dir={:?}; canonical_directory={:?}; database={:?}",
+        std::env::temp_dir(),
+        directory.0,
+        directory.database()
+    );
     let mut first = snapshot("operation");
     first.phase = OperationPhase::Succeeded;
     first.effects = EffectState::Committed;
