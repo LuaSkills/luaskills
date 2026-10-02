@@ -114,5 +114,6 @@ rtk proxy python -X utf8 -m py_compile scripts/release/candidate.py scripts/rele
 ```
 
 离线测试使用真实冻结源码归档与明确合成的库字节，运行真实临时 tar 写入、sidecar、汇总和 SDK 输入派生。
-Windows 另外实际运行临时目录内的 PowerShell Rust demo 打包器。测试不运行 Cargo、不触发远端工作流、不写 release、
-不执行 `cargo publish`、不提交或推送 Git。远端五平台真实构建与草稿 API 属于单独发布阶段；离线通过不能代替它们。
+Windows 另外实际运行临时目录内的 PowerShell Rust demo 打包器。工作流历史场景在独立临时仓库内创建真实提交并验证祖先及树身份；
+不修改原仓库的引用、索引、配置或源码。测试不运行 Cargo、不触发远端工作流、不写 release、不执行 `cargo publish`，也不推送 Git。
+远端五平台真实构建与草稿 API 属于单独发布阶段；离线通过不能代替它们。
