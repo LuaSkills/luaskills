@@ -290,6 +290,12 @@ fn embedded_scheduler_persistence_initial_failure_retains_cleanup_and_identity()
             .join("unexpected-initialization")
             .exists()
     );
+    // The checkpoint fault is observable before the executor registers cleanup; wait for that separate ownership transition.
+    // 检查点故障可先于执行者登记清理被观测；等待这一独立的所有权转换。
+    until(
+        || runtime.usage().unwrap().cleaning_operations == 1,
+        "failed initialization never retained its scheduler cleanup ownership",
+    );
     assert_eq!(runtime.usage().unwrap().cleaning_operations, 1);
     assert_eq!(
         runtime
