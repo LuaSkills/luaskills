@@ -28,6 +28,13 @@ GitHub 的 `GITHUB_TOKEN` 不能获得工作流写权限；来源提交相对实
 `source_sha` 必须是包含本流程修改的最终完整提交，并与工作流触发提交完全相等；`version` 必须等于该提交的
 `Cargo.toml` 中 `package.version`。脚本不会把当前脏工作树冒充为 HEAD 对应源码。本地功能通过仅证明当前字节；发布候选仍须以实际干净的完整提交及对应构建证据为准。
 
+冻结作业从已核验提交读取完整 `git archive --format=tar` 字节，仅在该作业压缩一次，独占写入
+`target/frozen-source/luaskills-source-<版本>-<完整提交>.tar.gz`；冻结回归通过后上传唯一
+`frozen-core-source-<完整提交>` 产物。全部五个平台下载同一文件，并通过显式源码归档参数交给打包器。
+打包器仍核对实际干净 HEAD、版本及整份 Git tar 字节，验证成功后原样保存传入的压缩字节；缺失、损坏
+或源码不符立即失败，不重新压缩代替。汇总仍要求五个平台的精确压缩 SHA 一致，不仅比较解压文件。
+这是为了避免相同 tar 在不同平台 gzip 实现中产生不同压缩结果；源码身份和压缩分发身份分别核验。
+
 冻结阶段在完整提交及包版本核验通过后，复用既有 Python 环境，依次运行 `test_candidate.py`、
 `test_sdk_prerequisites.py`、`test_sdk_recovery.py` 三个现有离线回归入口；任一失败均使冻结作业失败，
 阻止依赖它的原生验收、候选构建、汇总与草稿创建。脚本与工作流来自同一个已核验完整 SHA。
@@ -49,6 +56,11 @@ rtk proxy powershell -NoProfile -File scripts/build/package_ffi_sdk.ps1 -Platfor
 Unix 包装器采用显式选项：`package_ffi_sdk.sh --platform <平台> --output <目录> --source-commit <完整提交> --version <实际包版本> --build-log <Cargo日志> --metadata <Cargo元数据> --cargo-version <实际Cargo详细版本输出>`。
 PowerShell 的 `-DryRun` 与 Python 的 `--dry-run` 执行相同输入及原生身份检查，只打印清单，不写候选文件。
 PowerShell 5.1 包装器仍可执行，但版本捕获文件必须为 UTF-8 无 BOM，不能直接使用其默认 UTF-16 重定向结果。
+
+正式工作流必须提供冻结归档：PowerShell 增加 `-SourceArchive <冻结归档路径>`，Unix 增加
+`--source-archive <冻结归档路径>`。Python `package --source-archive` 使用相同参数，三者均保持原始
+压缩字节及其摘要。本地单平台调用可省略该可选参数，由本机从真实 Git tar 生成归档；这不证明其他平台
+独立压缩结果一致，也不能替代正式工作流的单次冻结输入。显式提供的路径无效时没有替代生成行为。
 
 Cargo JSON 日志的 `compiler-artifact.manifest_path` 确认根包归属，`build-script-executed.out_dir` 指定唯一报告；不扫描旧构建目录。
 `luaskills_ffi_embedded_describe_v1` 读取实际刚构建库的借用型描述，不创建运行时，不释放该借用缓冲。

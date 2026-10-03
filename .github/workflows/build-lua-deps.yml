@@ -33,6 +33,7 @@ jobs:
     outputs:
       source_sha: ${{ steps.identity.outputs.source_sha }}
       version: ${{ steps.identity.outputs.version }}
+      source_archive: ${{ steps.identity.outputs.source_archive }}
     steps:
       - name: Preserve exact tracked source bytes
         run: git config --global core.autocrlf false
@@ -55,14 +56,17 @@ jobs:
           from pathlib import Path
           import sys
           sys.path.insert(0, "scripts/release")
-          from candidate import source_identity
+          from candidate import source_identity, write_new
           # Commit includes the workflow definition and every candidate script as one frozen source.
           # 提交将工作流定义及每个候选脚本纳入同一冻结源码。
           if os.environ["SOURCE_SHA"] != os.environ["DISPATCH_SHA"]:
               raise SystemExit("Source SHA must equal the workflow dispatch commit")
-          source_identity(Path.cwd(), os.environ["SOURCE_SHA"], os.environ["CORE_VERSION"])
+          # Compress the authoritative Git tar once; every platform must preserve these exact frozen bytes.
+          # 权威 Git tar 只压缩一次；每个平台必须保留这些精确冻结字节。
+          source_archive_name = f"luaskills-source-{os.environ['CORE_VERSION']}-{os.environ['SOURCE_SHA']}.tar.gz"
+          write_new(Path("target/frozen-source") / source_archive_name, source_identity(Path.cwd(), os.environ["SOURCE_SHA"], os.environ["CORE_VERSION"]))
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"source_sha={os.environ['SOURCE_SHA']}\nversion={os.environ['CORE_VERSION']}\n")
+              output.write(f"source_sha={os.environ['SOURCE_SHA']}\nversion={os.environ['CORE_VERSION']}\nsource_archive={source_archive_name}\n")
           PY
       # Offline regressions use the verified source checkout before any candidate build or draft operation.
       # 离线回归在任何候选构建或草稿操作前使用已核验的源码检出。
@@ -72,6 +76,14 @@ jobs:
           python -X utf8 -m unittest discover -s scripts/release -p test_candidate.py -v
           python -X utf8 -m unittest discover -s scripts/release -p test_sdk_prerequisites.py -v
           python -X utf8 -m unittest discover -s scripts/release -p test_sdk_recovery.py -v
+      # One immutable source artifact supplies every native packager after the freeze regressions pass.
+      # 冻结回归通过后，由一份不可变源码产物供全部原生打包器使用。
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frozen-core-source-${{ inputs.source_sha }}
+          path: target/frozen-source/${{ steps.identity.outputs.source_archive }}
+          if-no-files-found: error
+          overwrite: false
       # GITHUB_TOKEN cannot receive workflows-write permission; draft source must match the actual default workflows tree.
       # GITHUB_TOKEN 不能获得工作流写权限；草稿源码必须匹配实际默认工作流树。
       - name: Freeze actual default-branch workflow evidence for draft mode
@@ -118,6 +130,9 @@ jobs:
       # MSVC setup exports PLATFORM=x64; keep the candidate protocol key in a dedicated variable.
       # MSVC 初始化会导出 PLATFORM=x64；候选协议平台键使用独立变量。
       LUASKILLS_CANDIDATE_PLATFORM: ${{ matrix.platform }}
+      # The freeze job owns both the filename and compressed bytes; runners never regenerate this input.
+      # 冻结作业拥有文件名及压缩字节；运行器不重新生成此输入。
+      LUASKILLS_FROZEN_SOURCE_ARCHIVE: target/frozen-source/${{ needs.freeze.outputs.source_archive }}
       RELEASE_PACKAGE_DIR: target/release-packages
     steps:
       - name: Preserve exact tracked source bytes
@@ -130,6 +145,10 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14.6"
+      - uses: actions/download-artifact@v4
+        with:
+          name: frozen-core-source-${{ needs.freeze.outputs.source_sha }}
+          path: target/frozen-source
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.0
@@ -151,7 +170,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          ./scripts/build/package_ffi_sdk.ps1 -Platform $env:LUASKILLS_CANDIDATE_PLATFORM -OutputDir $env:RELEASE_PACKAGE_DIR -SourceCommit $env:SOURCE_SHA -Version $env:CORE_VERSION -BuildLog target/candidate-build.jsonl -Metadata target/candidate-metadata.json -CargoVersion target/candidate-cargo-version.txt
+          ./scripts/build/package_ffi_sdk.ps1 -Platform $env:LUASKILLS_CANDIDATE_PLATFORM -OutputDir $env:RELEASE_PACKAGE_DIR -SourceCommit $env:SOURCE_SHA -SourceArchive $env:LUASKILLS_FROZEN_SOURCE_ARCHIVE -Version $env:CORE_VERSION -BuildLog target/candidate-build.jsonl -Metadata target/candidate-metadata.json -CargoVersion target/candidate-cargo-version.txt
           ./scripts/build/package_demo.ps1 -Mode ffi -Platform $env:LUASKILLS_CANDIDATE_PLATFORM -OutputDir $env:RELEASE_PACKAGE_DIR -ReleaseTag "v$env:CORE_VERSION" -SourceCommit $env:SOURCE_SHA
           ./scripts/build/package_demo.ps1 -Mode rust -Platform $env:LUASKILLS_CANDIDATE_PLATFORM -OutputDir $env:RELEASE_PACKAGE_DIR -ReleaseTag "v$env:CORE_VERSION" -SourceCommit $env:SOURCE_SHA
           ./scripts/build/package_debug_tool.ps1 -Platform $env:LUASKILLS_CANDIDATE_PLATFORM -OutputDir $env:RELEASE_PACKAGE_DIR -ReleaseTag "v$env:CORE_VERSION"
@@ -160,7 +179,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bash scripts/build/package_ffi_sdk.sh --platform "$LUASKILLS_CANDIDATE_PLATFORM" --output "$RELEASE_PACKAGE_DIR" --source-commit "$SOURCE_SHA" --version "$CORE_VERSION" --build-log target/candidate-build.jsonl --metadata target/candidate-metadata.json --cargo-version target/candidate-cargo-version.txt
+          bash scripts/build/package_ffi_sdk.sh --platform "$LUASKILLS_CANDIDATE_PLATFORM" --output "$RELEASE_PACKAGE_DIR" --source-commit "$SOURCE_SHA" --source-archive "$LUASKILLS_FROZEN_SOURCE_ARCHIVE" --version "$CORE_VERSION" --build-log target/candidate-build.jsonl --metadata target/candidate-metadata.json --cargo-version target/candidate-cargo-version.txt
           bash scripts/build/package_demo.sh ffi "$LUASKILLS_CANDIDATE_PLATFORM" "v$CORE_VERSION" "$RELEASE_PACKAGE_DIR" "$SOURCE_SHA"
           bash scripts/build/package_demo.sh rust "$LUASKILLS_CANDIDATE_PLATFORM" "v$CORE_VERSION" "$RELEASE_PACKAGE_DIR" "$SOURCE_SHA"
           bash scripts/build/package_debug_tool.sh "$LUASKILLS_CANDIDATE_PLATFORM" "v$CORE_VERSION" "$RELEASE_PACKAGE_DIR"

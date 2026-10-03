@@ -312,6 +312,126 @@ class CandidateTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Dirty candidates"):
                 candidate.source_identity(self.root, self.commit, self.version)
 
+    def frozen_source_checkout(self):
+        """Create a clean temporary Git checkout with a Cargo version; return root, full commit and exact Git tar.
+        创建具有 Cargo 版本的干净临时 Git 检出；返回根目录、完整提交及精确 Git tar。
+
+        No arguments are required; all repository writes stay inside this test's temporary directory.
+        无需参数；全部仓库写入均限制在此测试的临时目录内。
+        """
+        # Root is isolated from both the dirty development checkout and the supplied archive path.
+        # 根目录与脏开发检出及提供的归档路径均隔离。
+        root = self.base / "frozen-checkout"
+        root.mkdir()
+        (root / "Cargo.toml").write_bytes(f'[package]\nname = "luaskills"\nversion = "{self.version}"\n'.encode())
+        candidate.git(root, "init", "--template=", "--object-format=sha1")
+        candidate.git(root, "-c", "core.autocrlf=false", "add", "Cargo.toml")
+        # Tree and commit are real immutable Git objects; commit-tree avoids user hooks and signing settings.
+        # 树及提交是真实不可变 Git 对象；commit-tree 避免用户钩子及签名设置。
+        tree = candidate.git(root, "write-tree").decode().strip()
+        commit = candidate.git(root, "-c", "user.name=Frozen source fixture", "-c", "user.email=frozen-source@example.invalid", "commit-tree", tree, "-m", "Frozen source fixture").decode().strip()
+        candidate.git(root, "update-ref", "HEAD", commit)
+        return root, commit, candidate.git(root, "archive", "--format=tar", commit)
+
+    def test_source_identity_without_supplied_archive_preserves_local_generation(self):
+        """Use the compatible three-argument call with a real clean checkout; return the locally compressed Git tar.
+        对真实干净检出使用兼容的三参数调用；返回本地压缩的 Git tar。
+        """
+        # Checkout identity and tar bytes come from actual Git commands in the isolated repository.
+        # 检出身份及 tar 字节来自隔离仓库中的实际 Git 命令。
+        root, commit, source_tar = self.frozen_source_checkout()
+        self.assertEqual(candidate.source_identity(root, commit, self.version), gzip.compress(source_tar, mtime=0))
+
+    def test_supplied_source_archive_preserves_different_gzip_representations(self):
+        """Accept different gzip representations of the exact Git tar; return each supplied compressed byte unchanged.
+        接受精确 Git tar 的不同 gzip 表示；返回各提供归档未经改动的压缩字节。
+        """
+        # Archive lives outside the checkout so it cannot make the verified source dirty.
+        # 归档位于检出外，避免使待验证源码变脏。
+        root, commit, source_tar = self.frozen_source_checkout()
+        source_archive = self.base / "frozen-source.tar.gz"
+        # Representations differ in compression level and header timestamp without implementing compression ourselves.
+        # 表示在压缩级别及头部时间戳上不同，不自行实现压缩。
+        representations = (gzip.compress(source_tar, compresslevel=1, mtime=0), gzip.compress(source_tar, compresslevel=9, mtime=17))
+        self.assertNotEqual(*representations)
+        for frozen_source in representations:
+            with self.subTest(sha256=candidate.digest(frozen_source)):
+                source_archive.write_bytes(frozen_source)
+                self.assertEqual(candidate.source_identity(root, commit, self.version, source_archive), frozen_source)
+
+    def test_supplied_source_archive_rejects_other_commit_and_extra_tar_bytes(self):
+        """Reject another real commit's tar and extra tar padding even when tracked file contents are unchanged.
+        即使受跟踪文件内容不变，也拒绝其他真实提交的 tar 及额外 tar 填充。
+        """
+        # Another commit deliberately has the same tree, isolating complete tar identity from file-content equality.
+        # 另一提交刻意具有相同树，使完整 tar 身份与文件内容相等相区分。
+        root, commit, source_tar = self.frozen_source_checkout()
+        tree = candidate.git(root, "rev-parse", f"{commit}^{{tree}}").decode().strip()
+        other_commit = candidate.git(root, "-c", "user.name=Frozen source fixture", "-c", "user.email=frozen-source@example.invalid", "commit-tree", tree, "-m", "Another source fixture", "-p", commit).decode().strip()
+        source_archive = self.base / "wrong-source.tar.gz"
+        # Invalid tars are otherwise valid gzip streams, so only exact Git tar comparison can reject them.
+        # 无效 tar 均是有效 gzip 流，因此只有精确 Git tar 比较能拒绝它们。
+        invalid_tars = (candidate.git(root, "archive", "--format=tar", other_commit), source_tar + b"\0" * 512)
+        for frozen_tar in invalid_tars:
+            with self.subTest(sha256=candidate.digest(frozen_tar)):
+                source_archive.write_bytes(gzip.compress(frozen_tar, mtime=0))
+                with self.assertRaisesRegex(ValueError, "does not match the exact Git tar"):
+                    candidate.source_identity(root, commit, self.version, source_archive)
+
+    def test_supplied_source_archive_rejects_missing_and_corrupt_gzip(self):
+        """Fail for missing, malformed, truncated or damaged gzip inputs; never substitute local compression.
+        对缺失、格式错误、截断或损坏的 gzip 输入失败；绝不替代为本地压缩。
+        """
+        # Supplied path remains explicit even when it is missing or unreadable as gzip.
+        # 即使路径缺失或无法作为 gzip 读取，提供路径仍保持显式。
+        root, commit, source_tar = self.frozen_source_checkout()
+        source_archive = self.base / "invalid-source.tar.gz"
+        with self.assertRaises(FileNotFoundError):
+            candidate.source_identity(root, commit, self.version, source_archive)
+        # Corruptions exercise header, stream length, checksum and deflate validation using standard gzip output.
+        # 损坏情形通过标准 gzip 输出覆盖头部、流长度、校验和及 deflate 验证。
+        frozen_source = gzip.compress(source_tar, mtime=0)
+        corruptions = (b"not gzip", frozen_source[:-8], frozen_source[:-8] + bytes([frozen_source[-8] ^ 1]) + frozen_source[-7:], frozen_source[:10] + b"\xff" + frozen_source[11:])
+        for corrupt_source in corruptions:
+            with self.subTest(sha256=candidate.digest(corrupt_source)):
+                source_archive.write_bytes(corrupt_source)
+                with self.assertRaisesRegex(ValueError, "not a valid gzip"):
+                    candidate.source_identity(root, commit, self.version, source_archive)
+
+    def test_supplied_source_archive_still_requires_complete_checkout_identity(self):
+        """Validate full SHA, HEAD, version and clean status before reading even a missing supplied archive.
+        在读取缺失的提供归档前，仍验证完整 SHA、HEAD、版本及干净状态。
+        """
+        # Missing archive exposes any attempt to skip checkout identity checks.
+        # 缺失归档会暴露任何跳过检出身份检查的尝试。
+        root, commit, source_tar = self.frozen_source_checkout()
+        source_archive = self.base / "missing-source.tar.gz"
+        with self.assertRaisesRegex(ValueError, "full lowercase Git SHA"):
+            candidate.source_identity(root, commit[:12], self.version, source_archive)
+        with self.assertRaisesRegex(ValueError, "Checkout HEAD"):
+            candidate.source_identity(root, "0" * 40, self.version, source_archive)
+        with self.assertRaisesRegex(ValueError, "version does not match"):
+            candidate.source_identity(root, commit, self.version + "-wrong", source_archive)
+        (root / "Cargo.toml").write_bytes(b"dirty source\n")
+        with self.assertRaisesRegex(ValueError, "Dirty candidates"):
+            candidate.source_identity(root, commit, self.version, source_archive)
+
+    def test_package_cli_declares_optional_frozen_source_path(self):
+        """Parse actual package CLI arguments; pass the supplied archive as Path and omission as None to packaging.
+        解析实际 package 命令行参数；将提供归档以 Path、缺省以 None 传递给打包函数。
+        """
+        # Required arguments name explicit fixture evidence; a mocked action isolates parser behavior from native loading.
+        # 必需参数指定显式夹具证据；模拟动作使解析行为与原生加载隔离。
+        arguments = ["candidate.py", "package", "--source-commit", self.commit, "--version", self.version, "--output", str(self.output), "--platform", "windows-x64", "--build-log", "build.jsonl", "--metadata", "metadata.json", "--cargo-version", "cargo-version.txt"]
+        source_archive = self.base / "frozen source.tar.gz"
+        with patch.object(candidate, "package") as package_action:
+            with patch.object(sys, "argv", arguments + ["--source-archive", str(source_archive)]):
+                candidate.main()
+            self.assertEqual(package_action.call_args.args[0].source_archive, source_archive)
+            with patch.object(sys, "argv", arguments):
+                candidate.main()
+            self.assertIsNone(package_action.call_args.args[0].source_archive)
+
     def test_duplicate_json_keys_fail(self):
         """Reject duplicate release fields instead of accepting the last value.
         拒绝重复发布字段，而非接受最后一个值。
@@ -384,10 +504,16 @@ class CandidateTests(unittest.TestCase):
         cargo_version.write_bytes(files[candidate.CARGO_VERSION_EVIDENCE_FILE])
         # Arguments name one explicit source snapshot while the native reader is the only synthetic boundary.
         # 参数命名一个显式源码快照，原生读取器是唯一合成边界。
-        args = argparse.Namespace(root=root, source_commit=self.commit, version=self.version, platform="windows-x64", build_log=log, metadata=metadata, cargo_version=cargo_version, output=self.base / "package", dry_run=True)
+        args = argparse.Namespace(root=root, source_commit=self.commit, source_archive=None, version=self.version, platform="windows-x64", build_log=log, metadata=metadata, cargo_version=cargo_version, output=self.base / "package", dry_run=True)
         with patch.object(candidate, "git", side_effect=lambda directory, *arguments: self.commit.encode() if arguments[0] == "rev-parse" else b"" if arguments[0] == "status" else gzip.decompress(self.source)), patch.object(candidate, "native_description", return_value=files["embedded-core-description.json"]), patch("builtins.print"):
             candidate.package(args)
             self.assertFalse(args.output.exists())
+            # Frozen input deliberately differs from local compression, making any re-compression observable.
+            # 冻结输入刻意与本地压缩不同，使任何重新压缩均可被观察。
+            frozen_source = gzip.compress(gzip.decompress(self.source), compresslevel=1, mtime=0)
+            self.assertNotEqual(frozen_source, self.source)
+            args.source_archive = self.base / "package-frozen-source.tar.gz"
+            args.source_archive.write_bytes(frozen_source)
             args.dry_run = False
             candidate.package(args)
             # Packaged manifest hashes are verified by the real collector, not an implementation-string assertion.
@@ -395,8 +521,11 @@ class CandidateTests(unittest.TestCase):
             packaged = candidate.archive_files(args.output / "luaskills-ffi-sdk-windows-x64.tar.gz")
             self.assertEqual(packaged["embedded-core-description.json"], files["embedded-core-description.json"])
             self.assertEqual(packaged["embedded-build-inputs.json"], files["embedded-build-inputs.json"])
+            self.assertEqual(candidate.decode_json(packaged["ffi-sdk-manifest.json"])["source_archive_sha256"], candidate.digest(frozen_source))
+            self.assertEqual((args.output / f"luaskills-source-{self.version}-{self.commit}.tar.gz").read_bytes(), frozen_source)
             self.write_auxiliary(args.output, "windows-x64", packaged)
             candidate.collect(args)
+            self.assertEqual(candidate.read_json(args.output / "candidate-windows-x64.json")["source_archive"]["sha256"], candidate.digest(frozen_source))
             # Original hashes must remain intact after a rejected packaging overwrite.
             # 打包覆盖被拒绝后，原始摘要必须保持完整。
             original = (args.output / "luaskills-ffi-sdk-windows-x64.tar.gz").read_bytes()

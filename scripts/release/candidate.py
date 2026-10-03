@@ -14,6 +14,7 @@ import re
 import subprocess
 import tarfile
 import tomllib
+import zlib
 
 # These release-only keys are declared here; runtime build fields remain owned by build.rs.
 # 发布专用键仅在此声明；运行时构建字段仍由 build.rs 拥有。
@@ -110,9 +111,16 @@ def git(root, *arguments):
     return subprocess.run(["git", "-C", str(root), *arguments], check=True, capture_output=True).stdout
 
 
-def source_identity(root, commit, version):
-    """Validate clean full commit and package version; return frozen source archive bytes.
-    验证干净的完整提交及包版本；返回冻结源码归档字节。
+def source_identity(root, commit, version, source_archive: Path | None = None):
+    """Validate root's clean full commit and package version; return exact frozen gzip bytes.
+    验证根目录的干净完整提交及包版本；返回精确冻结 gzip 字节。
+
+    Root is the checkout, commit is its full SHA, and version is its Cargo package version.
+    root 是检出目录，commit 是其完整 SHA，version 是其 Cargo 包版本。
+    Source_archive is an optional frozen gzip Path whose complete tar bytes must match Git; None compresses locally.
+    source_archive 是可选冻结 gzip 路径，其完整 tar 字节必须匹配 Git；None 表示在本地压缩。
+    Missing, corrupt or mismatched supplied archives fail without generating replacement bytes.
+    明确提供的归档缺失、损坏或不匹配时失败，不生成替代字节。
     """
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("Source commit must be a full lowercase Git SHA")
@@ -124,9 +132,23 @@ def source_identity(root, commit, version):
     # Cargo 配置始终使用 UTF-8，不依赖 Windows 进程区域编码。
     if tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"] != version:
         raise ValueError("Candidate version does not match Cargo.toml package.version")
-    # git archive preserves tracked input bytes, including lockfile and build identity sources.
-    # git archive 保留受跟踪输入字节，包括锁文件及构建身份源码。
-    return gzip.compress(git(root, "archive", "--format=tar", commit), mtime=0)
+    # Git tar is authoritative for all tracked bytes and member metadata, independently of gzip implementation differences.
+    # Git tar 是全部受跟踪字节及成员元数据的权威，不受 gzip 实现差异影响。
+    source_tar = git(root, "archive", "--format=tar", commit)
+    if source_archive is None:
+        return gzip.compress(source_tar, mtime=0)
+    # Frozen bytes must survive platform packaging unchanged so aggregate can enforce the exact compressed SHA.
+    # 冻结字节必须在平台打包过程中保持不变，使汇总可以强制验证精确压缩 SHA。
+    frozen_source = source_archive.read_bytes()
+    try:
+        # Decoded tar must match the entire Git archive, not only extracted file contents.
+        # 解码 tar 必须匹配整份 Git 归档，而不只是解压后的文件内容。
+        frozen_tar = gzip.decompress(frozen_source)
+    except (OSError, EOFError, zlib.error) as error:
+        raise ValueError(f"Frozen source archive is not a valid gzip: {source_archive}") from error
+    if frozen_tar != source_tar:
+        raise ValueError(f"Frozen source archive does not match the exact Git tar for {commit}: {source_archive}")
+    return frozen_source
 
 
 def source_files(root):
@@ -315,7 +337,7 @@ def package(args):
     root = args.root.resolve()
     # Source archive binds commit identity to exact tracked source bytes.
     # 源码归档将提交身份绑定到精确受跟踪源码字节。
-    source = source_identity(root, args.source_commit, args.version)
+    source = source_identity(root, args.source_commit, args.version, args.source_archive)
     # Names are the platform's complete library set; no arbitrary release-directory glob is used.
     # 名称是平台完整库集合；不使用任意发布目录通配。
     names = PLATFORMS[args.platform][3]
@@ -713,6 +735,7 @@ def main():
             command.add_argument("--platform", choices=PLATFORMS, required=True)
         if name == "package":
             command.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
+            command.add_argument("--source-archive", type=Path, help="Frozen gzip source archive whose complete tar bytes must match the source commit")
             command.add_argument("--build-log", type=Path, required=True)
             command.add_argument("--metadata", type=Path, required=True)
             command.add_argument("--cargo-version", type=Path, required=True)

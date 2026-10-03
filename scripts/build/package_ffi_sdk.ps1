@@ -8,6 +8,9 @@
     # Full frozen Git commit validated against a clean checkout.
     # 对照干净检出验证的完整冻结 Git 提交。
     [Parameter(Mandatory = $true)][string]$SourceCommit,
+    # Optional frozen gzip archive; preserve its exact bytes after validating the complete Git tar.
+    # 可选冻结 gzip 归档；验证完整 Git tar 后保留其精确字节。
+    [string]$SourceArchive,
     # Current Cargo package version, without a tag prefix.
     # 当前 Cargo 包版本，不含标签前缀。
     [Parameter(Mandatory = $true)][string]$Version,
@@ -39,6 +42,9 @@ $CandidateArguments = @(
     "--source-commit", $SourceCommit, "--version", $Version,
     "--build-log", $BuildLog, "--metadata", $Metadata, "--cargo-version", $CargoVersion
 )
+if ($PSBoundParameters.ContainsKey("SourceArchive")) {
+    $CandidateArguments += @("--source-archive", $SourceArchive)
+}
 if ($DryRun) {
     $CandidateArguments += "--dry-run"
 }
