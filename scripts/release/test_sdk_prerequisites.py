@@ -110,7 +110,9 @@ class PublicationHttp(gate.Http):
         if url == f"{gate.REPO_API}/git/trees/{self.owner.github_tree}":
             return Response(candidate.encode({"sha":self.owner.github_tree,"truncated":False,"tree":[{"path":"workflows","type":"tree","sha":self.owner.workflows_tree}]}))
         if url == f"{gate.REPO_API}/zipball/{self.owner.commit}":
-            self.owner.assertEqual(request.get_header("Accept"), "application/octet-stream")
+            # GitHub negotiates the archive redirect as JSON even though the resulting body is ZIP bytes.
+            # GitHub 用 JSON 媒体协商归档重定向，最终正文仍是 ZIP 字节。
+            self.owner.assertEqual(request.get_header("Accept"), "application/json")
             return Response(self.owner.commit_zip)
         for name, asset in self.owner.assets.items():
             if url == asset["url"]:

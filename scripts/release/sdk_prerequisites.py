@@ -289,7 +289,9 @@ def verify_commit_source(http, downloads, commit, source_path):
     """
     # A forged git-archive comment cannot establish source identity by itself.
     # 伪造的 git-archive 注释自身无法建立源码身份。
-    content = http.get(f"{REPO_API}/zipball/{commit}", binary=True)[0]
+    # GitHub requires a JSON-compatible Accept header for this redirect; get still returns exact ZIP bytes.
+    # GitHub 要求此重定向使用兼容 JSON 的 Accept 头；get 仍返回精确 ZIP 字节。
+    content = http.get(f"{REPO_API}/zipball/{commit}")[0]
     with zipfile.ZipFile(io.BytesIO(content)) as archive:
         # GitHub archive root is obtained from actual members; no short-SHA prefix is guessed.
         # GitHub 归档根从实际成员取得；不猜测短 SHA 前缀。

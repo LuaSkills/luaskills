@@ -76,6 +76,28 @@ jobs:
           python -X utf8 -m unittest discover -s scripts/release -p test_candidate.py -v
           python -X utf8 -m unittest discover -s scripts/release -p test_sdk_prerequisites.py -v
           python -X utf8 -m unittest discover -s scripts/release -p test_sdk_recovery.py -v
+      # Exercise the real public source endpoint before native builds, packaging or draft creation.
+      # 在原生构建、打包或草稿创建前验证真实公共源码端点。
+      - name: Verify exact public commit archive before native builds
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_ARCHIVE: ${{ steps.identity.outputs.source_archive }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, "scripts/release")
+          from candidate import encode, write_new
+          from sdk_prerequisites import Http, verify_commit_source
+          # The freeze step owns the exact source archive; the original verifier compares every ZIP member.
+          # 冻结步骤拥有精确源码归档；原校验器比较每个 ZIP 成员。
+          proof_root = Path("target/source-http-proof")
+          proof = verify_commit_source(Http(), proof_root, os.environ["SOURCE_SHA"], Path("target/frozen-source") / os.environ["SOURCE_ARCHIVE"])
+          write_new(proof_root / "source-http-proof.json", encode(proof))
+          print(f"Verified public commit archive source SHA-256: {proof['source_sha256']}")
+          PY
       # One immutable source artifact supplies every native packager after the freeze regressions pass.
       # 冻结回归通过后，由一份不可变源码产物供全部原生打包器使用。
       - uses: actions/upload-artifact@v4

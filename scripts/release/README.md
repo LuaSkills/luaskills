@@ -44,6 +44,14 @@ GitHub 的 `GITHUB_TOKEN` 不能获得工作流写权限；来源提交相对实
 
 ## 构建与打包输入
 
+公开源码核验使用 GitHub 的 `/zipball/<完整提交>`。该入口先按 JSON 媒体协商重定向，
+请求头使用 `application/json`，随后读取返回的精确 ZIP 字节并比较全部源码成员；
+它不接受发布资产下载所用的 `application/octet-stream`。发布资产仍通过精确资产 API
+以 octet-stream 下载。两类请求的媒体规则分别由离线夹具检查；源码归档的规则已以真实
+接口验证，错误媒体返回 HTTP 415。冻结作业在离线回归后、原生构建前，直接使用同一
+生产源码校验器读取当前精确提交的公共 ZIP，与已冻结完整 Git 源码逐成员比较；
+真实接口失败会提前阻止构建及草稿创建。依据：[GitHub 下载仓库 ZIP 接口](https://docs.github.com/en/rest/repos/contents#download-a-repository-archive-zip)。
+
 在固定提交的干净源码中执行；捕获命令使用 PowerShell 7 的 UTF-8 输出，所有输出保持在忽略的 `target/` 下：
 
 ```powershell
