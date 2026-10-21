@@ -1,6 +1,6 @@
 # 宿主指定受管运行时根目录
 
-LuaSkills 0.5.1 将原先统一从 `runtime_root` 派生的三类文件系统授权拆分开：
+LuaSkills 把三类文件系统授权分开，宿主可以分别指定：
 
 - `runtime_root`：LuaSkills 数据、包存储、快照、配置和 System Plugin 状态。
 - `managed_runtime_distribution_root`：只读 Python、Node.js、uv 与 pnpm 安装。
@@ -29,7 +29,7 @@ let engine = LuaEngine::new(LuaEngineOptions::new(pool_config, host_options))?;
 
 配置任意显式受管根时仍必须提供 `runtime_root`。两个显式根都必须是绝对路径。发行根必须已经存在；在受支持平台上，LuaSkills 会安全创建环境根，并固定每个活动根的平台原生文件系统对象身份。
 
-省略新字段时继续使用 0.5.0 布局：
+省略新字段时，受管目录统一从 `runtime_root` 派生：
 
 ```text
 distribution_root = <runtime_root>/dependencies/runtimes
@@ -132,7 +132,7 @@ Rust 描述符会有意保留原生规范 `PathBuf`，供依赖文件对象身�
 
 ## Python、TypeScript 与 Go SDK
 
-三个 0.5.1 SDK 都暴露相同的两个 JSON Host Options 与只读解析器。Python：
+三个语言 SDK 都暴露相同的两个 JSON Host Options 与只读解析器。Python：
 
 ```python
 client = LuaSkillsClient(

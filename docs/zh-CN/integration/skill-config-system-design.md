@@ -231,6 +231,6 @@ If mutation is unavailable, ask the user to provide the listed parameters.
 
 ## 相关入口
 
-- [技能开发指南](../../skill-development.md)
-- [FFI 对接指南](../ffi/integration-guide.md)
+- [技能开发指南](../../development/skill-development.md)
+- [FFI 对接指南](ffi-integration-guide.md)
 - [完整示例](../../../examples/skill-package-config/README.md)

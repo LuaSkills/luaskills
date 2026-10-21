@@ -4,49 +4,29 @@
 
 [Repository README](../README.md) | [Why LuaSkills](product/why-luaskills.md)
 
-This is the English documentation hub for LuaSkills.
-The skill author manual is available in English, while some deep host and FFI references still live in Chinese under `docs/zh-CN`.
+Documentation is grouped by what you are building. Deep host and FFI references are maintained in Chinese and linked where no English edition exists yet.
 
-## Product Overview
+## Choose your path
 
-LuaSkills is a runtime for product-grade Lua skills.
-It lets a host application load, run, manage, and document Lua skill packages while keeping product policy in the host.
-
-Read:
-
-- [Why LuaSkills](product/why-luaskills.md)
-- [Skill development manual](skill-development.md)
-- [FFI and SDK overview](ffi/overview.md)
-- [System Plugin managed runtime guide](system-plugin-managed-runtime.md)
-- [Host-selected managed runtime roots](managed-runtime-host-roots.md)
-- [LuaSkills 0.5.5 package configuration upgrade guide](upgrade-0.5.5.md)
-- [LuaSkills 0.5.4 patch upgrade guide](upgrade-0.5.4.md)
-- [LuaSkills 0.5.3 patch upgrade guide](upgrade-0.5.3.md)
-- [LuaSkills 0.5.2 patch upgrade guide](upgrade-0.5.2.md)
-- [LuaSkills 0.5.1 upgrade guide](upgrade-0.5.1.md)
-- [LuaSkills 0.4.6 upgrade guide](upgrade-0.4.6.md)
-- [LuaSkills 0.5.0 breaking upgrade guide](upgrade-0.5.0.md)
-- [Database provider overview](providers/database-providers.md)
-- [Runtime architecture overview](architecture/runtime-model.md)
-- [Chinese product overview](../README.zh-CN.md)
-- [Chinese technical documentation index](zh-CN/index.md)
-
-## Choose Your Path
-
-| Reader | Start Here |
+| You are | Start here |
 | --- | --- |
-| Product or platform owner | [Why LuaSkills](product/why-luaskills.md) |
-| Lua skill author | [Skill development manual](skill-development.md) |
-| Rust host developer | [Repository README](../README.md#integration-paths) |
-| C ABI or SDK integrator | [FFI and SDK overview](ffi/overview.md) |
-| System Plugin author or managed-session host | [System Plugin managed runtime guide](system-plugin-managed-runtime.md) |
-| Host sharing Python/Node distributions with LuaSkills | [Host-selected managed runtime roots](managed-runtime-host-roots.md) |
-| Deep FFI integrator | [FFI integration guide](zh-CN/ffi/integration-guide.md) |
-| Integrator who needs `runtime_lease`, `system_runtime_lease`, `system_lua_lib`, or `host_result` details | [Chinese FFI integration guide](zh-CN/ffi/integration-guide.md) |
-| Database provider implementer | [Database provider overview](providers/database-providers.md) |
-| Runtime architecture reader | [Runtime architecture overview](architecture/runtime-model.md) |
+| Evaluating LuaSkills | [Why LuaSkills](product/why-luaskills.md) |
+| Writing a Lua skill | [Skill development manual](development/skill-development.md) |
+| Writing a System Plugin or managed Python/Node workflow | [System Plugin managed runtime guide](development/system-plugin-managed-runtime.md) |
+| Embedding LuaSkills in a Rust host | [Runtime architecture](integration/runtime-model.md) |
+| Embedding through the C ABI or JSON FFI | [FFI and integration overview](integration/ffi-overview.md) |
+| Using TypeScript, Python, or Go | [SDK overview](sdk/index.md) |
 
-## Skill Naming Rules
+## Skill development
+
+For skill and System Plugin authors.
+
+- [Skill development manual](development/skill-development.md): package layout, `skill.yaml`, entries, input schemas, and every `vulcan.*` API. [中文](zh-CN/development/skill-development.md)
+- [System Plugin managed runtime guide](development/system-plugin-managed-runtime.md): strict System Plugin packages, persistent Python/Node sessions, events, and cleanup. [中文](zh-CN/development/system-plugin-managed-runtime.md)
+- [demo-skill](https://github.com/LuaSkills/demo-skill): minimal skill template.
+- [vulcan-codekit](https://github.com/LuaSkills/vulcan-codekit): production-grade skill example.
+
+### Skill naming rules
 
 `skill_id` and every `entry.name` must match `^[a-z]([a-z0-9-]*[a-z0-9])?$`.
 The physical skill directory name is the only `skill_id`; `skill.yaml` must not declare a `skill_id` field.
@@ -54,65 +34,46 @@ Canonical entries are exposed as `{skill_id}-{entry_name}` and may receive a sta
 For GitHub-managed skills, the repository-derived or explicit `skill_id`, release zip prefix, checksum prefix, zip top-level directory, and installed directory must be identical.
 Use `{skill_id}-v{version}-skill.zip`, `{skill_id}-v{version}-checksums.txt`, and a zip containing `{skill_id}/skill.yaml`.
 
-## English Documents
+## Host integration
 
-- [Why LuaSkills](product/why-luaskills.md)
-- [Skill development manual](skill-development.md)
-- [FFI and SDK overview](ffi/overview.md)
-- [System Plugin managed runtime guide](system-plugin-managed-runtime.md)
-- [Host-selected managed runtime roots](managed-runtime-host-roots.md)
-- [LuaSkills 0.5.5 package configuration upgrade guide](upgrade-0.5.5.md)
-- [LuaSkills 0.5.4 patch upgrade guide](upgrade-0.5.4.md)
-- [LuaSkills 0.5.3 patch upgrade guide](upgrade-0.5.3.md)
-- [LuaSkills 0.5.2 patch upgrade guide](upgrade-0.5.2.md)
-- [LuaSkills 0.5.1 upgrade guide](upgrade-0.5.1.md)
-- [Database provider overview](providers/database-providers.md)
-- [Runtime architecture overview](architecture/runtime-model.md)
+For products that embed the runtime.
 
-## Main Technical Documents
+- [Runtime architecture](integration/runtime-model.md): host and runtime responsibilities, managed identity and project-path fields, model callbacks, skill root layers, and help.
+- [FFI and integration overview](integration/ffi-overview.md): integration layers, the first integration sequence, and key FFI rules.
+- [Host-selected managed runtime roots](integration/managed-runtime-host-roots.md): independent data, distribution, and environment roots, resource policy, and resolvers. [中文](zh-CN/integration/managed-runtime-host-roots.md)
+- [Package configuration host contract](integration/package-configuration.md): declarations, stores, revisions, disclosure, and events.
+- [Database providers](integration/database-providers.md): SQLite and LanceDB ownership modes.
+- Chinese references:
+  - [FFI integration guide](zh-CN/integration/ffi-integration-guide.md)
+  - [FFI host checklist](zh-CN/integration/ffi-host-checklist.md)
+  - [Host database provider guide](zh-CN/integration/host-database-provider-guide.md)
+  - [Skill root layer policy](zh-CN/integration/skill-root-layer-policy.md)
+  - [Skill sources, official hub, and progress events](zh-CN/integration/skill-source-policy-and-hub.md)
+  - [Package configuration design](zh-CN/integration/skill-config-system-design.md)
+  - [Host tooling result bridge and `system_lua_lib`](zh-CN/integration/host-tooling-result-bridge-design.md)
+- Machine contracts: [embedded runtime](../contracts/embedded-runtime.md), [embedded FFI](../contracts/embedded-ffi.md), [System lease execution](../contracts/system-lease-execution.md).
 
-Skill development is available in English. The deepest host, FFI, provider, and architecture references are still maintained in Chinese.
+## SDKs
 
-- [Lua Skill developer manual](skill-development.md)
-- [System Plugin managed runtime guide](system-plugin-managed-runtime.md)
-- [System Plugin 受管运行时使用指南](zh-CN/system-plugin-managed-runtime.md)
-- [Host-selected managed runtime roots](managed-runtime-host-roots.md)
-- [LuaSkills 0.5.5 package configuration upgrade guide](upgrade-0.5.5.md)
-- [宿主指定受管运行时根目录](zh-CN/managed-runtime-host-roots.md)
-- [LuaSkills 0.5.4 patch upgrade guide](upgrade-0.5.4.md)
-- [LuaSkills 0.5.3 patch upgrade guide](upgrade-0.5.3.md)
-- [LuaSkills 0.5.2 patch upgrade guide](upgrade-0.5.2.md)
-- [LuaSkills 0.5.1 upgrade guide](upgrade-0.5.1.md)
-- [LuaSkills 0.4.6 upgrade guide](upgrade-0.4.6.md)
-- [LuaSkills 0.5.0 breaking upgrade guide](upgrade-0.5.0.md)
-- [LuaSkills 0.5.1 managed runtime roots upgrade guide](upgrade-0.5.1.md)
-- [Chinese Lua Skill developer manual](zh-CN/skill-development.md)
-- [FFI beta release notes](zh-CN/ffi/beta-release-notes.md)
-- [FFI host checklist](zh-CN/ffi/host-checklist.md)
-- [FFI integration guide](zh-CN/ffi/integration-guide.md)
-- [Host database provider guide](zh-CN/providers/host-database-provider-guide.md)
-- [Skill root layer policy](zh-CN/architecture/skill-root-layer-policy.md)
-- [Skill package configuration declaration and host integration](zh-CN/architecture/skill-config-system-design.md)
-- [Host tooling result bridge and `system_lua_lib` design draft](zh-CN/architecture/host-tooling-result-bridge-design.md)
-- [FFI refactor draft archive](zh-CN/archive/ffi-refactor-draft.md)
+- [SDK overview](sdk/index.md): packages, coverage, version rules, and release order.
+- [luaskills-sdk-typescript](https://github.com/LuaSkills/luaskills-sdk-typescript)
+- [luaskills-sdk-python](https://github.com/LuaSkills/luaskills-sdk-python)
+- [luaskills-sdk-go](https://github.com/LuaSkills/luaskills-sdk-go)
 
-## Ecosystem References
+## Local examples
 
-- [vulcan-codekit](https://github.com/LuaSkills/vulcan-codekit): production-grade LuaSkills example.
-- [demo-skill](https://github.com/LuaSkills/demo-skill): minimal skill repository template.
-- [luaskills-sdk-typescript](https://github.com/LuaSkills/luaskills-sdk-typescript): TypeScript / Node.js SDK.
-- [luaskills-sdk-python](https://github.com/LuaSkills/luaskills-sdk-python): Python SDK.
-- [luaskills-sdk-go](https://github.com/LuaSkills/luaskills-sdk-go): Go SDK.
-
-## Local Examples
-
+- [Rust demo](../examples/demo-rust/README.md): direct crate integration with `call_skill` and `vulcan.host.*`.
+- [Managed Python/Node runtime example](../examples/managed_runtime/README.md)
+- [Skill package configuration example](../examples/skill-package-config/README.md)
 - [C FFI demo](../examples/ffi/c/README.md)
 - [TypeScript FFI demo](../examples/ffi/typescript/README.md)
 - [Standard runtime fixture](../examples/ffi/standard_runtime/README.md)
 - [FFI demo runtime](../examples/ffi/demo_runtime/README.md)
 - [Host provider demo](../examples/ffi/host_provider_demo/README.md)
-- [Rust demo](../examples/demo-rust/README.md): direct crate host integration with `call_skill` and `vulcan.host.*`.
-- [Managed Python/Node runtime example](../examples/managed_runtime/README.md): Lua-first skill package that calls managed Python and Node.js child runtimes.
-- `cargo run --bin luaskills-debug -- inspect --runtime-root <dir> --skill-path <dir>`: repository-side single-skill debug bin that syncs one skill into a real `runtime_root` before loading it.
-- New hosts should pass `runtime_root` for the LuaSkills data layout. Hosts that share application-managed Python/Node assets may additionally pass independent managed distribution and environment roots; all other directories remain derived from `runtime_root`.
-- [FFI demo package entry](../examples/demo-ffi/README.md)
+- [FFI demo package](../examples/demo-ffi/README.md)
+- `cargo run --bin luaskills-debug -- inspect --runtime-root <dir> --skill-path <dir>`: syncs one skill into a real `runtime_root` and loads it the way a host would.
+
+## Maintainers
+
+- [Release workflow](../scripts/release/README.md)
+- [Contributing and DCO](../CONTRIBUTING.md)

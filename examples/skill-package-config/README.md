@@ -2,7 +2,7 @@
 
 This example demonstrates one package-level configuration declaration shared by two entries.
 
-中文完整说明见 [Skill 包级配置声明、运行时控制与宿主对接](../../docs/zh-CN/architecture/skill-config-system-design.md)。
+中文完整说明见 [Skill 包级配置声明、运行时控制与宿主对接](../../docs/zh-CN/integration/skill-config-system-design.md)。
 
 The package covers:
 

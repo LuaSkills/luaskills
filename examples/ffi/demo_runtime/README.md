@@ -14,9 +14,9 @@
 
 ## 2. 目录结构
 
-- [D:\projects\vulcan-luaskills\examples\ffi\demo_runtime\runtime_root](/D:/projects/vulcan-luaskills/examples/ffi/demo_runtime/runtime_root)
+- [D:\projects\vulcan-luaskills\examples\ffi\demo_runtime\runtime_root](runtime_root)
   - 演示使用的空运行时根目录
-- [D:\projects\vulcan-luaskills\examples\ffi\demo_runtime\run_python_install_demo.py](/D:/projects/vulcan-luaskills/examples/ffi/demo_runtime/run_python_install_demo.py)
+- [D:\projects\vulcan-luaskills\examples\ffi\demo_runtime\run_python_install_demo.py](run_python_install_demo.py)
   - 可直接运行的 Python FFI 安装与调用烟测脚本
 
 ## 3. 前置条件
@@ -53,7 +53,7 @@ python .\examples\ffi\demo_runtime\run_python_install_demo.py
 
 Go 和 TypeScript 示例仍保留在：
 
-- [D:\projects\vulcan-luaskills\examples\ffi\go\demo.go](/D:/projects/vulcan-luaskills/examples/ffi/go/demo.go)
-- [D:\projects\vulcan-luaskills\examples\ffi\typescript\demo.ts](/D:/projects/vulcan-luaskills/examples/ffi/typescript/demo.ts)
+- [D:\projects\vulcan-luaskills\examples\ffi\go\demo.go](../go/demo.go)
+- [D:\projects\vulcan-luaskills\examples\ffi\typescript\demo.ts](../typescript/demo.ts)
 
 它们当前主要用于说明最小标准 FFI 对接方式。

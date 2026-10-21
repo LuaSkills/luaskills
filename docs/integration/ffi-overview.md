@@ -1,6 +1,6 @@
 # FFI and SDK Overview
 
-[Documentation hub](../index.md) | [Chinese FFI guide](../zh-CN/ffi/integration-guide.md)
+[Documentation hub](../index.md) | [Chinese FFI guide](../zh-CN/integration/ffi-integration-guide.md)
 
 LuaSkills exposes the same runtime through several host integration layers.
 The goal is to let each host choose the right binding cost without changing the skill model.
@@ -201,15 +201,15 @@ SDK mapping:
 
 ## Deep References
 
-- [System Plugin managed runtime guide](../system-plugin-managed-runtime.md)
-- [System Plugin 受管运行时使用指南](../zh-CN/system-plugin-managed-runtime.md)
-- [Host-selected managed runtime roots](../managed-runtime-host-roots.md)
-- [宿主指定受管运行时根目录](../zh-CN/managed-runtime-host-roots.md)
-- [FFI beta release notes](../zh-CN/ffi/beta-release-notes.md)
-- [FFI host checklist](../zh-CN/ffi/host-checklist.md)
-- [FFI integration guide](../zh-CN/ffi/integration-guide.md)
-- [Host tooling result bridge and `system_lua_lib` design draft](../zh-CN/architecture/host-tooling-result-bridge-design.md)
-- [Host database provider guide](../zh-CN/providers/host-database-provider-guide.md)
+- [System Plugin managed runtime guide](../development/system-plugin-managed-runtime.md)
+- [System Plugin 受管运行时使用指南](../zh-CN/development/system-plugin-managed-runtime.md)
+- [Host-selected managed runtime roots](managed-runtime-host-roots.md)
+- [宿主指定受管运行时根目录](../zh-CN/integration/managed-runtime-host-roots.md)
+- [FFI host checklist](../zh-CN/integration/ffi-host-checklist.md)
+- [FFI integration guide](../zh-CN/integration/ffi-integration-guide.md)
+- [Host tooling result bridge and `system_lua_lib` design draft](../zh-CN/integration/host-tooling-result-bridge-design.md)
+- [Host database provider guide](../zh-CN/integration/host-database-provider-guide.md)
+- [Package configuration host contract](package-configuration.md)
 
 ## Examples
 

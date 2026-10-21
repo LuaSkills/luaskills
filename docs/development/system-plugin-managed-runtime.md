@@ -1,6 +1,6 @@
 # System Plugin Managed Runtime Guide
 
-[简体中文](zh-CN/system-plugin-managed-runtime.md) | [Documentation hub](index.md) | [FFI overview](ffi/overview.md)
+[简体中文](../zh-CN/development/system-plugin-managed-runtime.md) | [Documentation hub](../index.md) | [FFI overview](../integration/ffi-overview.md)
 
 This guide is the task-oriented entry point for package-isolated Python/Node child runtimes in a persistent System Plugin lease. It covers the complete path from package preparation to deterministic cleanup. For field-by-field Lua API details, also see the [Skill development manual](skill-development.md#59-managed-python-and-node-child-runtimes).
 
@@ -74,7 +74,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deps/fetch_managed_r
 RUNTIME_ROOT=<runtime_root> scripts/deps/fetch_managed_runtimes.sh all
 ```
 
-LuaSkills 0.5.1 also lets the host place distributions and writable environments outside `runtime_root`:
+LuaSkills also lets the host place distributions and writable environments outside `runtime_root`:
 
 ```rust
 let mut host_options = LuaRuntimeHostOptions::with_runtime_root(runtime_data_root);
@@ -92,7 +92,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deps/fetch_managed_r
 RUNTIME_ROOT=<build_cache_root> MANAGED_RUNTIME_DISTRIBUTION_ROOT=<distribution_root> scripts/deps/fetch_managed_runtimes.sh all
 ```
 
-The explicit distribution root must already exist when the engine is created. The explicit environment root is safely created and identity-pinned. See [Host-selected managed runtime roots](managed-runtime-host-roots.md) for Rust, JSON FFI, C ABI V3, hashing, and migration details.
+The explicit distribution root must already exist when the engine is created. The explicit environment root is safely created and identity-pinned. See [Host-selected managed runtime roots](../integration/managed-runtime-host-roots.md) for Rust, JSON FFI, C ABI V3, hashing, and migration details.
 
 LuaSkills does not fall back to a system Python, system Node.js, external `node_modules`, or undeclared packages.
 
@@ -108,7 +108,7 @@ The host fixes the following policy in `LuaRuntimeHostOptions.managed_runtime_co
 | Retained session output per stdout/stderr stream | `1 MiB` |
 | `python.invoke` / `node.invoke` timeout | Unlimited |
 
-All configured numeric values must be positive. A per-call positive `invoke.timeout_ms` overrides the engine invoke default, and a per-session positive `session.open.buffer_limit_bytes` overrides the engine output-buffer default. See [Host-selected managed runtime roots](managed-runtime-host-roots.md#engine-wide-resource-policy) for Rust, JSON FFI, standard C ABI V3, and SDK examples.
+All configured numeric values must be positive. A per-call positive `invoke.timeout_ms` overrides the engine invoke default, and a per-session positive `session.open.buffer_limit_bytes` overrides the engine output-buffer default. See [Host-selected managed runtime roots](../integration/managed-runtime-host-roots.md#engine-wide-resource-policy) for Rust, JSON FFI, standard C ABI V3, and SDK examples.
 
 ## 3. Create A Strict System Lease
 
@@ -145,7 +145,7 @@ The System create body is strict:
 - `dependencies_file` is package-relative and must resolve to a contained regular file without a symlink escape.
 - `workspace_root`, when supplied, must be an existing absolute directory.
 - `cwd` must resolve under the package root or the authorized workspace. It defaults to the package root.
-- On Windows, LuaSkills 0.5.3 retains canonical native objects for identity checks while converting supported verbatim drive and UNC spellings at Lua, host-API, module-search, and child-process boundaries. Other verbatim namespaces and mixed separators fail explicitly before lookup or process creation.
+- On Windows, LuaSkills retains canonical native objects for identity checks while converting supported verbatim drive and UNC spellings at Lua, host-API, module-search, and child-process boundaries. Other verbatim namespaces and mixed separators fail explicitly before lookup or process creation.
 - Public `lua_roots`, `c_roots`, and unknown fields are rejected.
 
 Keep the returned `lease_id`, `sid`, and `generation` together. Send all three on later eval, status, and close requests so a stale or crossed handle fails explicitly.
@@ -300,7 +300,7 @@ Correlate by the full event identity:
 3. Inside that eval, verify/use the stored userdata whose status has the same `managed_session_id`.
 4. Call `read(...)` until the required output is drained.
 
-Repository JSON FFI helpers expose the same operations as `ManagedSessionEventsClient.poll(...)` and `.wait(...)` in [Python](../examples/ffi/python/json_runtime.py) and [TypeScript](../examples/ffi/typescript/json_runtime.ts).
+Repository JSON FFI helpers expose the same operations as `ManagedSessionEventsClient.poll(...)` and `.wait(...)` in [Python](../../examples/ffi/python/json_runtime.py) and [TypeScript](../../examples/ffi/typescript/json_runtime.ts).
 
 ## 6. Use The Standard-ABI Wake Callback Safely
 
@@ -387,9 +387,9 @@ An unrelated ordinary Skill-root reload does not replace the dedicated System le
 
 ## 11. Related References
 
-- [FFI and SDK overview](ffi/overview.md)
-- [Chinese FFI integration guide](zh-CN/ffi/integration-guide.md)
+- [FFI and SDK overview](../integration/ffi-overview.md)
+- [Chinese FFI integration guide](../zh-CN/integration/ffi-integration-guide.md)
 - [Skill development manual](skill-development.md#59-managed-python-and-node-child-runtimes)
-- [Managed runtime invoke example](../examples/managed_runtime/README.md)
-- [Standard C ABI header](../include/luaskills_ffi.h)
-- [Public JSON FFI header](../include/luaskills_json_ffi.h)
+- [Managed runtime invoke example](../../examples/managed_runtime/README.md)
+- [Standard C ABI header](../../include/luaskills_ffi.h)
+- [Public JSON FFI header](../../include/luaskills_json_ffi.h)

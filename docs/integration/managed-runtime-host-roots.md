@@ -1,6 +1,6 @@
 # Host-Selected Managed Runtime Roots
 
-LuaSkills 0.5.1 separates three filesystem authorities that were previously derived from one `runtime_root`:
+LuaSkills separates three filesystem authorities that hosts may place independently:
 
 - `runtime_root`: LuaSkills data, package stores, snapshots, configuration, and System Plugin state.
 - `managed_runtime_distribution_root`: read-only Python, Node.js, uv, and pnpm installations.
@@ -29,7 +29,7 @@ let engine = LuaEngine::new(LuaEngineOptions::new(pool_config, host_options))?;
 
 `runtime_root` remains required when either explicit managed root is configured. Both explicit roots must be absolute. The distribution root must already exist. LuaSkills safely creates the environment root on supported platforms and pins the native filesystem identity of every live root.
 
-When a new field is omitted, LuaSkills preserves the 0.5.0 layout:
+When a new field is omitted, LuaSkills derives the managed directories from `runtime_root`:
 
 ```text
 distribution_root = <runtime_root>/dependencies/runtimes
@@ -132,7 +132,7 @@ Do not enlarge V1 or V2 structs in an existing binding.
 
 ## Python, TypeScript, and Go SDKs
 
-All 0.5.1 SDKs expose the same two JSON Host Options and the read-only resolver. Python:
+All language SDKs expose the same two JSON Host Options and the read-only resolver. Python:
 
 ```python
 client = LuaSkillsClient(

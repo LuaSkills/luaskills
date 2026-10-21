@@ -1,6 +1,6 @@
 # Lua Skill Developer Manual
 
-[Documentation hub](index.md) | [Chinese manual](zh-CN/skill-development.md)
+[Documentation hub](../index.md) | [Chinese manual](../zh-CN/development/skill-development.md)
 
 ## 1. Purpose
 
@@ -513,9 +513,9 @@ Current stable error codes:
 
 Host integration references:
 
-- [Runtime architecture model capability boundary](architecture/runtime-model.md#standard-model-capability-boundary)
-- [FFI and SDK model capability quick path](ffi/overview.md#model-capability-quick-path)
-- [Chinese FFI model callback guide](zh-CN/ffi/integration-guide.md#98-模型能力-callback)
+- [Runtime architecture model capability boundary](../integration/runtime-model.md#standard-model-capability-boundary)
+- [FFI and SDK model capability quick path](../integration/ffi-overview.md#model-capability-quick-path)
+- [Chinese FFI model callback guide](../zh-CN/integration/ffi-integration-guide.md#98-模型能力-callback)
 
 ## 4.6 `vulcan.host.*`
 
@@ -836,7 +836,7 @@ Stable fields:
 
 `labels` should include only currently existing `PROJECT` and `USER` layers; it should not include `ROOT`. Without a project context, the runtime returns only `USER`. If only `ROOT` exists, it returns an empty list and top-level `writable=false`. When the bridge is disabled, layer discovery can still work, but top-level `writable` and each layer's `writable` must be `false`. If future install, update, or uninstall inputs allow selecting a layer, they should only accept labels returned by `layers()`.
 
-For the full layer and management boundary model, see [Skill root layer policy](zh-CN/architecture/skill-root-layer-policy.md).
+For the full layer and management boundary model, see [Skill root layer policy](../zh-CN/integration/skill-root-layer-policy.md).
 
 Notes:
 
@@ -1070,7 +1070,7 @@ Lifecycle rules are deterministic:
 - `session:close(...)` and `session:kill()` terminate descendants as well as the direct child.
 - Background stdout, stderr, exit, and failure watchers never invoke Lua. System Plugin sessions publish bounded engine events for the host to poll or wait on; a host wake callback may only wake or schedule host work and must not synchronously enter Lua.
 
-For the complete System lease, persistent-session, host-event, and cleanup workflow, see the [System Plugin managed runtime guide](system-plugin-managed-runtime.md). The [Managed Runtime Example](../examples/managed_runtime/README.md) is a working ordinary-Skill package for the pooled `status` / `invoke` path. During repository development, the layout checker and isolated smoke scripts provide a fast end-to-end verification path:
+For the complete System lease, persistent-session, host-event, and cleanup workflow, see the [System Plugin managed runtime guide](system-plugin-managed-runtime.md). The [Managed Runtime Example](../../examples/managed_runtime/README.md) is a working ordinary-Skill package for the pooled `status` / `invoke` path. During repository development, the layout checker and isolated smoke scripts provide a fast end-to-end verification path:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/debug-tools/managed_runtime_smoke.ps1
@@ -1121,7 +1121,7 @@ Notes:
 - Hosts must provide one absolute user-level `skill_config_root`; normal and system packages route to `skills/config.json` and `system-skills/config.json` under that root.
 - Optional `config_validator` runs cross-field checks in an isolated, capability-free Lua state during the same atomic transaction.
 - Human-readable declaration fields use the single language chosen by the package author. English is recommended for broadly distributed packages but is not enforced.
-- The complete declaration schema, storage formats, host authorization boundary, and FFI contract are documented in [Skill package configuration](zh-CN/architecture/skill-config-system-design.md).
+- The complete declaration schema, storage formats, host authorization boundary, and FFI contract are documented in [Skill package configuration](../zh-CN/integration/skill-config-system-design.md).
 
 ## 6. `vulcan.fs.*`
 
@@ -1886,7 +1886,7 @@ Stable development constraints:
 - Treat `info()` and `status()` as probing entry points.
 - Check `enabled` before business calls so "capability not bound" is not mistaken for a query failure.
 - For exact input and output fields, combine the host SQLite provider contract with:
-  - [Host database provider guide](zh-CN/providers/host-database-provider-guide.md)
+  - [Host database provider guide](../zh-CN/integration/host-database-provider-guide.md)
 - If you are a skill author rather than a host implementer, prefer existing memory-skill examples over guessing provider-specific result fields.
 
 ## 15. `vulcan.lancedb.*`
@@ -1941,7 +1941,7 @@ When the result format is JSON, the result table contains `data_json`; otherwise
 
 For exact input and output fields, combine the host LanceDB provider contract with:
 
-- [Host database provider guide](zh-CN/providers/host-database-provider-guide.md)
+- [Host database provider guide](../zh-CN/integration/host-database-provider-guide.md)
 
 ## 16. Common Development Guidance
 
@@ -1994,10 +1994,10 @@ If you see the real client name during normal skill execution but see `luaexec_c
 If you mainly write skills, read in this order:
 
 1. This manual: understand the actual current `vulcan.*` capability surface.
-2. [README.md](../README.md): understand runtime positioning and host boundaries.
-3. [Host database provider guide](zh-CN/providers/host-database-provider-guide.md): understand SQLite / LanceDB host integration contracts.
+2. [README.md](../../README.md): understand runtime positioning and host boundaries.
+3. [Host database provider guide](../zh-CN/integration/host-database-provider-guide.md): understand SQLite / LanceDB host integration contracts.
 
 If you are integrating a host rather than writing a skill, read:
 
-- [FFI integration guide](zh-CN/ffi/integration-guide.md)
-- [FFI host checklist](zh-CN/ffi/host-checklist.md)
+- [FFI integration guide](../zh-CN/integration/ffi-integration-guide.md)
+- [FFI host checklist](../zh-CN/integration/ffi-host-checklist.md)

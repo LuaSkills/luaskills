@@ -4,7 +4,7 @@
 
 这个目录提供一个最小 `C` 标准 ABI 示例，用于演示：
 
-- 通过 [luaskills_ffi.h](/D:/projects/vulcan-luaskills/include/luaskills_ffi.h) 接入底层标准 C ABI
+- 通过 [luaskills_ffi.h](../../../include/luaskills_ffi.h) 接入底层标准 C ABI
 - 查询 `version`
 - 创建 `engine`
 - `load_from_roots`
@@ -15,7 +15,7 @@
 
 对应源码：
 
-- [demo.c](/D:/projects/vulcan-luaskills/examples/ffi/c/demo.c)
+- [demo.c](demo.c)
 
 ## 2. 运行前提
 
@@ -90,8 +90,8 @@ gcc -std=c11 -Iinclude examples/ffi/c/demo.c -Ltarget/debug -lluaskills -o examp
 
 如果需要看高层动态语言入口，请参考：
 
-- [Python demo](/D:/projects/vulcan-luaskills/examples/ffi/python/demo.py)
-- [Go demo](/D:/projects/vulcan-luaskills/examples/ffi/go/demo.go)
-- [TypeScript demo](/D:/projects/vulcan-luaskills/examples/ffi/typescript/demo.ts)
-- [Standard Runtime Fixture](/D:/projects/vulcan-luaskills/examples/ffi/standard_runtime/README.md)
-- [FFI Demo Runtime](/D:/projects/vulcan-luaskills/examples/ffi/demo_runtime/README.md)
+- [Python demo](../python/demo.py)
+- [Go demo](../go/demo.go)
+- [TypeScript demo](../typescript/demo.ts)
+- [Standard Runtime Fixture](../standard_runtime/README.md)
+- [FFI Demo Runtime](../demo_runtime/README.md)

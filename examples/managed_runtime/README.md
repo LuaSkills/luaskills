@@ -6,8 +6,8 @@ This directory contains a minimal LuaSkills package that calls managed Python an
 Lua remains the orchestration layer. Python and Node.js run as managed child runtimes, with their own versioned executables, package managers, package environments, and pooled workers.
 Lua 仍然是调度层。Python 与 Node.js 作为受管子运行时运行，拥有独立版本的主程序、包管理器、包环境与常驻 worker 池。
 
-This example intentionally covers the ordinary-Skill `status` and pooled `invoke` path. It does not open a persistent `session.open(...)`, because persistent managed sessions are available only inside a strict System Plugin lease. For that end-to-end workflow, see the [System Plugin managed runtime guide](../../docs/system-plugin-managed-runtime.md).
-本示例只覆盖普通 Skill 的 `status` 与池化 `invoke` 路径。它不会打开持久 `session.open(...)`，因为持久受管会话只允许在严格 System Plugin 租约内使用。完整流程见 [System Plugin 受管运行时使用指南](../../docs/zh-CN/system-plugin-managed-runtime.md)。
+This example intentionally covers the ordinary-Skill `status` and pooled `invoke` path. It does not open a persistent `session.open(...)`, because persistent managed sessions are available only inside a strict System Plugin lease. For that end-to-end workflow, see the [System Plugin managed runtime guide](../../docs/development/system-plugin-managed-runtime.md).
+本示例只覆盖普通 Skill 的 `status` 与池化 `invoke` 路径。它不会打开持久 `session.open(...)`，因为持久受管会话只允许在严格 System Plugin 租约内使用。完整流程见 [System Plugin 受管运行时使用指南](../../docs/zh-CN/development/system-plugin-managed-runtime.md)。
 
 Hosts may set Worker capacity/idle retirement and the omitted `invoke.timeout_ms` through engine `managed_runtime_config`; the stable defaults are `4`, `60` seconds, and unlimited. An explicit positive `timeout_ms` in this package still has per-call priority.
 宿主可以通过引擎 `managed_runtime_config` 设置 Worker 容量、空闲回收与省略时的 `invoke.timeout_ms`；稳定默认值分别为 `4`、`60` 秒与无限制。本包显式传入的正数 `timeout_ms` 仍具有单次调用优先级。

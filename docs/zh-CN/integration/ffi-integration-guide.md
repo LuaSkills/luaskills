@@ -6,9 +6,8 @@
 
 如果您希望先按最短路径做宿主自检，而不是从头读完整文档，请先看：
 
-- [FFI Beta 发布说明](beta-release-notes.md)
-- [FFI 宿主接入检查清单](host-checklist.md)
-- [宿主工具结果桥接、宿主 LuaRuntime（`system_lua_lib`）与执行平面设计稿](../architecture/host-tooling-result-bridge-design.md)
+- [FFI 宿主接入检查清单](ffi-host-checklist.md)
+- [宿主工具结果桥接、宿主 LuaRuntime（`system_lua_lib`）与执行平面设计稿](host-tooling-result-bridge-design.md)
 
 本文档覆盖当前对外公开的两层 FFI：
 
@@ -109,7 +108,7 @@
 
 数据库 provider 的详细对接说明见：
 
-- [宿主数据库 Provider 对接说明](../providers/host-database-provider-guide.md)
+- [宿主数据库 Provider 对接说明](host-database-provider-guide.md)
 
 ### 2.5 固定术语
 
@@ -142,14 +141,14 @@
 - `host_result` 第四返回值桥接
 - `change_set` 这一类结构化宿主结果
 
-也就是说，本文档不是只覆盖最早的 `call_skill / run_lua` 主链，而是覆盖当前 `0.4.x` 稳定线实际对外承诺的完整宿主集成面。
+也就是说，本文档不是只覆盖最早的 `call_skill / run_lua` 主链，而是覆盖当前稳定线实际对外承诺的完整宿主集成面。
 
 ## 3. 运行时资产、动态库与头文件
 
 ### 3.1 当前运行时资产边界
 
 当前稳定协议线中，FFI 对接方需要明确区分两类发布来源。
-这条边界从 `0.3` 建立，并延续到当前 `0.4.x` 稳定线：
+当前资产边界如下：
 
 | 资产 | 来源仓库 |
 | --- | --- |
@@ -438,46 +437,17 @@ FFI 不直接暴露 `LuaEngine` 指针，而是通过内部注册表分配一个
 
 **凡是 FFI 分配出来的结果结构，必须使用对应 free 函数释放。**
 
-### 6.4 当前 ABI 迁移要点
-
-当前正式协议线已经对现有 FFI 做完一轮接口收敛。
-如果宿主参考的是更早的 `0.2.x / beta` 示例、旧草稿或早期 SDK 封装，请优先按下面的对应关系理解：
-
-- 旧：标准 C ABI 接口大量使用 `char **error_out`
-  - 新：标准 C ABI 接口统一改成 `FfiOwnedBuffer *error_out`
-- 旧：`version_out` / `skill_id_out` / `result_json_out` 这类文本输出按裸字符串读取
-  - 新：这些文本输出都应按 `FfiOwnedBuffer` 读取，并通过 `luaskills_ffi_buffer_free` 释放
-- 旧：`_json` 请求输入依赖 NUL 终止字符串
-  - 新：`_json` 请求输入统一改成 `FfiBorrowedBuffer`
-- 旧：JSON provider callback 通过裸字符串返回响应
-  - 新：JSON provider callback 通过 `FfiOwnedBuffer response_out / error_out` 返回
-- 旧：标准 SQLite / LanceDB provider callback 的 `input_json` 是裸字符串
-  - 新：标准 provider request 的 `input_json` 统一改成 `FfiBorrowedBuffer`
-- 旧：标准 `call_skill / run_lua / render_skill_help_detail` 的请求级 JSON 输入按裸字符串传入
-  - 新：这些输入当前统一改成 `FfiBorrowedBuffer`
-- 旧：`FfiLuaInvocationContext` 里的三个 JSON 字段按裸字符串传入
-  - 新：`FfiLuaInvocationContext` 当前统一改成三段 `FfiBorrowedBuffer`
-- 旧：`FfiStringArray.items` 与 `related_entries` 数组元素按 `char **` 理解
-  - 新：这类数组元素已经统一收敛为 `FfiOwnedBuffer *`
-- 旧：结构体内部文本字段多数按裸 `char *` 处理
-  - 新：标准结果结构中的大量文本字段已改成 `FfiOwnedBuffer`
-
-迁移时最容易出错的只有两条：
-
-1. 不要继续把标准错误输出按 `char *` 读取。
-2. 不要手动释放结构体内嵌的 `FfiOwnedBuffer` 字段，仍应优先调用结构体专用 free 函数。
-
-### 6.5 当前发布定位与安全边界
+### 6.4 当前发布定位与安全边界
 
 当前 FFI 发布面应按以下定位理解：
 
-- 当前版本已经是 `0.4.x` 稳定线下的**受控宿主集成接口**
+- 当前版本是稳定线下的**受控宿主集成接口**
 - 当前版本的主集成方式仍然是 Rust 直连，FFI 主要服务于非 Rust 宿主或跨语言桥接
 - packaged runtime、FFI SDK 与 Lua runtime packages 已经拆成独立来源，宿主应接受这条新的资产边界
 - FFI 是低层 ABI，不承诺“误用后仍然安全”，宿主必须严格遵守本文档中的所有权、线程与回调规则
 - 当前运行时默认把 skill 当作**受信代码**看待，FFI 文档不提供 Lua skill 沙箱安全承诺
 
-### 6.6 必须遵守的 FFI 契约
+### 6.5 必须遵守的 FFI 契约
 
 以下规则应视为强约束，而不是最佳实践建议：
 
@@ -491,7 +461,7 @@ FFI 不直接暴露 `LuaEngine` 指针，而是通过内部注册表分配一个
 - 若宿主需要数据库 callback 或运行时技能管理 callback，必须先注册 callback，再创建 engine
 - callback 返回文本时，文本必须是合法 UTF-8；其中 JSON callback 与标准 provider callback 的 JSON 载荷还必须是合法 JSON 文本
 
-### 6.7 回调与快照规则
+### 6.6 回调与快照规则
 
 当前回调模型需要宿主特别注意：
 
@@ -729,7 +699,7 @@ System Plugin 租约不把整个 `system_lua_lib` 当成一个共享包。每次
 - JSON FFI 可在 `host_options.managed_runtime_config` 配置 `worker_pool_max_size_per_environment=4`、`worker_idle_ttl_secs=60`、`persistent_session_limit_per_engine=256`、`persistent_session_default_buffer_limit_bytes_per_stream=1048576` 与可空 `invoke_default_timeout_ms`；这些是稳定默认值，所有已配置数值必须大于零
 - 单次正数 `invoke.timeout_ms` 优先于引擎默认超时，单个 Session 的正数 `session.open.buffer_limit_bytes` 优先于引擎默认输出缓冲；Lua 不能修改其余引擎级策略
 - 标准 C ABI 的 `has_invoke_default_timeout_ms` 必须严格为 `0` 或 `1`；为 `0` 时数值成员被忽略
-- 完整示例见[宿主指定受管运行时根目录](../managed-runtime-host-roots.md)
+- 完整示例见[宿主指定受管运行时根目录](managed-runtime-host-roots.md)
 
 已取消字段：
 
@@ -1280,7 +1250,7 @@ system 版本的 `_json` 生命周期接口，以及可见性查询、prompt com
 - `refresh` 显式刷新一个或两个缓存快照；events poll 返回本地写入、外部重载和结构化失败事件。
 - 原始 `list/get/delete` 可以管理技能包升级后留下的未声明值；`set` 始终要求当前声明。
 - LuaSkills 不对配置值执行用户授权，也不因 `sensitive=true` 自动遮罩。上级封装必须决定是否允许 `get/list`、是否允许 `include_values=true`、是否直接修改或先请求用户授权。
-- 完整请求响应与权限建议见 [Skill 包级配置声明、运行时控制与宿主对接](../architecture/skill-config-system-design.md)。
+- 完整请求响应与权限建议见 [Skill 包级配置声明、运行时控制与宿主对接](skill-config-system-design.md)。
 
 ### 9.7 宿主工具桥接 callback
 
@@ -2005,7 +1975,7 @@ FFI 宿主接入时，推荐优先使用 `RuntimeSkillRoot[]`。
 
 如果宿主内部存在组织、工作区、模板等更复杂来源，建议在宿主侧折叠成单个对外 `PROJECT` 标签，而不是向用户暴露任意多层 root 链。
 
-完整策略见 [Skill Root 层级与管理边界](../architecture/skill-root-layer-policy.md)。
+完整策略见 [Skill Root 层级与管理边界](skill-root-layer-policy.md)。
 
 ## 14. 标准 C ABI 与公共 `_json` FFI 的选择建议
 
@@ -2252,7 +2222,7 @@ Go 宿主如果希望用 Go module 封装主链，建议优先使用独立仓库
 
 ## 19. 对接建议结论
 
-如果目标是接入严格 `system_package`、持久 Python/Node 会话、受管会话事件与 wake callback，请先按本篇完成基础 FFI 生命周期，再按 [System Plugin 受管运行时使用指南](../system-plugin-managed-runtime.md) 完成端到端链路与关闭验收。
+如果目标是接入严格 `system_package`、持久 Python/Node 会话、受管会话事件与 wake callback，请先按本篇完成基础 FFI 生命周期，再按 [System Plugin 受管运行时使用指南](../development/system-plugin-managed-runtime.md) 完成端到端链路与关闭验收。
 
 如果宿主：
 

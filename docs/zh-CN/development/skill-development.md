@@ -513,9 +513,9 @@ return result.vector
 
 宿主对接参考：
 
-- [运行时架构中的模型能力边界](../architecture/runtime-model.md#standard-model-capability-boundary)
-- [FFI 与 SDK 模型能力速查](../ffi/overview.md#model-capability-quick-path)
-- [中文 FFI 模型 callback 对接说明](ffi/integration-guide.md#98-模型能力-callback)
+- [运行时架构中的模型能力边界](../../integration/runtime-model.md#standard-model-capability-boundary)
+- [FFI 与 SDK 模型能力速查](../../integration/ffi-overview.md#model-capability-quick-path)
+- [中文 FFI 模型 callback 对接说明](../integration/ffi-integration-guide.md#98-模型能力-callback)
 
 ## 4.6 `vulcan.host.*`
 
@@ -836,7 +836,7 @@ ROOT -> PROJECT -> USER
 
 其中 `labels` 只应包含 `PROJECT` / `USER` 中当前实际存在的层级，不应包含 `ROOT`。如果当前没有项目上下文，运行时只返回 `USER`；如果只有 `ROOT`，则返回空列表且顶层 `writable=false`。bridge 关闭时仍可发现层级，但顶层 `writable` 与每个 layer 的 `writable` 都必须为 `false`。如果后续安装、更新、卸载输入允许指定层级，也只能使用 `layers()` 返回的标签。
 
-完整层级与管理边界见 [Skill Root 层级与管理边界](architecture/skill-root-layer-policy.md)。
+完整层级与管理边界见 [Skill Root 层级与管理边界](../integration/skill-root-layer-policy.md)。
 
 注意事项：
 
@@ -1070,7 +1070,7 @@ return {
 - `session:close(...)` 与 `session:kill()` 会同时终止直接子进程及其后代。
 - 后台 stdout、stderr、退出与失败观察器绝不会调用 Lua。System Plugin 会话只向宿主发布有界引擎事件；宿主 wake callback 只能唤醒或调度宿主工作，不能同步进入 Lua。
 
-完整 System 租约、持久会话、宿主事件与清理流程见 [System Plugin 受管运行时使用指南](system-plugin-managed-runtime.md)。[Managed Runtime Example](../../examples/managed_runtime/README.md) 是覆盖池化 `status` / `invoke` 路径的可运行普通 Skill 包。仓库开发阶段可以用布局检查器与隔离冒烟脚本做端到端验证：
+完整 System 租约、持久会话、宿主事件与清理流程见 [System Plugin 受管运行时使用指南](system-plugin-managed-runtime.md)。[Managed Runtime Example](../../../examples/managed_runtime/README.md) 是覆盖池化 `status` / `invoke` 路径的可运行普通 Skill 包。仓库开发阶段可以用布局检查器与隔离冒烟脚本做端到端验证：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/debug-tools/managed_runtime_smoke.ps1
@@ -1121,7 +1121,7 @@ return use_service(api_token)
 - 宿主必须提供绝对用户级 `skill_config_root`；普通包与系统包分别路由到其下的 `skills/config.json` 与 `system-skills/config.json`。
 - 可选 `config_validator` 在同一个原子事务内通过隔离且无能力的 Lua 状态执行跨字段校验。
 - 声明中的人类可读字段使用技能包作者选择的单一语言；面向广泛分发的技能包建议使用英文，但不强制。
-- 完整声明格式、类型存储规则、宿主权限边界和 FFI 对接见 [Skill 包级配置声明、运行时控制与宿主对接](architecture/skill-config-system-design.md)。
+- 完整声明格式、类型存储规则、宿主权限边界和 FFI 对接见 [Skill 包级配置声明、运行时控制与宿主对接](../integration/skill-config-system-design.md)。
 
 ## 6. `vulcan.fs.*`
 
@@ -1886,7 +1886,7 @@ local ffi_root = vulcan.deps.ffi_path
 - 把 `info()` / `status()` 当成探测入口。
 - 业务调用前先判断 `enabled`，避免把“能力未绑定”误当成查询失败。
 - 具体输入输出字段请结合宿主的 SQLite provider 契约与：
-  - [宿主数据库 Provider 对接说明](providers/host-database-provider-guide.md)
+  - [宿主数据库 Provider 对接说明](../integration/host-database-provider-guide.md)
 - 如果你是 skill 作者而不是宿主实现者，建议优先参考对应记忆类 skill 的现有调用示例，而不是猜测 SQL provider 的自定义返回字段。
 
 ## 15. `vulcan.lancedb.*`
@@ -1941,7 +1941,7 @@ local ffi_root = vulcan.deps.ffi_path
 
 具体输入输出字段请结合宿主的 LanceDB provider 契约与：
 
-- [宿主数据库 Provider 对接说明](providers/host-database-provider-guide.md)
+- [宿主数据库 Provider 对接说明](../integration/host-database-provider-guide.md)
 
 ## 16. 常见开发建议
 
@@ -1994,10 +1994,10 @@ return {
 如果你主要是写 skill，建议按下面顺序阅读：
 
 1. 本文档：了解当前 `vulcan.*` 真实能力面
-2. [README.zh-CN.md](../../README.zh-CN.md)：理解运行时定位与宿主边界
-3. [宿主数据库 Provider 对接说明](providers/host-database-provider-guide.md)：了解 SQLite / LanceDB 与宿主的对接契约
+2. [README.zh-CN.md](../../../README.zh-CN.md)：理解运行时定位与宿主边界
+3. [宿主数据库 Provider 对接说明](../integration/host-database-provider-guide.md)：了解 SQLite / LanceDB 与宿主的对接契约
 
 如果后续你要做宿主集成而不是写 skill，请改看：
 
-- [FFI 对接文档](ffi/integration-guide.md)
-- [FFI 宿主接入检查清单](ffi/host-checklist.md)
+- [FFI 对接文档](../integration/ffi-integration-guide.md)
+- [FFI 宿主接入检查清单](../integration/ffi-host-checklist.md)

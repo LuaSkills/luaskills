@@ -1,43 +1,55 @@
-# LuaSkills 日本語ドキュメント
+# LuaSkills ドキュメント
 
 [English](../index.md) | [简体中文](../zh-CN/index.md) | [日本語](index.md) | [한국어](../ko/index.md) | [Español](../es/index.md) | [Français](../fr/index.md) | [Deutsch](../de/index.md) | [Português (BR)](../pt-BR/index.md)
 
-[日本語 README](../../README.ja.md) | [英語ドキュメント](../index.md) | [中国語の詳細技術ドキュメント](../zh-CN/index.md)
+[日本語 README](../../README.ja.md) | [LuaSkills を選ぶ理由](product/why-luaskills.md)
 
-ここは LuaSkills の日本語ドキュメント入口です。
-この言語では製品概要とナビゲーションを提供します。Skill 作者向け手冊は英語で利用でき、より深い host / FFI 参照は引き続き中国語ドキュメントにあります。
+ドキュメントは目的別に「スキル開発」「ホスト統合」「SDK」の 3 つに分かれています。技術ドキュメントは英語、ホストと FFI の詳細リファレンスは中国語で管理しています。
 
-## 推奨ルート
+## 読み始める場所
 
-| 読者 | 入口 |
+| 目的 | 入口 |
 | --- | --- |
-| 初めて読む人 | [日本語 README](../../README.ja.md) |
-| 製品価値を知りたい人 | [なぜ LuaSkills なのか](product/why-luaskills.md) |
-| Skill 作者 | [Skill development manual](../skill-development.md) |
-| FFI / SDK 統合担当 | [FFI and SDK overview](../ffi/overview.md) |
-| Database provider 実装者 | [Database provider overview](../providers/database-providers.md) |
-| Runtime 境界を理解したい人 | [Runtime architecture overview](../architecture/runtime-model.md) |
-| 詳細技術仕様が必要な人 | [中国語ドキュメント入口](../zh-CN/index.md) |
+| LuaSkills を評価する | [LuaSkills を選ぶ理由](product/why-luaskills.md) |
+| Lua スキルを書く | [Skill development manual](../development/skill-development.md) |
+| System Plugin や管理された Python/Node 処理を書く | [System Plugin managed runtime guide](../development/system-plugin-managed-runtime.md) |
+| Rust ホストに組み込む | [Runtime architecture](../integration/runtime-model.md) |
+| C ABI または JSON FFI で組み込む | [FFI and integration overview](../integration/ffi-overview.md) |
+| TypeScript・Python・Go を使う | [SDK overview](../sdk/index.md) |
 
-## Skill 命名規則
+## スキル開発
 
-`skill_id` と各 `entry.name` は `^[a-z]([a-z0-9-]*[a-z0-9])?$` に一致する必要があります。
-物理的な skill ディレクトリ名だけが `skill_id` の唯一のソースであり、`skill.yaml` で `skill_id` フィールドを宣言してはいけません。
-canonical entry は `{skill_id}-{entry_name}` として公開され、競合時には安定した `-N` サフィックスが追加されることがあります。
-GitHub 管理 skill では、リポジトリから派生した、または明示された `skill_id`、release zip のプレフィックス、checksum のプレフィックス、zip の最上位ディレクトリ、インストール先ディレクトリがすべて同一である必要があります。
-asset は `{skill_id}-v{version}-skill.zip` と `{skill_id}-v{version}-checksums.txt` を使い、zip には `{skill_id}/skill.yaml` が含まれている必要があります。
+- [Skill development manual](../development/skill-development.md)
+- [System Plugin managed runtime guide](../development/system-plugin-managed-runtime.md)
+- [demo-skill](https://github.com/LuaSkills/demo-skill)：最小のスキルテンプレート。
+- [vulcan-codekit](https://github.com/LuaSkills/vulcan-codekit)：実運用レベルの例。
 
-## エコシステム
+### スキル命名規則
 
-- [vulcan-codekit](https://github.com/LuaSkills/vulcan-codekit): 実運用に近い重要な LuaSkills 例。
-- [demo-skill](https://github.com/LuaSkills/demo-skill): 最小 skill template。
-- [luaskills-sdk-typescript](https://github.com/LuaSkills/luaskills-sdk-typescript): TypeScript / Node.js SDK。
-- [luaskills-sdk-python](https://github.com/LuaSkills/luaskills-sdk-python): Python SDK。
-- [luaskills-sdk-go](https://github.com/LuaSkills/luaskills-sdk-go): Go SDK。
+`skill_id` とすべての `entry.name` は `^[a-z]([a-z0-9-]*[a-z0-9])?$` に一致する必要があります。
+物理的なスキルディレクトリ名が唯一の `skill_id` であり、`skill.yaml` に `skill_id` フィールドを宣言してはいけません。
+canonical entry は `{skill_id}-{entry_name}` として公開され、衝突時には安定した `-N` 接尾辞が付く場合があります。
+GitHub 管理のスキルでは、リポジトリ由来または明示的な `skill_id`、リリース zip の接頭辞、checksum の接頭辞、zip の最上位ディレクトリ、インストール先ディレクトリが一致する必要があります。
+リリース資産は `{skill_id}-v{version}-skill.zip` と `{skill_id}-v{version}-checksums.txt` を使い、zip には `{skill_id}/skill.yaml` を含めます。
+
+## ホスト統合
+
+- [Runtime architecture](../integration/runtime-model.md)
+- [FFI and integration overview](../integration/ffi-overview.md)
+- [Host-selected managed runtime roots](../integration/managed-runtime-host-roots.md)
+- [Package configuration host contract](../integration/package-configuration.md)
+- [Database providers](../integration/database-providers.md)
+- [中国語の詳細リファレンス](../zh-CN/index.md#宿主对接)
+
+## SDK
+
+- [SDK overview](../sdk/index.md)
+- [luaskills-sdk-typescript](https://github.com/LuaSkills/luaskills-sdk-typescript) · [luaskills-sdk-python](https://github.com/LuaSkills/luaskills-sdk-python) · [luaskills-sdk-go](https://github.com/LuaSkills/luaskills-sdk-go)
 
 ## ローカル例
 
-- [C FFI Demo](../../examples/ffi/c/README.md)
-- [TypeScript FFI Demo](../../examples/ffi/typescript/README.md)
+- [Rust デモ](../../examples/demo-rust/README.md)
+- [C FFI デモ](../../examples/ffi/c/README.md)
+- [TypeScript FFI デモ](../../examples/ffi/typescript/README.md)
 - [Standard Runtime Fixture](../../examples/ffi/standard_runtime/README.md)
 - [Host Provider Demo](../../examples/ffi/host_provider_demo/README.md)

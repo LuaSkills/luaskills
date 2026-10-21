@@ -1,6 +1,6 @@
 # System Plugin 受管运行时使用指南
 
-[English](../system-plugin-managed-runtime.md) | [中文文档首页](index.md) | [FFI 对接文档](ffi/integration-guide.md)
+[English](../../development/system-plugin-managed-runtime.md) | [中文文档首页](../index.md) | [FFI 对接文档](../integration/ffi-integration-guide.md)
 
 本文是持久 System Plugin 租约中包隔离 Python/Node 子运行时的任务式帮助入口，覆盖从包准备到确定性清理的完整链路。需要逐字段 Lua API 说明时，另见 [Lua Skill 开发手册](skill-development.md#59-受管-python-与-node-子运行时)。
 
@@ -74,7 +74,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deps/fetch_managed_r
 RUNTIME_ROOT=<runtime_root> scripts/deps/fetch_managed_runtimes.sh all
 ```
 
-LuaSkills 0.5.1 也允许宿主把发行包与可写环境放在 `runtime_root` 外：
+LuaSkills 也允许宿主把发行包与可写环境放在 `runtime_root` 外：
 
 ```rust
 let mut host_options = LuaRuntimeHostOptions::with_runtime_root(runtime_data_root);
@@ -92,7 +92,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deps/fetch_managed_r
 RUNTIME_ROOT=<build_cache_root> MANAGED_RUNTIME_DISTRIBUTION_ROOT=<distribution_root> scripts/deps/fetch_managed_runtimes.sh all
 ```
 
-创建引擎时，显式发行根必须已经存在；显式环境根会被安全创建并固定身份。Rust、JSON FFI、C ABI V3、哈希与迁移细节见[宿主指定受管运行时根目录](managed-runtime-host-roots.md)。
+创建引擎时，显式发行根必须已经存在；显式环境根会被安全创建并固定身份。Rust、JSON FFI、C ABI V3、哈希与迁移细节见[宿主指定受管运行时根目录](../integration/managed-runtime-host-roots.md)。
 
 LuaSkills 不会回退使用系统 Python、系统 Node.js、外部 `node_modules` 或未声明依赖。
 
@@ -108,7 +108,7 @@ LuaSkills 不会回退使用系统 Python、系统 Node.js、外部 `node_module
 | 每个 Session stdout/stderr 流保留输出 | `1 MiB` |
 | `python.invoke` / `node.invoke` 超时 | 无限制 |
 
-所有已配置数值都必须为正数。单次正数 `invoke.timeout_ms` 优先于引擎 invoke 默认值；单个 Session 的正数 `session.open.buffer_limit_bytes` 优先于引擎输出缓冲默认值。Rust、JSON FFI、标准 C ABI V3 与 SDK 示例见[宿主指定受管运行时根目录](managed-runtime-host-roots.md#引擎级资源策略)。
+所有已配置数值都必须为正数。单次正数 `invoke.timeout_ms` 优先于引擎 invoke 默认值；单个 Session 的正数 `session.open.buffer_limit_bytes` 优先于引擎输出缓冲默认值。Rust、JSON FFI、标准 C ABI V3 与 SDK 示例见[宿主指定受管运行时根目录](../integration/managed-runtime-host-roots.md#引擎级资源策略)。
 
 ## 3. 创建严格 System 租约
 
@@ -145,7 +145,7 @@ System create 正文是严格结构：
 - `dependencies_file` 是包相对路径，必须解析为包内普通文件，不能通过符号链接逃逸。
 - 可选 `workspace_root` 必须是既有绝对目录。
 - `cwd` 必须解析到包根或已授权工作区内；省略时默认为包根。
-- 在 Windows 上，LuaSkills 0.5.3 继续使用规范原生对象完成身份校验，并在 Lua、宿主 API、模块搜索和子进程边界转换受支持的 verbatim 盘符路径与 UNC 路径。其他 verbatim 命名空间和混合分隔符会在寻址或创建进程前明确失败。
+- 在 Windows 上，LuaSkills 使用规范原生对象完成身份校验，并在 Lua、宿主 API、模块搜索和子进程边界转换受支持的 verbatim 盘符路径与 UNC 路径。其他 verbatim 命名空间和混合分隔符会在寻址或创建进程前明确失败。
 - 公共 `lua_roots`、`c_roots` 与未知字段都会被拒绝。
 
 把返回的 `lease_id`、`sid` 与 `generation` 作为一个整体保存。后续 eval、status 与 close 请求都回传这三项，使陈旧句柄或串线调用显式失败。
@@ -300,7 +300,7 @@ poll 与 wait 都是破坏性有界排空，`max_events` 必须为正数。事�
 3. 在 eval 内确认/使用 `status().managed_session_id` 与事件相同的 userdata。
 4. 调用 `read(...)`，直到所需输出被排空。
 
-仓库 JSON FFI 辅助封装提供同语义的 `ManagedSessionEventsClient.poll(...)` 与 `.wait(...)`，见 [Python](../../examples/ffi/python/json_runtime.py) 和 [TypeScript](../../examples/ffi/typescript/json_runtime.ts)。
+仓库 JSON FFI 辅助封装提供同语义的 `ManagedSessionEventsClient.poll(...)` 与 `.wait(...)`，见 [Python](../../../examples/ffi/python/json_runtime.py) 和 [TypeScript](../../../examples/ffi/typescript/json_runtime.ts)。
 
 ## 6. 安全使用标准 ABI wake callback
 
@@ -387,9 +387,9 @@ callback 在每个 engine 的单个串行后台调度器上运行，可以发信
 
 ## 11. 相关资料
 
-- [FFI 对接文档](ffi/integration-guide.md)
-- [FFI 宿主接入检查清单](ffi/host-checklist.md)
+- [FFI 对接文档](../integration/ffi-integration-guide.md)
+- [FFI 宿主接入检查清单](../integration/ffi-host-checklist.md)
 - [Lua Skill 开发手册](skill-development.md#59-受管-python-与-node-子运行时)
-- [受管运行时 invoke 示例](../../examples/managed_runtime/README.md)
-- [标准 C ABI 头文件](../../include/luaskills_ffi.h)
-- [公共 JSON FFI 头文件](../../include/luaskills_json_ffi.h)
+- [受管运行时 invoke 示例](../../../examples/managed_runtime/README.md)
+- [标准 C ABI 头文件](../../../include/luaskills_ffi.h)
+- [公共 JSON FFI 头文件](../../../include/luaskills_json_ffi.h)

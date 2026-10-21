@@ -1,43 +1,55 @@
-# Documentação LuaSkills Em Português Do Brasil
+# Documentação do LuaSkills
 
 [English](../index.md) | [简体中文](../zh-CN/index.md) | [日本語](../ja/index.md) | [한국어](../ko/index.md) | [Español](../es/index.md) | [Français](../fr/index.md) | [Deutsch](../de/index.md) | [Português (BR)](index.md)
 
-[README em português do Brasil](../../README.pt-BR.md) | [Documentação em inglês](../index.md) | [Documentação técnica detalhada em chinês](../zh-CN/index.md)
+[README em português](../../README.pt-BR.md) | [Por que LuaSkills](product/why-luaskills.md)
 
-Esta é a entrada em português do Brasil para a documentação do LuaSkills.
-Esta camada oferece visão de produto e navegação; o manual para autores de skills está disponível em inglês, enquanto as referências profundas de host e FFI continuam em chinês.
+A documentação é organizada por tarefa: desenvolvimento de skills, integração com o host e SDKs. Os documentos técnicos estão em inglês; as referências aprofundadas de host e FFI são mantidas em chinês.
 
-## Caminho Recomendado
+## Por onde começar
 
-| Leitor | Início |
+| Você quer | Comece aqui |
 | --- | --- |
-| Primeira visita | [README em português do Brasil](../../README.pt-BR.md) |
-| Valor de produto | [Por Que LuaSkills](product/why-luaskills.md) |
-| Autor de skills | [Skill development manual](../skill-development.md) |
-| Integrador FFI / SDK | [FFI and SDK overview](../ffi/overview.md) |
-| Implementador de database provider | [Database provider overview](../providers/database-providers.md) |
-| Arquitetura runtime | [Runtime architecture overview](../architecture/runtime-model.md) |
-| Especificação detalhada | [Documentação chinesa](../zh-CN/index.md) |
+| Avaliar o LuaSkills | [Por que LuaSkills](product/why-luaskills.md) |
+| Escrever uma skill em Lua | [Skill development manual](../development/skill-development.md) |
+| Escrever um System Plugin ou fluxos gerenciados de Python/Node | [System Plugin managed runtime guide](../development/system-plugin-managed-runtime.md) |
+| Incorporar o LuaSkills em um host Rust | [Runtime architecture](../integration/runtime-model.md) |
+| Incorporar via C ABI ou JSON FFI | [FFI and integration overview](../integration/ffi-overview.md) |
+| Usar TypeScript, Python ou Go | [SDK overview](../sdk/index.md) |
 
-## Regras De Nomenclatura De Skills
+## Desenvolvimento de skills
 
-`skill_id` e cada `entry.name` devem cumprir `^[a-z]([a-z0-9-]*[a-z0-9])?$`.
-O nome físico do diretório do skill é a única fonte de `skill_id`; `skill.yaml` não deve declarar um campo `skill_id`.
-As entradas canonical são expostas como `{skill_id}-{entry_name}` e podem receber um sufixo estável `-N` em caso de conflito.
-Para skills gerenciados pelo GitHub, o `skill_id` derivado do repositório ou explícito, o prefixo do zip de release, o prefixo de checksums, o diretório superior do zip e o diretório instalado devem ser idênticos.
-Os assets usam `{skill_id}-v{version}-skill.zip` e `{skill_id}-v{version}-checksums.txt`; o zip deve conter `{skill_id}/skill.yaml`.
+- [Skill development manual](../development/skill-development.md)
+- [System Plugin managed runtime guide](../development/system-plugin-managed-runtime.md)
+- [demo-skill](https://github.com/LuaSkills/demo-skill): modelo mínimo de skill.
+- [vulcan-codekit](https://github.com/LuaSkills/vulcan-codekit): exemplo de nível de produção.
 
-## Ecossistema
+### Regras de nomes de skills
 
-- [vulcan-codekit](https://github.com/LuaSkills/vulcan-codekit): exemplo importante e próximo de produção.
-- [demo-skill](https://github.com/LuaSkills/demo-skill): template mínimo de skill.
-- [luaskills-sdk-typescript](https://github.com/LuaSkills/luaskills-sdk-typescript): SDK TypeScript / Node.js.
-- [luaskills-sdk-python](https://github.com/LuaSkills/luaskills-sdk-python): SDK Python.
-- [luaskills-sdk-go](https://github.com/LuaSkills/luaskills-sdk-go): SDK Go.
+`skill_id` e cada `entry.name` devem corresponder a `^[a-z]([a-z0-9-]*[a-z0-9])?$`.
+O nome físico do diretório da skill é a única fonte de `skill_id`; `skill.yaml` não deve declarar o campo `skill_id`.
+Entradas canônicas são publicadas como `{skill_id}-{entry_name}` e podem receber um sufixo estável `-N` em caso de conflito.
+Para skills gerenciadas pelo GitHub, o `skill_id` derivado ou explícito, o prefixo do zip de release, o prefixo do checksum, o diretório raiz do zip e o diretório instalado devem ser idênticos.
+Os ativos de release usam `{skill_id}-v{version}-skill.zip` e `{skill_id}-v{version}-checksums.txt`; o zip deve conter `{skill_id}/skill.yaml`.
 
-## Exemplos Locais
+## Integração com o host
 
-- [C FFI Demo](../../examples/ffi/c/README.md)
-- [TypeScript FFI Demo](../../examples/ffi/typescript/README.md)
+- [Runtime architecture](../integration/runtime-model.md)
+- [FFI and integration overview](../integration/ffi-overview.md)
+- [Host-selected managed runtime roots](../integration/managed-runtime-host-roots.md)
+- [Package configuration host contract](../integration/package-configuration.md)
+- [Database providers](../integration/database-providers.md)
+- [Referências detalhadas em chinês](../zh-CN/index.md#宿主对接)
+
+## SDKs
+
+- [SDK overview](../sdk/index.md)
+- [luaskills-sdk-typescript](https://github.com/LuaSkills/luaskills-sdk-typescript) · [luaskills-sdk-python](https://github.com/LuaSkills/luaskills-sdk-python) · [luaskills-sdk-go](https://github.com/LuaSkills/luaskills-sdk-go)
+
+## Exemplos locais
+
+- [Demo em Rust](../../examples/demo-rust/README.md)
+- [Demo C FFI](../../examples/ffi/c/README.md)
+- [Demo TypeScript FFI](../../examples/ffi/typescript/README.md)
 - [Standard Runtime Fixture](../../examples/ffi/standard_runtime/README.md)
 - [Host Provider Demo](../../examples/ffi/host_provider_demo/README.md)

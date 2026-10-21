@@ -9,10 +9,10 @@
 
 如果您需要完整背景说明，请继续阅读：
 
-- [FFI 对接文档](integration-guide.md)
-- [System Plugin 受管运行时使用指南](../system-plugin-managed-runtime.md)
-- [宿主数据库 Provider 对接说明](../providers/host-database-provider-guide.md)
-- [宿主工具结果桥接、宿主 LuaRuntime（`system_lua_lib`）与执行平面设计稿](../architecture/host-tooling-result-bridge-design.md)
+- [FFI 对接文档](ffi-integration-guide.md)
+- [System Plugin 受管运行时使用指南](../development/system-plugin-managed-runtime.md)
+- [宿主数据库 Provider 对接说明](host-database-provider-guide.md)
+- [宿主工具结果桥接、宿主 LuaRuntime（`system_lua_lib`）与执行平面设计稿](host-tooling-result-bridge-design.md)
 
 ## 2. 先选接入面
 

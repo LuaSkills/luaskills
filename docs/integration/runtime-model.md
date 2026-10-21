@@ -1,6 +1,6 @@
 # Runtime Architecture Overview
 
-[Documentation hub](../index.md) | [Chinese root policy](../zh-CN/architecture/skill-root-layer-policy.md)
+[Documentation hub](../index.md) | [Chinese root policy](../zh-CN/integration/skill-root-layer-policy.md)
 
 LuaSkills is intentionally a runtime layer, not a full product host.
 Its architecture separates skill execution truth from product policy.
@@ -227,9 +227,9 @@ The host can render help as:
 
 ## Deep References
 
-- [System Plugin managed runtime guide](../system-plugin-managed-runtime.md)
-- [System Plugin 受管运行时使用指南](../zh-CN/system-plugin-managed-runtime.md)
-- [Skill root layer policy](../zh-CN/architecture/skill-root-layer-policy.md)
-- [Skill package configuration declaration and host integration](../zh-CN/architecture/skill-config-system-design.md)
-- [Lua Skill developer manual](../skill-development.md)
-- [Chinese Lua Skill developer manual](../zh-CN/skill-development.md)
+- [System Plugin managed runtime guide](../development/system-plugin-managed-runtime.md)
+- [System Plugin 受管运行时使用指南](../zh-CN/development/system-plugin-managed-runtime.md)
+- [Skill root layer policy](../zh-CN/integration/skill-root-layer-policy.md)
+- [Skill package configuration declaration and host integration](../zh-CN/integration/skill-config-system-design.md)
+- [Lua Skill developer manual](../development/skill-development.md)
+- [Chinese Lua Skill developer manual](../zh-CN/development/skill-development.md)

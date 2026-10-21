@@ -1,6 +1,6 @@
 # Database Provider Overview
 
-[Documentation hub](../index.md) | [Chinese provider guide](../zh-CN/providers/host-database-provider-guide.md)
+[Documentation hub](../index.md) | [Chinese provider guide](../zh-CN/integration/host-database-provider-guide.md)
 
 LuaSkills supports database-aware skills through SQLite and LanceDB bindings.
 The important product question is not only how a skill queries a database, but who owns database placement, sharing, lifecycle, and concurrency.
@@ -40,6 +40,6 @@ Host callback mode lets LuaSkills keep a stable skill-facing API while the host 
 
 ## Recommended Reading
 
-- [Host database provider guide](../zh-CN/providers/host-database-provider-guide.md)
-- [FFI integration guide](../zh-CN/ffi/integration-guide.md)
+- [Host database provider guide](../zh-CN/integration/host-database-provider-guide.md)
+- [FFI integration guide](../zh-CN/integration/ffi-integration-guide.md)
 - [Host provider demo](../../examples/ffi/host_provider_demo/README.md)
