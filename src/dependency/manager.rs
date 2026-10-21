@@ -819,7 +819,7 @@ impl DependencyManager {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(url)
         );
         let cached_text = self.downloader.fetch_text(url, &cache_key)?;
-        serde_yaml::from_str::<SkillListIndexFile>(&cached_text)
+        serde_norway::from_str::<SkillListIndexFile>(&cached_text)
             .map_err(|error| format!("failed to parse skilllist index {}: {}", url, error))
     }
 }

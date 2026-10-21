@@ -1027,7 +1027,7 @@ fn load_managed_dependency_manifest_from_fixed_object(
             render_host_visible_path(path)
         )
     })?;
-    let manifest = serde_yaml::from_str(&yaml_text).map_err(|error| {
+    let manifest = serde_norway::from_str(&yaml_text).map_err(|error| {
         format!(
             "failed to parse dependency manifest {}: {error}",
             render_host_visible_path(path)

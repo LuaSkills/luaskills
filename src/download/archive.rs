@@ -110,7 +110,19 @@ pub fn extract_skill_package_zip(
         let mut entry = archive
             .by_index(index)
             .map_err(|error| format!("Failed to read zip entry #{}: {}", index, error))?;
-        let entry_path = normalize_zip_entry_path(entry.name())?;
+        // EntryName is decoded once and reused by every diagnostic below.
+        // EntryName 只解码一次，供下方所有诊断复用。
+        let entry_name = entry
+            .name()
+            .map_err(|error| {
+                format!(
+                    "Failed to decode the name of zip entry '{}': {}",
+                    String::from_utf8_lossy(entry.name_raw()),
+                    error
+                )
+            })?
+            .into_owned();
+        let entry_path = normalize_zip_entry_path(&entry_name)?;
         if entry_path.components().next().is_none() {
             continue;
         }
@@ -122,7 +134,7 @@ pub fn extract_skill_package_zip(
             .ok_or_else(|| {
                 format!(
                     "Failed to read the top-level directory of zip entry '{}'",
-                    entry.name()
+                    entry_name
                 )
             })?;
         if top_level != expected_skill_id {
@@ -165,7 +177,7 @@ pub fn extract_skill_package_zip(
         std::io::copy(&mut entry, &mut output).map_err(|error| {
             format!(
                 "Failed to extract '{}' into {}: {}",
-                entry.name(),
+                entry_name,
                 render_archive_path(&target_path),
                 error
             )
@@ -217,7 +229,7 @@ fn install_from_zip_archive(
     let mut archive =
         ZipArchive::new(file).map_err(|error| format!("Failed to open zip archive: {}", error))?;
     for export in exports {
-        let entry_name = resolve_zip_export_entry_name(&mut archive, &export.spec.archive_path)
+        let entry_index = resolve_zip_export_entry_index(&archive, &export.spec.archive_path)
             .ok_or_else(|| {
                 format!(
                     "Failed to read zip entry '{}' from {}: specified file not found in archive",
@@ -225,10 +237,10 @@ fn install_from_zip_archive(
                     render_archive_path(archive_path)
                 )
             })?;
-        let mut entry = archive.by_name(&entry_name).map_err(|error| {
+        let mut entry = archive.by_index(entry_index).map_err(|error| {
             format!(
                 "Failed to read zip entry '{}' from {}: {}",
-                entry_name,
+                export.spec.archive_path,
                 render_archive_path(archive_path),
                 error
             )
@@ -380,27 +392,34 @@ fn install_from_tar_gz_archive(
 
 /// Resolve one zip export entry by exact path first and then by stripping one leading archive directory.
 /// 先按精确路径解析单个 zip 导出条目，再尝试剥离一层归档顶层目录进行匹配。
-fn resolve_zip_export_entry_name<R: Read + std::io::Seek>(
-    archive: &mut ZipArchive<R>,
+/// Entries whose names cannot be decoded never match, because declared export paths are UTF-8.
+/// 名称无法解码的条目永不匹配，因为声明的导出路径都是 UTF-8。
+fn resolve_zip_export_entry_index<R: Read + std::io::Seek>(
+    archive: &ZipArchive<R>,
     expected_archive_path: &str,
-) -> Option<String> {
+) -> Option<usize> {
     let expected = normalize_archive_entry_match_path(expected_archive_path);
-    if let Some(entry_name) = archive
+    // NormalizedNames keeps archive order so the index addresses the same entry in `by_index`.
+    // NormalizedNames 保持归档顺序，使索引在 `by_index` 中指向同一条目。
+    let normalized_names = archive
         .file_names()
-        .find(|name| normalize_archive_entry_match_path(name) == expected)
+        .map(|name| {
+            name.ok()
+                .map(|name| normalize_archive_entry_match_path(&name))
+        })
+        .collect::<Vec<_>>();
+    if let Some(index) = normalized_names
+        .iter()
+        .position(|name| name.as_deref() == Some(expected.as_str()))
     {
-        return Some(entry_name.to_string());
+        return Some(index);
     }
 
-    archive.file_names().find_map(|name| {
-        let normalized_name = normalize_archive_entry_match_path(name);
-        if strip_one_leading_archive_component(&normalized_name).as_deref()
+    normalized_names.iter().position(|name| {
+        name.as_deref()
+            .and_then(strip_one_leading_archive_component)
+            .as_deref()
             == Some(expected.as_str())
-        {
-            Some(name.to_string())
-        } else {
-            None
-        }
     })
 }
 

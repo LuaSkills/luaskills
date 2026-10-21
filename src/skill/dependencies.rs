@@ -347,7 +347,7 @@ impl PackageDependencyManifest {
                 error
             )
         })?;
-        serde_yaml::from_str(&yaml_text).map_err(|error| {
+        serde_norway::from_str(&yaml_text).map_err(|error| {
             format!(
                 "Failed to parse {}: {}",
                 render_host_visible_path(path),
@@ -484,7 +484,7 @@ ffi_dependencies:
         package: example-lib
 "#;
         let manifest: PackageDependencyManifest =
-            serde_yaml::from_str(yaml_text).expect("manifest should parse");
+            serde_norway::from_str(yaml_text).expect("manifest should parse");
         assert_eq!(manifest.tool_dependencies.len(), 1);
         assert_eq!(manifest.lua_dependencies.len(), 1);
         assert_eq!(manifest.ffi_dependencies.len(), 1);
@@ -531,7 +531,7 @@ ffi_dependencies:
     packages: {}
 "#;
         let manifest: PackageDependencyManifest =
-            serde_yaml::from_str(yaml_text).expect("manifest should parse");
+            serde_norway::from_str(yaml_text).expect("manifest should parse");
         assert_eq!(
             manifest.tool_dependencies[0].scope,
             crate::dependency::types::DependencyScope::Skill
@@ -564,7 +564,7 @@ node_runtime:
   lockfile: node/pnpm-lock.yaml
 "#;
         let manifest: PackageDependencyManifest =
-            serde_yaml::from_str(yaml_text).expect("manifest should parse");
+            serde_norway::from_str(yaml_text).expect("manifest should parse");
         let python_runtime = manifest
             .python_runtime
             .expect("python runtime should parse");

@@ -732,7 +732,7 @@ fn load_bound_skill_manifest(skill_path: &Path) -> Result<SkillMeta, String> {
             error
         )
     })?;
-    let mut manifest: SkillMeta = serde_yaml::from_str(&manifest_text).map_err(|error| {
+    let mut manifest: SkillMeta = serde_norway::from_str(&manifest_text).map_err(|error| {
         format!(
             "Failed to parse skill manifest '{}': {}",
             render_debug_path(&manifest_path),

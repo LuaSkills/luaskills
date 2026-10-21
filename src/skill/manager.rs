@@ -1589,7 +1589,7 @@ impl SkillManager {
                 error
             )
         })?;
-        let record: InstalledSkillRecord = serde_yaml::from_str(&yaml).map_err(|error| {
+        let record: InstalledSkillRecord = serde_norway::from_str(&yaml).map_err(|error| {
             format!(
                 "Failed to parse {}: {}",
                 render_skill_manager_path(&path),
@@ -1604,7 +1604,7 @@ impl SkillManager {
     fn persist_install_record(&self, record: &InstalledSkillRecord) -> Result<(), String> {
         self.ensure_state_layout()?;
         let path = self.install_record_path(&record.skill_id);
-        let yaml = serde_yaml::to_string(record)
+        let yaml = serde_norway::to_string(record)
             .map_err(|error| format!("Failed to serialize install record: {}", error))?;
         fs::write(&path, yaml).map_err(|error| {
             format!(
@@ -2229,7 +2229,7 @@ fn read_skill_manifest_from_directory(skill_dir: &Path) -> Result<SkillMeta, Str
             error
         )
     })?;
-    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&yaml_text).map_err(|error| {
+    let yaml_value: serde_norway::Value = serde_norway::from_str(&yaml_text).map_err(|error| {
         format!(
             "Failed to parse {}: {}",
             render_skill_manager_path(&skill_yaml_path),
@@ -2238,7 +2238,7 @@ fn read_skill_manifest_from_directory(skill_dir: &Path) -> Result<SkillMeta, Str
     })?;
     if yaml_value
         .as_mapping()
-        .and_then(|mapping| mapping.get(serde_yaml::Value::String("skill_id".to_string())))
+        .and_then(|mapping| mapping.get(serde_norway::Value::String("skill_id".to_string())))
         .is_some()
     {
         return Err(format!(
@@ -2246,7 +2246,7 @@ fn read_skill_manifest_from_directory(skill_dir: &Path) -> Result<SkillMeta, Str
             render_skill_manager_path(skill_dir)
         ));
     }
-    let mut meta: SkillMeta = serde_yaml::from_value(yaml_value).map_err(|error| {
+    let mut meta: SkillMeta = serde_norway::from_value(yaml_value).map_err(|error| {
         format!(
             "Failed to decode {}: {}",
             render_skill_manager_path(&skill_yaml_path),
@@ -2439,7 +2439,7 @@ fn is_skill_manifest_enabled(skill_dir: &Path) -> Result<bool, String> {
             error
         )
     })?;
-    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&yaml_text).map_err(|error| {
+    let yaml_value: serde_norway::Value = serde_norway::from_str(&yaml_text).map_err(|error| {
         format!(
             "Failed to parse {}: {}",
             render_skill_manager_path(&skill_yaml),
@@ -2447,7 +2447,7 @@ fn is_skill_manifest_enabled(skill_dir: &Path) -> Result<bool, String> {
         )
     })?;
     if yaml_value.as_mapping().is_some_and(|mapping| {
-        mapping.contains_key(serde_yaml::Value::String("skill_id".to_string()))
+        mapping.contains_key(serde_norway::Value::String("skill_id".to_string()))
     }) {
         return Err(format!(
             "skill manifest {} must not declare skill_id; directory name is the only skill_id",
@@ -2466,7 +2466,7 @@ fn is_skill_manifest_enabled(skill_dir: &Path) -> Result<bool, String> {
     fn default_skill_enable() -> bool {
         true
     }
-    let probe: SkillEnableProbe = serde_yaml::from_value(yaml_value).map_err(|error| {
+    let probe: SkillEnableProbe = serde_norway::from_value(yaml_value).map_err(|error| {
         format!(
             "Failed to parse {}: {}",
             render_skill_manager_path(&skill_yaml),

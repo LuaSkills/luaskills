@@ -924,7 +924,7 @@ impl SkillPackageConfigService {
                     validate_luaskills_identifier(&skill_id, "skill_id")?;
                     let source = std::fs::read_to_string(&manifest_path)
                         .map_err(|error| error.to_string())?;
-                    let mut meta = serde_yaml::from_str::<SkillMeta>(&source)
+                    let mut meta = serde_norway::from_str::<SkillMeta>(&source)
                         .map_err(|error| error.to_string())?;
                     meta.bind_directory_skill_id(skill_id.clone());
                     validate_luaskills_version(meta.version(), "version")?;
@@ -2307,7 +2307,8 @@ mod tests {
         let yaml = format!(
             "name: {skill_id}\nversion: 1.2.3\nenable: true\ndebug: false\nconfig:\n{config_yaml}\nentries: []\n"
         );
-        let mut manifest = serde_yaml::from_str::<SkillMeta>(&yaml).expect("manifest should parse");
+        let mut manifest =
+            serde_norway::from_str::<SkillMeta>(&yaml).expect("manifest should parse");
         manifest.bind_directory_skill_id(skill_id.to_string());
         manifest
             .resolve_entry_input_schemas(Path::new("."))
@@ -2366,7 +2367,8 @@ config:
 entries: []
 "#
         );
-        let mut manifest = serde_yaml::from_str::<SkillMeta>(&yaml).expect("manifest should parse");
+        let mut manifest =
+            serde_norway::from_str::<SkillMeta>(&yaml).expect("manifest should parse");
         manifest.bind_directory_skill_id(skill_id.to_string());
         manifest
             .resolve_entry_input_schemas(skill_dir)

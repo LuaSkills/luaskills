@@ -9048,9 +9048,9 @@ impl LuaEngine {
         }
 
         let yaml_str = std::fs::read_to_string(&skill_yaml)?;
-        let yaml_value: serde_yaml::Value = serde_yaml::from_str(&yaml_str)?;
+        let yaml_value: serde_norway::Value = serde_norway::from_str(&yaml_str)?;
         if yaml_value.as_mapping().is_some_and(|mapping| {
-            mapping.contains_key(serde_yaml::Value::String("skill_id".to_string()))
+            mapping.contains_key(serde_norway::Value::String("skill_id".to_string()))
         }) {
             return Err(format!(
                 "skill {} must not declare skill_id in skill.yaml; directory name is the only skill_id",
@@ -9058,7 +9058,7 @@ impl LuaEngine {
             )
             .into());
         }
-        let mut meta: SkillMeta = serde_yaml::from_value(yaml_value)?;
+        let mut meta: SkillMeta = serde_norway::from_value(yaml_value)?;
         let directory_skill_id = dir
             .file_name()
             .and_then(|value| value.to_str())

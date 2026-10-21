@@ -600,7 +600,7 @@ fn make_loaded_skill(
     local_entry_name: &str,
     lua_module: &str,
 ) -> LoadedSkill {
-    let mut meta: SkillMeta = serde_yaml::from_str(&format!("name: {skill_id}\nversion: 0.1.0\nenable: true\ndebug: false\nentries:\n  - name: {local_entry_name}\n    lua_entry: runtime/test.lua\n    lua_module: {lua_module}\n"))
+    let mut meta: SkillMeta = serde_norway::from_str(&format!("name: {skill_id}\nversion: 0.1.0\nenable: true\ndebug: false\nentries:\n  - name: {local_entry_name}\n    lua_entry: runtime/test.lua\n    lua_module: {lua_module}\n"))
             .expect("deserialize minimal skill meta");
     meta.bind_directory_skill_id(skill_id.to_string());
     // Real temporary runtime root required by the trusted package constructor.

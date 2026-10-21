@@ -1011,7 +1011,7 @@ mod tests {
         )
         .expect("write schema file");
 
-        let mut meta: SkillMeta = serde_yaml::from_str(
+        let mut meta: SkillMeta = serde_norway::from_str(
             r#"
 name: demo-skill
 version: 0.1.0
@@ -1052,7 +1052,7 @@ entries:
     fn skill_tool_meta_unresolved_input_schema_returns_error() {
         // Skill metadata intentionally left before `resolve_entry_input_schemas` to exercise the lifecycle guard.
         // 有意让技能元数据停留在 `resolve_entry_input_schemas` 之前，以覆盖生命周期保护逻辑。
-        let meta: SkillMeta = serde_yaml::from_str(
+        let meta: SkillMeta = serde_norway::from_str(
             r#"
 name: demo-skill
 version: 0.1.0
@@ -1096,7 +1096,7 @@ entries:
         fs::write(&schema_path, "{not-json").expect("invalid schema file should be written");
         // Skill metadata that resolves the external schema through the real manifest path.
         // 通过真实 manifest 路径解析外部 schema 的技能元数据。
-        let mut meta: SkillMeta = serde_yaml::from_str(
+        let mut meta: SkillMeta = serde_norway::from_str(
             r#"
 name: demo-skill
 version: 0.1.0
@@ -1138,7 +1138,7 @@ entries:
         let skill_dir = make_manifest_test_dir("invalid_schema");
         fs::create_dir_all(&skill_dir).expect("create invalid schema dir");
 
-        let mut meta: SkillMeta = serde_yaml::from_str(
+        let mut meta: SkillMeta = serde_norway::from_str(
             r#"
 name: demo-skill
 version: 0.1.0
@@ -1172,7 +1172,7 @@ entries:
         fs::create_dir_all(&skill_dir).expect("create invalid schema description dir");
         // Manifest with a property description that cannot be projected to a legacy text description.
         // 包含无法投影为旧版文本描述的属性 description 的清单。
-        let mut meta: SkillMeta = serde_yaml::from_str(
+        let mut meta: SkillMeta = serde_norway::from_str(
             r#"
 name: demo-skill
 version: 0.1.0
@@ -1210,7 +1210,7 @@ entries:
 /// 验证技能包配置声明只允许出现在清单顶层。
 #[test]
 fn package_config_is_rejected_inside_individual_entries() {
-    let error = serde_yaml::from_str::<SkillMeta>(
+    let error = serde_norway::from_str::<SkillMeta>(
         r#"
 name: demo-package
 version: 1.0.0
@@ -1234,7 +1234,7 @@ entries:
 /// 验证未知清单顶层字段会失败而不是被静默忽略。
 #[test]
 fn skill_meta_rejects_unknown_top_level_fields() {
-    let error = serde_yaml::from_str::<SkillMeta>(
+    let error = serde_norway::from_str::<SkillMeta>(
         r#"
 name: demo-package
 version: 1.0.0

@@ -90,7 +90,7 @@ pub fn parse_skill_source_manifest(
     content: &str,
     origin: &str,
 ) -> Result<SkillSourceManifest, String> {
-    serde_yaml::from_str::<SkillSourceManifest>(content).map_err(|error| {
+    serde_norway::from_str::<SkillSourceManifest>(content).map_err(|error| {
         format!(
             "Failed to parse skill source manifest from {}: {}",
             origin, error

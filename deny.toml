@@ -12,6 +12,9 @@ allow = [
     "ISC",
     "LGPL-2.1-or-later",
     "MIT",
+    # MIT-0 is MIT without the attribution clause, used by borrow-or-share through jsonschema.
+    # MIT-0 是去掉署名条款的 MIT 许可，经 jsonschema 引入的 borrow-or-share 使用。
+    "MIT-0",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",

@@ -974,7 +974,7 @@ mod tests {
     /// Returns the validated declarations.
     /// 返回校验后的声明。
     fn parse_declarations(yaml: &str) -> Vec<SkillPackageConfigDeclaration> {
-        let mut declarations = serde_yaml::from_str::<Vec<SkillPackageConfigDeclaration>>(yaml)
+        let mut declarations = serde_norway::from_str::<Vec<SkillPackageConfigDeclaration>>(yaml)
             .expect("declarations should parse");
         validate_skill_package_config_declarations("configuration-test-package", &mut declarations)
             .expect("declarations should validate");
@@ -1069,7 +1069,7 @@ mod tests {
     /// 验证声明校验会拒绝未知字段与非法结构组合。
     #[test]
     fn declaration_validation_rejects_unknown_and_invalid_shapes() {
-        let unknown_field = serde_yaml::from_str::<SkillPackageConfigDeclaration>(
+        let unknown_field = serde_norway::from_str::<SkillPackageConfigDeclaration>(
             r#"
 key: retries
 type: integer
@@ -1080,7 +1080,7 @@ unknown: true
         .expect_err("unknown declaration fields must fail");
         assert!(unknown_field.to_string().contains("unknown field"));
 
-        let mut duplicate_keys = serde_yaml::from_str::<Vec<SkillPackageConfigDeclaration>>(
+        let mut duplicate_keys = serde_norway::from_str::<Vec<SkillPackageConfigDeclaration>>(
             r#"
 - key: retries
   type: integer
@@ -1098,7 +1098,7 @@ unknown: true
         .expect_err("duplicate keys must fail");
         assert!(error.contains("duplicate configuration key"));
 
-        let mut invalid_constraints = serde_yaml::from_str::<Vec<SkillPackageConfigDeclaration>>(
+        let mut invalid_constraints = serde_norway::from_str::<Vec<SkillPackageConfigDeclaration>>(
             r#"
 - key: retries
   type: integer
@@ -1120,7 +1120,7 @@ unknown: true
     /// 验证仅用于本地化的声明字段会作为未知结构被拒绝。
     #[test]
     fn localization_fields_are_not_part_of_package_config_schema() {
-        let error = serde_yaml::from_str::<SkillPackageConfigDeclaration>(
+        let error = serde_norway::from_str::<SkillPackageConfigDeclaration>(
             r#"
 key: provider
 type: enum
@@ -1203,7 +1203,7 @@ options:
         assert!(declaration.restart_required);
         assert!(declaration.deprecated);
 
-        let mut invalid = serde_yaml::from_str::<Vec<SkillPackageConfigDeclaration>>(
+        let mut invalid = serde_norway::from_str::<Vec<SkillPackageConfigDeclaration>>(
             r#"
 - key: retry_count
   type: integer
@@ -1217,7 +1217,7 @@ options:
                 .expect_err("wrong typed example must fail");
         assert!(error.contains("example must use the declared integer type"));
 
-        let mut empty_title = serde_yaml::from_str::<Vec<SkillPackageConfigDeclaration>>(
+        let mut empty_title = serde_norway::from_str::<Vec<SkillPackageConfigDeclaration>>(
             r#"
 - key: retry_count
   type: integer
