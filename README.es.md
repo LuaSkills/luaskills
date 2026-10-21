@@ -1,125 +1,191 @@
+<div align="center">
+
 # LuaSkills
 
-[English](README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [Português (BR)](README.pt-BR.md)
+**Un runtime en Rust que convierte scripts Lua en skills de calidad de producto**
 
-[Documentación](docs/es/index.md) | [Plantilla de skill](https://github.com/LuaSkills/demo-skill) | [Ejemplo CodeKit](https://github.com/LuaSkills/vulcan-codekit)
+Núcleo en Rust · skills en LuaJIT · Rust API, C ABI, JSON FFI y SDK de TypeScript / Python / Go
 
-LuaSkills es un runtime escrito en Rust para cargar, ejecutar y administrar skills basadas en Lua.
-Permite que una aplicación host agregue herramientas scriptables, help estructurado, APIs de runtime, rutas de dependencias e integración con SQLite / LanceDB sin construir su propio runtime de plugins desde cero.
+[![crates.io](https://img.shields.io/crates/v/luaskills.svg)](https://crates.io/crates/luaskills)
+[![docs.rs](https://img.shields.io/docsrs/luaskills)](https://docs.rs/luaskills)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/LuaSkills/luaskills)](https://github.com/LuaSkills/luaskills/releases)
 
-En una frase: LuaSkills ejecuta skills; el host decide cómo convertirlas en funciones de producto.
+[English](README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | **Español** | [Français](README.fr.md) | [Deutsch](README.de.md) | [Português (BR)](README.pt-BR.md)
 
-## Qué Es
+[Documentación](docs/es/index.md) · [Plantilla de skill](https://github.com/LuaSkills/demo-skill) · [Ejemplo CodeKit](https://github.com/LuaSkills/vulcan-codekit)
 
-LuaSkills es la capa de runtime central del ecosistema LuaSkills.
-Está diseñado para aplicaciones que necesitan un sistema de skills controlado, no scripts sueltos.
+</div>
 
-Proporciona:
+> Esta es una traducción del [README en inglés](README.md). Si difieren, prevalece la versión en inglés.
 
-- Descubrimiento, carga, enumeración e invocación de skills.
-- Strict help trees que el host puede mostrar como documentación, comandos, tools o UI.
-- Inyección de APIs estándar `vulcan.*` y `vulcan.runtime.*`.
-- Sesiones persistentes de Python y Node.js aisladas por paquete para skills y System Plugins en Windows x64, Linux x64/ARM64 y macOS x64/ARM64; Windows ARM no está soportado explícitamente.
-- Contexto de runtime para request actual, directorios de skill, recursos, dependencias y metadatos del cliente.
-- Integración opcional con SQLite y LanceDB para skills con estado o memoria.
-- API Rust, C ABI estándar y FFI pública `_json`.
-- Rutas de integración SDK para TypeScript, Python y Go.
+---
 
-## Qué No Es
+## Acerca del proyecto
 
-LuaSkills no controla toda la superficie del producto.
+LuaSkills carga, ejecuta y gestiona paquetes de skills en Lua dentro de una aplicación host. El host obtiene herramientas programables, ayuda estructurada, runtimes gestionados de Python y Node.js, gestión de dependencias y ejecución con acceso a bases de datos, sin construir su propio runtime de plugins.
 
-No es:
+**LuaSkills ejecuta skills; el host decide cómo se convierten en funciones de producto.** Las políticas, la autenticación, las confirmaciones de permisos, los presupuestos, la ubicación del almacenamiento y la experiencia de usuario siguen en manos del host.
 
-- Un MCP server por sí mismo.
-- Un lector de configuración del host.
-- Un calculador de budget del cliente.
-- Un renderer de UI de producto.
-- Una frontera sandbox para código Lua no confiable.
+LuaSkills impulsa el sistema de skills de [Vulcan Code](https://github.com/OpenVulcan/vulcan-code). Encaja en cualquier agente de IA, IDE o producto de escritorio o servidor que necesite un sistema de skills controlado en lugar de scripts embebidos aislados.
 
-El host sigue controlando permisos, autenticación, UI, budgets, almacenamiento y exposición al usuario.
+## Características
 
-## Ecosistema
+### 🧩 Runtime de skills
 
-- [vulcan-codekit](https://github.com/LuaSkills/vulcan-codekit): ejemplo importante y cercano a producción que muestra navegación de código, inspección AST, búsqueda estructural, navegación Markdown y workflows de patch.
-- [vulcan-curl](https://github.com/LuaSkills/vulcan-curl): skill de requests HTTP con entradas GET / POST estructuradas y ejecución de requests estilo curl.
-- [vulcan-file](https://github.com/LuaSkills/vulcan-file): skill de operaciones de archivo para listar con reglas de ignore, leer texto exacto y hacer ediciones pequeñas con vista previa.
-- [vulcan-lua](https://github.com/LuaSkills/vulcan-lua): skill de ejecución Lua controlada para código inline o tareas basadas en archivos Lua.
-- [vulcan-testkit](https://github.com/LuaSkills/vulcan-testkit): router de validación que convierte salidas de build, test, lint y typecheck en diagnósticos compactos.
-- [vulcan-workmem](https://github.com/LuaSkills/vulcan-workmem): skill de memoria de trabajo por proyecto para checkpoints de tarea y contexto de handoff persistente.
-- [demo-skill](https://github.com/LuaSkills/demo-skill): plantilla mínima para aprender `skill.yaml`, runtime entries, help y layout de repositorio.
-- [luaskills-sdk-typescript](https://github.com/LuaSkills/luaskills-sdk-typescript): SDK para TypeScript / Node.js.
-- [luaskills-sdk-python](https://github.com/LuaSkills/luaskills-sdk-python): SDK para Python.
-- [luaskills-sdk-go](https://github.com/LuaSkills/luaskills-sdk-go): SDK para Go.
+- Descubrir, cargar, listar, invocar y recargar skills en raíces por capas `ROOT`, `PROJECT` y `USER`
+- Árboles de ayuda estrictos que el host muestra como documentación, descripciones de herramientas, paletas de comandos o paneles
+- Un esquema de entrada de objeto completo por entrada, con nombres canónicos `{skill_id}-{entry_name}`
+- Instalar, actualizar y desinstalar desde releases de GitHub o URL, con dependencias verificadas por checksum
 
-## Documentación
+### 🧰 APIs estándar de Lua
 
-- [Entrada en español](docs/es/index.md)
-- [Por Qué LuaSkills](docs/es/product/why-luaskills.md)
-- [Entrada en inglés](docs/index.md)
-- [Documentación técnica detallada en chino](docs/zh-CN/index.md)
+- `vulcan.fs`, `vulcan.path`, `vulcan.process`, `vulcan.io`, `vulcan.os`, `vulcan.json`, `vulcan.cache`
+- `vulcan.context` con datos de solicitud, cliente, presupuesto y directorios del skill; `vulcan.deps` para las raíces de dependencias
+- `vulcan.host.*` llama a herramientas registradas por el host; `vulcan.models.*` usa modelos de embeddings y LLM gestionados por el host
+- `vulcan.config.*` ofrece a cada paquete configuración tipada y validada, con almacenes versionados y eventos de cambio
 
-## Rutas De Integración
+### 🐍 Python y Node.js gestionados
 
-| Tipo de host | Ruta recomendada |
+- Los skills invocan manejadores versionados de Python y Node.js mediante `vulcan.runtime.python.*` y `vulcan.runtime.node.*`
+- Dependencias bloqueadas, salida acotada y limpieza determinista del árbol de procesos
+- Sesiones persistentes entre llamadas para leases estrictos de System Plugin, con eventos del host y un callback de activación por flanco
+- Raíces de distribución de solo lectura y raíces de entorno escribibles elegidas por el host
+
+### 🔌 Integración con el host
+
+- API del crate para hosts Rust
+- C ABI estándar y FFI pública `_json` para cualquier otro lenguaje
+- `runtime_lease` público y `system_runtime_lease` ligado a autoridad para VMs de Lua persistentes
+- Resultados estructurados `host_result`, empezando por ediciones `change_set` de nivel IDE
+- SQLite y LanceDB opcionales mediante bibliotecas dinámicas, callbacks del host o un space controller
+
+### 📦 SDK
+
+- SDK de [TypeScript / Node.js](https://github.com/LuaSkills/luaskills-sdk-typescript), [Python](https://github.com/LuaSkills/luaskills-sdk-python) y [Go](https://github.com/LuaSkills/luaskills-sdk-go) sobre la FFI JSON
+- Instalación de recursos del runtime con verificación SHA-256
+
+## Lo que LuaSkills no es
+
+- No es un servidor MCP por sí mismo; [vulcan-mcp](https://github.com/OpenVulcan/vulcan-mcp) aporta una capa de host MCP
+- No lee la configuración del host, no calcula presupuestos ni renderiza interfaces
+- **No es un sandbox.** Los skills son código de confianza. El host decide qué raíces se activan, qué skills se instalan, qué acciones de gestión se exponen, qué modos de base de datos se permiten y qué autoridad lleva cada operación.
+
+## Arquitectura
+
+```
+┌──────────────────────────────┐         ┌──────────────────────────────────────┐
+│  Host application            │  Rust   │  LuaSkills runtime                   │
+│  policy · UI · permissions   │  C ABI  │  skill loader · help · lifecycle     │
+│  budgets · model providers   │◀───────▶│  LuaJIT VMs · leases · vulcan.* APIs │
+│  host tools · storage        │  JSON   │  managed Python / Node · deps        │
+│                              │  FFI    │  config stores · SQLite / LanceDB    │
+└──────────────────────────────┘         └──────────────────────────────────────┘
+                                                          │
+                                              skills/<skill_id>/skill.yaml
+```
+
+| Directorio | Descripción |
 | --- | --- |
-| Rust | Usar directamente el crate Rust. |
-| C / C++ / host de bajo nivel | Usar el C ABI estándar. |
-| TypeScript / Node.js | Preferir `luaskills-sdk-typescript`. |
-| Python | Preferir `luaskills-sdk-python`. |
-| Go | Elegir `luaskills-sdk-go` o C ABI estándar según callbacks y despliegue. |
+| `src/runtime` | Motor, VMs de Lua, leases, contexto, ayuda, resultados y runtimes gestionados |
+| `src/skill` | Manifiestos, raíces, configuración y gestión del ciclo de vida |
+| `src/dependency`, `src/download` | Resolución de dependencias, descargas y extracción de archivos |
+| `src/providers` | Enlaces de SQLite y LanceDB |
+| `src/ffi`, `src/ffi_standard`, `src/ffi_embedded` | FFI pública `_json`, C ABI estándar y transporte del runtime embebido |
+| `include/` | Cabeceras C para hosts FFI |
+| `contracts/` | Contratos de máquina compartidos con los SDK |
+| `examples/` | Ejemplos de Rust, FFI, runtimes gestionados y configuración |
 
-## Inicio Rápido
+## Primeros pasos
 
-Host Rust:
+### Hosts Rust
 
 ```toml
 [dependencies]
-luaskills = "0.5"
+luaskills = "0.6.2"
 ```
 
-Comandos de desarrollo:
+[`examples/demo-rust`](examples/demo-rust/README.md) muestra `call_skill` y el puente de herramientas `vulcan.host.*`.
+
+### Otros lenguajes
+
+| Host | Opción |
+| --- | --- |
+| TypeScript / Node.js | `npm install @luaskills/sdk` |
+| Python | `pip install luaskills-sdk` |
+| Go | `go get github.com/LuaSkills/luaskills-sdk-go` |
+| C / C++ | Descarga `luaskills-ffi-sdk-{platform}.tar.gz` desde [Releases](https://github.com/LuaSkills/luaskills/releases) y usa la C ABI estándar |
+
+Consulta el [SDK overview](docs/sdk/index.md) y el [FFI overview](docs/integration/ffi-overview.md).
+
+### Escribir un skill
+
+Empieza con [demo-skill](https://github.com/LuaSkills/demo-skill) y lee el [Skill development manual](docs/development/skill-development.md). Para depurar un skill con una estructura de runtime real:
 
 ```bash
-cargo check
-cargo test --lib
+cargo run --bin luaskills-debug -- call \
+  --runtime-root D:/runtime \
+  --skill-path D:/skills/demo-skill \
+  --tool ping \
+  --args-json "{\"note\":\"hello\"}"
 ```
 
-Para aprender la forma de un skill:
+`luaskills-debug` copia el skill a `runtime_root/skills/<skill_id>` y ejecuta la ruta normal `load_from_roots -> call_skill`, de modo que raíces de dependencias, estado, bases de datos y contexto coinciden con la ejecución real del host. Es una herramienta de desarrollo del repositorio y no añade API al SDK ni a la FFI.
 
-1. [demo-skill](https://github.com/LuaSkills/demo-skill)
-2. [vulcan-codekit](https://github.com/LuaSkills/vulcan-codekit)
-3. [Skill development manual](docs/skill-development.md)
+## Documentación
 
-## Reglas De Nomenclatura De Skills
-
-`skill_id` y cada `entry.name` deben cumplir `^[a-z]([a-z0-9-]*[a-z0-9])?$`.
-El nombre físico del directorio del skill es la única fuente de `skill_id`; `skill.yaml` no debe declarar un campo `skill_id`.
-Las entradas canonical usan `{skill_id}-{entry_name}` y pueden recibir un sufijo estable `-N` si hay conflictos.
-Para skills gestionados por GitHub, el `skill_id` derivado del repositorio o explícito, el prefijo del zip de release, el prefijo de checksums, el directorio superior del zip y el directorio instalado deben ser idénticos.
-Los assets usan `{skill_id}-v{version}-skill.zip` y `{skill_id}-v{version}-checksums.txt`; el zip debe contener `{skill_id}/skill.yaml`.
-
-## Modelo De Confianza
-
-Actualmente LuaSkills trata los skills como código confiable por defecto.
-No ofrece una promesa de sandbox para paquetes Lua arbitrarios y no confiables.
-
-El host debe decidir roots, skills instalables, acciones de gestión, modo de database provider y authority de cada operación.
-
-## Matriz De Versiones Actual
-
-| Componente | Versión actual |
+| Tema | Documentos |
 | --- | --- |
-| Núcleo LuaSkills, FFI SDK y línea de SDK de lenguajes | `0.5.4` |
-| Serie compatible de paquetes del runtime Lua | `0.1` |
+| Desarrollo de skills | [Skill development manual](docs/development/skill-development.md) · [System Plugin managed runtime guide](docs/development/system-plugin-managed-runtime.md) |
+| Integración con el host | [Runtime architecture](docs/integration/runtime-model.md) · [FFI overview](docs/integration/ffi-overview.md) · [Managed runtime roots](docs/integration/managed-runtime-host-roots.md) · [Package configuration](docs/integration/package-configuration.md) · [Database providers](docs/integration/database-providers.md) |
+| SDK | [SDK overview](docs/sdk/index.md) |
+| Todo | [Documentación en español](docs/es/index.md) · [Documentation hub](docs/index.md) |
+
+## Ecosistema
+
+| Repositorio | Descripción |
+| --- | --- |
+| [vulcan-codekit](https://github.com/LuaSkills/vulcan-codekit) | Navegación de código, inspección AST, búsqueda estructural, navegación Markdown y parches seguros |
+| [vulcan-curl](https://github.com/LuaSkills/vulcan-curl) | Solicitudes HTTP GET / POST estructuradas |
+| [vulcan-file](https://github.com/LuaSkills/vulcan-file) | Listados que respetan reglas de ignorado, lecturas exactas y pequeñas ediciones con vista previa |
+| [vulcan-lua](https://github.com/LuaSkills/vulcan-lua) | Ejecución acotada de Lua en línea o desde archivos |
+| [vulcan-testkit](https://github.com/LuaSkills/vulcan-testkit) | Convierte la salida de build, tests, lint y verificación de tipos en diagnósticos compactos |
+| [vulcan-workmem](https://github.com/LuaSkills/vulcan-workmem) | Memoria de trabajo por proyecto para puntos de control y traspasos |
+| [demo-skill](https://github.com/LuaSkills/demo-skill) | Plantilla mínima de repositorio de skill |
+| [luaskills-packages](https://github.com/LuaSkills/luaskills-packages) | Paquetes del runtime de Lua y dependencias nativas |
+
+## Versiones
+
+| Componente | Versión |
+| --- | --- |
+| Núcleo de LuaSkills y FFI SDK | `0.6.2` |
+| SDK de TypeScript, Python y Go | Líneas de versión independientes; ver [SDK overview](docs/sdk/index.md#versions) |
+| Paquetes del runtime de Lua | serie compatible `0.1` |
 | Python / uv gestionados | `3.14.6` / `0.11.28` |
 | Node.js / pnpm gestionados | `24.18.0` / `11.11.0` |
-| Valores predeterminados del motor administrado | `workers=4 / inactividad=60s / sesiones=256 / búfer=1MiB/flujo / invoke=ilimitado` |
+| Valores por defecto del runtime gestionado | `workers=4 / idle=60s / sessions=256 / buffer=1MiB/stream / invoke=unlimited` |
 | vldb-controller | `0.2.3` |
 | vldb-sqlite / vldb-lancedb | `0.1.6` / `0.1.5` |
 
-Los valores ejecutables predeterminados se definen en `scripts/deps/fetch_managed_runtimes.*`, `scripts/deps/fetch_deps.*` y `scripts/deps/sync_runtime_assets.*`. `dependencies.yaml` debe declarar estas versiones exactas del runtime y del gestor de paquetes, salvo que el host instale y declare deliberadamente otra versión exacta compatible.
+Los valores por defecto de los scripts están en `scripts/deps/`. Las publicaciones siguen el [flujo de release](scripts/release/README.md): primero los paquetes del runtime, luego el release del núcleo en cinco plataformas, después el crate y por último los SDK.
 
-## License
+## Contribuir
 
-MIT
+Issues y pull requests son bienvenidos.
+
+1. Haz un fork del repositorio y crea una rama desde `main`.
+2. Verifica en local:
+
+   ```bash
+   cargo fmt --all -- --check
+   cargo clippy --all-targets -- -D warnings
+   cargo test --all-targets -- --test-threads=1
+   cargo deny check
+   ```
+
+3. Firma cada commit con `git commit -s`; consulta [CONTRIBUTING.md](CONTRIBUTING.md) para el DCO.
+4. Mantén cada pull request centrado en un solo cambio y explica qué cambiaste, por qué y cómo lo verificaste.
+
+## Licencia
+
+[MIT](LICENSE). Los avisos de terceros están en [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

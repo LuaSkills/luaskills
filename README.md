@@ -1,165 +1,124 @@
+<div align="center">
+
 # LuaSkills
 
-[English](README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [Português (BR)](README.pt-BR.md)
+**A Rust runtime that turns Lua scripts into product-grade skills**
 
-[Documentation hub](docs/index.md) | [Skill template](https://github.com/LuaSkills/demo-skill) | [CodeKit example](https://github.com/LuaSkills/vulcan-codekit)
+Rust core · LuaJIT skills · Rust API, C ABI, JSON FFI, and TypeScript / Python / Go SDKs
 
-LuaSkills is a Rust-powered runtime for loading, running, and managing Lua-based skills.
-It gives host applications a compact way to add scriptable tools, structured help, runtime capabilities, dependency paths, and database-aware skill execution without turning every host into its own plugin runtime.
+[![crates.io](https://img.shields.io/crates/v/luaskills.svg)](https://crates.io/crates/luaskills)
+[![docs.rs](https://img.shields.io/docsrs/luaskills)](https://docs.rs/luaskills)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/LuaSkills/luaskills)](https://github.com/LuaSkills/luaskills/releases)
 
-In one sentence: LuaSkills runs skills; the host decides how those skills become product features.
+**English** | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [Português (BR)](README.pt-BR.md)
 
-## What It Is
+[Documentation](docs/index.md) · [Skill template](https://github.com/LuaSkills/demo-skill) · [CodeKit example](https://github.com/LuaSkills/vulcan-codekit)
 
-LuaSkills is the core runtime layer for the LuaSkills ecosystem.
-It is designed for applications that want a controlled skill system instead of one-off embedded scripts.
+</div>
 
-It provides:
+---
 
-- Skill discovery, loading, entry enumeration, and invocation.
-- Persistent runtime leases through `runtime_lease` and authority-bound `system_runtime_lease` entrypoints, with strict System Plugin package identity.
-- Strict help trees that hosts can render as docs, command palettes, tools, or UI panels.
-- Standard Lua capability namespaces under `vulcan.*` and system-side helpers under `vulcan.runtime.*`.
-- Runtime context injection for current requests, skill directories, resources, dependency roots, and client metadata.
-- Host-owned structured result bridging through `host_result`, including the first canonical `change_set` result kind.
-- Optional SQLite and LanceDB bindings for stateful or memory-oriented skills.
-- Managed Python and Node.js child runtimes that Lua skills and System Plugins can invoke through `vulcan.runtime.python.*` and `vulcan.runtime.node.*`; persistent cross-eval sessions are restricted to dedicated System Plugin leases.
-- Host-selected read-only Python/Node distribution roots and writable environment roots, with Rust and JSON FFI read-only resolution plus standard C ABI V3 engine creation.
-- Bounded host-side managed-session events with destructive poll/wait APIs and an edge-triggered wake callback that never executes Lua.
-- Rust API integration for Rust hosts.
-- Standard C ABI and public `_json` FFI for non-Rust hosts.
-- SDK-oriented integration paths for TypeScript, Python, and Go.
+## About
 
-## What It Is Not
+LuaSkills loads, runs, and manages Lua skill packages inside a host application. A host gets scriptable tools, structured help, managed Python and Node.js runtimes, dependency management, and database-aware execution without building its own plugin runtime.
 
-LuaSkills intentionally does not own the whole product surface.
+**LuaSkills runs skills; the host decides how they become product features.** Policy, authentication, permission prompts, budgets, storage placement, and user experience stay with the host.
 
-It is not:
+LuaSkills powers the skill system of [Vulcan Code](https://github.com/OpenVulcan/vulcan-code). It fits any AI agent, IDE, or desktop or server product that needs a controlled skill system instead of one-off embedded scripts.
 
-- An MCP server by itself.
-- A host configuration file reader.
-- A client budget calculator.
-- A product UI renderer.
-- A sandbox boundary for untrusted Lua code.
+## Highlights
 
-Hosts stay in charge of policy, authentication, user experience, budgeting, permission prompts, storage placement, and how skills are exposed to users.
+### 🧩 Skill runtime
 
-## Why Use It
+- Discover, load, list, call, and reload skills across layered `ROOT`, `PROJECT`, and `USER` roots
+- Strict help trees that hosts render as docs, tool descriptions, command palettes, or UI panels
+- A full object input schema per entry, with canonical `{skill_id}-{entry_name}` naming
+- Install, update, and uninstall from GitHub releases or URLs, with checksum-verified dependencies
 
-Use LuaSkills when you want skills to feel like a product capability instead of loose scripts.
+### 🧰 Standard Lua APIs
 
-Good fits include:
+- `vulcan.fs`, `vulcan.path`, `vulcan.process`, `vulcan.io`, `vulcan.os`, `vulcan.json`, `vulcan.cache`
+- `vulcan.context` for request, client, budget, and skill directory data; `vulcan.deps` for dependency roots
+- `vulcan.host.*` calls host-registered tools; `vulcan.models.*` uses host-managed embedding and LLM models
+- `vulcan.config.*` gives each package typed, validated configuration with versioned stores and change events
 
-- AI agents that need reusable local tools.
-- IDEs and developer tools that want scriptable workflows.
-- Desktop or server hosts that need first-party and user-installed skills.
-- Products that want a stable runtime contract across Rust, C ABI, TypeScript, Python, and Go.
-- Memory, database, search, or automation skills that need a clear host ownership model.
+### 🐍 Managed Python and Node.js
 
-LuaSkills is especially useful when you need a split between runtime truth and host presentation:
+- Skills call versioned Python and Node.js handlers through `vulcan.runtime.python.*` and `vulcan.runtime.node.*`
+- Locked package dependencies, bounded output, and deterministic process-tree cleanup
+- Persistent cross-call sessions for strict System Plugin leases, with host events and an edge-triggered wake callback
+- Host-selected read-only distribution roots and writable environment roots
 
-- The runtime knows how to load and execute skills.
-- The host knows what the user is allowed to do.
-- The skill author gets stable `vulcan.*` APIs instead of guessing host internals.
+### 🔌 Host integration
 
-## Core Capabilities
+- Rust crate API for Rust hosts
+- Standard C ABI and public `_json` FFI for every other language
+- Public `runtime_lease` and authority-bound `system_runtime_lease` for persistent Lua VMs
+- Structured `host_result` returns, starting with IDE-grade `change_set` edits
+- Optional SQLite and LanceDB through dynamic libraries, host callbacks, or a space controller
 
-| Area | What LuaSkills Provides |
+### 📦 SDKs
+
+- [TypeScript / Node.js](https://github.com/LuaSkills/luaskills-sdk-typescript), [Python](https://github.com/LuaSkills/luaskills-sdk-python), and [Go](https://github.com/LuaSkills/luaskills-sdk-go) SDKs over the JSON FFI
+- Runtime asset installation with SHA-256 verification
+
+## What LuaSkills is not
+
+- Not an MCP server by itself; [vulcan-mcp](https://github.com/OpenVulcan/vulcan-mcp) provides an MCP host layer
+- Not a host configuration reader, a budget calculator, or a UI renderer
+- **Not a sandbox.** Skills are trusted code. Hosts decide which roots are enabled, which skills are installed, which management actions are exposed, which database modes are allowed, and which authority each operation carries.
+
+## Architecture
+
+```
+┌──────────────────────────────┐         ┌──────────────────────────────────────┐
+│  Host application            │  Rust   │  LuaSkills runtime                   │
+│  policy · UI · permissions   │  C ABI  │  skill loader · help · lifecycle     │
+│  budgets · model providers   │◀───────▶│  LuaJIT VMs · leases · vulcan.* APIs │
+│  host tools · storage        │  JSON   │  managed Python / Node · deps        │
+│                              │  FFI    │  config stores · SQLite / LanceDB    │
+└──────────────────────────────┘         └──────────────────────────────────────┘
+                                                          │
+                                              skills/<skill_id>/skill.yaml
+```
+
+| Directory | Description |
 | --- | --- |
-| Skill runtime | Load skills, list entries, call entries, reload roots, and manage lifecycle operations. |
-| Lua API | Inject `vulcan.call`, `vulcan.fs`, `vulcan.path`, `vulcan.process`, `vulcan.os`, `vulcan.json`, `vulcan.cache`, `vulcan.context`, `vulcan.deps`, `vulcan.sqlite`, `vulcan.lancedb`, and `vulcan.runtime`. |
-| Help model | Parse strict skill help trees and expose structured help for host rendering. |
-| Host boundary | Keep product policy, UI, budgets, and permissions outside the runtime. |
-| Host runtime leases | Support public `runtime_lease` and authority-bound `system_runtime_lease` calls for persistent Lua VM state; System leases require `system_package { id, root, dependencies_file }` and run in a dedicated package-isolated VM. |
-| Structured host results | Let hosts opt into `host_result` so skills can return a fourth structured payload such as `change_set` without replacing the main text result. |
-| Database providers | Support dynamic-library, host-callback, and space-controller modes for SQLite and LanceDB. |
-| Managed child runtimes | Let Lua skills and System Plugins call versioned Python/Node handlers; dedicated System Plugin leases may also open persistent child sessions with locked package dependencies, bounded output, deterministic process-tree cleanup, and host events. |
-| Multi-language integration | Expose Rust APIs, standard C ABI, and public `_json` FFI for SDKs and host bridges. |
-| Skill roots | Support layered roots such as `ROOT`, `PROJECT`, and `USER` with host-controlled management authority. |
+| `src/runtime` | Engine, Lua VMs, leases, context, help, results, managed runtimes |
+| `src/skill` | Manifests, roots, configuration, and lifecycle management |
+| `src/dependency`, `src/download` | Dependency resolution, downloads, and archive extraction |
+| `src/providers` | SQLite and LanceDB bindings |
+| `src/ffi`, `src/ffi_standard`, `src/ffi_embedded` | Public `_json` FFI, standard C ABI, and embedded runtime transport |
+| `include/` | C headers for FFI hosts |
+| `contracts/` | Machine contracts shared with the SDKs |
+| `examples/` | Rust, FFI, managed-runtime, and configuration examples |
 
-## Ecosystem
+## Getting started
 
-LuaSkills is most useful when read together with its ecosystem repositories.
-
-- [vulcan-codekit](https://github.com/LuaSkills/vulcan-codekit): a production-grade LuaSkills example that exposes source-code navigation, AST inspection, structural search, Markdown navigation, and safe patching workflows.
-- [vulcan-curl](https://github.com/LuaSkills/vulcan-curl): an HTTP request skill built around structured GET / POST entries and curl-style request execution.
-- [vulcan-file](https://github.com/LuaSkills/vulcan-file): a focused file operation skill for ignored-aware listing, exact text reads, and preview-first small edits.
-- [vulcan-lua](https://github.com/LuaSkills/vulcan-lua): a controlled Lua execution skill for bounded inline code or file-based Lua tasks.
-- [vulcan-testkit](https://github.com/LuaSkills/vulcan-testkit): a validation router that turns build, test, lint, and typecheck output into compact diagnostics.
-- [vulcan-workmem](https://github.com/LuaSkills/vulcan-workmem): a project-scoped working-memory skill for durable task checkpoints and handoff context.
-- [demo-skill](https://github.com/LuaSkills/demo-skill): a minimal skill repository template for learning package layout, `skill.yaml`, runtime entries, and help files.
-- [luaskills-sdk-typescript](https://github.com/LuaSkills/luaskills-sdk-typescript): TypeScript and Node.js SDK for the public `_json` FFI path.
-- [luaskills-sdk-python](https://github.com/LuaSkills/luaskills-sdk-python): Python SDK for ctypes-based public `_json` FFI integration.
-- [luaskills-sdk-go](https://github.com/LuaSkills/luaskills-sdk-go): Go SDK for cgo-backed public `_json` FFI integration.
-- [vulcan-mcp](https://github.com/OpenVulcan/vulcan-mcp): MCP host and protocol adaptation layer.
-
-## Documentation
-
-Start here:
-
-- [Documentation hub](docs/index.md): English navigation and product-level map.
-- [Chinese documentation](README.zh-CN.md): Chinese product overview and full technical docs entry.
-- [Why LuaSkills](docs/product/why-luaskills.md): product narrative, architecture value, and supported integration categories.
-- [Skill development manual](docs/skill-development.md): full English manual for skill authors.
-- [FFI and SDK overview](docs/ffi/overview.md): English overview for host integrators.
-- [System Plugin managed runtime guide](docs/system-plugin-managed-runtime.md): end-to-end package, persistent Python/Node session, event, and cleanup workflow.
-- [Host-selected managed runtime roots](docs/managed-runtime-host-roots.md): independent roots, B3-B7 engine policy, asset identity hashes, Rust/JSON resolvers, and C ABI V3.
-- [LuaSkills 0.5.4 patch guide](docs/upgrade-0.5.4.md): VLDB controller client 0.2.3 and SQLite 0.1.6 runtime alignment.
-- [LuaSkills 0.5.5 package configuration guide](docs/upgrade-0.5.5.md): strict declarations, versioned stores, transactions, events, and SDK integration.
-- [LuaSkills 0.5.3 patch guide](docs/upgrade-0.5.3.md): JSON Object/Array/Null fidelity, explicit Lua JSON constructors, and strict Windows verbatim-path boundaries.
-- [LuaSkills 0.5.2 patch guide](docs/upgrade-0.5.2.md): Windows System-lease cwd, SHA-256 release assets, and Go runtime-lease example corrections.
-- [LuaSkills 0.5.1 upgrade guide](docs/upgrade-0.5.1.md): host-root, resource-policy, FFI, SDK, and validation migration checklist.
-- [Database provider overview](docs/providers/database-providers.md): English overview for SQLite and LanceDB ownership.
-- [Runtime architecture overview](docs/architecture/runtime-model.md): English overview of host/runtime boundaries.
-- [Chinese docs index](docs/zh-CN/index.md): full Chinese technical documentation map.
-
-Important technical docs:
-
-- [Lua Skill developer manual](docs/skill-development.md)
-- [Chinese Lua Skill developer manual](docs/zh-CN/skill-development.md)
-- [System Plugin managed runtime guide](docs/system-plugin-managed-runtime.md)
-- [System Plugin 受管运行时使用指南](docs/zh-CN/system-plugin-managed-runtime.md)
-- [Host-selected managed runtime roots](docs/managed-runtime-host-roots.md)
-- [宿主指定受管运行时根目录](docs/zh-CN/managed-runtime-host-roots.md)
-- [FFI integration guide](docs/zh-CN/ffi/integration-guide.md)
-- [FFI host checklist](docs/zh-CN/ffi/host-checklist.md)
-- [Host database provider guide](docs/zh-CN/providers/host-database-provider-guide.md)
-- [Skill root layer policy](docs/zh-CN/architecture/skill-root-layer-policy.md)
-- [Skill package configuration declaration and host integration](docs/zh-CN/architecture/skill-config-system-design.md)
-- [Host tooling result bridge and `system_lua_lib` design draft](docs/zh-CN/architecture/host-tooling-result-bridge-design.md)
-
-## Integration Paths
-
-Choose the path by host type:
-
-| Host type | Recommended path |
-| --- | --- |
-| Rust | Use the Rust crate directly. |
-| C / C++ / low-level hosts | Use the standard C ABI. |
-| TypeScript / Node.js | Use `luaskills-sdk-typescript` over the public `_json` FFI. |
-| Python | Use `luaskills-sdk-python` over the public `_json` FFI. |
-| Go | Use `luaskills-sdk-go` or the standard C ABI depending on callback and deployment needs. |
-| Mixed host | Use standard C ABI for the stable core path and public `_json` FFI for dynamic operations or SDK-style integration. |
-
-## Quick Start
-
-Rust hosts can depend on the crate directly:
+### Rust hosts
 
 ```toml
 [dependencies]
-luaskills = "0.6.0"
+luaskills = "0.6.2"
 ```
 
-Repository development uses the normal Rust workflow:
+[`examples/demo-rust`](examples/demo-rust/README.md) shows `call_skill` and the `vulcan.host.*` tool bridge.
 
-```bash
-cargo check
-cargo test --lib
-```
+### Other languages
 
-The direct Rust host example lives in [examples/demo-rust](examples/demo-rust/README.md) and covers both `call_skill` and the `vulcan.host.*` host-tool bridge.
+| Host | Path |
+| --- | --- |
+| TypeScript / Node.js | `npm install @luaskills/sdk` |
+| Python | `pip install luaskills-sdk` |
+| Go | `go get github.com/LuaSkills/luaskills-sdk-go` |
+| C / C++ | Download `luaskills-ffi-sdk-{platform}.tar.gz` from [Releases](https://github.com/LuaSkills/luaskills/releases) and use the standard C ABI |
 
-For local skill-package debugging, the repository also ships a standalone Rust bin:
+See the [SDK overview](docs/sdk/index.md) and the [FFI overview](docs/integration/ffi-overview.md).
+
+### Writing a skill
+
+Start from [demo-skill](https://github.com/LuaSkills/demo-skill), then read the [skill development manual](docs/development/skill-development.md). To debug one skill against a real runtime layout:
 
 ```bash
 cargo run --bin luaskills-debug -- call \
@@ -169,114 +128,62 @@ cargo run --bin luaskills-debug -- call \
   --args-json "{\"note\":\"hello\"}"
 ```
 
-`luaskills-debug` is a repository-side developer tool only. It does not add any SDK API or FFI API. The bin first synchronizes the target skill into `runtime_root/skills/<skill_id>`, then reuses the normal `load_from_roots -> call_skill` path so dependency roots, state directories, databases, and runtime context remain aligned with real host execution. The runtime root is now the single directory input; LuaSkills derives `bin`, `libs`, `lua_packages`, `resources`, `skills`, `temp`, `dependencies`, `state`, `databases`, `config`, and `system_lua_lib` from it. Host tools live directly under `runtime_root/bin`, and native/FFI libraries live under `runtime_root/libs`.
+`luaskills-debug` copies the skill into `runtime_root/skills/<skill_id>` and runs the normal `load_from_roots -> call_skill` path, so dependency roots, state, databases, and context match real host execution. It is a repository developer tool and adds no SDK or FFI API.
 
-To learn the skill package shape before writing a host integration, start with:
+## Documentation
 
-1. [demo-skill](https://github.com/LuaSkills/demo-skill)
-2. [vulcan-codekit](https://github.com/LuaSkills/vulcan-codekit)
-3. [Lua Skill developer manual](docs/skill-development.md)
-
-For FFI hosts, begin with:
-
-1. [FFI beta release notes](docs/zh-CN/ffi/beta-release-notes.md)
-2. [FFI host checklist](docs/zh-CN/ffi/host-checklist.md)
-3. [FFI integration guide](docs/zh-CN/ffi/integration-guide.md)
-
-## Skill Naming Rules
-
-`skill_id` and every `entry.name` must match `^[a-z]([a-z0-9-]*[a-z0-9])?$`.
-The physical skill directory name is the only `skill_id`; `skill.yaml` must not declare a `skill_id` field.
-Canonical entries use `{skill_id}-{entry_name}` and may receive a stable `-N` suffix on conflicts.
-For GitHub-managed skills, the repository-derived or explicit `skill_id`, release zip prefix, checksum prefix, zip top-level directory, and final installed directory must be identical.
-Use `{skill_id}-v{version}-skill.zip`, `{skill_id}-v{version}-checksums.txt`, and a zip containing `{skill_id}/skill.yaml`.
-
-## Trust Model
-
-LuaSkills currently treats skills as trusted code by default.
-It does not provide a sandbox security promise for arbitrary untrusted Lua packages.
-
-Product hosts should decide:
-
-- Which roots are enabled.
-- Which skills are installed or ignored.
-- Which management actions are exposed.
-- Which database provider mode is allowed.
-- Which user or system authority is attached to an operation.
-
-## Repository Layout
-
-```text
-README.md        English product homepage.
-README.zh-CN.md  Chinese product homepage.
-README.ja.md     Japanese product homepage.
-README.ko.md     Korean product homepage.
-README.es.md     Spanish product homepage.
-README.fr.md     French product homepage.
-README.de.md     German product homepage.
-README.pt-BR.md  Brazilian Portuguese product homepage.
-
-src/
-  dependency/    Skill dependency parsing, installation, and cleanup.
-  download/      GitHub, URL, and archive download support.
-  host/          Host callbacks and host option models.
-  providers/     SQLite and LanceDB provider bindings.
-  runtime/       Engine, context, help, result, logging, and cache runtime.
-  skill/         Manifest, source records, and lifecycle management.
-  ffi.rs         Public `_json` FFI exports.
-  ffi_standard.rs Standard C ABI exports.
-
-docs/
-  index.md       English documentation hub.
-  skill-development.md
-                 English skill author overview.
-  architecture/  English runtime architecture overview.
-  ffi/           English FFI and SDK overview.
-  product/       English product-level documents.
-  providers/     English database provider overview.
-  zh-CN/         Chinese product and deep technical documentation.
-  ja/            Japanese product documentation.
-  ko/            Korean product documentation.
-  es/            Spanish product documentation.
-  fr/            French product documentation.
-  de/            German product documentation.
-  pt-BR/         Brazilian Portuguese product documentation.
-
-examples/
-  demo-rust/     Rust host demo with call_skill and host-tool bridge examples.
-  demo-ffi/      Packaged FFI demo entry.
-  ffi/           C, Python, Go, TypeScript, runtime fixture, and provider demos.
-```
-
-## Ecosystem Release Order
-
-This source targets the `0.6.0` release line. Publication and artifact verification follow the [release workflow](scripts/release/README.md), in this order:
-
-1. Verify that the declared compatible `LuaSkills/luaskills-packages` runtime and dependency assets already exist; publish that repository first only when changing its compatible series.
-2. Complete local validation, then build and verify the five-platform Core GitHub candidate, including `luaskills-ffi-sdk-*` and demo assets, before publishing the `v0.6.0` GitHub release.
-3. Publish the `luaskills` crate at `0.6.0` only after the Core GitHub release and its complete assets pass verification.
-4. Publish the TypeScript SDK `@luaskills/sdk@0.6.0` and Python SDK `luaskills-sdk==0.6.0` after verifying the Core release and crate prerequisites; complete each SDK's formal candidate/completion chain and cold registry consumer verification.
-5. Publish the Go SDK module tag `v0.6.0` only after both TypeScript and Python formal publication chains pass the Go prerequisite checks.
-6. Run the **Examples Release** workflow for each SDK only after its successful SDK completion chain is verified and its package or module tag is visible upstream.
-
-This order keeps every installer and examples workflow pointed at already-published packages assets, core assets, and SDK packages.
-
-## Source and Release Line Matrix
-
-| Component | Declared source or release line |
+| Topic | Documents |
 | --- | --- |
-| LuaSkills core | `0.6.0` |
-| Packaged FFI SDK release line | `0.6.0` |
-| TypeScript, Python, and Go SDK line | `0.6.0` |
-| Lua runtime packages compatible series | `0.1` |
+| Skill development | [Skill development manual](docs/development/skill-development.md) · [System Plugin managed runtime guide](docs/development/system-plugin-managed-runtime.md) |
+| Host integration | [Runtime architecture](docs/integration/runtime-model.md) · [FFI overview](docs/integration/ffi-overview.md) · [Managed runtime roots](docs/integration/managed-runtime-host-roots.md) · [Package configuration](docs/integration/package-configuration.md) · [Database providers](docs/integration/database-providers.md) |
+| SDKs | [SDK overview](docs/sdk/index.md) |
+| Everything | [Documentation hub](docs/index.md) · [中文文档](docs/zh-CN/index.md) |
+
+## Ecosystem
+
+| Repository | Description |
+| --- | --- |
+| [vulcan-codekit](https://github.com/LuaSkills/vulcan-codekit) | Code navigation, AST inspection, structural search, Markdown navigation, and safe patching |
+| [vulcan-curl](https://github.com/LuaSkills/vulcan-curl) | Structured HTTP GET / POST requests |
+| [vulcan-file](https://github.com/LuaSkills/vulcan-file) | Ignore-aware listing, exact reads, and preview-first small edits |
+| [vulcan-lua](https://github.com/LuaSkills/vulcan-lua) | Bounded inline or file-based Lua execution |
+| [vulcan-testkit](https://github.com/LuaSkills/vulcan-testkit) | Turns build, test, lint, and typecheck output into compact diagnostics |
+| [vulcan-workmem](https://github.com/LuaSkills/vulcan-workmem) | Project-scoped working memory for checkpoints and handoffs |
+| [demo-skill](https://github.com/LuaSkills/demo-skill) | Minimal skill repository template |
+| [luaskills-packages](https://github.com/LuaSkills/luaskills-packages) | Lua runtime packages and native dependency bundles |
+
+## Versions
+
+| Component | Version |
+| --- | --- |
+| LuaSkills core and FFI SDK | `0.6.2` |
+| TypeScript, Python, and Go SDKs | Independent version lines; see the [SDK overview](docs/sdk/index.md#versions) |
+| Lua runtime packages | compatible `0.1` series |
 | Managed Python / uv | `3.14.6` / `0.11.28` |
 | Managed Node.js / pnpm | `24.18.0` / `11.11.0` |
-| Managed-runtime engine defaults | `workers=4 / idle=60s / sessions=256 / buffer=1MiB/stream / invoke=unlimited` |
+| Managed runtime defaults | `workers=4 / idle=60s / sessions=256 / buffer=1MiB/stream / invoke=unlimited` |
 | vldb-controller | `0.2.3` |
 | vldb-sqlite / vldb-lancedb | `0.1.6` / `0.1.5` |
 
-The executable defaults are defined by `scripts/deps/fetch_managed_runtimes.*`, `scripts/deps/fetch_deps.*`, and `scripts/deps/sync_runtime_assets.*`. `dependencies.yaml` must declare the exact managed runtime and package-manager versions shown above unless the host deliberately installs and declares another exact supported version.
+Script defaults live in `scripts/deps/`; `dependencies.yaml` must declare the exact managed runtime and package-manager versions above unless the host installs and declares another supported version. Releases follow the [release workflow](scripts/release/README.md): runtime packages first, then the five-platform core release, then the crate, then the SDKs.
+
+## Contributing
+
+Issues and pull requests are welcome.
+
+1. Fork the repository and branch from `main`.
+2. Verify locally:
+
+   ```bash
+   cargo fmt --all -- --check
+   cargo clippy --all-targets -- -D warnings
+   cargo test --all-targets -- --test-threads=1
+   cargo deny check
+   ```
+
+3. Sign off every commit with `git commit -s`; see [CONTRIBUTING.md](CONTRIBUTING.md) for the DCO.
+4. Keep each pull request focused, and explain what changed, why, and how you verified it.
 
 ## License
 
-MIT
+[MIT](LICENSE). Third-party notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
