@@ -272,8 +272,8 @@ pub fn probe_github_mirrors(
     let handles: Vec<_> = request
         .targets
         .iter()
-        .cloned()
         .map(|target| {
+            let target = target.clone();
             let client = client.clone();
             let release_path = release_path.clone();
             thread::spawn(move || probe_one_mirror(&client, &target, &release_path, max_bytes))
