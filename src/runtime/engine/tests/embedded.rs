@@ -15,6 +15,21 @@ mod pools;
 mod scheduler;
 mod values;
 
+/// Backstop in seconds for Lua fixture barriers that wait for a host release file.
+/// 等待宿主释放文件的 Lua 夹具屏障的兜底期限（秒）。
+/// Every barrier has a drop guard that writes its release file, so passing and failing tests never
+/// reach it; it only bounds a stranded fixture and must outlast any runner stall between the
+/// barrier and the test's pending-state assertion.
+/// 每个屏障都有写入释放文件的析构守卫，通过与失败的测试都不会到达它；它只约束被遗留的夹具，
+/// 且必须长于屏障与测试待定状态断言之间任何运行器停顿。
+const LUA_BARRIER_BACKSTOP_SECS: u64 = 120;
+
+/// Return `source` with each `__BARRIER_SECS__` placeholder set to the shared barrier backstop.
+/// 返回将每个 `__BARRIER_SECS__` 占位符替换为共享屏障兜底期限后的 `source`。
+fn with_barrier_backstop(source: &str) -> String {
+    source.replace("__BARRIER_SECS__", &LUA_BARRIER_BACKSTOP_SECS.to_string())
+}
+
 /// Build a declaration using the established System fixture and exact `source`.
 /// 使用既有 System 测试夹具与精确 `source` 构造声明。
 /// The returned module exposes only the `call` export.

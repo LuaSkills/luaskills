@@ -1,0 +1,6 @@
+# Local builds use the exact toolchain the release and acceptance workflows pin, so clippy and rustfmt
+# report the same findings before a push as they do in CI.
+# 本地构建使用发行与验收工作流固定的同一工具链，使 clippy 与 rustfmt 在推送前给出与 CI 相同的结果。
+[toolchain]
+channel = "1.94.0"
+components = ["clippy", "rustfmt"]

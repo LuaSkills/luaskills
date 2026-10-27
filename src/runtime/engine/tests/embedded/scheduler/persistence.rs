@@ -434,10 +434,11 @@ fn embedded_scheduler_persistence_terminal_failure_retries_only_storage() {
     let release = FinalizerRelease(layout.package_root.join("business-release"));
     // A real append records how often the business function actually runs.
     // 真实追加记录业务函数实际运行次数。
-    let source = r#"
+    let source = with_barrier_backstop(
+        r#"
         -- Retain controlled file and clock functions for deterministic fixture coordination.
         -- 保留受控文件及计时函数以进行确定性夹具协调。
-        local open, clock = io.open, os.clock
+        local open, now = io.open, os.time
         return {call=function(result_bytes)
             -- The append is the observable business effect whose duplication is forbidden.
             -- 此追加是禁止重复的可观测业务副作用。
@@ -447,21 +448,22 @@ fn embedded_scheduler_persistence_terminal_failure_retries_only_storage() {
             local entered=assert(open('business-entered','w')); entered:write('yes'); entered:close()
             -- Bound the fixture gate independently from runtime operation deadlines.
             -- 独立于运行时操作截止时间约束夹具门禁。
-            local deadline=clock()+8
+            local deadline = now() + __BARRIER_SECS__
             repeat
                 -- Host release controls real Lua progress without a guessed sleep.
                 -- 宿主释放控制真实 Lua 推进，不使用推测性睡眠。
                 local ok, released=pcall(open,'business-release','r')
                 if ok and released then released:close(); break end
-            until clock() >= deadline
+            until now() >= deadline
             return string.rep('v',result_bytes)
         end}
-    "#;
+    "#,
+    );
     // Ordinary reusable execution permits inspection after failure without migrating the original call.
     // 普通复用执行允许失败后检查，不迁移原始调用。
     let pool = runtime
         .register_pool(
-            definition(&layout, source),
+            definition(&layout, &source),
             pool_policy(InstanceReuse::Reusable),
             permissions(),
             "r1".into(),
@@ -560,10 +562,11 @@ fn embedded_scheduler_persistence_late_session_close_preserves_prepared_result()
     let finalizer_release = FinalizerRelease(layout.package_root.join("finalizer-release"));
     // Both gates use real Lua execution; the terminal preparation point comes from an actual SQLite failure.
     // 两个门禁均使用真实 Lua 执行；终态准备时点来自实际 SQLite 失败。
-    let source = r#"
+    let source = with_barrier_backstop(
+        r#"
         -- Keep controlled host file and clock functions for both real lifecycle gates.
         -- 为两个真实生命周期门禁保留受控宿主文件和计时函数。
-        local open, clock = io.open, os.clock
+        local open, now = io.open, os.time
         -- The proxy remains reachable through the session export until the VM is actually destroyed.
         -- 代理通过会话导出保持可达，直到 VM 实际销毁。
         local proxy = newproxy(true)
@@ -573,13 +576,13 @@ fn embedded_scheduler_persistence_late_session_close_preserves_prepared_result()
             local entered=assert(open('finalizer-entered','w')); entered:write('yes'); entered:close()
             -- The test releases this gate after observing terminal publication.
             -- 测试在观测终态发布后释放此门禁。
-            local deadline=clock()+8
+            local deadline = now() + __BARRIER_SECS__
             repeat
                 -- Poll the explicit fixture release file without changing process cwd.
                 -- 轮询显式夹具释放文件，不改变进程工作目录。
                 local ok, released=pcall(open,'finalizer-release','r')
                 if ok and released then released:close(); break end
-            until clock() >= deadline
+            until now() >= deadline
         end
         return {call=function(result_bytes)
             -- Keep finalization pinned to the session's actual VM lifetime.
@@ -593,21 +596,22 @@ fn embedded_scheduler_persistence_late_session_close_preserves_prepared_result()
             local entered=assert(open('business-entered','w')); entered:write('yes'); entered:close()
             -- Bound this fixture's rendezvous independently of the finalizer gate.
             -- 独立于析构门禁约束此夹具会合。
-            local deadline=clock()+8
+            local deadline = now() + __BARRIER_SECS__
             repeat
                 -- The host releases business only after inserting the real disk filler.
                 -- 宿主仅在插入真实磁盘填充项后释放业务。
                 local ok, released=pcall(open,'business-release','r')
                 if ok and released then released:close(); break end
-            until clock() >= deadline
+            until now() >= deadline
             return string.rep('v',result_bytes)
         end}
-    "#;
+    "#,
+    );
     // Session reuse retains this precise VM after the business function succeeds.
     // 会话复用在业务函数成功后保留此精确 VM。
     let pool = runtime
         .register_pool(
-            definition(&layout, source),
+            definition(&layout, &source),
             pool_policy(InstanceReuse::Session),
             permissions(),
             "r1".into(),

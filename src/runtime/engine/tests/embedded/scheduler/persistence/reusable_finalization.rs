@@ -163,10 +163,11 @@ fn embedded_reusable_finalization_durable_recovery_retains_original_instance() {
         let (journal, writer, runtime) =
             durable_runtime(&layout, pool_config(), journal_config(16, 1024 * 1024));
         let release = FinalizerRelease(layout.package_root.join("closing-release"));
-        let source = r#"
+        let source = with_barrier_backstop(
+            r#"
             -- VM-local state survives the business result and both closing disk failures.
             -- VM 局部状态跨业务结果及两次关闭磁盘失败保留。
-            local open, clock = io.open, os.clock
+            local open, now = io.open, os.time
             local n=0
             return {call=function() n=n+1; return n end, shutdown=function()
                 assert(n==1)
@@ -174,17 +175,18 @@ fn embedded_reusable_finalization_durable_recovery_retains_original_instance() {
                 local entered=assert(open('closing-entered','w')); entered:write('yes'); entered:close()
                 -- Release only after the host arms the next real database confirmation failure.
                 -- 仅在宿主设置下一次真实数据库确认故障后释放。
-                local deadline=clock()+8
+                local deadline = now() + __BARRIER_SECS__
                 repeat
                     local ok, released=pcall(open,'closing-release','r')
                     if ok and released then released:close(); return n end
-                until clock() >= deadline
+                until now() >= deadline
                 error('fixture gate expired')
             end}
-        "#;
+        "#,
+        );
         let pool = runtime
             .register_pool(
-                closing_definition(&layout, source, OBSERVE.as_millis() as u64),
+                closing_definition(&layout, &source, OBSERVE.as_millis() as u64),
                 pool_policy(InstanceReuse::Reusable),
                 permissions(),
                 "r1".into(),
@@ -525,14 +527,16 @@ fn embedded_reusable_finalization_business_and_closing_outcomes_are_independent(
             policy.max_uses = max_uses;
             let pool = runtime
                 .register_pool(
-                    closing_definition(&layout, &source, 50),
+                    closing_definition(&layout, &source, 1000),
                     policy,
                     permissions(),
                     "r1".into(),
                 )
                 .unwrap();
+            // The budget covers VM creation as well as the call, so it stays far above slow-runner startup.
+            // 预算同时覆盖 VM 创建与调用，因此远高于慢速运行器的启动耗时。
             let business = runtime
-                .submit(call(&pool, Value::Null), Duration::from_millis(100))
+                .submit(call(&pool, Value::Null), Duration::from_secs(2))
                 .unwrap();
             let result = business.wait(OBSERVE).unwrap();
             assert_eq!(

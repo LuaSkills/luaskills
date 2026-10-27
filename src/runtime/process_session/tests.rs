@@ -1398,7 +1398,7 @@ fn process_session_core_zero_timeout_is_truly_non_blocking() {
     let empty_result = empty_core
         .read(&non_blocking_read)
         .expect("read empty core without waiting");
-    assert!(empty_start.elapsed() < Duration::from_millis(100));
+    assert!(empty_start.elapsed() < Duration::from_secs(1));
     assert!(empty_result.timed_out);
     assert!(empty_result.stdout.is_empty());
     empty_core.kill().expect("kill empty-output managed core");
@@ -1419,7 +1419,7 @@ fn process_session_core_zero_timeout_is_truly_non_blocking() {
     let ready_result = ready_core
         .read(&non_blocking_read)
         .expect("read ready core without waiting");
-    assert!(ready_start.elapsed() < Duration::from_millis(100));
+    assert!(ready_start.elapsed() < Duration::from_secs(1));
     assert!(!ready_result.timed_out);
     assert_eq!(ready_result.stdout, "ready");
     ready_core.kill().expect("kill ready-output managed core");

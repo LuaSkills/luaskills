@@ -290,10 +290,11 @@ fn embedded_capacity_physical_retirement_keeps_execution_charge() {
         .unwrap();
     // Real Lua code makes module state and lifetime boundaries observable.
     // 真实 Lua 代码使模块状态及寿命边界可观察。
-    let source = r#"
+    let source = with_barrier_backstop(
+        r#"
         -- Preserve controlled filesystem access and a finite destructor observation deadline.
         -- 保留受控文件访问及有限析构观测截止时间。
-        local open, clock = io.open, os.clock
+        local open, now = io.open, os.time
         -- Retain the finalizable object until actual physical VM destruction.
         -- 保留可关闭对象，直到真实物理 VM 销毁。
         local proxy = newproxy(true)
@@ -305,24 +306,25 @@ fn embedded_capacity_physical_retirement_keeps_execution_charge() {
             local entered=assert(open('capacity-retirement-entered','w')); entered:close()
             -- Bound the fixture even if external release never arrives.
             -- 即使外部释放未到达，也约束夹具运行时间。
-            local deadline=clock()+5
+            local deadline = now() + __BARRIER_SECS__
             repeat
                 -- Missing release files are expected until the test acknowledges destruction.
                 -- 测试确认销毁前，释放文件缺失属于预期状态。
                 local ok, release=pcall(open,'capacity-retirement-release','r')
                 if ok and release then release:close(); break end
-            until clock() >= deadline
+            until now() >= deadline
         end
         -- Returning business success must not release physical ownership early.
         -- 返回业务成功不得提前释放物理归属。
         return {call=function() return proxy ~= nil end}
-    "#;
+    "#,
+    );
     // Retain this exact module identity to verify cross-member isolation and ordering.
     // 保留此精确模块身份以验证跨成员隔离及顺序。
     let first = runtime
         .register_pool_in_capacity(
             &capacity,
-            definition(&layout, source),
+            definition(&layout, &source),
             member_policy(&config, InstanceReuse::SingleCall),
             permissions(),
             "first".into(),

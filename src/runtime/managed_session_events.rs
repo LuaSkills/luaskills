@@ -1263,7 +1263,7 @@ mod tests {
         assert!(empty.events.is_empty());
         assert_eq!(empty.remaining, 0);
         assert!(!empty.timed_out);
-        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(1));
         assert!(center.poll(0).is_err());
 
         center

@@ -81,26 +81,30 @@ fn embedded_pool_host_owner_waits_for_real_finalizer_and_failed_initialization()
         // 观察使用弱引用，绝不延长被测所有者的寿命。
         let lifetime = Arc::downgrade(&file);
         // The finalizer retains captured IO through Lua destruction and signals both sides of its barrier.
+        // Automatic collection stays stopped, because a rejected chunk leaves the finalizer unreachable
+        // and an incremental step could otherwise run the barrier on the caller thread before retirement.
         // 终结器在 Lua 销毁期间保留已捕获 IO，并标记屏障两端。
+        // 自动回收保持停止，因为被拒绝的代码块使终结器不可达，否则增量步可能在退役前于调用线程上执行屏障。
         let source = format!(
             r#"
-            local open, clock = io.open, os.clock
+            collectgarbage('stop')
+            local open, now = io.open, os.time
             local finalizer = newproxy(true)
             getmetatable(finalizer).__gc = function()
                 local entered = assert(open('entered-host-finalizer', 'w'))
                 entered:write('entered'); entered:close()
-                local deadline = clock() + {}
+                local deadline = now() + {}
                 repeat
                     local ok, marker = pcall(open, 'release-host-finalizer', 'r')
                     if ok and marker then marker:close(); break end
-                until clock() >= deadline
+                until now() >= deadline
                 local finished = assert(open('finished-host-finalizer', 'w'))
                 finished:write('finished'); finished:close()
             end
             {}
             return {{call=function() return finalizer ~= nil end}}
         "#,
-            OWNER_WAIT.as_secs() * 2,
+            LUA_BARRIER_BACKSTOP_SECS,
             if fail_initialization {
                 "error('reject source initialization')"
             } else {

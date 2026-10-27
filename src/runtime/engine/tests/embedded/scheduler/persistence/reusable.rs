@@ -12,27 +12,29 @@ fn embedded_scheduler_reusable_idle_close_waits_for_actual_retirement() {
     let layout = SystemRuntimeTestLayout::new("scheduler reusable idle retirement");
     let runtime = runtime(&layout, pool_config());
     let release = FinalizerRelease(layout.package_root.join("retirement-release"));
-    let source = r#"
+    let source = with_barrier_backstop(
+        r#"
         -- Keep the resource proxy reachable until the owning VM is really destroyed.
         -- 保持资源代理可达，直到所属 VM 真实销毁。
-        local open, clock = io.open, os.clock
+        local open, now = io.open, os.time
         local proxy = newproxy(true)
         getmetatable(proxy).__gc = function()
             local entered=assert(open('retirement-entered','w')); entered:write('yes'); entered:close()
             -- The host releases this destructor after verifying capacity and independent execution.
             -- 宿主验证容量和独立执行后释放此析构器。
-            local deadline=clock()+8
+            local deadline = now() + __BARRIER_SECS__
             repeat
                 local ok, released=pcall(open,'retirement-release','r')
                 if ok and released then released:close(); break end
-            until clock() >= deadline
+            until now() >= deadline
             local finished=assert(open('retirement-finished','w')); finished:write('yes'); finished:close()
         end
         return {call=function() return proxy ~= nil end}
-    "#;
+    "#,
+    );
     let pool = runtime
         .register_pool(
-            definition(&layout, source),
+            definition(&layout, &source),
             pool_policy(InstanceReuse::Reusable),
             permissions(),
             "r1".into(),
@@ -187,28 +189,30 @@ fn embedded_scheduler_reusable_failed_checkpoint_retains_vm_past_idle_ttl() {
         // Release the Lua gate during assertion unwinding as well as the successful test path.
         // 断言展开和测试成功路径均释放 Lua 门禁。
         let release = FinalizerRelease(layout.package_root.join("business-release"));
-        let source = r#"
+        let source = with_barrier_backstop(
+            r#"
             -- Host files coordinate real execution before the next disk checkpoint.
             -- 宿主文件在下一磁盘检查点前协调真实执行。
-            local open, clock = io.open, os.clock
+            local open, now = io.open, os.time
             return {call=function()
                 local count=assert(open('business-count','a')); count:write('x'); count:close()
                 local entered=assert(open('business-entered','w')); entered:write('yes'); entered:close()
                 -- The explicit release controls progress; timeout only bounds fixture failure.
                 -- 显式释放控制推进；超时仅约束夹具失败。
-                local deadline=clock()+8
+                local deadline = now() + __BARRIER_SECS__
                 repeat
                     local ok, released=pcall(open,'business-release','r')
                     if ok and released then released:close(); return 1 end
-                until clock() >= deadline
+                until now() >= deadline
                 error('fixture gate expired')
             end}
-        "#;
+        "#,
+        );
         let mut policy = pool_policy(InstanceReuse::Reusable);
         policy.idle_ttl_ms = Some(1);
         let pool = runtime
             .register_pool(
-                definition(&layout, source),
+                definition(&layout, &source),
                 policy,
                 permissions(),
                 "r1".into(),

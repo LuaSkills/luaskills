@@ -13,26 +13,28 @@ fn embedded_session_finalization_durable_recovery_never_replays() {
         let (journal, writer, runtime) =
             durable_runtime(&layout, pool_config(), journal_config(16, 1024 * 1024));
         let closing_release = FinalizerRelease(layout.package_root.join("closing-release"));
-        let source = r#"
-            local open, clock = io.open, os.clock
+        let source = with_barrier_backstop(
+            r#"
+            local open, now = io.open, os.time
             local n = 0
             return {
                 call=function() n=n+1; return n end,
                 shutdown=function()
                     assert(n==1)
                     local count=assert(open('closing-count','a')); count:write('x'); count:close()
-                    local deadline=clock()+8
+                    local deadline = now() + __BARRIER_SECS__
                     repeat
                         local ok, released=pcall(open,'closing-release','r')
                         if ok and released then released:close(); return n end
-                    until clock()>=deadline
+                    until now()>=deadline
                     error('fixture gate expired')
                 end
             }
-        "#;
+        "#,
+        );
         let pool = runtime
             .register_pool(
-                closing_definition(&layout, source, OBSERVE.as_millis() as u64),
+                closing_definition(&layout, &source, OBSERVE.as_millis() as u64),
                 pool_policy(InstanceReuse::Session),
                 permissions(),
                 "r1".into(),
@@ -139,20 +141,21 @@ fn embedded_scheduler_finalization_recovery_retains_vm_and_never_replays() {
         // 断言失败时释放两个真实 Lua 门禁，避免夹具清理遗留工作线程。
         let business_release = FinalizerRelease(layout.package_root.join("business-release"));
         let closing_release = FinalizerRelease(layout.package_root.join("closing-release"));
-        let source = r#"
+        let source = with_barrier_backstop(
+            r#"
             -- File gates expose actual execution without invoking another durable host checkpoint.
             -- 文件门禁暴露真实执行，且不引入其他持久宿主检查点。
-            local open, clock = io.open, os.clock
+            local open, now = io.open, os.time
             local count = 0
             -- Wait for the named host-owned release and return after bounded fixture coordination.
             -- 等待指定的宿主释放，在有界夹具协调后返回。
             local function gate(name)
                 local entered=assert(open(name..'-entered','w')); entered:write('yes'); entered:close()
-                local deadline=clock()+8
+                local deadline = now() + __BARRIER_SECS__
                 repeat
                     local ok, released=pcall(open,name..'-release','r')
                     if ok and released then released:close(); return end
-                until clock() >= deadline
+                until now() >= deadline
                 error('fixture gate expired')
             end
             return {
@@ -173,10 +176,11 @@ fn embedded_scheduler_finalization_recovery_retains_vm_and_never_replays() {
                     return 'closed'
                 end
             }
-        "#;
+        "#,
+        );
         let pool = runtime
             .register_pool(
-                closing_definition(&layout, source, OBSERVE.as_millis() as u64),
+                closing_definition(&layout, &source, OBSERVE.as_millis() as u64),
                 pool_policy(InstanceReuse::SingleCall),
                 permissions(),
                 "r1".into(),

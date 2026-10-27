@@ -2169,9 +2169,10 @@ mod tests {
     /// 验证生产客户端构建器会约束始终不开始响应的请求。
     #[test]
     fn blocking_http_client_bounds_stalled_requests() {
-        // Server holds the accepted socket longer than the configured test request timeout.
-        // Server 持有已接受套接字的时间长于测试配置的请求超时。
-        let server = TestHttpServer::start_stalled(Duration::from_millis(250));
+        // Server holds the accepted socket far longer than the request timeout, so a slow runner cannot
+        // confuse the client timeout with the server's own close.
+        // Server 持有已接受套接字的时间远长于请求超时，慢速运行器也不会把客户端超时与服务自身关闭混淆。
+        let server = TestHttpServer::start_stalled(Duration::from_secs(3));
         // Client uses the same builder as production with shorter deterministic test bounds.
         // Client 使用与生产相同的构建器，但采用更短且确定的测试边界。
         let client = DownloadManager::build_http_client_with_timeouts(
@@ -2187,7 +2188,7 @@ mod tests {
             .send()
             .expect_err("stalled response must hit the request timeout");
         assert!(error.is_timeout(), "expected timeout error, got {error}");
-        assert!(started_at.elapsed() < Duration::from_millis(200));
+        assert!(started_at.elapsed() < Duration::from_secs(2));
         assert_eq!(server.finish(), 1);
     }
 

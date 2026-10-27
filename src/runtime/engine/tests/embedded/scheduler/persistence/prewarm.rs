@@ -19,20 +19,21 @@ fn embedded_prewarm_persistence_failure_blocks_reuse_until_explicit_recovery() {
         // The file gate is actual Lua initialization; release it even if a test assertion unwinds.
         // 文件门禁属于真实 Lua 初始化；即使测试断言展开也释放它。
         let release = FinalizerRelease(layout.package_root.join("prewarm-release"));
-        let source = r#"
+        let source = with_barrier_backstop(
+            r#"
             -- File markers independently prove initialization and business entry counts.
             -- 文件标记独立证明初始化及业务进入次数。
-            local open, clock = io.open, os.clock
+            local open, now = io.open, os.time
             local initialized = assert(open('prewarm-count','a'))
             initialized:write('x'); initialized:close()
-            -- The observation budget is injected from the single Rust fixture constant.
-            -- 观测预算从唯一 Rust 夹具常量注入。
-            local deadline = clock() + __OBSERVE_SECS__
+            -- The backstop is injected from the single Rust fixture constant.
+            -- 兜底期限从唯一 Rust 夹具常量注入。
+            local deadline = now() + __BARRIER_SECS__
             local released = false
             repeat
                 local ok, gate = pcall(open, 'prewarm-release', 'r')
                 if ok and gate then gate:close(); released=true; break end
-            until clock() >= deadline
+            until now() >= deadline
             assert(released, 'prewarm fixture gate expired')
             return {call=function()
                 -- Business begins only after confirmed prewarm publication permits reuse.
@@ -41,8 +42,8 @@ fn embedded_prewarm_persistence_failure_blocks_reuse_until_explicit_recovery() {
                 count:write('x'); count:close()
                 return true
             end}
-        "#
-        .replace("__OBSERVE_SECS__", &OBSERVE.as_secs().to_string());
+        "#,
+        );
         let pool = runtime
             .register_pool(
                 definition(&layout, &source),

@@ -80,26 +80,28 @@ fn embedded_pool_retirement_receipt_waits_for_actual_lua_finalizer() {
     let release = FinalizerRelease(layout.package_root.join("release-finalizer"));
     // Captured IO and clock functions remain available while Lua closes its state.
     // Lua 关闭自身状态时，捕获的 IO 与时钟函数仍然可用。
-    let source = r#"
-        local open, clock = io.open, os.clock
+    let source = with_barrier_backstop(
+        r#"
+        local open, now = io.open, os.time
         local finalizer = newproxy(true)
         getmetatable(finalizer).__gc = function()
             local entered = assert(open('entered-finalizer', 'w'))
             entered:write('entered'); entered:close()
-            local deadline = clock() + 5
+            local deadline = now() + __BARRIER_SECS__
             repeat
                 local ok, release = pcall(open, 'release-finalizer', 'r')
                 if ok and release then release:close(); break end
-            until clock() >= deadline
+            until now() >= deadline
             local finished = assert(open('finished-finalizer', 'w'))
             finished:write('finished'); finished:close()
         end
         return {call=function() return finalizer ~= nil end}
-    "#;
+    "#,
+    );
     let pool = manager
         .create_pool(
             "finalizer".into(),
-            definition(&layout, source),
+            definition(&layout, &source),
             pool_policy(InstanceReuse::SingleCall),
         )
         .unwrap();

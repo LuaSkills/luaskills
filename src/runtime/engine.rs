@@ -511,6 +511,19 @@ struct LuaVm {
     last_used_at: Instant,
 }
 
+impl Drop for LuaVm {
+    /// Run pending Lua finalizers while the instance is still alive, before `lua_close`.
+    /// 在 `lua_close` 之前、实例仍存活时运行待执行的 Lua 终结器。
+    /// Finalizers that `lua_close` runs cannot call wrapped host functions, because mlua has
+    /// already released the instance, so a full collection makes their timing deterministic.
+    /// `lua_close` 运行的终结器无法调用被包装的宿主函数，因为 mlua 已释放实例，所以完整回收使其时机确定。
+    fn drop(&mut self) {
+        if let Err(error) = self.lua.gc_collect() {
+            log_error(format!("Lua VM finalization before close failed: {error}"));
+        }
+    }
+}
+
 /// Complete dependency context required to construct one isolated runlua-compatible VM.
 /// 构造单个隔离且兼容 runlua 的 VM 所需的完整依赖上下文。
 struct RunLuaVmBuildContext<'a> {

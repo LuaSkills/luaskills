@@ -51,6 +51,23 @@ Before opening a Pull Request, please make sure:
 
 Pull Requests without DCO sign-off lines may be blocked until the commits are properly signed.
 
+## Timing in Tests
+
+The acceptance suite runs on slow shared runners, serially in one process, so tests must not depend on luck:
+
+- Lua fixtures that wait for the host use the wall clock (`os.time`), never `os.clock`. On Linux and macOS
+  `os.clock` is the CPU time of the whole process, so other busy threads make its deadlines expire early.
+- A Lua barrier that waits for a host release file takes its deadline from `__BARRIER_SECS__`
+  (`with_barrier_backstop`) and has a drop guard that writes the release file. The deadline is only a
+  backstop: a cloud runner can stall one thread for seconds, and a short deadline lets the barrier expire
+  before the test asserts that it is still held.
+- A VM runs a full collection before `lua_close`, so finalizers of unreachable objects run while the
+  instance is alive and can call host functions. A fixture whose finalizer may become unreachable before
+  retirement calls `collectgarbage('stop')`, otherwise an incremental step can run it on the caller thread.
+- A budget that must not expire covers its slowest legitimate case with a wide margin: at least one second
+  when it includes creating a VM, and an upper bound on elapsed time well above the operation's own timeout.
+- `rust-toolchain.toml` pins the toolchain the workflows use, so local clippy and rustfmt match CI.
+
 ## Reference
 
 See the standard DCO text here: [Developer Certificate of Origin](https://developercertificate.org/).
@@ -107,6 +124,20 @@ git push --force-with-lease
 - 变更范围聚焦，避免混入无关格式化或重构。
 
 未包含 DCO 签署行的 Pull Request 可能会被要求补签后再合并。
+
+## 测试中的计时
+
+验收套件在较慢的共享运行器上、于同一进程内串行执行，因此测试不能依赖运气：
+
+- 等待宿主的 Lua 夹具使用墙钟时间（`os.time`），绝不使用 `os.clock`。在 Linux 与 macOS 上，
+  `os.clock` 是整个进程的 CPU 时间，其他繁忙线程会让它的截止时间提前到达。
+- 等待宿主释放文件的 Lua 屏障从 `__BARRIER_SECS__`（`with_barrier_backstop`）取得期限，并配有写入
+  释放文件的析构守卫。该期限只是兜底：云运行器可能让某个线程停顿数秒，过短的期限会在测试断言屏障
+  仍被持有之前到期。
+- VM 在 `lua_close` 之前执行一次完整回收，使不可达对象的终结器在实例存活时运行并可调用宿主函数。
+  终结器可能在退役前变得不可达的夹具应调用 `collectgarbage('stop')`，否则增量步可能在调用线程上执行它。
+- 不应到期的预算要以充足余量覆盖最慢的合理情况：包含创建 VM 时至少一秒；对耗时的上限断言要远高于操作自身的超时。
+- `rust-toolchain.toml` 固定工作流使用的工具链，使本地 clippy 与 rustfmt 结果与 CI 一致。
 
 ## 参考
 

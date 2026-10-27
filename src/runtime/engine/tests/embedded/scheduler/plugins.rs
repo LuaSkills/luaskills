@@ -655,25 +655,27 @@ fn embedded_plugin_generation_retirement_keeps_aggregate_reservation() {
     limits.max_running_calls = 1;
     let runtime = runtime_with_plugin(&layout, config, limits);
     let release = FinalizerRelease(layout.package_root.join("plugin-retirement-release"));
-    let source = r#"
-        local open, clock = io.open, os.clock
+    let source = with_barrier_backstop(
+        r#"
+        local open, now = io.open, os.time
         local proxy = newproxy(true)
         getmetatable(proxy).__gc=function()
             local f=assert(open('plugin-retirement-entered','w')); f:close()
-            local deadline=clock()+5
+            local deadline = now() + __BARRIER_SECS__
             repeat
                 local ok, release=pcall(open,'plugin-retirement-release','r')
                 if ok and release then release:close(); break end
-            until clock() >= deadline
+            until now() >= deadline
         end
         return {call=function() return proxy ~= nil end}
-    "#;
+    "#,
+    );
     let mut policy = domain(InstanceReuse::Reusable, 8);
     policy.kind = PoolKind::Dedicated;
     policy.min_resident_vms = 1;
     let old = runtime
         .register_pool(
-            definition(&layout, source),
+            definition(&layout, &source),
             policy.clone(),
             permissions(),
             "r1".into(),

@@ -160,13 +160,13 @@ fn embedded_effect_intent_lua_failure_recovers_storage_without_execution() {
         local marker=assert(io.open('intent-entered','w')); marker:write('ready'); marker:close()
         -- Bound fixture coordination independently from production cancellation.
         -- 独立于生产取消限制夹具协调时间。
-        local deadline=os.clock()+__OBSERVE_SECONDS__
+        local deadline=os.time()+__OBSERVE_SECONDS__
         while true do
             -- Release only after the test has retained all available writer receipts.
             -- 仅在测试保留全部可用写入回执之后释放。
             local opened,ready=pcall(io.open,'release-intent','r')
             if opened and ready then ready:close(); break end
-            assert(os.clock()<deadline,'intent fixture release timed out')
+            assert(os.time()<deadline,'intent fixture release timed out')
         end
         pcall(function() vulcan.capabilities.call('test.persisted_write',{}) end)
         return 11

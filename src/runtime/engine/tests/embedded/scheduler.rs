@@ -97,25 +97,27 @@ fn embedded_scheduler_operation_stays_cleaning_until_actual_vm_retirement() {
     let release = FinalizerRelease(layout.package_root.join("release-cleanup"));
     // The captured proxy stays reachable until the typed module releases its function roots.
     // 捕获代理保持可达，直到类型化模块释放其函数根。
-    let source = r#"
-        local open, clock = io.open, os.clock
+    let source = with_barrier_backstop(
+        r#"
+        local open, now = io.open, os.time
         local proxy = newproxy(true)
         getmetatable(proxy).__gc = function()
             local entered = assert(open('entered-cleanup', 'w'))
             entered:write('entered'); entered:close()
-            local deadline = clock() + 5
+            local deadline = now() + __BARRIER_SECS__
             repeat
                 local ok, release = pcall(open, 'release-cleanup', 'r')
                 if ok and release then release:close(); break end
-            until clock() >= deadline
+            until now() >= deadline
             local finished = assert(open('finished-cleanup', 'w'))
             finished:write('done'); finished:close()
         end
         return {call=function() return proxy ~= nil end}
-    "#;
+    "#,
+    );
     let pool = runtime
         .register_pool(
-            definition(&layout, source),
+            definition(&layout, &source),
             pool_policy(InstanceReuse::SingleCall),
             permissions(),
             "r1".into(),
