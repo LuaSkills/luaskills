@@ -34,7 +34,7 @@ LuaSkills 的公开用户安装面只建议开放两类来源：
 
 `github_base_url` 与 `github_api_base_url` 是全局 GitHub 源替换。只要安装或依赖解析使用 GitHub Release，就会统一使用这组配置，不需要在每个 skill 依赖里单独封装。
 
-`github_token` 是可选的 GitHub 令牌，用来提高 GitHub API 的请求额度。它只会附加到发往 `https://api.github.com`（默认端口）的请求；镜像、LuaSkills 资源站与其他任何主机都不会收到它，`Debug` 输出也只显示 `<redacted>`。额度耗尽时，错误会提示配置令牌或改用资源站。
+`github_token` 是可选的 GitHub 令牌，用来提高 GitHub API 的请求额度。它只会附加到发往 `https://api.github.com`（默认端口）的请求；镜像与其他任何主机都不会收到它，`Debug` 输出也只显示 `<redacted>`。额度耗尽时，错误会提示配置令牌。
 
 完整性不依赖镜像：受管技能包按 Release 校验文件验证 SHA-256，Release 元数据报告的摘要必须与校验文件一致；依赖下载在 GitHub 报告摘要时同样校验。镜像失败不会自动切换到其他镜像，只对同一地址的连接失败与 502/503/504 做有限重试。
 
@@ -167,7 +167,7 @@ luaskills_ffi_set_skill_operation_progress_json_callback
 
 ## 6. GitHub 镜像目录与测速
 
-核心内置一份镜像目录（`builtin_github_mirrors()`，JSON FFI：`luaskills_ffi_github_mirror_catalog_json`），每项含 `id`、`kind`（`direct`、`prefix`、`luaskills_station`）、`region`、`github_base_url` 与 `github_api_base_url`。宿主把选中项的两个基址写入网络选项即可；前缀代理只替换下载地址，API 仍走官方。
+核心内置一份镜像目录（`builtin_github_mirrors()`，JSON FFI：`luaskills_ffi_github_mirror_catalog_json`），每项含 `id`、`kind`（`direct`、`prefix`）、`region` 与 `github_base_url`。宿主把选中项的基址写入网络选项即可；镜像只替换下载地址，API 仍走官方。LuaSkills Hub 是独立发布体系，技能包下载地址由 Hub API 返回，不属于 GitHub 镜像。
 
 用户自定义镜像先经 `normalize_github_mirror_base_url`（`luaskills_ffi_normalize_github_mirror_json`，请求 `{ "url": "..." }`）规范化：裸源地址如 `https://mirror.example.cn` 视为前缀代理并补上 `/https://github.com`，带路径的地址按 GitHub 兼容布局根保留。
 

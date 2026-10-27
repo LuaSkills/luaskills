@@ -1600,8 +1600,8 @@ fn send_github_api_request(
     api_url: &str,
     token: Option<&LuaRuntimeSecretString>,
 ) -> Result<reqwest::blocking::Response, String> {
-    // Authorization is never computed for a mirror, a LuaSkills resource station or any other host.
-    // 对镜像、LuaSkills 资源站或任何其他主机永不生成 Authorization。
+    // Authorization is never computed for a mirror or any other host.
+    // 对镜像或任何其他主机永不生成 Authorization。
     let authorization = github_api_token_for(api_url, token);
     send_with_transient_retry(|| {
         let request = client
@@ -1635,7 +1635,7 @@ fn check_github_api_status(
         .is_some_and(|remaining| remaining.as_bytes() == b"0");
     if rate_limited {
         return Err(format!(
-            "GitHub API rate limit exceeded while querying {}; configure a GitHub token (sent only to {}) or choose a LuaSkills resource station",
+            "GitHub API rate limit exceeded while querying {}; configure a GitHub token (sent only to {})",
             api_url,
             crate::download::github::OFFICIAL_GITHUB_API_HOST
         ));

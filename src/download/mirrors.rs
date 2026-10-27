@@ -2,10 +2,12 @@
 //! 内置 GitHub Release 下载镜像，以及宿主用来比较镜像的测速探针。
 //!
 //! A mirror only replaces the `https://github.com` prefix of release download URLs. Release
-//! metadata keeps coming from the GitHub API or a LuaSkills resource station, and integrity is
-//! enforced by the release digest and checksum files rather than by trusting the mirror.
-//! 镜像只替换 Release 下载地址中的 `https://github.com` 前缀。Release 元数据仍来自 GitHub API 或
-//! LuaSkills 资源站，完整性由 Release 摘要与校验文件保证，而不是依赖对镜像的信任。
+//! metadata keeps coming from the GitHub API, and integrity is enforced by the release digest
+//! and checksum files rather than by trusting the mirror. The LuaSkills Hub is a separate
+//! publishing system with its own download addresses, not a GitHub mirror.
+//! 镜像只替换 Release 下载地址中的 `https://github.com` 前缀。Release 元数据仍来自 GitHub API，
+//! 完整性由 Release 摘要与校验文件保证，而不是依赖对镜像的信任。LuaSkills Hub 是拥有自身下载地址的
+//! 独立发布体系，不是 GitHub 镜像。
 
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -15,9 +17,9 @@ use std::time::{Duration, Instant};
 /// Release asset path probed on every mirror, relative to the GitHub web root.
 /// 在每个镜像上探测的 Release 资产路径，相对于 GitHub 网页根。
 ///
-/// The same path works for official GitHub, prefix proxies and LuaSkills resource stations
-/// because all of them keep the GitHub release layout below their base URL.
-/// 官方 GitHub、前缀代理与 LuaSkills 资源站都在基址下保持 GitHub Release 布局，因此同一路径通用。
+/// The same path works for official GitHub and prefix proxies because both keep the GitHub
+/// release layout below their base URL.
+/// 官方 GitHub 与前缀代理都在基址下保持 GitHub Release 布局，因此同一路径通用。
 pub const MIRROR_PROBE_DEFAULT_RELEASE_PATH: &str =
     "LuaSkills/luaskills/releases/download/v0.6.1/luaskills-debug-tool-windows-x64.tar.gz";
 
@@ -57,9 +59,6 @@ pub enum LuaRuntimeGithubMirrorKind {
     /// Public proxy that takes the full GitHub URL after its own origin.
     /// 在自身源地址后接收完整 GitHub 地址的公共代理。
     Prefix,
-    /// LuaSkills resource station that mirrors allowlisted release assets.
-    /// 镜像白名单内 Release 资产的 LuaSkills 资源站。
-    LuaskillsStation,
 }
 
 /// Network region a mirror is meant to serve.
@@ -96,9 +95,6 @@ pub struct LuaRuntimeGithubMirror {
     /// Base that replaces `https://github.com` in release download URLs; `None` keeps GitHub.
     /// 替换 Release 下载地址中 `https://github.com` 的基址；`None` 表示保持 GitHub。
     pub github_base_url: Option<String>,
-    /// GitHub-compatible API base; `None` keeps the official GitHub API.
-    /// GitHub 兼容 API 基址；`None` 表示保持官方 GitHub API。
-    pub github_api_base_url: Option<String>,
 }
 
 /// One mirror to probe; built-in and user-defined mirrors share this shape.
@@ -181,24 +177,14 @@ pub struct LuaRuntimeGithubMirrorProbeResult {
 /// third-party services, so integrity always comes from release digests and checksum files.
 /// 公共代理按中国大陆实测可达性挑选；它们是第三方服务，因此完整性始终来自 Release 摘要与校验文件。
 pub fn builtin_github_mirrors() -> Vec<LuaRuntimeGithubMirror> {
-    use LuaRuntimeGithubMirrorKind::{Direct, LuaskillsStation, Prefix};
+    use LuaRuntimeGithubMirrorKind::{Direct, Prefix};
     use LuaRuntimeGithubMirrorRegion::{China, Global};
-    let station =
-        |id: &str, label: &str, region, resource: &str, hub: &str| LuaRuntimeGithubMirror {
-            id: id.to_string(),
-            label: label.to_string(),
-            kind: LuaskillsStation,
-            region,
-            github_base_url: Some(format!("{resource}/github")),
-            github_api_base_url: Some(format!("{hub}/github-api")),
-        };
     let prefix = |id: &str, label: &str, region, origin: &str| LuaRuntimeGithubMirror {
         id: id.to_string(),
         label: label.to_string(),
         kind: Prefix,
         region,
         github_base_url: Some(format!("{origin}/{OFFICIAL_GITHUB_BASE_URL}")),
-        github_api_base_url: None,
     };
     vec![
         LuaRuntimeGithubMirror {
@@ -207,22 +193,7 @@ pub fn builtin_github_mirrors() -> Vec<LuaRuntimeGithubMirror> {
             kind: Direct,
             region: Global,
             github_base_url: None,
-            github_api_base_url: None,
         },
-        station(
-            "luaskills-cn",
-            "LuaSkills resource station (China)",
-            China,
-            "https://res.luaskills.cn",
-            "https://hub.luaskills.cn",
-        ),
-        station(
-            "luaskills-global",
-            "LuaSkills resource station (Global)",
-            Global,
-            "https://res.luaskills.com",
-            "https://hub.luaskills.com",
-        ),
         prefix(
             "gh-proxy-com",
             "gh-proxy.com",

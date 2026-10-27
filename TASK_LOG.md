@@ -9300,11 +9300,11 @@
 ### 关键代码调整
 
 - 令牌由 `github_api_token_for` 统一判定：只有 HTTPS、主机恰为 `api.github.com`、默认端口的请求才附带；`Debug` 输出为 `<redacted>`；设置网络的 FFI 响应不回显令牌。
-- 403/429 且 `x-ratelimit-remaining: 0` 时报额度耗尽并提示配置令牌或改用资源站；官方 API 拒绝令牌时单独提示。
+- 403/429 且 `x-ratelimit-remaining: 0` 时报额度耗尽并提示配置令牌；官方 API 拒绝令牌时单独提示。
 - 连接失败与 502/503/504 在同一地址重试 3 次（指数退避），不切换镜像。
 - Release 报告的 `sha256:` 摘要与校验文件不一致时拒绝安装；依赖在已知摘要时以 `download_with_sha256` 下载；技能声明的 `sha256` 必须与 Release 摘要一致。
 - `bundled` 载荷经 `resolve_existing_package_file` 限定在技能目录内（含链接逃逸），不受网络开关约束，安装失败只清理目标目录，不删除包内载荷。
-- 内置镜像：`github`、`luaskills-cn`、`luaskills-global`、`gh-proxy-com`、`ghfast-top`、`gh-llkk-cc`、`ghproxy-net`；测速读取同一 Release 资产前 1 MiB，以 HTML 应答的代理判为失败，截止前部分到达标记为不完整。
+- 内置镜像：`github`、`gh-proxy-com`、`ghfast-top`、`gh-llkk-cc`、`ghproxy-net`；LuaSkills Hub 是拥有自身下载地址的独立发布体系，不列入 GitHub 镜像目录；测速读取同一 Release 资产前 1 MiB，以 HTML 应答的代理判为失败，截止前部分到达标记为不完整。
 - 更换来源：新来源须指向同一技能，允许相同版本、拒绝降级；成功后安装记录改为新来源。
 
 ### 验证记录
@@ -9312,10 +9312,9 @@
 - 定向测试：`download::github`、`download::manager::network_policy_tests`、`download::mirrors`、`dependency::`、`skill::manager`、`ffi` 全部通过。
 - `cargo run --features contract-generation --bin generate_embedded_contract` 已重新生成契约。
 - 全量 `cargo test`：1065 通过，3 个失败（`embedded_diagnostics_observe_real_reuse_host_wait_heap_and_retirement`、`system_runtime_lease_ignores_process_cwd_guard`、`system_runtime_lease_process_session_inherits_non_verbatim_package_cwd`），均为进程工作目录与调度计时相关测试，`--test-threads=1` 单独重跑全部通过；`cargo clippy --all-targets` 无警告。
-- `luaskills-debug probe-mirrors` 本机实测：ghfast-top 8.59 MB/s、github 2.00 MB/s、gh-llkk-cc 1.76 MB/s、gh-proxy-com 1.47 MB/s、ghproxy-net 0.35 MB/s（首字节约 12 s）；两个 LuaSkills 资源站返回 404，原因是资源站白名单尚未收录该仓库。
+- `luaskills-debug probe-mirrors` 本机实测：ghfast-top 8.59 MB/s、github 2.00 MB/s、gh-llkk-cc 1.76 MB/s、gh-proxy-com 1.47 MB/s、ghproxy-net 0.35 MB/s（首字节约 12 s）。
 
 ### 代码审核与遗留事项
 
-- LuaSkills 资源站需在 Hub 白名单中加入 `LuaSkills/luaskills` 等仓库后，资源站镜像才能用于 Release 下载与测速。
 - 依赖同目录其他 DLL 的原生库在 Windows 上仍需技能自行处理加载目录；本轮未加入 `AddDllDirectory`。
 - 测速探测资产固定为 v0.6.1 调试工具包；该 Release 删除时需同步 `MIRROR_PROBE_DEFAULT_RELEASE_PATH`。

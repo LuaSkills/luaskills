@@ -31,7 +31,7 @@ Network options (sync, inspect, list-tools, call):
   --github-mirror <id|url>     Download GitHub release assets through a built-in mirror id or a mirror URL.
   --github-token-env <name>    Read a GitHub token from this environment variable; it is sent only to api.github.com.
 
-Built-in mirror ids: github, luaskills-cn, luaskills-global, gh-proxy-com, ghfast-top, gh-llkk-cc, ghproxy-net.
+Built-in mirror ids: github, gh-proxy-com, ghfast-top, gh-llkk-cc, ghproxy-net.
 
 Managed runtime root options:
   --managed-runtime-distribution-root <dir>  Existing absolute Python/Node distribution root.
@@ -164,9 +164,6 @@ struct DebugNetworkFlags {
     /// Base URL replacing `https://github.com` in release downloads.
     /// 替换 Release 下载中 `https://github.com` 的基址。
     github_base_url: Option<String>,
-    /// GitHub-compatible API base, set only by LuaSkills resource stations.
-    /// GitHub 兼容 API 基址，仅由 LuaSkills 资源站设置。
-    github_api_base_url: Option<String>,
     /// Environment variable holding the GitHub token; the token itself never appears in arguments.
     /// 保存 GitHub 令牌的环境变量；令牌本身永不出现在命令行参数中。
     github_token_env: Option<String>,
@@ -176,9 +173,7 @@ impl DebugNetworkFlags {
     /// Apply one `--github-mirror` value: a built-in mirror id or a mirror URL.
     /// 应用单个 `--github-mirror` 值：内置镜像标识或镜像地址。
     fn select_mirror(&mut self, value: &str) -> Result<(), String> {
-        let (github_base_url, github_api_base_url) = resolve_debug_mirror(value)?;
-        self.github_base_url = github_base_url;
-        self.github_api_base_url = github_api_base_url;
+        self.github_base_url = resolve_debug_mirror(value)?;
         Ok(())
     }
 
@@ -186,7 +181,6 @@ impl DebugNetworkFlags {
     /// 将选择写入宿主选项，并从环境变量读取令牌。
     fn apply(&self, host_options: &mut LuaRuntimeHostOptions) -> Result<(), String> {
         host_options.github_base_url = self.github_base_url.clone();
-        host_options.github_api_base_url = self.github_api_base_url.clone();
         host_options.github_token = match self.github_token_env.as_deref() {
             Some(name) => {
                 let token = env::var(name)
@@ -206,17 +200,17 @@ impl DebugNetworkFlags {
     }
 }
 
-/// Resolve one mirror id or URL into download and API base URLs.
-/// 将单个镜像标识或地址解析为下载与 API 基址。
-fn resolve_debug_mirror(value: &str) -> Result<(Option<String>, Option<String>), String> {
+/// Resolve one mirror id or URL into the download base URL; `None` keeps GitHub.
+/// 将单个镜像标识或地址解析为下载基址；`None` 表示保持 GitHub。
+fn resolve_debug_mirror(value: &str) -> Result<Option<String>, String> {
     let value = value.trim();
     if let Some(mirror) = builtin_github_mirrors()
         .into_iter()
         .find(|mirror| mirror.id == value)
     {
-        return Ok((mirror.github_base_url, mirror.github_api_base_url));
+        return Ok(mirror.github_base_url);
     }
-    Ok((Some(normalize_github_mirror_base_url(value)?), None))
+    Ok(Some(normalize_github_mirror_base_url(value)?))
 }
 
 /// Probe the selected mirrors, or every built-in mirror, and render the measurements.
@@ -230,7 +224,7 @@ fn run_probe_mirrors(args: &[String]) -> Result<(), String> {
         match flag {
             "--github-mirror" => {
                 let value = read_cli_value(args, &mut index, flag)?;
-                let (github_base_url, _) = resolve_debug_mirror(value)?;
+                let github_base_url = resolve_debug_mirror(value)?;
                 targets.push(LuaRuntimeGithubMirrorProbeTarget {
                     id: value.trim().to_string(),
                     github_base_url,
