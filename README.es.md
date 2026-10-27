@@ -102,7 +102,7 @@ LuaSkills impulsa el sistema de skills de [Vulcan Code](https://github.com/OpenV
 
 ```toml
 [dependencies]
-luaskills = "0.7.0"
+luaskills = "0.7.1"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md) muestra `call_skill` y el puente de herramientas `vulcan.host.*`.
@@ -158,7 +158,7 @@ cargo run --bin luaskills-debug -- call \
 
 | Componente | Versión |
 | --- | --- |
-| Núcleo de LuaSkills y FFI SDK | `0.7.0` |
+| Núcleo de LuaSkills y FFI SDK | `0.7.1` |
 | SDK de TypeScript, Python y Go | Líneas de versión independientes; ver [SDK overview](docs/sdk/index.md#versions) |
 | Paquetes del runtime de Lua | serie compatible `0.1` |
 | Python / uv gestionados | `3.14.6` / `0.11.28` |

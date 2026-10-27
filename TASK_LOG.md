@@ -9318,3 +9318,23 @@
 
 - 依赖同目录其他 DLL 的原生库在 Windows 上仍需技能自行处理加载目录；本轮未加入 `AddDllDirectory`。
 - 测速探测资产固定为 v0.6.1 调试工具包；该 Release 删除时需同步 `MIRROR_PROBE_DEFAULT_RELEASE_PATH`。
+
+## 2026-10-28：0.7.1 以 LF 字节重新发布 crate
+
+### 概述
+
+- crates.io 上的 `luaskills 0.7.0` 从 `core.autocrlf=true` 的 Windows 工作树发布，全部文件为 CRLF，
+  TypeScript 与 Python SDK 发布在前置门禁报 `Registry original Cargo manifest differs from frozen source`。
+  crates.io 版本不可替换，源码不变，版本升至 0.7.1 并改由脚本从 LF 克隆发布。
+
+### 文件变更清单
+
+- `scripts/release/publish_crate.py`（新增）：全新 LF 克隆标签、打包、逐字节对照标签 blob，一致才发布。
+- `scripts/release/test_publish_crate.py`（新增）及 `build-lua-deps.yml` 测试步骤。
+- `scripts/release/README.md`：新增“crate 发布”一节。
+- `contracts/embedded/v1/*`：重新生成；`Cargo.toml`、`Cargo.lock`、八种语言 README：版本 0.7.1。
+
+### 验证记录
+
+- `test_publish_crate.py` 3 项通过，覆盖 CRLF 字节、未跟踪文件、脏提交与他人提交。
+- 已发布的 0.7.0 crate 下载核对：`Cargo.toml.orig` 与源文件为 CRLF；0.6.1 为 LF。

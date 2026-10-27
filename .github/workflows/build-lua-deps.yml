@@ -78,6 +78,7 @@ jobs:
           python -X utf8 -m unittest discover -s scripts/release -p test_sdk_recovery.py -v
           python -X utf8 -m unittest discover -s scripts/release -p test_certum_totp.py -v
           python -X utf8 -m unittest discover -s scripts/release -p test_release_gpg.py -v
+          python -X utf8 -m unittest discover -s scripts/release -p test_publish_crate.py -v
       # Exercise the real public source endpoint before native builds, packaging or draft creation.
       # 在原生构建、打包或草稿创建前验证真实公共源码端点。
       - name: Verify exact public commit archive before native builds

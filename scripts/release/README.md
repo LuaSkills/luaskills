@@ -138,6 +138,21 @@ rtk proxy python scripts/release/candidate.py sdk-inputs --input target/verified
 必须比较实际描述完整对象，不把局部版本号或报告摘要当成完整兼容验收。
 派生命令复核 FFI 归档、逐文件摘要、完整描述与报告、冻结源码身份；不会发布 SDK。
 
+## crate 发布
+
+crates.io 版本不可替换，SDK 前置门禁又逐字节对照标签提交检查 `Cargo.toml.orig` 及每个打包文件，
+因此 crate 只能经 `publish_crate.py` 发布：
+
+```bash
+python scripts/release/publish_crate.py 0.7.1 --publish
+```
+
+脚本以 `core.autocrlf=false` 从官方仓库全新克隆已推送的 `v<version>` 标签，执行 `cargo package --locked`，
+对照 `git archive` 读出的标签 blob 比较 `.crate` 中除 Cargo 生成文件外的全部字节，并核对 `.cargo_vcs_info.json`
+指向干净的标签提交；任何差异都在 `cargo publish` 之前拒绝。不带 `--publish` 时只打包和比较。
+不得在开发工作树直接执行 `cargo publish`：`core.autocrlf=true` 的 Windows 工作树会打包 CRLF 字节，
+0.7.0 即因此无法通过 SDK 前置门禁，被 0.7.1 取代。
+
 ## 本地验证边界
 
 ```powershell
