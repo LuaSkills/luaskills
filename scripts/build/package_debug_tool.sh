@@ -787,6 +787,11 @@ cp -f "$DEBUG_BINARY_PATH" "$PACKAGE_ROOT/bin/$DEBUG_BINARY_NAME"
 if ! platform_is_windows; then
   chmod +x "$PACKAGE_ROOT/bin/$DEBUG_BINARY_NAME"
 fi
+# A release build places the detached OpenPGP signature beside the binary; local builds have none.
+# 发行构建在二进制旁放置分离式 OpenPGP 签名；本地构建没有签名。
+if [ -f "$DEBUG_BINARY_PATH.asc" ]; then
+  cp -f "$DEBUG_BINARY_PATH.asc" "$PACKAGE_ROOT/bin/$DEBUG_BINARY_NAME.asc"
+fi
 cp -f LICENSE "$PACKAGE_ROOT/licenses/LICENSE"
 if platform_is_windows; then
   cp -f scripts/deps/fetch_deps.ps1 "$PACKAGE_ROOT/scripts/deps/fetch_deps.ps1"

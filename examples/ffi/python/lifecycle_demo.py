@@ -162,6 +162,7 @@ def main() -> None:
     host.allow_network_download = 0
     host.github_base_url = None
     host.github_api_base_url = None
+    host.github_token = None
     host.sqlite_library_path = None
     host.sqlite_provider_mode = 0
     host.sqlite_callback_mode = 0

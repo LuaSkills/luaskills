@@ -461,6 +461,7 @@ class StandardFixtureRuntimeClient:
                     "allow_network_download": False,
                     "github_base_url": None,
                     "github_api_base_url": None,
+                    "github_token": None,
                     "default_text_encoding": default_text_encoding,
                     "sqlite_library_path": None,
                     "sqlite_provider_mode": "dynamic_library",

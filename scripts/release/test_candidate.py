@@ -151,7 +151,10 @@ class CandidateTests(unittest.TestCase):
         # Binary follows the same actual OS-derived path as the debug packager.
         # 二进制遵循调试打包器相同的实际 OS 派生路径。
         binary = "bin/luaskills-debug.exe" if candidate.PLATFORMS[platform][1] == "windows" else "bin/luaskills-debug"
-        (directory / f"luaskills-debug-tool-{platform}.tar.gz").write_bytes(candidate.archive_bytes({"debug-tool-manifest.json": candidate.encode({"platform": platform, "release_tag": f"v{self.version}", "binary": binary}), binary: b"explicit debug executable fixture"}))
+        debug = {"debug-tool-manifest.json": candidate.encode({"platform": platform, "release_tag": f"v{self.version}", "binary": binary}), binary: b"explicit debug executable fixture"}
+        if candidate.PLATFORMS[platform][1] == "linux":
+            debug[f"{binary}.asc"] = b"-----BEGIN PGP SIGNATURE-----\nfixture\n-----END PGP SIGNATURE-----\n"
+        (directory / f"luaskills-debug-tool-{platform}.tar.gz").write_bytes(candidate.archive_bytes(debug))
 
     def all_platforms(self):
         """Write every mandatory native-platform fixture; return aggregate arguments.
@@ -216,6 +219,19 @@ class CandidateTests(unittest.TestCase):
         archive.write_bytes(candidate.archive_bytes(files))
         with self.assertRaisesRegex(ValueError, "same frozen source commit"):
             candidate.verify_auxiliary(directory, "windows-x64", self.commit, self.version, core_files)
+
+    def test_linux_debug_tool_requires_openpgp_signature(self):
+        """Reject a Linux debug package whose detached OpenPGP signature is missing.
+        拒绝缺少分离式 OpenPGP 签名的 Linux 调试包。
+        """
+        directory = self.write_platform("linux-x64")
+        core_files, _ = self.platform_fixture("linux-x64")
+        archive = directory / "luaskills-debug-tool-linux-x64.tar.gz"
+        files = candidate.archive_files(archive)
+        del files["bin/luaskills-debug.asc"]
+        archive.write_bytes(candidate.archive_bytes(files))
+        with self.assertRaisesRegex(ValueError, "missing its OpenPGP signature"):
+            candidate.verify_auxiliary(directory, "linux-x64", self.commit, self.version, core_files)
 
     def test_duplicate_platform_fails(self):
         """Reject duplicate evidence despite its identical platform and source labels.

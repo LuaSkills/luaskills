@@ -49,6 +49,7 @@ class FfiLuaRuntimeHostOptions(ctypes.Structure):
         ("allow_network_download", ctypes.c_uint8),
         ("github_base_url", ctypes.c_char_p),
         ("github_api_base_url", ctypes.c_char_p),
+        ("github_token", ctypes.c_char_p),
         ("official_skill_hub_base_url", ctypes.c_char_p),
         ("enable_private_url_skill_install", ctypes.c_uint8),
         ("private_skill_source_allowlist", ctypes.POINTER(ctypes.c_char_p)),
@@ -442,6 +443,7 @@ def main() -> None:
     host.allow_network_download = 0
     host.github_base_url = None
     host.github_api_base_url = None
+    host.github_token = None
     host.official_skill_hub_base_url = None
     host.enable_private_url_skill_install = 0
     host.private_skill_source_allowlist = None

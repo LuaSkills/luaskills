@@ -55,6 +55,7 @@ class FfiLuaRuntimeHostOptions(ctypes.Structure):
         ("allow_network_download", ctypes.c_uint8),
         ("github_base_url", ctypes.c_char_p),
         ("github_api_base_url", ctypes.c_char_p),
+        ("github_token", ctypes.c_char_p),
         # Source-policy fields complete the public V1 host-options layout.
         # 来源策略字段补全公共 V1 宿主选项布局。
         ("official_skill_hub_base_url", ctypes.c_char_p),
@@ -478,6 +479,7 @@ def main() -> None:
     host.allow_network_download = 0
     host.github_base_url = None
     host.github_api_base_url = None
+    host.github_token = None
     # Source-policy defaults keep private URL installation disabled for this provider demo.
     # 来源策略默认值使本 Provider 示例保持禁用私有 URL 安装。
     host.official_skill_hub_base_url = None
@@ -528,6 +530,7 @@ def main() -> None:
                 "allow_network_download": False,
                 "github_base_url": None,
                 "github_api_base_url": None,
+                "github_token": None,
                 "default_text_encoding": None,
                 "sqlite_library_path": None,
                 "sqlite_provider_mode": "host_callback",

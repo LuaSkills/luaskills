@@ -110,6 +110,7 @@ func main() {
 		allow_network_download:           0,
 		github_base_url:                  nil,
 		github_api_base_url:              nil,
+		github_token:                     nil,
 		sqlite_library_path:              nil,
 		sqlite_provider_mode:             0,
 		sqlite_callback_mode:             0,

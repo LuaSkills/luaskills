@@ -581,6 +581,7 @@ export class StandardFixtureRuntimeClient {
           allow_network_download: false,
           github_base_url: null,
           github_api_base_url: null,
+          github_token: null,
           default_text_encoding: defaultTextEncoding,
           sqlite_library_path: null,
           sqlite_provider_mode: "dynamic_library",

@@ -551,6 +551,10 @@ def verify_auxiliary(directory, platform, commit, version, core_files):
     expected_binary = "bin/luaskills-debug.exe" if PLATFORMS[platform][1] == "windows" else "bin/luaskills-debug"
     if manifest["platform"] != platform or manifest["release_tag"] != f"v{version}" or manifest["binary"] != expected_binary or not debug[expected_binary]:
         raise ValueError("Debug candidate manifest or executable mismatch")
+    # Linux debug tools ship a detached OpenPGP signature; release_gpg.py verified it before packaging.
+    # Linux 调试工具附带分离式 OpenPGP 签名；release_gpg.py 已在打包前验证。
+    if PLATFORMS[platform][1] == "linux" and not debug.get(f"{expected_binary}.asc", b"").startswith(b"-----BEGIN PGP SIGNATURE-----"):
+        raise ValueError("Linux debug candidate is missing its OpenPGP signature")
 
 
 def collect(args):

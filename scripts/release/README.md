@@ -36,7 +36,7 @@ GitHub 的 `GITHUB_TOKEN` 不能获得工作流写权限；来源提交相对实
 这是为了避免相同 tar 在不同平台 gzip 实现中产生不同压缩结果；源码身份和压缩分发身份分别核验。
 
 冻结阶段在完整提交及包版本核验通过后，复用既有 Python 环境，依次运行 `test_candidate.py`、
-`test_sdk_prerequisites.py`、`test_sdk_recovery.py`、`test_certum_totp.py` 四个离线回归入口；任一失败均使冻结作业失败，
+`test_sdk_prerequisites.py`、`test_sdk_recovery.py`、`test_certum_totp.py`、`test_release_gpg.py` 五个离线回归入口；任一失败均使冻结作业失败，
 阻止依赖它的原生验收、候选构建、汇总与草稿创建。脚本与工作流来自同一个已核验完整 SHA。
 五平台原生验收在既有 `cargo test --locked --all-targets -j 4 -- --test-threads=1` 之后，独立执行
 `cargo test --locked --doc -j 4 -- --test-threads=1`，覆盖前者不运行的文档测试，并保留编译并发 4、共享测试串行的限制。
@@ -87,14 +87,19 @@ FFI 归档保留既有 `include/`、`lib/` 和 `ffi-sdk-manifest.json` 布局，
 现有清单的 `platform`、`release_tag` 及实际可执行文件均复核。源码另以 `git archive` 冻结为包含完整提交的
 `luaskills-source-<版本>-<完整提交>.tar.gz`。这是精确 Git 源码归档，不宣称等同于未来 Cargo 规范化的 `.crate` 包。
 
-## Windows 调试工具签名
+## 调试工具签名
 
 Windows 构建在 Cargo 构建之后、打包之前，以 Certum 云证书对 `target/release/luaskills-debug.exe` 原地签名，
 调试归档因此携带已签名字节。流程与 VMM 发行一致：`sign_windows.ps1 -Phase Install` 只安装哈希与签名均已固定的
 官方 SimplySign Desktop；`-Phase Sign` 用 `certum_totp.py` 由 `CERTUM_TOTP_SECRET` 生成一次性动态码，
 连同 `CERTUM_TOTP_EMAIL` 只交给一次登录进程，随后以 `signtool` 加 `http://time.certum.pl` 时间戳签名，
-并逐个验证证书链、`signing-policy.json` 固定的主体、颁发者、指纹与时间戳。任一密钥缺失、证书未就绪或身份不符都直接失败，
-不产出未签名的 Windows 调试工具。核心动态库、demo 与 Unix 产物不签名。
+并逐个验证证书链、`signing-policy.json` 固定的主体、颁发者、指纹与时间戳。已登记证书不代表登录完成，签名在限定次数内重试。
+任一密钥缺失、证书未就绪或身份不符都直接失败，不产出未签名的 Windows 调试工具。
+
+Linux 构建在同一位置以 `release_gpg.py sign` 为 `target/release/luaskills-debug` 生成分离式签名 `luaskills-debug.asc`，
+私钥 `GPG_PRIVATE_KEY` 只导入隔离的临时密钥环，签名身份固定为 `signing-policy.json` 的 `gpg_primary_fingerprint`，
+随后用只含 `release-gpg-public.asc` 的全新密钥环复验。打包时签名放在调试归档的 `bin/` 中，候选核验要求 Linux 调试归档携带它。
+核心动态库、demo 与 macOS 产物不签名。
 
 ## 唯一候选清单定义
 
@@ -140,6 +145,7 @@ rtk proxy python -X utf8 -m unittest discover -s scripts/release -p test_candida
 rtk proxy python -X utf8 -m unittest discover -s scripts/release -p test_sdk_prerequisites.py -v
 rtk proxy python -X utf8 -m unittest discover -s scripts/release -p test_sdk_recovery.py -v
 rtk proxy python -X utf8 -m unittest discover -s scripts/release -p test_certum_totp.py -v
+rtk proxy python -X utf8 -m unittest discover -s scripts/release -p test_release_gpg.py -v
 rtk proxy python -X utf8 -m py_compile scripts/release/candidate.py scripts/release/create_draft.py scripts/release/freeze_draft_source.py scripts/release/test_candidate.py
 ```
 
