@@ -151,10 +151,16 @@ try {
     }
     foreach ($file in $Files) {
         if ($Phase -eq 'Sign') {
-            $signed = Invoke-BoundedTool -Executable $signTool -Arguments @(
-                'sign', '/sha1', $policy.certificate_thumbprint, '/fd', 'SHA256',
-                '/tr', 'http://time.certum.pl', '/td', 'SHA256', $file
-            ) -TimeoutSeconds 120
+            # A certificate already in the store does not prove login finished, so signing retries within a bound.
+            # 存储中已有证书不代表登录已完成，因此签名在限定次数内重试。
+            for ($attempt = 1; $attempt -le 6; $attempt++) {
+                $signed = Invoke-BoundedTool -Executable $signTool -Arguments @(
+                    'sign', '/sha1', $policy.certificate_thumbprint, '/fd', 'SHA256',
+                    '/tr', 'http://time.certum.pl', '/td', 'SHA256', $file
+                ) -TimeoutSeconds 120
+                if ($signed.ExitCode -eq 0) { break }
+                Start-Sleep -Seconds 10
+            }
             if ($signed.ExitCode -ne 0) { throw 'certum_product_signing_failed' }
         }
         # Verify the file bytes, trusted chain, exact publisher, and timestamp before packaging.
