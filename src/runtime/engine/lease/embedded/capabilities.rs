@@ -60,7 +60,7 @@ pub(super) fn install(lua: &Lua, binding: Option<ModuleCapabilities>) -> mlua::R
     let discovery = binding.clone();
     capabilities.set(
         "list",
-        lua.create_function(move |lua, ()| {
+        lua.create_host_function(move |lua, ()| {
             // Unbound modules expose an empty capability set, never process-global callback state.
             // 未绑定模块暴露空能力集合，绝不暴露进程全局回调状态。
             let context = lua
@@ -82,7 +82,7 @@ pub(super) fn install(lua: &Lua, binding: Option<ModuleCapabilities>) -> mlua::R
     // Existence checks are permission-filtered through the same registry authority.
     // 存在性检查通过相同注册表权威进行权限过滤。
     let existence = binding.clone();
-    let has = lua.create_function(move |lua, name: String| {
+    let has = lua.create_host_function(move |lua, name: String| {
         // A retained Lua closure reads the current host stage on every use, not the stage when it was captured.
         // 保留的 Lua 闭包在每次使用时读取当前宿主阶段，而非其被捕获时的阶段。
         let context = lua
@@ -100,7 +100,7 @@ pub(super) fn install(lua: &Lua, binding: Option<ModuleCapabilities>) -> mlua::R
     capabilities.set("has_tool", has)?;
     capabilities.set(
         "call",
-        lua.create_function(move |lua, (name, arguments): (String, LuaValue)| {
+        lua.create_host_function(move |lua, (name, arguments): (String, LuaValue)| {
             // Copy app data before any callback can block; no Lua app-data borrow crosses a host wait.
             // 在任何回调可能阻塞前复制应用数据；宿主等待期间不持有 Lua 应用数据借用。
             let context = lua

@@ -1,0 +1,8 @@
+# Host callbacks must fail with an error, not a panic, when a finalizer calls them while the Lua VM closes.
+# 终结器在 Lua 虚拟机关闭期间调用宿主回调时，回调必须返回错误而非 panic。
+disallowed-methods = [
+    { path = "mlua::Lua::create_function", reason = "use HostFunctions::create_host_function (src/runtime/engine/vm_closing.rs)" },
+    { path = "mlua::Lua::create_function_mut", reason = "use HostFunctions::create_host_function_mut (src/runtime/engine/vm_closing.rs)" },
+    { path = "mlua::UserDataMethods::add_method", reason = "use HostMethods::add_host_method (src/runtime/engine/vm_closing.rs)" },
+    { path = "mlua::UserDataMethods::add_meta_method", reason = "use HostMethods::add_host_meta_method (src/runtime/engine/vm_closing.rs)" },
+]

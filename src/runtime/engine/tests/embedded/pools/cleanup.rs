@@ -1,5 +1,6 @@
 use super::*;
 use crate::runtime::embedded::{ModuleRelease, ModuleRetirementPhase};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// VM destruction completion is distinct from business success inside a global Lua finalizer.
 /// VM 销毁完成与全局 Lua 终结器中的业务成功不同。
@@ -52,6 +53,86 @@ fn embedded_pool_global_finalizer_failure_does_not_prove_worker_failure() {
         assert!(
             Instant::now() < deadline,
             "retirement worker must exit after real destruction"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// Process-wide count of host callbacks that panicked because their Lua instance was destroyed.
+/// 进程范围内因 Lua 实例已销毁而 panic 的宿主回调次数。
+static DESTROYED_INSTANCE_PANICS: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the counting panic hook once, chained to the previous hook, and return the current count.
+/// 安装一次计数 panic 钩子（链接到原钩子），并返回当前计数。
+fn destroyed_instance_panics() -> usize {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if info
+                .payload_as_str()
+                .is_some_and(|message| message.contains("Lua instance is destroyed"))
+            {
+                DESTROYED_INSTANCE_PANICS.fetch_add(1, Ordering::SeqCst);
+            }
+            previous(info);
+        }));
+    });
+    DESTROYED_INSTANCE_PANICS.load(Ordering::SeqCst)
+}
+
+/// A finalizer that `lua_close` runs gets an error from host functions instead of a panic, and retirement completes.
+/// `lua_close` 运行的终结器从宿主函数得到错误而非 panic，退役照常完成。
+#[test]
+fn embedded_pool_close_finalizer_host_call_fails_clearly_and_retirement_completes() {
+    let layout = SystemRuntimeTestLayout::new("embedded closing host gate");
+    let manager = pool_manager(&layout);
+    let panics = destroyed_instance_panics();
+    // Path arguments make the wrapped `io.open` convert a Lua string, which panicked before the gate.
+    // 路径参数使包装后的 `io.open` 转换 Lua 字符串，闸门之前这里会 panic。
+    let pool = manager
+        .create_pool(
+            "closing-host-call".into(),
+            definition(
+                &layout,
+                r#"
+                retained_finalizer = newproxy(true)
+                getmetatable(retained_finalizer).__gc = function()
+                    pcall(io.open, 'closing-host-call.marker', 'w')
+                    io.open('closing-host-call.marker', 'w')
+                end
+                return {call=function() return true end}
+            "#,
+            ),
+            pool_policy(InstanceReuse::SingleCall),
+        )
+        .unwrap();
+    let lease = pool.acquire_tracked(control()).unwrap();
+    let ModuleRelease::Retiring(receipt) = lease.finish().unwrap() else {
+        panic!("single-call instance must retire");
+    };
+    assert_eq!(
+        receipt.wait(Duration::from_secs(3)).unwrap().phase,
+        ModuleRetirementPhase::Completed
+    );
+    assert!(
+        !layout
+            .package_root
+            .join("closing-host-call.marker")
+            .exists()
+    );
+    assert_eq!(
+        destroyed_instance_panics(),
+        panics,
+        "host calls during lua_close must fail with an error, not a destroyed-instance panic"
+    );
+    assert_eq!(manager.usage().unwrap().resident, 0);
+    manager.request_close().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !manager.poll_closed().unwrap() {
+        assert!(
+            Instant::now() < deadline,
+            "retirement worker must exit after the gated close"
         );
         std::thread::yield_now();
     }

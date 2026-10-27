@@ -1369,7 +1369,7 @@ impl UserData for ReadonlyJsonContextValue {
     /// Register immutable indexing, iteration, length, and mutation-rejection behavior.
     /// 注册不可变索引、迭代、长度与修改拒绝行为。
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_method(MetaMethod::Index, |lua, context, key: LuaValue| {
+        methods.add_host_meta_method(MetaMethod::Index, |lua, context, key: LuaValue| {
             // Child selected only from the exact retained JSON container shape.
             // 仅从精确保留的 JSON 容器形状中选择的子值。
             let child = match (&context.value, key) {
@@ -1386,7 +1386,7 @@ impl UserData for ReadonlyJsonContextValue {
                 None => Ok(LuaValue::Nil),
             }
         });
-        methods.add_meta_method(
+        methods.add_host_meta_method(
             MetaMethod::NewIndex,
             |_, context, (_key, _value): (LuaValue, LuaValue)| -> mlua::Result<()> {
                 Err(mlua::Error::runtime(format!(
@@ -1395,16 +1395,16 @@ impl UserData for ReadonlyJsonContextValue {
                 )))
             },
         );
-        methods.add_meta_method(MetaMethod::Len, |_, context, ()| {
+        methods.add_host_meta_method(MetaMethod::Len, |_, context, ()| {
             Ok(match &context.value {
                 Value::Array(array) => array.len(),
                 _ => 0,
             })
         });
-        methods.add_meta_method(MetaMethod::Pairs, |lua, context, ()| {
+        methods.add_host_meta_method(MetaMethod::Pairs, |lua, context, ()| {
             create_readonly_json_context_iterator(lua, context, false)
         });
-        methods.add_meta_method(MetaMethod::IPairs, |lua, context, ()| {
+        methods.add_host_meta_method(MetaMethod::IPairs, |lua, context, ()| {
             create_readonly_json_context_iterator(lua, context, true)
         });
     }
@@ -1500,7 +1500,7 @@ fn create_readonly_json_context_iterator(
     // 完全由迭代器闭包拥有的稳定标签与游标。
     let label = context.label.clone();
     let mut entries = entries.into_iter();
-    let iterator = lua.create_function_mut(move |lua, _arguments: MultiValue| {
+    let iterator = lua.create_host_function_mut(move |lua, _arguments: MultiValue| {
         let Some((key, value)) = entries.next() else {
             return Ok(MultiValue::new());
         };
@@ -1611,7 +1611,7 @@ pub(super) fn install_system_runtime_context_boundary(lua: &Lua) -> Result<(), S
         .create_table()
         .map_err(|error| format!("failed to create protected runtime metatable: {error}"))?;
     let index = lua
-        .create_function(|lua, (_table, key): (Table, LuaValue)| {
+        .create_host_function(|lua, (_table, key): (Table, LuaValue)| {
             let LuaValue::String(key) = key else {
                 return Ok(LuaValue::Nil);
             };
@@ -1624,7 +1624,7 @@ pub(super) fn install_system_runtime_context_boundary(lua: &Lua) -> Result<(), S
         })
         .map_err(|error| format!("failed to create protected runtime index: {error}"))?;
     let new_index = lua
-        .create_function(|_lua, (table, key, value): (Table, LuaValue, LuaValue)| {
+        .create_host_function(|_lua, (table, key, value): (Table, LuaValue, LuaValue)| {
             if let LuaValue::String(key_text) = &key {
                 let key_text = key_text.to_str()?;
                 if is_protected_system_runtime_context_key(key_text.as_ref()) {

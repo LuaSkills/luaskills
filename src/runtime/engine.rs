@@ -108,6 +108,8 @@ mod host_result;
 mod lease;
 pub(crate) mod logical_cwd;
 mod runlua;
+pub(crate) mod vm_closing;
+use vm_closing::{HostFunctions, HostMethods};
 
 use self::bridge::{
     create_host_tool_call_fn, create_host_tool_has_fn, create_host_tool_list_fn,
@@ -512,15 +514,10 @@ struct LuaVm {
 }
 
 impl Drop for LuaVm {
-    /// Run pending Lua finalizers while the instance is still alive, before `lua_close`.
-    /// 在 `lua_close` 之前、实例仍存活时运行待执行的 Lua 终结器。
-    /// Finalizers that `lua_close` runs cannot call wrapped host functions, because mlua has
-    /// already released the instance, so a full collection makes their timing deterministic.
-    /// `lua_close` 运行的终结器无法调用被包装的宿主函数，因为 mlua 已释放实例，所以完整回收使其时机确定。
+    /// Run pending finalizers while the instance is alive, then refuse host functions during `lua_close`.
+    /// 在实例存活时运行待执行终结器，然后在 `lua_close` 期间拒绝宿主函数。
     fn drop(&mut self) {
-        if let Err(error) = self.lua.gc_collect() {
-            log_error(format!("Lua VM finalization before close failed: {error}"));
-        }
+        vm_closing::prepare_lua_close(&self.lua);
     }
 }
 
@@ -10196,7 +10193,7 @@ impl LuaEngine {
 
             let upsert_binding = binding.clone();
             let vector_upsert_fn = lua
-                .create_function(move |lua, input: LuaValue| {
+                .create_host_function(move |lua, input: LuaValue| {
                     let mut input_json =
                         provider_input_table_to_json(input, "lancedb.vector_upsert")?;
                     let input_object = input_json.as_object_mut().ok_or_else(|| {
@@ -10263,7 +10260,7 @@ impl LuaEngine {
 
             let search_binding = binding.clone();
             let vector_search_fn = lua
-                .create_function(move |lua, input: LuaValue| {
+                .create_host_function(move |lua, input: LuaValue| {
                     let mut input_json =
                         provider_input_table_to_json(input, "lancedb.vector_search")?;
                     let input_object = input_json.as_object_mut().ok_or_else(|| {
@@ -10496,7 +10493,7 @@ impl LuaEngine {
 
             let list_words_binding = binding.clone();
             let list_words_fn = lua
-                .create_function(move |lua, ()| {
+                .create_host_function(move |lua, ()| {
                     provider_json_result_to_lua(lua, list_words_binding.list_custom_words_json())
                 })
                 .map_err(|error| {
@@ -10883,7 +10880,7 @@ impl LuaEngine {
         let dispatch_entries = build_lua_call_dispatch_entries(skills_map, entry_registry)?;
 
         let dispatcher = lua
-            .create_function(move |lua, (name, args): (LuaValue, LuaValue)| {
+            .create_host_function(move |lua, (name, args): (LuaValue, LuaValue)| {
                 let name = require_string_arg(name, "call", "name", false)?;
                 let args = require_table_arg(args, "call", "args")?;
                 let dispatch_entry = resolve_lua_call_dispatch_entry(&dispatch_entries, &name)?;
@@ -11070,23 +11067,24 @@ impl LuaEngine {
         let default_text_encoding = resolve_host_default_text_encoding(host_options)?;
         let vulcan_io = create_vulcan_io_table(lua, default_text_encoding)?;
 
-        let runtime_log_fn = lua.create_function(|_, (level, msg): (LuaValue, LuaValue)| {
-            let level = require_string_arg(level, "runtime.log", "level", false)?;
-            let msg = require_string_arg(msg, "runtime.log", "message", true)?;
-            let normalized_level = level.trim().to_ascii_lowercase();
-            let rendered = format!("[LuaSkill:{}] {}", level, msg);
-            if normalized_level.contains("error") || normalized_level.contains("fatal") {
-                log_error(rendered);
-            } else if normalized_level.contains("warn") {
-                log_warn(rendered);
-            } else {
-                log_info(rendered);
-            }
-            Ok(())
-        })?;
+        let runtime_log_fn =
+            lua.create_host_function(|_, (level, msg): (LuaValue, LuaValue)| {
+                let level = require_string_arg(level, "runtime.log", "level", false)?;
+                let msg = require_string_arg(msg, "runtime.log", "message", true)?;
+                let normalized_level = level.trim().to_ascii_lowercase();
+                let rendered = format!("[LuaSkill:{}] {}", level, msg);
+                if normalized_level.contains("error") || normalized_level.contains("fatal") {
+                    log_error(rendered);
+                } else if normalized_level.contains("warn") {
+                    log_warn(rendered);
+                } else {
+                    log_info(rendered);
+                }
+                Ok(())
+            })?;
         runtime.set("log", runtime_log_fn)?;
 
-        let print_fn = lua.create_function(|_, args: MultiValue| {
+        let print_fn = lua.create_host_function(|_, args: MultiValue| {
             let mut parts = Vec::new();
             for val in args.into_iter() {
                 parts.push(render_lua_print_argument(val));
@@ -11096,7 +11094,7 @@ impl LuaEngine {
         })?;
         lua.globals().set("print", print_fn)?;
 
-        let fs_list_fn = lua.create_function(|_, dir: LuaValue| {
+        let fs_list_fn = lua.create_host_function(|_, dir: LuaValue| {
             let dir = require_path_arg(dir, "fs.list", "dir")?;
             let mut entries = Vec::new();
             let dir_path = Path::new(&dir);
@@ -11116,23 +11114,24 @@ impl LuaEngine {
         })?;
         fs.set("list", fs_list_fn)?;
 
-        let fs_read_fn = lua.create_function(|_, path: LuaValue| {
+        let fs_read_fn = lua.create_host_function(|_, path: LuaValue| {
             let path = require_path_arg(path, "fs.read", "path")?;
             std::fs::read_to_string(&path)
                 .map_err(|e| mlua::Error::runtime(format!("fs.read: {}", e)))
         })?;
         fs.set("read", fs_read_fn)?;
 
-        let fs_write_fn = lua.create_function(|_, (path, content): (LuaValue, LuaValue)| {
-            let path = require_path_arg(path, "fs.write", "path")?;
-            let content = require_string_arg(content, "fs.write", "content", true)?;
-            std::fs::write(&path, content)
-                .map_err(|e| mlua::Error::runtime(format!("fs.write: {}", e)))
-        })?;
+        let fs_write_fn =
+            lua.create_host_function(|_, (path, content): (LuaValue, LuaValue)| {
+                let path = require_path_arg(path, "fs.write", "path")?;
+                let content = require_string_arg(content, "fs.write", "content", true)?;
+                std::fs::write(&path, content)
+                    .map_err(|e| mlua::Error::runtime(format!("fs.write: {}", e)))
+            })?;
         fs.set("write", fs_write_fn)?;
 
         let fs_write_bytes_fn =
-            lua.create_function(|_, (path, content): (LuaValue, LuaValue)| {
+            lua.create_host_function(|_, (path, content): (LuaValue, LuaValue)| {
                 let path = require_path_arg(path, "fs.write_bytes", "path")?;
                 let content = require_string_arg(content, "fs.write_bytes", "content", false)?;
                 let bytes = BASE64_STANDARD
@@ -11149,7 +11148,7 @@ impl LuaEngine {
         fs.set("write_bytes", fs_write_bytes_fn)?;
 
         let fs_rename_fn =
-            lua.create_function(|_, (old_path, new_path): (LuaValue, LuaValue)| {
+            lua.create_host_function(|_, (old_path, new_path): (LuaValue, LuaValue)| {
                 let old_path = require_path_arg(old_path, "fs.rename", "old_path")?;
                 let new_path = require_path_arg(new_path, "fs.rename", "new_path")?;
                 fs::rename(&old_path, &new_path)
@@ -11158,7 +11157,7 @@ impl LuaEngine {
             })?;
         fs.set("rename", fs_rename_fn)?;
 
-        let fs_remove_fn = lua.create_function(|_, args: MultiValue| {
+        let fs_remove_fn = lua.create_host_function(|_, args: MultiValue| {
             let mut values = args.into_iter();
             let path =
                 require_path_arg(values.next().unwrap_or(LuaValue::Nil), "fs.remove", "path")?;
@@ -11191,7 +11190,7 @@ impl LuaEngine {
         })?;
         fs.set("remove", fs_remove_fn)?;
 
-        let fs_mkdir_fn = lua.create_function(|_, args: MultiValue| {
+        let fs_mkdir_fn = lua.create_host_function(|_, args: MultiValue| {
             let mut values = args.into_iter();
             let path =
                 require_path_arg(values.next().unwrap_or(LuaValue::Nil), "fs.mkdir", "path")?;
@@ -11221,7 +11220,7 @@ impl LuaEngine {
         })?;
         fs.set("mkdir", fs_mkdir_fn)?;
 
-        let fs_copy_fn = lua.create_function(|_, args: MultiValue| {
+        let fs_copy_fn = lua.create_host_function(|_, args: MultiValue| {
             let mut values = args.into_iter();
             let source_path = require_path_arg(
                 values.next().unwrap_or(LuaValue::Nil),
@@ -11267,7 +11266,7 @@ impl LuaEngine {
         })?;
         fs.set("copy", fs_copy_fn)?;
 
-        let fs_stat_fn = lua.create_function(|lua, path: LuaValue| {
+        let fs_stat_fn = lua.create_host_function(|lua, path: LuaValue| {
             let path = require_path_arg(path, "fs.stat", "path")?;
             match fs::symlink_metadata(&path) {
                 Ok(metadata) => Ok(LuaValue::Table(create_vulcan_fs_stat_table(
@@ -11281,7 +11280,7 @@ impl LuaEngine {
         })?;
         fs.set("stat", fs_stat_fn)?;
 
-        let fs_read_bytes_fn = lua.create_function(|lua, path: LuaValue| {
+        let fs_read_bytes_fn = lua.create_host_function(|lua, path: LuaValue| {
             let path = require_path_arg(path, "fs.read_bytes", "path")?;
             let bytes = fs::read(&path)
                 .map_err(|error| mlua::Error::runtime(format!("fs.read_bytes: {}", error)))?;
@@ -11289,19 +11288,19 @@ impl LuaEngine {
         })?;
         fs.set("read_bytes", fs_read_bytes_fn)?;
 
-        let fs_exists_fn = lua.create_function(|_, path: LuaValue| {
+        let fs_exists_fn = lua.create_host_function(|_, path: LuaValue| {
             let path = require_path_arg(path, "fs.exists", "path")?;
             vulcan_fs_target_exists(Path::new(&path), "fs.exists").map_err(mlua::Error::runtime)
         })?;
         fs.set("exists", fs_exists_fn)?;
 
-        let fs_is_dir_fn = lua.create_function(|_, path: LuaValue| {
+        let fs_is_dir_fn = lua.create_host_function(|_, path: LuaValue| {
             let path = require_path_arg(path, "fs.is_dir", "path")?;
             vulcan_fs_target_is_dir(Path::new(&path), "fs.is_dir").map_err(mlua::Error::runtime)
         })?;
         fs.set("is_dir", fs_is_dir_fn)?;
 
-        let path_join_fn = lua.create_function(|lua, parts: MultiValue| {
+        let path_join_fn = lua.create_host_function(|lua, parts: MultiValue| {
             if parts.is_empty() {
                 return Err(mlua::Error::runtime(
                     "path.join: expected at least one path segment",
@@ -11318,14 +11317,14 @@ impl LuaEngine {
         })?;
         path.set("join", path_join_fn)?;
 
-        let path_dirname_fn = lua.create_function(|lua, path: LuaValue| {
+        let path_dirname_fn = lua.create_host_function(|lua, path: LuaValue| {
             let path = require_path_arg(path, "path.dirname", "path")?;
             let rendered = render_vulcan_path_dirname(Path::new(&path));
             lua.create_string(&rendered)
         })?;
         path.set("dirname", path_dirname_fn)?;
 
-        let path_basename_fn = lua.create_function(|lua, path: LuaValue| {
+        let path_basename_fn = lua.create_host_function(|lua, path: LuaValue| {
             let path = require_path_arg(path, "path.basename", "path")?;
             let rendered =
                 render_vulcan_path_component(Path::new(&path).file_name(), "path.basename")?;
@@ -11333,14 +11332,14 @@ impl LuaEngine {
         })?;
         path.set("basename", path_basename_fn)?;
 
-        let path_stem_fn = lua.create_function(|lua, path: LuaValue| {
+        let path_stem_fn = lua.create_host_function(|lua, path: LuaValue| {
             let path = require_path_arg(path, "path.stem", "path")?;
             let rendered = render_vulcan_path_component(Path::new(&path).file_stem(), "path.stem")?;
             lua.create_string(&rendered)
         })?;
         path.set("stem", path_stem_fn)?;
 
-        let path_extname_fn = lua.create_function(|lua, path: LuaValue| {
+        let path_extname_fn = lua.create_host_function(|lua, path: LuaValue| {
             let path = require_path_arg(path, "path.extname", "path")?;
             let extension =
                 render_vulcan_path_component(Path::new(&path).extension(), "path.extname")?;
@@ -11353,20 +11352,20 @@ impl LuaEngine {
         })?;
         path.set("extname", path_extname_fn)?;
 
-        let path_normalize_fn = lua.create_function(|lua, path: LuaValue| {
+        let path_normalize_fn = lua.create_host_function(|lua, path: LuaValue| {
             let path = require_path_arg(path, "path.normalize", "path")?;
             let rendered = render_vulcan_normalized_path(Path::new(&path));
             lua.create_string(&rendered)
         })?;
         path.set("normalize", path_normalize_fn)?;
 
-        let path_is_abs_fn = lua.create_function(|_, path: LuaValue| {
+        let path_is_abs_fn = lua.create_host_function(|_, path: LuaValue| {
             let path = require_path_arg(path, "path.is_abs", "path")?;
             Ok(Path::new(&path).is_absolute())
         })?;
         path.set("is_abs", path_is_abs_fn)?;
 
-        let cwd_fn = lua.create_function(|lua, ()| {
+        let cwd_fn = lua.create_host_function(|lua, ()| {
             let current_dir = match logical_cwd::directory(lua) {
                 Some(directory) => directory,
                 None => std::env::current_dir()
@@ -11377,29 +11376,29 @@ impl LuaEngine {
         })?;
         runtime.set("cwd", cwd_fn)?;
 
-        let python_status_fn = lua.create_function(|lua, ()| managed_python_status(lua))?;
+        let python_status_fn = lua.create_host_function(|lua, ()| managed_python_status(lua))?;
         runtime_python.set("status", python_status_fn)?;
         let python_invoke_fn =
-            lua.create_function(|lua, spec: LuaValue| invoke_managed_python(lua, spec))?;
+            lua.create_host_function(|lua, spec: LuaValue| invoke_managed_python(lua, spec))?;
         runtime_python.set("invoke", python_invoke_fn)?;
         // Persistent Python session namespace backed by the shared process core.
         // 由共享进程核心支撑的持久 Python 会话命名空间。
         let runtime_python_session = lua.create_table()?;
-        let python_session_open_fn = lua.create_function(move |lua, spec: LuaValue| {
+        let python_session_open_fn = lua.create_host_function(move |lua, spec: LuaValue| {
             open_managed_python_session(lua, spec, default_text_encoding)
         })?;
         runtime_python_session.set("open", python_session_open_fn)?;
         runtime_python.set("session", runtime_python_session)?;
 
-        let node_status_fn = lua.create_function(|lua, ()| managed_node_status(lua))?;
+        let node_status_fn = lua.create_host_function(|lua, ()| managed_node_status(lua))?;
         runtime_node.set("status", node_status_fn)?;
         let node_invoke_fn =
-            lua.create_function(|lua, spec: LuaValue| invoke_managed_node(lua, spec))?;
+            lua.create_host_function(|lua, spec: LuaValue| invoke_managed_node(lua, spec))?;
         runtime_node.set("invoke", node_invoke_fn)?;
         // Persistent Node session namespace backed by the shared process core.
         // 由共享进程核心支撑的持久 Node 会话命名空间。
         let runtime_node_session = lua.create_table()?;
-        let node_session_open_fn = lua.create_function(move |lua, spec: LuaValue| {
+        let node_session_open_fn = lua.create_host_function(move |lua, spec: LuaValue| {
             open_managed_node_session(lua, spec, default_text_encoding)
         })?;
         runtime_node_session.set("open", node_session_open_fn)?;
@@ -11416,7 +11415,7 @@ impl LuaEngine {
         }
 
         let exec_default_encoding = default_text_encoding;
-        let launchers_fn = lua.create_function(|lua, ()| {
+        let launchers_fn = lua.create_host_function(|lua, ()| {
             let info = lua.create_table()?;
             let shells = lua.create_table()?;
             for (index, shell_name) in
@@ -11431,7 +11430,7 @@ impl LuaEngine {
             Ok(info)
         })?;
         process.set("launchers", launchers_fn)?;
-        let exec_fn = lua.create_function(move |lua, spec: LuaValue| {
+        let exec_fn = lua.create_host_function(move |lua, spec: LuaValue| {
             let directory = logical_cwd::directory(lua);
             let mut request = parse_exec_request(
                 spec,
@@ -11449,7 +11448,7 @@ impl LuaEngine {
             exec_result_to_lua_table(lua, result)
         })?;
         process.set("exec", exec_fn)?;
-        let which_fn = lua.create_function(|lua, program: LuaValue| {
+        let which_fn = lua.create_host_function(|lua, program: LuaValue| {
             let program = require_string_arg(program, "process.which", "program", false)?;
             let found = match logical_cwd::directory(lua) {
                 Some(directory) => resolve_vulcan_process_which_in_directory(&program, &directory),
@@ -11470,7 +11469,7 @@ impl LuaEngine {
             create_process_session_table(lua, default_text_encoding)?,
         )?;
 
-        let os_info_fn = lua.create_function(|lua, ()| {
+        let os_info_fn = lua.create_host_function(|lua, ()| {
             let current_os = std::env::consts::OS;
             let arch = match std::env::consts::ARCH {
                 "x86_64" => "x86_64",
@@ -11487,7 +11486,7 @@ impl LuaEngine {
         os.set("info", os_info_fn)?;
 
         let json_encode_fn =
-            lua.create_function(|lua, val: LuaValue| match lua_value_to_json(&val) {
+            lua.create_host_function(|lua, val: LuaValue| match lua_value_to_json(&val) {
                 Ok(value) => {
                     let text = serde_json::to_string(&value).map_err(|error| {
                         mlua::Error::runtime(format!(
@@ -11500,7 +11499,7 @@ impl LuaEngine {
             })?;
         json.set("encode", json_encode_fn)?;
 
-        let json_decode_fn = lua.create_function(|lua, s: LuaValue| {
+        let json_decode_fn = lua.create_host_function(|lua, s: LuaValue| {
             let s = require_string_arg(s, "json.decode", "text", false)?;
             match serde_json::from_str::<Value>(&s) {
                 Ok(value) => json_value_to_lua(lua, &value),
@@ -11511,14 +11510,14 @@ impl LuaEngine {
 
         // Explicit JSON object constructor that returns a protected, shallow copy.
         // 显式 JSON 对象构造器，返回受保护的浅拷贝。
-        let json_object_fn = lua.create_function(|lua, arguments: MultiValue| {
+        let json_object_fn = lua.create_host_function(|lua, arguments: MultiValue| {
             create_json_container(lua, arguments, JsonContainerKind::Object)
         })?;
         json.set("object", json_object_fn)?;
 
         // Explicit JSON array constructor that returns a protected, shallow copy.
         // 显式 JSON 数组构造器，返回受保护的浅拷贝。
-        let json_array_fn = lua.create_function(|lua, arguments: MultiValue| {
+        let json_array_fn = lua.create_host_function(|lua, arguments: MultiValue| {
             create_json_container(lua, arguments, JsonContainerKind::Array)
         })?;
         json.set("array", json_array_fn)?;
@@ -11527,25 +11526,27 @@ impl LuaEngine {
         // 稳定的 JSON null 哨兵，在对象与数组内部不会消失。
         json.set("null", LuaValue::NULL)?;
 
-        let cache_put_fn = lua.create_function(|lua, (value, ttl_sec): (LuaValue, LuaValue)| {
-            let internal = get_vulcan_runtime_internal_table(lua).map_err(mlua::Error::runtime)?;
-            let tool_name: Option<String> =
-                internal.get("tool_name").map_err(mlua::Error::runtime)?;
-            let skill_name: Option<String> =
-                internal.get("skill_name").map_err(mlua::Error::runtime)?;
-            let scope = tool_name
-                .or(skill_name)
-                .unwrap_or_else(|| "__runtime".to_string());
-            let ttl_secs = optional_u64_arg(ttl_sec, "cache.put", "ttl_sec")?;
-            let payload = lua_value_to_json(&value)
-                .map_err(|error| mlua::Error::runtime(format!("cache.put: {}", error)))?;
-            global_tool_cache()
-                .create(&scope, payload, ttl_secs)
-                .map_err(|error| mlua::Error::runtime(format!("cache.put: {}", error)))
-        })?;
+        let cache_put_fn =
+            lua.create_host_function(|lua, (value, ttl_sec): (LuaValue, LuaValue)| {
+                let internal =
+                    get_vulcan_runtime_internal_table(lua).map_err(mlua::Error::runtime)?;
+                let tool_name: Option<String> =
+                    internal.get("tool_name").map_err(mlua::Error::runtime)?;
+                let skill_name: Option<String> =
+                    internal.get("skill_name").map_err(mlua::Error::runtime)?;
+                let scope = tool_name
+                    .or(skill_name)
+                    .unwrap_or_else(|| "__runtime".to_string());
+                let ttl_secs = optional_u64_arg(ttl_sec, "cache.put", "ttl_sec")?;
+                let payload = lua_value_to_json(&value)
+                    .map_err(|error| mlua::Error::runtime(format!("cache.put: {}", error)))?;
+                global_tool_cache()
+                    .create(&scope, payload, ttl_secs)
+                    .map_err(|error| mlua::Error::runtime(format!("cache.put: {}", error)))
+            })?;
         cache.set("put", cache_put_fn)?;
 
-        let cache_get_fn = lua.create_function(|lua, cache_id: LuaValue| {
+        let cache_get_fn = lua.create_host_function(|lua, cache_id: LuaValue| {
             let internal = get_vulcan_runtime_internal_table(lua).map_err(mlua::Error::runtime)?;
             let tool_name: Option<String> =
                 internal.get("tool_name").map_err(mlua::Error::runtime)?;
@@ -11562,7 +11563,7 @@ impl LuaEngine {
         })?;
         cache.set("get", cache_get_fn)?;
 
-        let cache_delete_fn = lua.create_function(|lua, cache_id: LuaValue| {
+        let cache_delete_fn = lua.create_host_function(|lua, cache_id: LuaValue| {
             let internal = get_vulcan_runtime_internal_table(lua).map_err(mlua::Error::runtime)?;
             let tool_name: Option<String> =
                 internal.get("tool_name").map_err(mlua::Error::runtime)?;
@@ -11577,7 +11578,7 @@ impl LuaEngine {
         cache.set("delete", cache_delete_fn)?;
 
         let config_get_service = skill_config_service.clone();
-        let config_get_fn = lua.create_function(move |lua, key: LuaValue| {
+        let config_get_fn = lua.create_host_function(move |lua, key: LuaValue| {
             let key = require_string_arg(key, "config.get", "key", false)?;
             let skill_id = current_vulcan_config_skill_id(lua, "vulcan.config.get")?;
             match config_get_service
@@ -11593,7 +11594,7 @@ impl LuaEngine {
         config.set("get", config_get_fn)?;
 
         let config_has_service = skill_config_service.clone();
-        let config_has_fn = lua.create_function(move |lua, key: LuaValue| {
+        let config_has_fn = lua.create_host_function(move |lua, key: LuaValue| {
             let key = require_string_arg(key, "config.has", "key", false)?;
             let skill_id = current_vulcan_config_skill_id(lua, "vulcan.config.has")?;
             config_has_service
@@ -11603,7 +11604,7 @@ impl LuaEngine {
         config.set("has", config_has_fn)?;
 
         let config_set_service = skill_config_service.clone();
-        let config_set_fn = lua.create_function(move |lua, mut arguments: MultiValue| {
+        let config_set_fn = lua.create_host_function(move |lua, mut arguments: MultiValue| {
             let first = arguments.pop_front().ok_or_else(|| {
                 mlua::Error::runtime("config.set requires one key/value pair or one table")
             })?;
@@ -11653,7 +11654,7 @@ impl LuaEngine {
         config.set("set", config_set_fn)?;
 
         let config_delete_service = skill_config_service.clone();
-        let config_delete_fn = lua.create_function(move |lua, key: LuaValue| {
+        let config_delete_fn = lua.create_host_function(move |lua, key: LuaValue| {
             let key = require_string_arg(key, "config.delete", "key", false)?;
             let skill_id = current_vulcan_config_skill_id(lua, "vulcan.config.delete")?;
             config_delete_service
@@ -11664,7 +11665,7 @@ impl LuaEngine {
         config.set("delete", config_delete_fn)?;
 
         let config_list_service = skill_config_service.clone();
-        let config_list_fn = lua.create_function(move |lua, ()| {
+        let config_list_fn = lua.create_host_function(move |lua, ()| {
             let skill_id = current_vulcan_config_skill_id(lua, "vulcan.config.list")?;
             let items = config_list_service
                 .list_effective_values(&skill_id)
@@ -11683,7 +11684,7 @@ impl LuaEngine {
         config.set("list", config_list_fn)?;
 
         let config_describe_service = skill_config_service.clone();
-        let config_describe_fn = lua.create_function(move |lua, ()| {
+        let config_describe_fn = lua.create_host_function(move |lua, ()| {
             let skill_id = current_vulcan_config_skill_id(lua, "vulcan.config.describe")?;
             let descriptors = config_describe_service
                 .describe(Some(&skill_id), false)
@@ -11699,7 +11700,7 @@ impl LuaEngine {
         config.set("describe", config_describe_fn)?;
 
         let config_status_service = skill_config_service;
-        let config_status_fn = lua.create_function(move |lua, ()| {
+        let config_status_fn = lua.create_host_function(move |lua, ()| {
             let skill_id = current_vulcan_config_skill_id(lua, "vulcan.config.status")?;
             let status = config_status_service
                 .status(&skill_id)
@@ -11735,7 +11736,7 @@ impl LuaEngine {
         let skill_management_enabled = host_options.capabilities.enable_skill_management_bridge;
         runtime_skills.set("enabled", skill_management_enabled)?;
 
-        let runtime_skills_status_fn = lua.create_function(move |lua, ()| {
+        let runtime_skills_status_fn = lua.create_host_function(move |lua, ()| {
             let status = lua.create_table()?;
             let callback_registered = try_has_skill_management_callback();
             status.set("enabled", skill_management_enabled)?;
@@ -11819,7 +11820,7 @@ impl LuaEngine {
         runtime.set("python", runtime_python)?;
         runtime.set("node", runtime_node)?;
 
-        let call_stub = lua.create_function(|_, _: (LuaValue, LuaValue)| {
+        let call_stub = lua.create_host_function(|_, _: (LuaValue, LuaValue)| {
             Err::<(), _>(mlua::Error::runtime("vulcan.call not initialized"))
         })?;
         vulcan.set("call", call_stub)?;
@@ -12015,7 +12016,7 @@ where
     let lua_path = format!("vulcan.{}", api_name);
     let input_api_name = api_name;
     let method_fn = lua
-        .create_function(move |lua, input: LuaValue| {
+        .create_host_function(move |lua, input: LuaValue| {
             let input_json = provider_input_table_to_json(input, &input_api_name)?;
             provider_json_result_to_lua(lua, invoke(&input_json))
         })
@@ -12061,7 +12062,7 @@ where
     F: Fn() -> Result<Value, String> + Send + 'static,
 {
     let method_fn = lua
-        .create_function(move |lua, ()| {
+        .create_host_function(move |lua, ()| {
             let value = resolve().map_err(mlua::Error::runtime)?;
             json_value_to_lua(lua, &value).map_err(mlua::Error::external)
         })
@@ -12129,7 +12130,7 @@ fn install_disabled_provider_context(
     for method_name in method_names {
         let error_text = disabled_error.to_string();
         let fn_value = lua
-            .create_function(move |_, _: MultiValue| {
+            .create_host_function(move |_, _: MultiValue| {
                 Err::<LuaValue, _>(mlua::Error::runtime(error_text.clone()))
             })
             .map_err(|error| {

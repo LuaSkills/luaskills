@@ -23,6 +23,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use mlua::{Function, Lua, MultiValue, Table, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::runtime::encoding::{RuntimeTextEncoding, decode_runtime_text, encode_runtime_text};
+use crate::runtime::engine::vm_closing::{HostFunctions, HostMethods};
 use crate::runtime::path::normalize_host_input_path_text;
 use crate::runtime::process_session::{ManagedChildProcessTree, finalize_one_shot_process_tree};
 
@@ -694,7 +695,7 @@ impl ManagedIoFile {
     /// 创建一个逐行读取直到 EOF 的迭代器函数。
     fn lines(&self, lua: &Lua) -> mlua::Result<Function> {
         let file = self.clone();
-        lua.create_function_mut(move |lua, ()| file.read_one_line(lua))
+        lua.create_host_function_mut(move |lua, ()| file.read_one_line(lua))
     }
 
     /// Lock the shared file state and return its guard, recovering after state lock poisoning.
@@ -710,20 +711,20 @@ impl UserData for ManagedIoFile {
     /// Register Lua-visible methods for the managed file handle.
     /// 为托管文件句柄注册 Lua 可见方法。
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("read", |lua, file, formats: MultiValue| {
+        methods.add_host_method("read", |lua, file, formats: MultiValue| {
             file.read_values(lua, formats)
         });
-        methods.add_method("write", |_, file, values: MultiValue| {
+        methods.add_host_method("write", |_, file, values: MultiValue| {
             file.write_values(values)
         });
-        methods.add_method("flush", |_, file, ()| file.flush());
-        methods.add_method("close", |_, file, ()| file.close());
-        methods.add_method(
+        methods.add_host_method("flush", |_, file, ()| file.flush());
+        methods.add_host_method("close", |_, file, ()| file.close());
+        methods.add_host_method(
             "seek",
             |_, file, (whence, offset): (Option<String>, Option<i64>)| file.seek(whence, offset),
         );
-        methods.add_method("lines", |lua, file, ()| file.lines(lua));
-        methods.add_method("setvbuf", |_, _file, _args: MultiValue| Ok(true));
+        methods.add_host_method("lines", |lua, file, ()| file.lines(lua));
+        methods.add_host_method("setvbuf", |_, _file, _args: MultiValue| Ok(true));
     }
 }
 
@@ -736,28 +737,32 @@ pub(crate) fn create_vulcan_io_table(
     let options = ManagedIoOptions { default_encoding };
     let io_table = lua.create_table()?;
     let open_options = options;
-    let open_fn =
-        lua.create_function(move |lua, args: MultiValue| open_from_args(lua, args, open_options))?;
+    let open_fn = lua.create_host_function(move |lua, args: MultiValue| {
+        open_from_args(lua, args, open_options)
+    })?;
     let read_text_options = options;
-    let read_text_fn = lua.create_function(move |lua, args: MultiValue| {
+    let read_text_fn = lua.create_host_function(move |lua, args: MultiValue| {
         read_text_from_args(lua, args, read_text_options)
     })?;
     let write_text_options = options;
-    let write_text_fn = lua.create_function(move |_, args: MultiValue| {
+    let write_text_fn = lua.create_host_function(move |_, args: MultiValue| {
         write_text_from_args(args, false, write_text_options)
     })?;
     let append_text_options = options;
-    let append_text_fn = lua.create_function(move |_, args: MultiValue| {
+    let append_text_fn = lua.create_host_function(move |_, args: MultiValue| {
         write_text_from_args(args, true, append_text_options)
     })?;
     let lines_options = options;
-    let lines_fn = lua
-        .create_function(move |lua, args: MultiValue| lines_from_args(lua, args, lines_options))?;
+    let lines_fn = lua.create_host_function(move |lua, args: MultiValue| {
+        lines_from_args(lua, args, lines_options)
+    })?;
     let popen_options = options;
-    let popen_fn = lua
-        .create_function(move |lua, args: MultiValue| popen_from_args(lua, args, popen_options))?;
+    let popen_fn = lua.create_host_function(move |lua, args: MultiValue| {
+        popen_from_args(lua, args, popen_options)
+    })?;
     let tmpfile_options = options;
-    let tmpfile_fn = lua.create_function(move |lua, ()| tmpfile_from_args(lua, tmpfile_options))?;
+    let tmpfile_fn =
+        lua.create_host_function(move |lua, ()| tmpfile_from_args(lua, tmpfile_options))?;
     io_table.set("open", open_fn)?;
     io_table.set("read_text", read_text_fn)?;
     io_table.set("write_text", write_text_fn)?;
@@ -789,7 +794,7 @@ pub(crate) fn install_managed_io_compat(
     let input_options = options;
     compat.set(
         "input",
-        lua.create_function(move |lua, value: LuaValue| {
+        lua.create_host_function(move |lua, value: LuaValue| {
             set_or_get_compat_input(lua, input_state.clone(), value, input_options)
         })?,
     )?;
@@ -797,39 +802,39 @@ pub(crate) fn install_managed_io_compat(
     let output_options = options;
     compat.set(
         "output",
-        lua.create_function(move |lua, value: LuaValue| {
+        lua.create_host_function(move |lua, value: LuaValue| {
             set_or_get_compat_output(lua, output_state.clone(), value, output_options)
         })?,
     )?;
     let read_state = compat_state.clone();
     compat.set(
         "read",
-        lua.create_function(move |lua, args: MultiValue| {
+        lua.create_host_function(move |lua, args: MultiValue| {
             read_from_compat_input(lua, read_state.clone(), args)
         })?,
     )?;
     let write_state = compat_state.clone();
     compat.set(
         "write",
-        lua.create_function(move |_, values: MultiValue| {
+        lua.create_host_function(move |_, values: MultiValue| {
             write_to_compat_output(write_state.clone(), values)
         })?,
     )?;
     let flush_state = compat_state.clone();
     compat.set(
         "flush",
-        lua.create_function(move |_, ()| flush_compat_output(flush_state.clone()))?,
+        lua.create_host_function(move |_, ()| flush_compat_output(flush_state.clone()))?,
     )?;
     let close_state = compat_state.clone();
     compat.set(
         "close",
-        lua.create_function(move |_, value: LuaValue| {
+        lua.create_host_function(move |_, value: LuaValue| {
             close_compat_file(close_state.clone(), value)
         })?,
     )?;
     compat.set(
         "type",
-        lua.create_function(|_, value: LuaValue| match value {
+        lua.create_host_function(|_, value: LuaValue| match value {
             LuaValue::UserData(userdata) if userdata.is::<ManagedIoFile>() => {
                 let file = userdata.borrow::<ManagedIoFile>()?;
                 if file.is_closed()? {
@@ -850,7 +855,7 @@ pub(crate) fn install_managed_io_compat(
             let compat_for_require = compat.clone();
             preload.set(
                 "io",
-                lua.create_function(move |_, ()| Ok(compat_for_require.clone()))?,
+                lua.create_host_function(move |_, ()| Ok(compat_for_require.clone()))?,
             )?;
         }
     }

@@ -354,6 +354,19 @@ return vulcan.json.encode({
 这项能力保留宿主和用户的最终选择权。  
 如果用户希望继续使用某个 skill，宿主不应在策略层把它加入忽略列表。
 
+## 3.3 终结器与 VM 关闭
+
+`__gc` 终结器（例如 `newproxy(true)` 对象上的终结器）不是释放宿主资源的可靠位置：
+
+- VM 关闭前，运行时会执行一次完整回收。此时已不可达对象的终结器在 VM 存活时运行，可以调用宿主函数。
+- VM 关闭时仍可达对象（全局变量、被保留函数的上值）的终结器在 `lua_close` 内运行，此时运行时已释放实例。
+  所有宿主函数都会以 Lua 错误 `host functions are unavailable while the Lua VM is closing; ...` 失败，
+  包括 `vulcan.*`、托管 `io.*` 与 `os.*` 函数，以及托管文件句柄和进程会话的方法。`string`、`table`、
+  `math` 等纯 Lua 库仍可使用。
+- 文件、进程与会话应在使用它们的工作结束时显式释放。
+- 嵌入式模块如需在 VM 退役时清理，应在模块定义中声明终结导出（`finalizer`：`export`、`arguments`、
+  `timeout_ms`）。宿主会在 VM 关闭之前、于存活 VM 上以独立时间预算调用该导出。
+
 ## 4. `vulcan.call`
 
 ### 4.1 用途

@@ -71,7 +71,7 @@ fn wrap_paths(
     let base = base.to_path_buf();
     table.set(
         name,
-        lua.create_function(move |lua, mut args: MultiValue| {
+        lua.create_host_function(move |lua, mut args: MultiValue| {
             for &index in indices {
                 if let Some(LuaValue::String(value)) = args.get(index) {
                     let resolved = resolve(&base, &value.to_str()?)?;
@@ -152,7 +152,7 @@ pub(super) fn install(lua: &Lua, base: &Path, encoding: RuntimeTextEncoding) -> 
     let runtime: Table = vulcan.get("runtime")?;
     runtime.set(
         "remaining_timeout_ms",
-        lua.create_function(|lua, ()| remaining_timeout_ms(lua))?,
+        lua.create_host_function(|lua, ()| remaining_timeout_ms(lua))?,
     )?;
     let fs: Table = vulcan.get("fs")?;
     for name in [
@@ -185,7 +185,7 @@ pub(super) fn install(lua: &Lua, base: &Path, encoding: RuntimeTextEncoding) -> 
     }
     let globals = lua.globals();
     let load_base = base.to_path_buf();
-    globals.set("loadfile", lua.create_function(move |lua, (path, mode, env): (String, Option<String>, Option<Table>)| {
+    globals.set("loadfile", lua.create_host_function(move |lua, (path, mode, env): (String, Option<String>, Option<Table>)| {
         match load_script(lua, &load_base, &path, mode, env) {
             Ok(function) => Ok((Some(function), None)),
             Err(error) => Ok((None, Some(error.to_string()))),
@@ -194,7 +194,7 @@ pub(super) fn install(lua: &Lua, base: &Path, encoding: RuntimeTextEncoding) -> 
     let do_base = base.to_path_buf();
     globals.set(
         "dofile",
-        lua.create_function(move |lua, path: String| {
+        lua.create_host_function(move |lua, path: String| {
             load_script(lua, &do_base, &path, None, None)?.call::<MultiValue>(())
         })?,
     )?;
@@ -206,7 +206,7 @@ pub(super) fn install(lua: &Lua, base: &Path, encoding: RuntimeTextEncoding) -> 
     for name in ["execute", "exit", "setlocale", "tmpname"] {
         os.set(
             name,
-            lua.create_function(move |_, _: MultiValue| -> mlua::Result<()> {
+            lua.create_host_function(move |_, _: MultiValue| -> mlua::Result<()> {
                 Err(mlua::Error::runtime(format!(
                     "os.{name} is unavailable in System leases; use managed host services."
                 )))
@@ -222,7 +222,7 @@ pub(super) fn install(lua: &Lua, base: &Path, encoding: RuntimeTextEncoding) -> 
     let search_base = base.to_path_buf();
     package.set(
         "searchpath",
-        lua.create_function(
+        lua.create_host_function(
             move |_,
                   (name, path, separator, replacement): (
                 String,
@@ -251,7 +251,7 @@ pub(super) fn install(lua: &Lua, base: &Path, encoding: RuntimeTextEncoding) -> 
     let script_package = package.clone();
     loaders.set(
         2,
-        lua.create_function(move |lua, name: String| {
+        lua.create_host_function(move |lua, name: String| {
             let templates: String = script_package.get("path")?;
             let (path, diagnostic) = find_module(
                 &script_base,
@@ -280,7 +280,7 @@ pub(super) fn install(lua: &Lua, base: &Path, encoding: RuntimeTextEncoding) -> 
         let base = base.to_path_buf();
         loaders.set(
             index + 1,
-            lua.create_function(move |_, args: MultiValue| {
+            lua.create_host_function(move |_, args: MultiValue| {
                 for field in ["path", "cpath"] {
                     let path: String = package.get(field)?;
                     package.set(field, search_path(&base, &path)?)?;
@@ -295,7 +295,7 @@ pub(super) fn install(lua: &Lua, base: &Path, encoding: RuntimeTextEncoding) -> 
     let preload: Table = package.get("preload")?;
     loaded.set("ffi", LuaValue::Nil)?;
     globals.set("ffi", LuaValue::Nil)?;
-    preload.set("ffi", lua.create_function(|_, _: MultiValue| -> mlua::Result<()> {
+    preload.set("ffi", lua.create_host_function(|_, _: MultiValue| -> mlua::Result<()> {
         Err(mlua::Error::runtime("FFI is unavailable in System leases; use managed host services or an isolated process."))
     })?)?;
     Ok(())

@@ -1344,7 +1344,7 @@ impl LuaEngine {
         let runtime_lua = get_vulcan_runtime_lua_table(lua)?;
 
         let exec_fn = lua
-            .create_function(move |lua, input: LuaValue| {
+            .create_host_function(move |lua, input: LuaValue| {
                 let input_table = require_table_arg(input, "runtime.lua.exec", "input")?;
                 let input_json = lua_value_to_json(&LuaValue::Table(input_table))
                     .map_err(mlua::Error::runtime)?;
@@ -1661,7 +1661,7 @@ impl LuaEngine {
 
         let print_capture = captured_output.clone();
         let print_fn = lua
-            .create_function(move |_, args: MultiValue| {
+            .create_host_function(move |_, args: MultiValue| {
                 let mut parts = Vec::new();
                 for value in args.into_iter() {
                     parts.push(LuaEngine::render_lua_value_inline(&value));

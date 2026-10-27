@@ -10,7 +10,7 @@ pub(super) fn create_runtime_skill_management_bridge_fn(
     function_name: &'static str,
 ) -> mlua::Result<Function> {
     let action_name = function_name.to_string();
-    lua.create_function(move |lua, input: LuaValue| {
+    lua.create_host_function(move |lua, input: LuaValue| {
         if !enabled {
             return Err(mlua::Error::runtime(format!(
                 "vulcan.runtime.skills.{} is disabled by host policy",
@@ -98,7 +98,7 @@ fn host_tool_args_table_to_json(args_table: Table) -> Result<Value, String> {
 /// Create the Lua-facing `vulcan.host.list` function.
 /// 创建面向 Lua 的 `vulcan.host.list` 函数。
 pub(super) fn create_host_tool_list_fn(lua: &Lua) -> mlua::Result<Function> {
-    lua.create_function(move |lua, ()| {
+    lua.create_host_function(move |lua, ()| {
         if !try_has_host_tool_callback() {
             return Ok(LuaValue::Table(lua.create_table()?));
         }
@@ -115,7 +115,7 @@ pub(super) fn create_host_tool_list_fn(lua: &Lua) -> mlua::Result<Function> {
 /// Create the Lua-facing `vulcan.host.has` and `vulcan.host.has_tool` function.
 /// 创建面向 Lua 的 `vulcan.host.has` 与 `vulcan.host.has_tool` 函数。
 pub(super) fn create_host_tool_has_fn(lua: &Lua) -> mlua::Result<Function> {
-    lua.create_function(move |_, tool_name: LuaValue| {
+    lua.create_host_function(move |_, tool_name: LuaValue| {
         let tool_name = require_string_arg(tool_name, "host.has", "tool_name", false)?;
         if !try_has_host_tool_callback() {
             return Ok(false);
@@ -134,7 +134,7 @@ pub(super) fn create_host_tool_has_fn(lua: &Lua) -> mlua::Result<Function> {
 /// Create the Lua-facing `vulcan.host.call` function.
 /// 创建面向 Lua 的 `vulcan.host.call` 函数。
 pub(super) fn create_host_tool_call_fn(lua: &Lua) -> mlua::Result<Function> {
-    lua.create_function(move |lua, (tool_name, args): (LuaValue, LuaValue)| {
+    lua.create_host_function(move |lua, (tool_name, args): (LuaValue, LuaValue)| {
         let tool_name = require_string_arg(tool_name, "host.call", "tool_name", false)?;
         let args_table = require_table_arg(args, "host.call", "args")?;
         let args_value = host_tool_args_table_to_json(args_table).map_err(|error| {
@@ -373,7 +373,7 @@ fn current_runtime_model_caller(lua: &Lua) -> Result<RuntimeModelCaller, String>
 /// Create the Lua-facing `vulcan.models.status` function.
 /// 创建面向 Lua 的 `vulcan.models.status` 函数。
 pub(super) fn create_model_status_fn(lua: &Lua) -> mlua::Result<Function> {
-    lua.create_function(move |lua, args: MultiValue| {
+    lua.create_host_function(move |lua, args: MultiValue| {
         // Exact positional arguments supplied by Lua; status accepts none.
         // Lua 传入的精确位置参数；status 不接受任何参数。
         let values = args.into_vec();
@@ -397,7 +397,7 @@ pub(super) fn create_model_status_fn(lua: &Lua) -> mlua::Result<Function> {
 /// Create the Lua-facing `vulcan.models.has` function.
 /// 创建面向 Lua 的 `vulcan.models.has` 函数。
 pub(super) fn create_model_has_fn(lua: &Lua) -> mlua::Result<Function> {
-    lua.create_function(move |_, args: MultiValue| {
+    lua.create_host_function(move |_, args: MultiValue| {
         let values = args.into_vec();
         if values.len() != 1 {
             return Ok(false);
@@ -418,7 +418,7 @@ pub(super) fn create_model_has_fn(lua: &Lua) -> mlua::Result<Function> {
 /// Create the Lua-facing `vulcan.models.embed` function.
 /// 创建面向 Lua 的 `vulcan.models.embed` 函数。
 pub(super) fn create_model_embed_fn(lua: &Lua) -> mlua::Result<Function> {
-    lua.create_function(move |lua, args: MultiValue| {
+    lua.create_host_function(move |lua, args: MultiValue| {
         let values = args.into_vec();
         let result = (|| -> Result<Value, RuntimeModelError> {
             validate_runtime_model_arg_count(values.len(), 1, "vulcan.models.embed")?;
@@ -440,7 +440,7 @@ pub(super) fn create_model_embed_fn(lua: &Lua) -> mlua::Result<Function> {
 /// Create the Lua-facing `vulcan.models.llm` function.
 /// 创建面向 Lua 的 `vulcan.models.llm` 函数。
 pub(super) fn create_model_llm_fn(lua: &Lua) -> mlua::Result<Function> {
-    lua.create_function(move |lua, args: MultiValue| {
+    lua.create_host_function(move |lua, args: MultiValue| {
         let values = args.into_vec();
         let result = (|| -> Result<Value, RuntimeModelError> {
             validate_runtime_model_arg_count(values.len(), 2, "vulcan.models.llm")?;
@@ -538,7 +538,7 @@ pub(super) fn create_runtime_skill_layers_fn(
         None
     };
     let any_layer_writable = skill_management_enabled && !available_layers.is_empty();
-    lua.create_function(move |lua, ()| {
+    lua.create_host_function(move |lua, ()| {
         let result = lua.create_table()?;
         if let Some(default_layer) = default_layer.as_deref() {
             result.set("default", default_layer)?;

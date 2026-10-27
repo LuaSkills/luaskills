@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use mlua::{AnyUserData, Lua, MultiValue, Table, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::runtime::encoding::{RuntimeTextEncoding, decode_runtime_text, encode_runtime_text};
+use crate::runtime::engine::vm_closing::{HostFunctions, HostMethods};
 use crate::runtime::path::normalize_host_input_path_text;
 
 #[cfg(unix)]
@@ -2092,17 +2093,17 @@ impl UserData for ManagedProcessSession {
     /// Register Lua-visible methods for process session userdata.
     /// 为进程会话 userdata 注册 Lua 可见方法。
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("write", |_, session, values: MultiValue| {
+        methods.add_host_method("write", |_, session, values: MultiValue| {
             session.write_values(values)
         });
-        methods.add_method("read", |lua, session, args: MultiValue| {
+        methods.add_host_method("read", |lua, session, args: MultiValue| {
             session.read(lua, args)
         });
-        methods.add_method("status", |lua, session, ()| session.status(lua));
-        methods.add_method("close", |lua, session, args: MultiValue| {
+        methods.add_host_method("status", |lua, session, ()| session.status(lua));
+        methods.add_host_method("close", |lua, session, args: MultiValue| {
             session.close(lua, args)
         });
-        methods.add_method("kill", |_, session, ()| session.kill());
+        methods.add_host_method("kill", |_, session, ()| session.kill());
     }
 }
 
@@ -2136,7 +2137,7 @@ pub(crate) fn create_process_session_table(
     let table = lua.create_table()?;
     table.set(
         "open",
-        lua.create_function(move |lua, spec: LuaValue| {
+        lua.create_host_function(move |lua, spec: LuaValue| {
             let mut request = parse_session_open_request(spec, default_encoding)?;
             // System process creation owns explicit absolute paths independently of host chdir.
             // 系统进程创建持有明确绝对路径，不依赖宿主目录切换。

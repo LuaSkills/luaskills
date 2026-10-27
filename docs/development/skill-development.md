@@ -354,6 +354,15 @@ Runtime effects:
 
 This capability preserves the host and user's final choice. If users should still be able to use a skill, hosts should not add it to the ignore policy.
 
+## 3.3 Finalizers And VM Close
+
+A `__gc` finalizer (for example on a `newproxy(true)` object) is not a reliable place to release host resources:
+
+- Before a VM closes, the runtime runs a full collection. Finalizers of objects that are already unreachable run then, while the VM is alive, and may call host functions.
+- Finalizers of objects that are still reachable when the VM closes (globals, upvalues of retained functions) run inside `lua_close`, after the runtime has released the instance. Every host function then fails with the Lua error `host functions are unavailable while the Lua VM is closing; ...`. This covers `vulcan.*`, the managed `io.*` and `os.*` functions, and methods of managed file handles and process sessions. Pure Lua libraries such as `string`, `table` and `math` keep working.
+- Release files, processes and sessions explicitly when the work that uses them finishes.
+- An embedded module that must clean up when its VM retires declares a finalizer export in its module definition (`finalizer`: `export`, `arguments`, `timeout_ms`). The host calls that export on the live VM, with its own time budget, before the VM closes.
+
 ## 4. `vulcan.call`
 
 ### 4.1 Purpose

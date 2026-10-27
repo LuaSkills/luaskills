@@ -64,6 +64,9 @@ The acceptance suite runs on slow shared runners, serially in one process, so te
 - A VM runs a full collection before `lua_close`, so finalizers of unreachable objects run while the
   instance is alive and can call host functions. A fixture whose finalizer may become unreachable before
   retirement calls `collectgarbage('stop')`, otherwise an incremental step can run it on the caller thread.
+- Rust functions and userdata methods exposed to Lua are created only through `HostFunctions` and
+  `HostMethods` (`src/runtime/engine/vm_closing.rs`; `clippy.toml` rejects the plain mlua constructors).
+  Finalizers that `lua_close` runs then get a Lua error from host functions instead of a destroyed-instance panic.
 - A budget that must not expire covers its slowest legitimate case with a wide margin: at least one second
   when it includes creating a VM, and an upper bound on elapsed time well above the operation's own timeout.
 - `rust-toolchain.toml` pins the toolchain the workflows use, so local clippy and rustfmt match CI.
@@ -136,6 +139,9 @@ git push --force-with-lease
   仍被持有之前到期。
 - VM 在 `lua_close` 之前执行一次完整回收，使不可达对象的终结器在实例存活时运行并可调用宿主函数。
   终结器可能在退役前变得不可达的夹具应调用 `collectgarbage('stop')`，否则增量步可能在调用线程上执行它。
+- 暴露给 Lua 的 Rust 函数与 userdata 方法只能通过 `HostFunctions` 与 `HostMethods` 创建
+  （`src/runtime/engine/vm_closing.rs`；`clippy.toml` 拒绝直接使用 mlua 构造器）。这样 `lua_close`
+  运行的终结器调用宿主函数时得到 Lua 错误，而不是实例已销毁的 panic。
 - 不应到期的预算要以充足余量覆盖最慢的合理情况：包含创建 VM 时至少一秒；对耗时的上限断言要远高于操作自身的超时。
 - `rust-toolchain.toml` 固定工作流使用的工具链，使本地 clippy 与 rustfmt 结果与 CI 一致。
 
