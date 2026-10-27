@@ -54,6 +54,15 @@ class ReleaseGPGTests(unittest.TestCase):
                     Path(str(asset) + ".asc").unlink()
                     with self.assertRaises(ValueError):
                         release_gpg.process_assets([asset])
+                # A secret key other than the pinned one is rejected before signing, naming what was supplied.
+                # 非固定身份的私钥在签名前被拒绝，并指出实际提供的密钥。
+                with patch.object(release_gpg, "PUBLIC_KEY", public), patch.dict(
+                    release_gpg.POLICY, {"gpg_primary_fingerprint": "A" * 40}
+                ), patch.dict(os.environ, {"GPG_PRIVATE_KEY": private, "GPG_PASSPHRASE": ""}):
+                    with self.assertRaises(ValueError) as rejected:
+                        release_gpg.process_assets([asset], sign=True)
+                    self.assertIn(fingerprint, str(rejected.exception))
+                    self.assertFalse(Path(str(asset) + ".asc").exists())
             finally:
                 subprocess.run(["gpgconf", "--homedir", str(home), "--kill", "all"],
                                capture_output=True, timeout=15, check=True)

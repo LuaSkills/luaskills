@@ -210,6 +210,7 @@ jobs:
         shell: bash
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: python3 scripts/release/release_gpg.py sign target/release/luaskills-debug
       - name: Package FFI core and complete existing archive set on Windows
         if: runner.os == 'Windows'
