@@ -1810,6 +1810,41 @@ local ffi_root = vulcan.deps.ffi_path
 - 在 System Plugin 租约 eval 中，这组旧 Skill 依赖根字段仍为 `nil`。受管 Python/Node 的 status、invoke 与 session API 会改为解析 `system_package` 绑定的精确 `dependencies_file`；不要用 `vulcan.deps.*` 判断 System 包是否声明了依赖。
 - skill 应当只依赖这些协议暴露出的路径，不要自己猜宿主物理目录结构。
 
+### 13.1 在技能包内分发原生库
+
+`source.type` 为 `bundled` 的依赖直接从技能包自身取载荷，安装时不需要访问 GitHub 或任何网络。每个平台条目用 `path` 指定载荷（相对技能目录，不能越出该目录，包括经由链接越出），并可用 `sha256` 固定其摘要。所有平台的库放在同一个包里：
+
+```yaml
+ffi_dependencies:
+  - name: demo-native
+    version: "1.0.0"
+    source:
+      type: bundled
+    packages:
+      windows-x64:
+        archive_type: raw
+        path: native/windows-x64/demo_native.dll
+        sha256: "<64 位十六进制>"
+        exports:
+          - archive_path: demo_native.dll
+            target_path: lib/demo_native.dll
+      linux-x64:
+        archive_type: raw
+        path: native/linux-x64/libdemo_native.so
+        exports:
+          - archive_path: libdemo_native.so
+            target_path: lib/libdemo_native.so
+```
+
+内置载荷与下载载荷安装到同一布局，因此无论来源如何，Lua 代码的加载方式相同：
+
+```lua
+local base = vulcan.path.join(vulcan.deps.ffi_path, "demo-native", "1.0.0", platform_key)
+local lib = ffi.load(vulcan.path.join(base, "lib", "demo_native.dll"))
+```
+
+包内分发压缩包时，`archive_type` 也可以是 `zip` 或 `tar_gz`。所有来源类型都接受 `sha256`；对 `github_release` 来源，它必须与 GitHub 为该资产报告的摘要一致。
+
 ## 14. `vulcan.sqlite.*`
 
 `vulcan.sqlite` 是**按当前 skill 作用域隔离**的 SQLite 绑定。

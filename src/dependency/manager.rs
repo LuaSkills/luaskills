@@ -63,6 +63,10 @@ pub struct DependencyManagerConfig {
     /// Optional GitHub API base URL override.
     /// 可选的 GitHub API 基址覆盖。
     pub github_api_base_url: Option<String>,
+    /// Optional GitHub token, attached only to requests for the official GitHub API host.
+    /// 可选的 GitHub 令牌，只附加到发往官方 GitHub API 主机的请求。
+    #[serde(default)]
+    pub github_token: Option<crate::host::options::LuaRuntimeSecretString>,
 }
 
 /// High-level dependency manager owned by the LuaSkills runtime.
@@ -81,15 +85,20 @@ impl DependencyManager {
             allow_network_download: config.allow_network_download,
             github_base_url: config.github_base_url.clone(),
             github_api_base_url: config.github_api_base_url.clone(),
+            github_token: config.github_token.clone(),
         });
         Self { config, downloader }
     }
 
     /// Ensure all declared dependencies for one skill are installed and ready.
     /// 确保单个 skill 声明的全部依赖已安装且可用。
+    ///
+    /// `skill_dir` is the installed skill directory that `bundled` payload paths resolve against.
+    /// `skill_dir` 是 `bundled` 载荷路径据以解析的已安装技能目录。
     pub fn ensure_skill_dependencies(
         &self,
         skill_id: &str,
+        skill_dir: &Path,
         manifest: &PackageDependencyManifest,
     ) -> Result<(), String> {
         validate_luaskills_identifier(skill_id, "skill_id")?;
@@ -101,13 +110,13 @@ impl DependencyManager {
         }
 
         for dependency in &manifest.tool_dependencies {
-            self.ensure_tool_dependency(skill_id, dependency, platform_key)?;
+            self.ensure_tool_dependency(skill_id, skill_dir, dependency, platform_key)?;
         }
         for dependency in &manifest.lua_dependencies {
-            self.ensure_lua_dependency(skill_id, dependency, platform_key)?;
+            self.ensure_lua_dependency(skill_id, skill_dir, dependency, platform_key)?;
         }
         for dependency in &manifest.ffi_dependencies {
-            self.ensure_ffi_dependency(skill_id, dependency, platform_key)?;
+            self.ensure_ffi_dependency(skill_id, skill_dir, dependency, platform_key)?;
         }
         Ok(())
     }
@@ -117,11 +126,13 @@ impl DependencyManager {
     fn ensure_tool_dependency(
         &self,
         skill_id: &str,
+        skill_dir: &Path,
         spec: &ToolDependencySpec,
         platform_key: &str,
     ) -> Result<(), String> {
         self.ensure_dependency(
             skill_id,
+            skill_dir,
             SkillDependencyKind::Tool,
             spec.name.as_str(),
             spec.version.clone(),
@@ -140,11 +151,13 @@ impl DependencyManager {
     fn ensure_lua_dependency(
         &self,
         skill_id: &str,
+        skill_dir: &Path,
         spec: &LuaDependencySpec,
         platform_key: &str,
     ) -> Result<(), String> {
         self.ensure_dependency(
             skill_id,
+            skill_dir,
             SkillDependencyKind::Lua,
             spec.name.as_str(),
             spec.version.clone(),
@@ -163,11 +176,13 @@ impl DependencyManager {
     fn ensure_ffi_dependency(
         &self,
         skill_id: &str,
+        skill_dir: &Path,
         spec: &FfiDependencySpec,
         platform_key: &str,
     ) -> Result<(), String> {
         self.ensure_dependency(
             skill_id,
+            skill_dir,
             SkillDependencyKind::Ffi,
             spec.name.as_str(),
             spec.version.clone(),
@@ -202,6 +217,7 @@ impl DependencyManager {
     fn ensure_dependency(
         &self,
         skill_id: &str,
+        skill_dir: &Path,
         kind: SkillDependencyKind,
         dependency_name: &str,
         version: Option<String>,
@@ -246,7 +262,9 @@ impl DependencyManager {
             ));
             return Ok(());
         }
-        if !self.config.allow_network_download {
+        // Bundled payloads are local files, so only remote sources depend on the network switch.
+        // 内置载荷是本地文件，因此只有远程来源受网络开关约束。
+        if !self.config.allow_network_download && source_type != DependencySourceType::Bundled {
             if required {
                 return Err(format!(
                     "required dependency '{}' is missing and network download is disabled",
@@ -262,6 +280,7 @@ impl DependencyManager {
 
         let resolved_request = self.resolve_dependency_request(
             skill_id,
+            skill_dir,
             kind,
             dependency_name,
             version,
@@ -281,6 +300,14 @@ impl DependencyManager {
                 ));
                 Ok(())
             }
+            DependencyDetectionStatus::Missing if source_type == DependencySourceType::Bundled => {
+                self.install_bundled_dependency(&resolved_request)?;
+                log_info(format!(
+                    "[LuaSkills:dependency] Installed bundled dependency '{}' for skill '{}' on {}",
+                    dependency_name, skill_id, platform_key
+                ));
+                Ok(())
+            }
             DependencyDetectionStatus::Missing => {
                 let cache_key = format!(
                     "{}-{}-{}",
@@ -292,11 +319,11 @@ impl DependencyManager {
                     dependency_name,
                     platform_key
                 );
-                let download_path = self.downloader.download(&DownloadRequest {
+                let download_path = self.download_dependency_payload(
+                    &resolved_request,
                     source_type,
-                    source_locator: resolved_request.download_url.clone(),
-                    cache_key: cache_key.clone(),
-                })?;
+                    cache_key.clone(),
+                )?;
                 if let Err(first_error) = install_downloaded_payload(
                     &download_path,
                     resolved_request.archive_type,
@@ -311,11 +338,11 @@ impl DependencyManager {
                         &download_path,
                         &resolved_request.install_root,
                     )?;
-                    let redownloaded_path = self.downloader.download(&DownloadRequest {
+                    let redownloaded_path = self.download_dependency_payload(
+                        &resolved_request,
                         source_type,
-                        source_locator: resolved_request.download_url.clone(),
                         cache_key,
-                    })?;
+                    )?;
                     install_downloaded_payload(
                         &redownloaded_path,
                         resolved_request.archive_type,
@@ -515,6 +542,7 @@ impl DependencyManager {
     fn resolve_dependency_request(
         &self,
         skill_id: &str,
+        skill_dir: &Path,
         kind: SkillDependencyKind,
         dependency_name: &str,
         version: Option<String>,
@@ -526,14 +554,14 @@ impl DependencyManager {
         install_root: &Path,
     ) -> Result<ResolvedDependencyRequest, String> {
         let resolved_package = match source_type {
-            DependencySourceType::GithubRelease | DependencySourceType::Url => {
-                package.cloned().ok_or_else(|| {
-                    format!(
-                        "dependency '{}' does not declare package metadata for platform '{}'",
-                        dependency_name, platform_key
-                    )
-                })?
-            }
+            DependencySourceType::GithubRelease
+            | DependencySourceType::Url
+            | DependencySourceType::Bundled => package.cloned().ok_or_else(|| {
+                format!(
+                    "dependency '{}' does not declare package metadata for platform '{}'",
+                    dependency_name, platform_key
+                )
+            })?,
             DependencySourceType::SkillList => {
                 let skilllist = source.skilllist.as_ref().ok_or_else(|| {
                     format!(
@@ -564,6 +592,7 @@ impl DependencyManager {
 
         let mut resolved_version = version.clone();
         let mut resolved_tag_name: Option<String> = None;
+        let mut expected_sha256: Option<String> = None;
         let download_url = match source_type {
             DependencySourceType::GithubRelease => {
                 let github_source = source.github.as_ref().ok_or_else(|| {
@@ -585,6 +614,7 @@ impl DependencyManager {
                 )?;
                 resolved_version = Some(resolved_asset.version.clone());
                 resolved_tag_name = Some(resolved_asset.tag_name.clone());
+                expected_sha256 = resolved_asset.sha256;
                 resolved_asset.download_url
             }
             DependencySourceType::Url | DependencySourceType::SkillList => {
@@ -595,7 +625,27 @@ impl DependencyManager {
                     )
                 })?
             }
+            DependencySourceType::Bundled => resolve_bundled_payload_path(
+                skill_dir,
+                dependency_name,
+                platform_key,
+                &resolved_package,
+            )?,
         };
+        // A digest declared by the skill must agree with the one reported by the release.
+        // 技能声明的摘要必须与 Release 报告的摘要一致。
+        if let Some(declared) = resolved_package.sha256.as_deref() {
+            let declared = declared.trim().to_ascii_lowercase();
+            if let Some(reported) = expected_sha256.as_deref()
+                && reported != declared
+            {
+                return Err(format!(
+                    "dependency '{}' platform '{}' declares sha256 {} but the release reports {}",
+                    dependency_name, platform_key, declared, reported
+                ));
+            }
+            expected_sha256 = Some(declared);
+        }
 
         Ok(ResolvedDependencyRequest {
             kind,
@@ -603,6 +653,7 @@ impl DependencyManager {
             scope,
             platform_key: platform_key.to_string(),
             download_url,
+            expected_sha256,
             version: resolved_version.clone(),
             install_root: build_dependency_install_root(
                 install_root,
@@ -619,6 +670,60 @@ impl DependencyManager {
                 resolved_tag_name.as_deref(),
             ),
         })
+    }
+
+    /// Install one bundled payload straight from the skill directory without any cache copy.
+    /// 直接从技能目录安装单个内置载荷，不经过任何缓存副本。
+    fn install_bundled_dependency(
+        &self,
+        resolved_request: &ResolvedDependencyRequest,
+    ) -> Result<(), String> {
+        let payload_path = Path::new(resolved_request.download_url.as_str());
+        if let Some(expected_sha256) = resolved_request.expected_sha256.as_deref() {
+            crate::download::manager::verify_file_sha256(payload_path, expected_sha256)?;
+        }
+        // The payload belongs to the skill package, so a failed install only removes the target.
+        // 载荷属于技能包，因此安装失败时只清理目标目录。
+        if let Err(error) = install_downloaded_payload(
+            payload_path,
+            resolved_request.archive_type,
+            &resolved_request.install_root,
+            &resolved_request.exports,
+        ) {
+            remove_failed_dependency_install_root(&resolved_request.install_root)?;
+            return Err(error);
+        }
+        if matches!(
+            self.detect_dependency(resolved_request)?,
+            DependencyDetectionStatus::Missing
+        ) {
+            return Err(format!(
+                "bundled dependency '{}' was installed but exported files are still missing",
+                resolved_request.name
+            ));
+        }
+        Ok(())
+    }
+
+    /// Download one dependency payload, verifying its SHA-256 whenever one is known.
+    /// 下载单个依赖载荷，只要已知 SHA-256 就进行校验。
+    fn download_dependency_payload(
+        &self,
+        resolved_request: &ResolvedDependencyRequest,
+        source_type: DependencySourceType,
+        cache_key: String,
+    ) -> Result<PathBuf, String> {
+        let request = DownloadRequest {
+            source_type,
+            source_locator: resolved_request.download_url.clone(),
+            cache_key,
+        };
+        match resolved_request.expected_sha256.as_deref() {
+            Some(expected_sha256) => self
+                .downloader
+                .download_with_sha256(&request, expected_sha256),
+            None => self.downloader.download(&request),
+        }
     }
 
     /// Remove dependencies owned by one uninstalled skill.
@@ -860,6 +965,35 @@ fn build_dependency_install_root(
             .join(normalized_version)
             .join(normalized_platform),
     }
+}
+
+/// Resolve one bundled payload path inside the skill directory, rejecting escapes and links out.
+/// 解析技能目录内单个内置载荷路径，拒绝路径逃逸与指向目录外的链接。
+fn resolve_bundled_payload_path(
+    skill_dir: &Path,
+    dependency_name: &str,
+    platform_key: &str,
+    package: &crate::skill::dependencies::DependencyPackageSpec,
+) -> Result<String, String> {
+    let relative_path = package.path.as_deref().ok_or_else(|| {
+        format!(
+            "dependency '{}' bundled package for platform '{}' must declare path",
+            dependency_name, platform_key
+        )
+    })?;
+    let canonical_skill_dir = fs::canonicalize(skill_dir).map_err(|error| {
+        format!(
+            "Failed to resolve skill directory {}: {}",
+            render_dependency_manager_path(skill_dir),
+            error
+        )
+    })?;
+    let payload_path = crate::runtime::managed_package::resolve_existing_package_file(
+        &canonical_skill_dir,
+        relative_path,
+        &format!("dependency '{}' bundled path", dependency_name),
+    )?;
+    Ok(payload_path.to_string_lossy().into_owned())
 }
 
 /// Build local version candidates that may map to one already-installed dependency root.
@@ -1159,6 +1293,7 @@ fn local_dependency_probe_request_variants_for_root(
             scope,
             platform_key: platform_key.to_string(),
             download_url: String::new(),
+            expected_sha256: None,
             version: version.map(str::to_string),
             install_root: install_root.clone(),
             archive_type: package.archive_type,

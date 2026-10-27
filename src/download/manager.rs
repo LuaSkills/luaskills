@@ -12,11 +12,16 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use reqwest::StatusCode;
+use reqwest::header::ACCEPT;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::dependency::types::DependencySourceType;
-use crate::download::github::{GithubReleaseApiResponse, rewrite_github_download_url};
+use crate::download::github::{
+    GithubReleaseApiResponse, github_api_token_for, is_official_github_api_url,
+    rewrite_github_download_url,
+};
+use crate::host::options::LuaRuntimeSecretString;
 use crate::runtime::file_system::replace_file_atomically;
 use crate::runtime::path::render_host_visible_path;
 use crate::runtime_logging::info as log_info;
@@ -37,6 +42,14 @@ const DOWNLOAD_HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Maximum total time allowed for one metadata or payload HTTP request.
 /// 单次元数据或载荷 HTTP 请求允许占用的最长总时间。
 const DOWNLOAD_HTTP_REQUEST_TIMEOUT_SECS: u64 = 5 * 60;
+
+/// Total attempts for one request whose connection failed or whose gateway answered 502/503/504.
+/// 单个请求在建连失败或网关返回 502/503/504 时的总尝试次数。
+const DOWNLOAD_HTTP_TRANSIENT_ATTEMPTS: u32 = 3;
+
+/// Backoff before the first transient retry; each later retry doubles it.
+/// 首次瞬时重试前的退避时间，之后每次重试翻倍。
+const DOWNLOAD_HTTP_TRANSIENT_BACKOFF_MS: u64 = 500;
 
 /// Maximum collision retries while creating one same-directory unique download temp file.
 /// 创建同目录唯一下载临时文件时允许的最大冲突重试次数。
@@ -288,6 +301,10 @@ pub struct DownloadManagerConfig {
     /// Optional GitHub API base URL override.
     /// 可选的 GitHub API 基址覆盖。
     pub github_api_base_url: Option<String>,
+    /// Optional GitHub token, attached only to requests for the official GitHub API host.
+    /// 可选的 GitHub 令牌，只附加到发往官方 GitHub API 主机的请求。
+    #[serde(default)]
+    pub github_token: Option<LuaRuntimeSecretString>,
 }
 
 /// One byte-level progress sample emitted by the shared downloader.
@@ -499,7 +516,7 @@ impl DownloadManager {
                 asset.browser_download_url.as_str(),
                 self.config.github_base_url.as_deref(),
             ),
-            sha256: None,
+            sha256: asset.sha256_digest(),
         })
     }
 
@@ -540,10 +557,22 @@ impl DownloadManager {
                 sanitize_cache_key_fragment(release.tag_name.as_str())
             ),
         )?;
-        resolved.sha256 = Some(parse_checksum_manifest_for_asset(
+        let manifest_sha256 = parse_checksum_manifest_for_asset(
             checksum_text.as_str(),
             resolved.asset_name.as_str(),
-        )?);
+        )?;
+        // A digest reported by the release metadata must agree with the checksum asset, so a
+        // download mirror cannot replace both the archive and its checksum file.
+        // Release 元数据给出的摘要必须与校验文件一致，使下载镜像无法同时替换压缩包与校验文件。
+        if let Some(digest) = resolved.sha256.as_deref()
+            && !digest.eq_ignore_ascii_case(manifest_sha256.as_str())
+        {
+            return Err(format!(
+                "GitHub release {} reports digest sha256:{} for '{}' but '{}' lists {}",
+                release.tag_name, digest, resolved.asset_name, checksum_asset_name, manifest_sha256
+            ));
+        }
+        resolved.sha256 = Some(manifest_sha256);
         Ok(resolved)
     }
 
@@ -791,13 +820,10 @@ impl DownloadManager {
     ) -> Result<GithubReleaseApiResponse, String> {
         let api_url = api_url.to_string();
         let request_url = api_url.clone();
+        let token = self.config.github_token.clone();
         let response_text = self.run_http_task(move |client| {
-            client
-                .get(&request_url)
-                .send()
-                .map_err(|error| format!("Failed to query {}: {}", request_url, error))?
-                .error_for_status()
-                .map_err(|error| format!("Failed to query {}: {}", request_url, error))?
+            let response = send_github_api_request(&client, &request_url, token.as_ref())?;
+            check_github_api_status(response, &request_url, token.is_some())?
                 .text()
                 .map_err(|error| format!("Failed to read {}: {}", request_url, error))
         })?;
@@ -812,17 +838,13 @@ impl DownloadManager {
         api_url: &str,
     ) -> Result<Option<GithubReleaseApiResponse>, String> {
         let api_url = api_url.to_string();
+        let token = self.config.github_token.clone();
         self.run_http_task(move |client| {
-            let response = client
-                .get(&api_url)
-                .send()
-                .map_err(|error| format!("Failed to query {}: {}", api_url, error))?;
+            let response = send_github_api_request(&client, &api_url, token.as_ref())?;
             if response.status() == StatusCode::NOT_FOUND {
                 return Ok(None);
             }
-            let response = response
-                .error_for_status()
-                .map_err(|error| format!("Failed to query {}: {}", api_url, error))?;
+            let response = check_github_api_status(response, &api_url, token.is_some())?;
             let response_text = response
                 .text()
                 .map_err(|error| format!("Failed to read {}: {}", api_url, error))?;
@@ -1306,9 +1328,7 @@ fn stream_download_to_temp_file(
 ) -> Result<PendingDownloadFile, DownloadAttemptError> {
     // Response is validated before any temp file is created or old cache is touched.
     // Response 在创建任何临时文件或触碰旧缓存前完成验证。
-    let mut response = client
-        .get(&source_locator)
-        .send()
+    let mut response = send_with_transient_retry(|| client.get(&source_locator).send())
         .map_err(|error| {
             DownloadAttemptError::Failed(format!(
                 "Failed to download {}: {}",
@@ -1541,6 +1561,95 @@ fn validate_file_utf8(path: &Path) -> Result<(), String> {
 
 /// Build the GitHub latest-release API URL for one repository.
 /// 为单个仓库构造 GitHub 最新 release API 地址。
+/// Send one GET request, retrying only failures that happen before any response body is read.
+/// 发送一次 GET 请求，仅重试在读取响应正文之前发生的失败。
+///
+/// Connection failures and 502/503/504 responses are retried with a short exponential backoff;
+/// whole-request timeouts and every other status are returned at once.
+/// 建连失败与 502/503/504 响应以短指数退避重试；整次请求超时及其他状态立即返回。
+fn send_with_transient_retry<F>(mut send: F) -> reqwest::Result<reqwest::blocking::Response>
+where
+    F: FnMut() -> reqwest::Result<reqwest::blocking::Response>,
+{
+    let mut attempt = 1;
+    loop {
+        let outcome = send();
+        let transient = match &outcome {
+            Err(error) => error.is_connect(),
+            Ok(response) => matches!(
+                response.status(),
+                StatusCode::BAD_GATEWAY
+                    | StatusCode::SERVICE_UNAVAILABLE
+                    | StatusCode::GATEWAY_TIMEOUT
+            ),
+        };
+        if !transient || attempt >= DOWNLOAD_HTTP_TRANSIENT_ATTEMPTS {
+            return outcome;
+        }
+        thread::sleep(Duration::from_millis(
+            DOWNLOAD_HTTP_TRANSIENT_BACKOFF_MS << (attempt - 1),
+        ));
+        attempt += 1;
+    }
+}
+
+/// Query one GitHub-compatible release API URL, attaching the token only for the official host.
+/// 查询一个 GitHub 兼容的 Release API 地址，仅在官方主机时附加令牌。
+fn send_github_api_request(
+    client: &reqwest::blocking::Client,
+    api_url: &str,
+    token: Option<&LuaRuntimeSecretString>,
+) -> Result<reqwest::blocking::Response, String> {
+    // Authorization is never computed for a mirror, a LuaSkills resource station or any other host.
+    // 对镜像、LuaSkills 资源站或任何其他主机永不生成 Authorization。
+    let authorization = github_api_token_for(api_url, token);
+    send_with_transient_retry(|| {
+        let request = client
+            .get(api_url)
+            .header(ACCEPT, "application/vnd.github+json");
+        match authorization {
+            Some(token) => request.bearer_auth(token.expose()).send(),
+            None => request.send(),
+        }
+    })
+    .map_err(|error| format!("Failed to query {}: {}", api_url, error.without_url()))
+}
+
+/// Turn a GitHub API error status into an actionable message, naming rate limits and rejected tokens.
+/// 将 GitHub API 错误状态转为可操作的消息，明确指出限流与令牌被拒。
+fn check_github_api_status(
+    response: reqwest::blocking::Response,
+    api_url: &str,
+    token_configured: bool,
+) -> Result<reqwest::blocking::Response, String> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let rate_limited = matches!(
+        status,
+        StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+    ) && response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .is_some_and(|remaining| remaining.as_bytes() == b"0");
+    if rate_limited {
+        return Err(format!(
+            "GitHub API rate limit exceeded while querying {}; configure a GitHub token (sent only to {}) or choose a LuaSkills resource station",
+            api_url,
+            crate::download::github::OFFICIAL_GITHUB_API_HOST
+        ));
+    }
+    if status == StatusCode::UNAUTHORIZED && token_configured && is_official_github_api_url(api_url)
+    {
+        return Err(format!(
+            "GitHub rejected the configured token while querying {} (401); replace or clear the token",
+            api_url
+        ));
+    }
+    Err(format!("Failed to query {}: HTTP {}", api_url, status))
+}
+
 fn build_github_release_api_url(config: &DownloadManagerConfig, repo: &str) -> String {
     let normalized_repo = repo
         .trim()
@@ -1698,10 +1807,9 @@ fn parse_checksum_manifest_for_asset(content: &str, asset_name: &str) -> Result<
     ))
 }
 
-/// Verify one downloaded file against one expected SHA-256 checksum.
-/// 使用单个期望的 SHA-256 校验值验证一个已下载文件。
-#[cfg(test)]
-fn verify_file_sha256(path: &Path, expected_sha256: &str) -> Result<(), String> {
+/// Verify one local file against one expected SHA-256 checksum.
+/// 使用单个期望的 SHA-256 校验值验证一个本地文件。
+pub(crate) fn verify_file_sha256(path: &Path, expected_sha256: &str) -> Result<(), String> {
     // Expected is validated once before the bounded file scan begins.
     // Expected 在有界文件扫描开始前只验证一次。
     let expected = normalize_expected_sha256(path, expected_sha256)?;
@@ -2053,6 +2161,7 @@ mod tests {
             allow_network_download: true,
             github_base_url: None,
             github_api_base_url: None,
+            github_token: None,
         })
     }
 
@@ -2182,6 +2291,7 @@ mod tests {
             allow_network_download: true,
             github_base_url: None,
             github_api_base_url: None,
+            github_token: None,
         });
         // Request uses parent traversal plus separators that previously escaped the cache root.
         // Request 使用此前可逃逸缓存根目录的父级遍历与分隔符。
@@ -2236,6 +2346,7 @@ mod tests {
             allow_network_download: true,
             github_base_url: None,
             github_api_base_url: None,
+            github_token: None,
         });
         // Download request whose deterministic cache path is occupied by a directory.
         // 其确定性缓存路径被目录占用的下载请求。
@@ -2499,6 +2610,7 @@ mod tests {
                 allow_network_download: true,
                 github_base_url: None,
                 github_api_base_url: None,
+                github_token: None,
             },
             Some(Arc::new(move |progress| {
                 callback_samples.lock().expect("record progress").push((
@@ -3196,5 +3308,212 @@ mod tests {
         assert_eq!(server.finish(), 1);
         assert_no_download_temp_files(&cache_root);
         let _ = std::fs::remove_dir_all(&cache_root);
+    }
+}
+
+#[cfg(test)]
+mod network_policy_tests {
+    use super::{DownloadManager, DownloadManagerConfig, send_with_transient_retry};
+    use crate::host::options::LuaRuntimeSecretString;
+    use crate::skill::dependencies::GithubReleaseSourceSpec;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+
+    /// Loopback server answering one fixed response per connection and recording each request head.
+    /// 每个连接回答一份固定响应并记录每个请求头的回环服务。
+    struct CaptureServer {
+        /// Base URL of the loopback listener.
+        /// 回环监听器的基础 URL。
+        url: String,
+        /// Lowercased request heads in arrival order.
+        /// 按到达顺序记录的小写请求头。
+        requests: Arc<Mutex<Vec<String>>>,
+        /// Server thread that answers exactly the planned responses.
+        /// 恰好回答计划响应的服务线程。
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl CaptureServer {
+        /// Start a server whose responses are planned from its own base URL, one per connection.
+        /// 启动按自身基址规划响应、每个连接回答一份的服务。
+        fn start(plan: impl FnOnce(&str) -> Vec<Vec<u8>>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind capture listener");
+            let url = format!("http://{}", listener.local_addr().expect("capture address"));
+            let responses = plan(&url);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&requests);
+            let handle = thread::spawn(move || {
+                for response in responses {
+                    let (mut stream, _) = listener.accept().expect("accept capture request");
+                    let mut head = Vec::new();
+                    let mut byte = [0_u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if stream.read(&mut byte).expect("read capture request") == 0 {
+                            break;
+                        }
+                        head.push(byte[0]);
+                    }
+                    seen.lock()
+                        .expect("capture lock")
+                        .push(String::from_utf8_lossy(&head).to_ascii_lowercase());
+                    stream.write_all(&response).expect("write capture response");
+                }
+            });
+            Self {
+                url,
+                requests,
+                handle: Some(handle),
+            }
+        }
+
+        /// Wait for every planned response to be served and return the recorded request heads.
+        /// 等待全部计划响应发送完毕并返回记录的请求头。
+        fn finish(mut self) -> Vec<String> {
+            self.handle
+                .take()
+                .expect("capture handle")
+                .join()
+                .expect("capture thread");
+            std::mem::take(&mut *self.requests.lock().expect("capture lock"))
+        }
+    }
+
+    /// Build one raw HTTP/1.1 response that closes its connection.
+    /// 构造一个会关闭连接的原始 HTTP/1.1 响应。
+    fn http_response(status: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+        let mut head = format!(
+            "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n",
+            body.len()
+        );
+        for (name, value) in headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str("\r\n");
+        let mut response = head.into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    /// Build a download manager with a token and an isolated cache root.
+    /// 构造带令牌与独立缓存根目录的下载管理器。
+    fn token_manager(label: &str) -> (DownloadManager, PathBuf) {
+        let cache_root = std::env::temp_dir().join(format!(
+            "luaskills-network-policy-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&cache_root);
+        std::fs::create_dir_all(&cache_root).expect("create network policy cache root");
+        let manager = DownloadManager::new(DownloadManagerConfig {
+            cache_root: cache_root.clone(),
+            allow_network_download: true,
+            github_base_url: None,
+            github_api_base_url: None,
+            github_token: Some(LuaRuntimeSecretString::new("ghp_fixture_secret")),
+        });
+        (manager, cache_root)
+    }
+
+    /// Return a release source whose metadata is served by the loopback server.
+    /// 返回元数据由回环服务提供的 Release 来源。
+    fn loopback_source(base: &str) -> GithubReleaseSourceSpec {
+        GithubReleaseSourceSpec {
+            repo: "demo/demo".to_string(),
+            tag_api: Some(format!("{base}/repos/demo/demo/releases/tags/v1.0.0")),
+        }
+    }
+
+    /// A gateway error before the response body is retried and the later success is returned.
+    /// 响应正文之前的网关错误会被重试，并返回之后的成功结果。
+    #[test]
+    fn transient_gateway_error_is_retried() {
+        let server = CaptureServer::start(|_| {
+            vec![
+                http_response("503 Service Unavailable", &[], b""),
+                http_response("200 OK", &[], b"ok"),
+            ]
+        });
+        let client = reqwest::blocking::Client::new();
+        let url = format!("{}/probe", server.url);
+        let response =
+            send_with_transient_retry(|| client.get(&url).send()).expect("retried request");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    /// A non-official API host never receives the token, and an exhausted rate limit names the remedy.
+    /// 非官方 API 主机永不收到令牌，额度耗尽时错误会指出解决办法。
+    #[test]
+    fn rate_limit_error_names_token_remedy_without_sending_token_to_other_hosts() {
+        let server = CaptureServer::start(|_| {
+            vec![http_response(
+                "403 Forbidden",
+                &[("x-ratelimit-remaining", "0")],
+                b"{}",
+            )]
+        });
+        let (manager, cache_root) = token_manager("rate");
+        let error = manager
+            .resolve_github_release_asset(
+                &loopback_source(&server.url),
+                "demo-v{version}-skill.zip",
+                None,
+            )
+            .expect_err("rate-limited release query must fail");
+        assert!(error.contains("rate limit"), "{error}");
+        assert!(error.contains("GitHub token"), "{error}");
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].contains("authorization"),
+            "token sent to loopback: {}",
+            requests[0]
+        );
+        assert!(!requests[0].contains("ghp_fixture_secret"));
+        let _ = std::fs::remove_dir_all(cache_root);
+    }
+
+    /// A release digest that disagrees with the checksum asset rejects the managed skill archive.
+    /// Release 摘要与校验文件不一致时拒绝受管技能压缩包。
+    #[test]
+    fn managed_skill_release_rejects_digest_checksum_disagreement() {
+        let reported = "a".repeat(64);
+        let listed = "b".repeat(64);
+        let server = CaptureServer::start(|base| {
+            let release = serde_json::json!({
+                "tag_name": "v1.0.0",
+                "assets": [
+                    {
+                        "name": "demo-v1.0.0-skill.zip",
+                        "browser_download_url": format!("{base}/download/demo-v1.0.0-skill.zip"),
+                        "digest": format!("sha256:{reported}"),
+                    },
+                    {
+                        "name": "demo-v1.0.0-checksums.txt",
+                        "browser_download_url": format!("{base}/download/demo-v1.0.0-checksums.txt"),
+                    }
+                ]
+            })
+            .to_string()
+            .into_bytes();
+            vec![
+                http_response("200 OK", &[], &release),
+                http_response("200 OK", &[], &release),
+                http_response(
+                    "200 OK",
+                    &[],
+                    format!("{listed}  demo-v1.0.0-skill.zip\n").as_bytes(),
+                ),
+            ]
+        });
+        let (manager, cache_root) = token_manager("digest");
+        let error = manager
+            .resolve_github_managed_skill_release_asset(&loopback_source(&server.url), "demo", None)
+            .expect_err("disagreeing digest must be rejected");
+        assert!(error.contains("reports digest"), "{error}");
+        assert_eq!(server.finish().len(), 3);
+        let _ = std::fs::remove_dir_all(cache_root);
     }
 }

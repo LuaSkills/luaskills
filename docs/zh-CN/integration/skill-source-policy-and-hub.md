@@ -34,6 +34,10 @@ LuaSkills 的公开用户安装面只建议开放两类来源：
 
 `github_base_url` 与 `github_api_base_url` 是全局 GitHub 源替换。只要安装或依赖解析使用 GitHub Release，就会统一使用这组配置，不需要在每个 skill 依赖里单独封装。
 
+`github_token` 是可选的 GitHub 令牌，用来提高 GitHub API 的请求额度。它只会附加到发往 `https://api.github.com`（默认端口）的请求；镜像、LuaSkills 资源站与其他任何主机都不会收到它，`Debug` 输出也只显示 `<redacted>`。额度耗尽时，错误会提示配置令牌或改用资源站。
+
+完整性不依赖镜像：受管技能包按 Release 校验文件验证 SHA-256，Release 元数据报告的摘要必须与校验文件一致；依赖下载在 GitHub 报告摘要时同样校验。镜像失败不会自动切换到其他镜像，只对同一地址的连接失败与 502/503/504 做有限重试。
+
 ## 3. 官方 Hub 接口
 
 宿主或官方 Hub 推荐提供以下接口：
@@ -161,7 +165,33 @@ luaskills_ffi_set_skill_operation_progress_json_callback
 
 同步 API 仍保持兼容。宿主 UI 不应在 progress callback 中重入同一个 engine 的 install/update；建议把事件投递到 UI 队列，由 SDK 在后台线程或异步任务中执行安装。
 
-## 6. `skill-search`
+## 6. GitHub 镜像目录与测速
+
+核心内置一份镜像目录（`builtin_github_mirrors()`，JSON FFI：`luaskills_ffi_github_mirror_catalog_json`），每项含 `id`、`kind`（`direct`、`prefix`、`luaskills_station`）、`region`、`github_base_url` 与 `github_api_base_url`。宿主把选中项的两个基址写入网络选项即可；前缀代理只替换下载地址，API 仍走官方。
+
+用户自定义镜像先经 `normalize_github_mirror_base_url`（`luaskills_ffi_normalize_github_mirror_json`，请求 `{ "url": "..." }`）规范化：裸源地址如 `https://mirror.example.cn` 视为前缀代理并补上 `/https://github.com`，带路径的地址按 GitHub 兼容布局根保留。
+
+测速使用 `probe_github_mirrors`（`luaskills_ffi_probe_github_mirrors_json`）：
+
+```json
+{
+  "targets": [{ "id": "ghfast-top", "github_base_url": "https://ghfast.top/https://github.com" }],
+  "max_bytes": 1048576,
+  "timeout_ms": 15000
+}
+```
+
+每个目标并行读取同一 Release 资产的前 `max_bytes` 字节，返回 `ok`、`complete`、`http_status`、`ttfb_ms`、`bytes_per_second` 与 `error`。以 HTML 页面应答的失效代理视为失败；截止前只收到部分字节时 `ok` 为真、`complete` 为假。
+
+运行中的引擎可用 `LuaEngine::set_network_options`（`luaskills_ffi_set_network_options_json`，请求 `{ "engine_id": 1, "network": { ... } }`）热替换下载开关、镜像、API 基址、令牌与 Hub 地址，之后的安装、更新与依赖下载立即生效；响应不会回显令牌。
+
+## 7. 检查更新与更换来源
+
+`check_skill_updates_in_root`（`luaskills_ffi_check_skill_updates_json`，system 版本为 `luaskills_ffi_system_check_skill_updates_json`）只读取元数据，逐个返回 `installed_version`、`latest_version`、`update_available`、来源与 `error`，不下载也不改动任何文件。请求省略 `skill_ids` 时检查目标根中全部带安装记录的技能。
+
+更换来源复用更新入口：在 `SkillInstallRequest` 中设置 `"replace_source": true`，并给出新的 `source_type` 与 `source`。新来源仍须指向同一技能；解析出的版本可以与已安装版本相同（用于切换来源），但更旧时直接报错而不会降级。成功后安装记录改为新来源。
+
+## 8. `skill-search`
 
 仓库提供 `skills/skill-search` 示例 skill。它通过以下宿主工具访问 Hub：
 

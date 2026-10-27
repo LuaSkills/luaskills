@@ -184,6 +184,15 @@ SDK mapping:
 | Python | `set_model_embed_json_callback`, `set_model_llm_json_callback` | `clear_model_embed_json_callback`, `clear_model_llm_json_callback` |
 | Go | Typed model callback boundary APIs | Requires a host-owned cgo callback bridge for real registration |
 
+## Network, Mirrors, And Updates Quick Path
+
+- `LuaRuntimeHostOptions.github_token` raises the GitHub API rate limit. It is sent only to `https://api.github.com`; mirrors and LuaSkills resource stations never receive it, and `Debug` prints it as `<redacted>`.
+- `luaskills_ffi_set_network_options_json` replaces the download switch, mirror, API base, token, and Hub address of a running engine. The response never echoes the token.
+- `luaskills_ffi_github_mirror_catalog_json` returns the built-in mirrors; `luaskills_ffi_normalize_github_mirror_json` turns a user-entered mirror into a base URL; `luaskills_ffi_probe_github_mirrors_json` measures time to first byte and throughput in parallel.
+- `luaskills_ffi_check_skill_updates_json` (and the `system_` variant) reports installed and latest versions without downloading anything.
+- Setting `replace_source: true` on an update request switches a skill to a new source. The same version is accepted; an older one is rejected rather than downgraded.
+- A mirror failure never falls back to another mirror; only connection failures and 502/503/504 on the same URL are retried.
+
 ## Key Rules
 
 - Register host callbacks before creating an engine.

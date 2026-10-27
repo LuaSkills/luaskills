@@ -437,6 +437,42 @@ Update one private URL-manifest skill through a host-private system JSON entrypo
 */
 FfiOwnedBuffer luaskills_ffi_system_private_update_skill_from_url_manifest_json(FfiBorrowedBuffer input_json);
 
+/*
+Check managed skills of one PROJECT or USER root for newer versions without changing anything.
+检查单个 PROJECT 或 USER 根中的受管技能是否有新版本，不做任何修改。
+*/
+FfiOwnedBuffer luaskills_ffi_check_skill_updates_json(FfiBorrowedBuffer input_json);
+
+/*
+Check managed skills of one root for newer versions with host-injected system authority.
+使用宿主注入的 system 权限检查单个根中的受管技能是否有新版本。
+*/
+FfiOwnedBuffer luaskills_ffi_system_check_skill_updates_json(FfiBorrowedBuffer input_json);
+
+/*
+Replace the network policy (download switch, GitHub mirror, API base, token, Hub) of one engine.
+替换单个引擎的网络策略（下载开关、GitHub 镜像、API 基址、令牌、Hub）。
+*/
+FfiOwnedBuffer luaskills_ffi_set_network_options_json(FfiBorrowedBuffer input_json);
+
+/*
+Return the built-in GitHub release download mirror catalog.
+返回内置 GitHub Release 下载镜像目录。
+*/
+FfiOwnedBuffer luaskills_ffi_github_mirror_catalog_json(void);
+
+/*
+Normalize one user-entered mirror URL into a base that replaces https://github.com.
+将用户输入的镜像地址规范化为替换 https://github.com 的基址。
+*/
+FfiOwnedBuffer luaskills_ffi_normalize_github_mirror_json(FfiBorrowedBuffer input_json);
+
+/*
+Probe several GitHub release download mirrors in parallel and report time to first byte and throughput.
+并行探测多个 GitHub Release 下载镜像，并报告首字节时间与吞吐量。
+*/
+FfiOwnedBuffer luaskills_ffi_probe_github_mirrors_json(FfiBorrowedBuffer input_json);
+
 #ifdef __cplusplus
 }
 #endif

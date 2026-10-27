@@ -198,7 +198,7 @@
     "title": "EmbeddedCoreDescription",
     "type": "object"
   },
-  "core_version": "0.6.2",
+  "core_version": "0.7.0",
   "error_response": {
     "$defs": {
       "EmbeddedError": {
@@ -333,11 +333,11 @@
     "type": "object"
   },
   "generator": {
-    "cargo_lock_sha256": "5d1fe5397b48db43489d47be7e8dc04905bac1ba4765c47d5f834fe3182067c5",
+    "cargo_lock_sha256": "1e104a88f1616d00ba53f6dd43700efba17088039a19b083c53ff14d8d78b018",
     "name": "luaskills/generate_embedded_contract",
     "schema_draft": "2020-12",
     "source_sha256": "f31dc521eeff41b774bddf11408f2a8dd2c1d6bb77c8650bfc3bfb7fa5e621d1",
-    "source_version": "0.6.2"
+    "source_version": "0.7.0"
   },
   "json_vectors": {
     "invalid": [
@@ -1677,6 +1677,18 @@
               "null"
             ]
           },
+          "github_token": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/LuaRuntimeSecretString"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional GitHub token, sent only to the official `https://api.github.com` host.\n可选的 GitHub 令牌，只发送给官方 `https://api.github.com` 主机。"
+          },
           "host_provided_ffi_root": {
             "description": "Host-managed root directory used only to probe host-provided FFI/native dependencies.\n仅用于探测宿主提供 FFI/原生依赖的宿主管理根目录。",
             "type": [
@@ -1965,6 +1977,10 @@
           "idle_ttl_secs"
         ],
         "type": "object"
+      },
+      "LuaRuntimeSecretString": {
+        "description": "Secret text supplied by the host, such as a GitHub token, that `Debug` never prints.\n宿主提供的机密文本（例如 GitHub 令牌），`Debug` 永不打印其内容。",
+        "type": "string"
       },
       "LuaRuntimeSpaceControllerOptions": {
         "description": "Host-provided controller client options used when one database backend chooses `space_controller`.\n当数据库后端选择 `space_controller` 时使用的宿主侧控制器客户端选项。",

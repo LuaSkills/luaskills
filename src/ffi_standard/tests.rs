@@ -192,6 +192,7 @@ fn empty_ffi_runtime_host_options() -> FfiLuaRuntimeHostOptions {
         allow_network_download: 0,
         github_base_url: ptr::null(),
         github_api_base_url: ptr::null(),
+        github_token: ptr::null(),
         official_skill_hub_base_url: ptr::null(),
         enable_private_url_skill_install: 0,
         private_skill_source_allowlist: ptr::null(),

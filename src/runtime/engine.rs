@@ -85,16 +85,17 @@ use crate::runtime_help::{
 };
 use crate::runtime_logging::{error as log_error, info as log_info, warn as log_warn};
 use crate::runtime_options::{
-    LuaInvocationContext, LuaRuntimeHostOptions, LuaRuntimeManagedRuntimeConfig, RuntimeSkillRoot,
+    LuaInvocationContext, LuaRuntimeHostOptions, LuaRuntimeManagedRuntimeConfig,
+    LuaRuntimeNetworkOptions, RuntimeSkillRoot,
 };
 use crate::runtime_result::RuntimeInvocationResult;
 use crate::skill::dependencies::PackageDependencyManifest;
 use crate::skill::manager::{
     PreparedSkillApply, ResolvedSkillInstance, SkillApplyResult, SkillInstallRequest,
     SkillManagementAuthority, SkillManager, SkillManagerConfig, SkillOperationPlane,
-    SkillUninstallOptions, SkillUninstallResult, collect_effective_skill_instances_from_roots,
-    resolve_declared_skill_instance_from_roots, resolve_effective_skill_instance_from_roots,
-    resolve_requested_skill_id,
+    SkillUninstallOptions, SkillUninstallResult, SkillUpdateCheck,
+    collect_effective_skill_instances_from_roots, resolve_declared_skill_instance_from_roots,
+    resolve_effective_skill_instance_from_roots, resolve_requested_skill_id,
 };
 use crate::sqlite_host::{
     SqliteSkillBinding, SqliteSkillHost,
@@ -7551,6 +7552,7 @@ impl LuaEngine {
             allow_network_download: self.host_options.allow_network_download,
             github_base_url: self.host_options.github_base_url.clone(),
             github_api_base_url: self.host_options.github_api_base_url.clone(),
+            github_token: self.host_options.github_token.clone(),
         })
     }
 
@@ -7567,6 +7569,7 @@ impl LuaEngine {
             allow_network_download: dependency_config.allow_network_download,
             github_base_url: dependency_config.github_base_url,
             github_api_base_url: dependency_config.github_api_base_url,
+            github_token: dependency_config.github_token,
             official_skill_hub_base_url: self.host_options.official_skill_hub_base_url.clone(),
             enable_private_url_skill_install: self.host_options.enable_private_url_skill_install,
             private_skill_source_allowlist: self
@@ -7594,6 +7597,7 @@ impl LuaEngine {
                 allow_network_download: dependency_config.allow_network_download,
                 github_base_url: dependency_config.github_base_url,
                 github_api_base_url: dependency_config.github_api_base_url,
+                github_token: dependency_config.github_token,
                 official_skill_hub_base_url: self.host_options.official_skill_hub_base_url.clone(),
                 enable_private_url_skill_install: self
                     .host_options
@@ -7626,7 +7630,7 @@ impl LuaEngine {
             .and_then(|value| value.to_str())
             .unwrap_or("unknown-skill");
         let manager = DependencyManager::new(self.dependency_manager_config_for(skill_root)?);
-        manager.ensure_skill_dependencies(skill_name, &manifest)?;
+        manager.ensure_skill_dependencies(skill_name, skill_dir, &manifest)?;
         Ok(Some(manifest))
     }
 
@@ -8706,6 +8710,23 @@ impl LuaEngine {
         )
     }
 
+    /// Replace the network policy used by later installs, updates and dependency downloads.
+    /// 替换后续安装、更新与依赖下载使用的网络策略。
+    ///
+    /// Running VMs are untouched; the next manager or VM built by this engine sees the new policy.
+    /// 运行中的 VM 不受影响；此后由本引擎构造的管理器或 VM 读取新策略。
+    pub fn set_network_options(&mut self, network: LuaRuntimeNetworkOptions) {
+        let mut host_options = (*self.host_options).clone();
+        host_options.set_network_options(network);
+        self.host_options = Arc::new(host_options);
+    }
+
+    /// Return the network policy currently in effect; its token stays redacted in `Debug`.
+    /// 返回当前生效的网络策略；其中令牌在 `Debug` 中保持脱敏。
+    pub fn network_options(&self) -> LuaRuntimeNetworkOptions {
+        self.host_options.network_options()
+    }
+
     /// Uninstall one skill directory through the ordinary skills plane and immediately reload the runtime view.
     /// 通过普通 skills 平面卸载单个技能目录，并立即重载运行时视图。
     pub fn uninstall_skill(
@@ -8913,6 +8934,48 @@ impl LuaEngine {
             Some(target_root),
             request,
         )
+    }
+
+    /// Check managed skills of one PROJECT or USER root for newer versions without changing anything.
+    /// 检查单个 PROJECT 或 USER 根中的受管技能是否有新版本，不做任何修改。
+    ///
+    /// `skill_ids` limits the check; `None` checks every skill with an install record in that root.
+    /// `skill_ids` 限定检查范围；`None` 表示检查该根中所有带安装记录的技能。
+    pub fn check_skill_updates_in_root(
+        &self,
+        skill_roots: &[RuntimeSkillRoot],
+        target_root: &RuntimeSkillRoot,
+        skill_ids: Option<&[String]>,
+    ) -> Result<Vec<SkillUpdateCheck>, Box<dyn std::error::Error>> {
+        Self::validate_formal_skill_root_chain(skill_roots)?;
+        Self::validate_ordinary_target_root(
+            skill_roots,
+            target_root,
+            crate::skill::manager::SkillLifecycleAction::Update,
+        )?;
+        let manager = self.skill_manager_for(target_root)?;
+        Ok(manager.check_skill_updates(SkillOperationPlane::Skills, skill_ids)?)
+    }
+
+    /// Check managed skills of one root for newer versions through the host-controlled system plane.
+    /// 通过宿主控制的 system 平面检查单个根中的受管技能是否有新版本。
+    pub fn system_check_skill_updates_in_root(
+        &self,
+        skill_roots: &[RuntimeSkillRoot],
+        target_root: &RuntimeSkillRoot,
+        authority: SkillManagementAuthority,
+        skill_ids: Option<&[String]>,
+    ) -> Result<Vec<SkillUpdateCheck>, Box<dyn std::error::Error>> {
+        Self::validate_formal_skill_root_chain(skill_roots)?;
+        Self::runtime_skill_root_index(skill_roots, target_root)?;
+        Self::validate_authority_for_target_root(
+            authority,
+            target_root,
+            crate::skill::manager::SkillLifecycleAction::Update,
+        )?;
+        let manager = self.skill_manager_for(target_root)?;
+        Ok(manager
+            .check_skill_updates(Self::operation_plane_for_authority(authority), skill_ids)?)
     }
 
     /// Preflight one update request through the host-controlled system plane and return a structured result.

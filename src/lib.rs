@@ -8,6 +8,12 @@ mod providers;
 pub mod runtime;
 pub mod skill;
 
+pub use download::mirrors::{
+    LuaRuntimeGithubMirror, LuaRuntimeGithubMirrorKind, LuaRuntimeGithubMirrorProbeRequest,
+    LuaRuntimeGithubMirrorProbeResult, LuaRuntimeGithubMirrorProbeTarget,
+    LuaRuntimeGithubMirrorRegion, builtin_github_mirrors, normalize_github_mirror_base_url,
+    probe_github_mirrors,
+};
 pub use host::callbacks::{
     RuntimeEntryRegistryCallback, RuntimeEntryRegistryDelta, RuntimeHostToolAction,
     RuntimeHostToolCallback, RuntimeHostToolRequest, RuntimeModelAvailabilityCallback,
@@ -39,7 +45,8 @@ pub use host::options::{
     DEFAULT_MANAGED_RUNTIME_WORKER_IDLE_TTL_SECS,
     DEFAULT_MANAGED_RUNTIME_WORKER_POOL_MAX_SIZE_PER_ENVIRONMENT, LuaInvocationContext,
     LuaRuntimeCapabilityOptions, LuaRuntimeHostOptions, LuaRuntimeManagedRuntimeConfig,
-    LuaRuntimeSpaceControllerOptions, LuaRuntimeSpaceControllerProcessMode, RuntimeSkillRoot,
+    LuaRuntimeNetworkOptions, LuaRuntimeSecretString, LuaRuntimeSpaceControllerOptions,
+    LuaRuntimeSpaceControllerProcessMode, RuntimeSkillRoot,
 };
 pub use runtime::cache::{
     DEFAULT_TOOL_CACHE_DEFAULT_TTL_SECS, DEFAULT_TOOL_CACHE_MAX_ENTRIES,
@@ -112,7 +119,7 @@ pub use skill::dependencies::{
 pub use skill::manager::{
     DisabledSkillRecord, ResolvedSkillInstance, SkillApplyResult, SkillInstallRequest,
     SkillLifecycleAction, SkillManagementAuthority, SkillManager, SkillManagerConfig,
-    SkillOperationPlane, SkillUninstallOptions, SkillUninstallResult,
+    SkillOperationPlane, SkillUninstallOptions, SkillUninstallResult, SkillUpdateCheck,
     collect_effective_skill_instances, resolve_declared_skill_instance_from_roots,
     resolve_effective_skill_instance,
 };

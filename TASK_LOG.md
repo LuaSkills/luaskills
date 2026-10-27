@@ -9277,3 +9277,45 @@
 - 本轮没有改变同步目标路径派生、同目录短路语义、同步目标目录类型校验、旧目标删除、递归复制或符号链接拒绝策略。
 - 同目录比较中的缺失路径、非目录路径、metadata 探测失败和 canonicalize 失败现在具备清晰职责边界。
 - 根据用户收尾指示，本轮记录后不再开启新的循环轮次；后续若继续，可优先排查 `ensure_debug_runtime_layout` 的目录创建前置类型诊断。
+
+## 2026-10-27：0.7.0 网络来源、镜像测速、内置原生库与更新检查
+
+### 概述
+
+- 面向访问 GitHub 困难的用户，核心新增 GitHub 令牌、镜像目录与测速、运行中热替换网络策略、技能包内置原生库、受管技能更新检查与更换来源，版本升至 0.7.0。
+- 决策：令牌只发往官方 `https://api.github.com`；镜像失败不自动切换到其他镜像；多平台原生库放在同一个技能包内。
+
+### 文件变更清单
+
+- `src/host/options.rs`、`src/lib.rs`：`LuaRuntimeSecretString`、`LuaRuntimeNetworkOptions`、`LuaRuntimeHostOptions.github_token` 与网络策略读写方法。
+- `src/download/github.rs`、`src/download/manager.rs`：令牌主机判定、Release 资产 `digest`、限额与令牌错误诊断、瞬时错误重试、受管技能摘要与校验文件交叉校验。
+- `src/download/mirrors.rs`（新增）：内置镜像目录、用户镜像地址规范化、并行测速。
+- `src/dependency/*`、`src/skill/dependencies.rs`、`src/runtime/managed_package.rs`：`bundled` 依赖来源、包条目 `path` 与 `sha256`、依赖下载按已知摘要校验。
+- `src/skill/manager.rs`、`src/runtime/engine.rs`：`SkillUpdateCheck`、`check_skill_updates*`、`SkillInstallRequest.replace_source`、`set_network_options`。
+- `src/ffi.rs`、`src/ffi/requests.rs`、`include/luaskills_json_ffi.h`：六个 JSON FFI 新入口；`src/ffi_standard*`、`include/luaskills_ffi.h`：标准 C 结构新增 `github_token`。
+- `src/bin/luaskills-debug.rs`：`--github-mirror`、`--github-token-env` 与 `probe-mirrors` 子命令。
+- `contracts/embedded/v1/*`：重新生成；`Cargo.toml`、`Cargo.lock`、八种语言 README：版本 0.7.0。
+- 文档：技能开发手册 13.1 节（中英）、`skill-source-policy-and-hub.md` 第 2、6、7 节、`ffi-integration-guide.md`、`ffi-overview.md`。
+
+### 关键代码调整
+
+- 令牌由 `github_api_token_for` 统一判定：只有 HTTPS、主机恰为 `api.github.com`、默认端口的请求才附带；`Debug` 输出为 `<redacted>`；设置网络的 FFI 响应不回显令牌。
+- 403/429 且 `x-ratelimit-remaining: 0` 时报额度耗尽并提示配置令牌或改用资源站；官方 API 拒绝令牌时单独提示。
+- 连接失败与 502/503/504 在同一地址重试 3 次（指数退避），不切换镜像。
+- Release 报告的 `sha256:` 摘要与校验文件不一致时拒绝安装；依赖在已知摘要时以 `download_with_sha256` 下载；技能声明的 `sha256` 必须与 Release 摘要一致。
+- `bundled` 载荷经 `resolve_existing_package_file` 限定在技能目录内（含链接逃逸），不受网络开关约束，安装失败只清理目标目录，不删除包内载荷。
+- 内置镜像：`github`、`luaskills-cn`、`luaskills-global`、`gh-proxy-com`、`ghfast-top`、`gh-llkk-cc`、`ghproxy-net`；测速读取同一 Release 资产前 1 MiB，以 HTML 应答的代理判为失败，截止前部分到达标记为不完整。
+- 更换来源：新来源须指向同一技能，允许相同版本、拒绝降级；成功后安装记录改为新来源。
+
+### 验证记录
+
+- 定向测试：`download::github`、`download::manager::network_policy_tests`、`download::mirrors`、`dependency::`、`skill::manager`、`ffi` 全部通过。
+- `cargo run --features contract-generation --bin generate_embedded_contract` 已重新生成契约。
+- 全量 `cargo test`：1065 通过，3 个失败（`embedded_diagnostics_observe_real_reuse_host_wait_heap_and_retirement`、`system_runtime_lease_ignores_process_cwd_guard`、`system_runtime_lease_process_session_inherits_non_verbatim_package_cwd`），均为进程工作目录与调度计时相关测试，`--test-threads=1` 单独重跑全部通过；`cargo clippy --all-targets` 无警告。
+- `luaskills-debug probe-mirrors` 本机实测：ghfast-top 8.59 MB/s、github 2.00 MB/s、gh-llkk-cc 1.76 MB/s、gh-proxy-com 1.47 MB/s、ghproxy-net 0.35 MB/s（首字节约 12 s）；两个 LuaSkills 资源站返回 404，原因是资源站白名单尚未收录该仓库。
+
+### 代码审核与遗留事项
+
+- LuaSkills 资源站需在 Hub 白名单中加入 `LuaSkills/luaskills` 等仓库后，资源站镜像才能用于 Release 下载与测速。
+- 依赖同目录其他 DLL 的原生库在 Windows 上仍需技能自行处理加载目录；本轮未加入 `AddDllDirectory`。
+- 测速探测资产固定为 v0.6.1 调试工具包；该 Release 删除时需同步 `MIRROR_PROBE_DEFAULT_RELEASE_PATH`。

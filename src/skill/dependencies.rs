@@ -55,6 +55,14 @@ pub struct DependencyPackageSpec {
     /// 用于直接 url 或已解析 skilllist 包的精确下载地址。
     #[serde(default)]
     pub url: Option<String>,
+    /// Payload path relative to the skill directory, used by `bundled` sources.
+    /// 相对技能目录的载荷路径，供 `bundled` 来源使用。
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Optional expected SHA-256 of the payload; it must agree with any release digest.
+    /// 可选的载荷期望 SHA-256；必须与任何 Release 摘要一致。
+    #[serde(default)]
+    pub sha256: Option<String>,
     /// Exported files that must be installed and later used for existence checks.
     /// 必须被安装、并在之后用于存在性检测的导出文件列表。
     #[serde(default)]

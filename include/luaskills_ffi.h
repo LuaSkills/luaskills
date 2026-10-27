@@ -210,6 +210,11 @@ typedef struct FfiLuaRuntimeHostOptions {
     const char *github_base_url;
     const char *github_api_base_url;
     /*
+    Optional GitHub token, sent only to the official https://api.github.com host.
+    可选 GitHub 令牌，只发送给官方 https://api.github.com 主机。
+    */
+    const char *github_token;
+    /*
     Optional official LuaSkills Hub base URL used by managed Hub installs.
     受管 Hub 安装使用的可选官方 LuaSkills Hub 基址。
     */

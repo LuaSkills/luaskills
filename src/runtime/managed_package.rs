@@ -1251,7 +1251,7 @@ pub(crate) fn optional_lua_managed_package_context(
 
 /// Resolve one package-relative real file and enforce canonical containment.
 /// 解析包相对真实文件并强制规范包含关系。
-fn resolve_existing_package_file(
+pub(crate) fn resolve_existing_package_file(
     canonical_package_root: &Path,
     relative_path: &str,
     field_name: &str,

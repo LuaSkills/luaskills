@@ -5,8 +5,8 @@ use super::{
     collect_effective_skill_instances, collect_effective_skill_instances_from_roots,
     format_uninstall_finalization_error, github_repo_skill_id, is_allowed_private_source_url,
     is_skill_manifest_enabled, normalize_github_repo_locator, publish_staged_skill_update,
-    remove_staging_dir_if_present, resolve_effective_skill_instance, resolve_requested_skill_id,
-    staging_temp_root_is_directory, unix_millis_from_system_time,
+    remove_staging_dir_if_present, resolve_effective_skill_instance, resolve_replacement_source,
+    resolve_requested_skill_id, staging_temp_root_is_directory, unix_millis_from_system_time,
 };
 use crate::runtime::path::render_host_visible_path;
 use crate::runtime_options::RuntimeSkillRoot;
@@ -25,6 +25,7 @@ fn test_manager_config(
         allow_network_download: false,
         github_base_url: None,
         github_api_base_url: None,
+        github_token: None,
         official_skill_hub_base_url: None,
         enable_private_url_skill_install: false,
         private_skill_source_allowlist: Vec::new(),
@@ -1064,6 +1065,7 @@ fn public_url_install_is_rejected_by_source_policy() {
                 skill_id: Some("demo-skill".to_string()),
                 source: Some("https://example.com/demo.yaml".to_string()),
                 source_type: SkillInstallSourceType::Url,
+                replace_source: false,
             },
         )
         .expect_err("public URL install should be rejected");
@@ -1079,6 +1081,7 @@ fn official_hub_request_derives_skill_id_from_source() {
         skill_id: None,
         source: Some("skill-search".to_string()),
         source_type: SkillInstallSourceType::OfficialHub,
+        replace_source: false,
     })
     .expect("official Hub skill id should derive from source");
     assert_eq!(skill_id, "skill-search");
@@ -1094,6 +1097,7 @@ fn github_request_derives_skill_id_from_repository_source() {
         skill_id: None,
         source: Some("https://github.com/vulcan-ai/vulcan-codekit".to_string()),
         source_type: SkillInstallSourceType::Github,
+        replace_source: false,
     })
     .expect("GitHub skill id should derive from repository source");
 
@@ -1180,6 +1184,7 @@ fn official_hub_install_rejects_mismatched_source_skill_id() {
                 skill_id: Some("expected-skill".to_string()),
                 source: Some("other-skill".to_string()),
                 source_type: SkillInstallSourceType::OfficialHub,
+                replace_source: false,
             },
         )
         .expect_err("mismatched official Hub locator should fail before network");
@@ -1226,6 +1231,7 @@ fn install_update_entrypoints_return_strict_structured_results() {
                 skill_id: Some("vulcan-codekit".to_string()),
                 source: None,
                 source_type: SkillInstallSourceType::Github,
+                replace_source: false,
             },
         )
         .expect_err("install without source should fail strictly");
@@ -1240,6 +1246,7 @@ fn install_update_entrypoints_return_strict_structured_results() {
                 skill_id: Some("vulcan-codekit".to_string()),
                 source: None,
                 source_type: SkillInstallSourceType::Github,
+                replace_source: false,
             },
         )
         .expect_err("update without install record should fail strictly");
@@ -1762,4 +1769,217 @@ fn unix_millis_from_system_time_rejects_pre_epoch_time() {
         "unexpected error: {}",
         error
     );
+}
+
+/// Serve Hub resolve manifests on a loopback port; each connection answers by the skill in its path.
+/// 在回环端口上提供 Hub resolve 清单；每个连接按路径中的技能作答。
+fn serve_hub_versions(
+    versions: &'static [(&'static str, &'static str)],
+    connections: usize,
+) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind hub listener");
+    let base = format!("http://{}", listener.local_addr().expect("hub address"));
+    let handle = std::thread::spawn(move || {
+        for _ in 0..connections {
+            let (mut stream, _) = listener.accept().expect("accept hub request");
+            let mut head = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).expect("read hub request") == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&head).to_string();
+            let (skill_id, version) = versions
+                .iter()
+                .find(|(skill_id, _)| head.contains(&format!("/skills/{skill_id}/resolve")))
+                .expect("known skill in hub request");
+            let body = serde_json::json!({
+                "schema_version": 1,
+                "skill_id": skill_id,
+                "version": version,
+                "archive": {
+                    "type": "zip",
+                    "url": format!("https://res.example.invalid/{skill_id}.zip"),
+                    "sha256": "a".repeat(64),
+                }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write hub response");
+        }
+    });
+    (base, handle)
+}
+
+/// Build one networked manager whose official Hub is the given base URL, with records for each skill.
+/// 构造官方 Hub 指向给定基址、并为每个技能写入记录的联网管理器。
+fn hub_manager_with_records(
+    label: &str,
+    hub_base: &str,
+    records: &[(&str, &str, SkillInstallSourceType, &str)],
+) -> (SkillManager, std::path::PathBuf) {
+    let temp_root = std::env::temp_dir().join(format!(
+        "luaskills_update_check_{label}_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&temp_root);
+    let skill_root = temp_root.join("skills");
+    std::fs::create_dir_all(&skill_root).expect("skill root should be created");
+    let manager = SkillManager::new(SkillManagerConfig {
+        allow_network_download: true,
+        official_skill_hub_base_url: Some(hub_base.to_string()),
+        ..test_manager_config(
+            &temp_root,
+            RuntimeSkillRoot {
+                name: "USER".to_string(),
+                skills_dir: skill_root,
+            },
+        )
+    });
+    let installs = temp_root.join("state").join("installs");
+    std::fs::create_dir_all(&installs).expect("install record root should be created");
+    for (skill_id, version, source_type, locator) in records {
+        let record = InstalledSkillRecord {
+            skill_id: skill_id.to_string(),
+            version: version.to_string(),
+            managed: true,
+            source: InstalledSkillSourceRecord {
+                source_type: *source_type,
+                locator: locator.to_string(),
+                tag: None,
+            },
+            installed_at_unix_ms: 1,
+        };
+        std::fs::write(
+            installs.join(format!("{skill_id}.yaml")),
+            serde_norway::to_string(&record).expect("serialize install record"),
+        )
+        .expect("write install record");
+    }
+    (manager, temp_root)
+}
+
+/// Update checks compare each recorded source with the installed version and fold failures per skill.
+/// 更新检查按技能比较记录来源与已安装版本，并逐个折叠失败。
+#[test]
+fn check_skill_updates_reports_each_managed_skill() {
+    static VERSIONS: [(&str, &str); 2] = [("alpha", "1.1.0"), ("beta", "2.0.0")];
+    let (hub_base, hub) = serve_hub_versions(&VERSIONS, 2);
+    let (manager, temp_root) = hub_manager_with_records(
+        "report",
+        &hub_base,
+        &[
+            (
+                "alpha",
+                "1.0.0",
+                SkillInstallSourceType::OfficialHub,
+                "alpha",
+            ),
+            ("beta", "2.0.0", SkillInstallSourceType::OfficialHub, "beta"),
+            (
+                "gamma",
+                "1.0.0",
+                SkillInstallSourceType::Url,
+                "https://example.invalid/gamma.yaml",
+            ),
+        ],
+    );
+    let checks = manager
+        .check_skill_updates(SkillOperationPlane::Skills, None)
+        .expect("update check");
+    hub.join().expect("hub server");
+    let ids: Vec<_> = checks.iter().map(|check| check.skill_id.as_str()).collect();
+    assert_eq!(ids, ["alpha", "beta", "gamma"]);
+    assert!(checks[0].update_available);
+    assert_eq!(checks[0].latest_version.as_deref(), Some("1.1.0"));
+    assert!(!checks[1].update_available);
+    assert!(checks[1].error.is_none());
+    assert!(!checks[2].update_available);
+    assert!(checks[2].error.is_some());
+    let missing = manager
+        .check_skill_updates(SkillOperationPlane::Skills, Some(&["delta".to_string()]))
+        .expect("explicit update check");
+    assert!(
+        missing[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("not managed"))
+    );
+    let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+/// Changing the source accepts the same version but refuses to downgrade the installed skill.
+/// 更换来源接受相同版本，但拒绝降级已安装技能。
+#[test]
+fn source_change_refuses_downgrade() {
+    static VERSIONS: [(&str, &str); 1] = [("alpha", "1.1.0")];
+    let (hub_base, hub) = serve_hub_versions(&VERSIONS, 1);
+    let (manager, temp_root) = hub_manager_with_records(
+        "downgrade",
+        &hub_base,
+        &[(
+            "alpha",
+            "1.2.0",
+            SkillInstallSourceType::Github,
+            "owner/alpha",
+        )],
+    );
+    let error = manager
+        .prepare_managed_skill_update(
+            SkillOperationPlane::Skills,
+            "alpha",
+            Some((SkillInstallSourceType::OfficialHub, "alpha".to_string())),
+        )
+        .expect_err("downgrading source change must fail");
+    hub.join().expect("hub server");
+    assert!(error.contains("downgrade"), "{error}");
+    let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+/// Replacement sources must still name the requested skill and use an allowed source type.
+/// 替换来源仍须指向所请求的技能，并使用允许的来源类型。
+#[test]
+fn replacement_source_is_validated_before_network() {
+    let request = |source_type, source: Option<&str>| SkillInstallRequest {
+        skill_id: Some("alpha".to_string()),
+        source: source.map(str::to_string),
+        source_type,
+        replace_source: true,
+    };
+    assert_eq!(
+        resolve_replacement_source("alpha", &request(SkillInstallSourceType::OfficialHub, None)),
+        Ok((SkillInstallSourceType::OfficialHub, "alpha".to_string()))
+    );
+    assert_eq!(
+        resolve_replacement_source(
+            "alpha",
+            &request(
+                SkillInstallSourceType::Github,
+                Some("https://github.com/owner/alpha")
+            )
+        ),
+        Ok((SkillInstallSourceType::Github, "owner/alpha".to_string()))
+    );
+    for (source_type, source) in [
+        (SkillInstallSourceType::Github, Some("owner/other")),
+        (SkillInstallSourceType::Github, None),
+        (SkillInstallSourceType::OfficialHub, Some("other")),
+        (
+            SkillInstallSourceType::Url,
+            Some("https://example.invalid/alpha.yaml"),
+        ),
+    ] {
+        assert!(
+            resolve_replacement_source("alpha", &request(source_type, source)).is_err(),
+            "{source_type:?} {source:?}"
+        );
+    }
 }

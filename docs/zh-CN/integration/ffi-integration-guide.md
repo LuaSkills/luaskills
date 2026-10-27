@@ -1188,6 +1188,14 @@ system 版本的标准 C ABI 生命周期接口，以及可见性查询、prompt
 - `luaskills_ffi_system_install_skill_json`
 - `luaskills_ffi_update_skill_json`
 - `luaskills_ffi_system_update_skill_json`
+- `luaskills_ffi_check_skill_updates_json`
+- `luaskills_ffi_system_check_skill_updates_json`
+- `luaskills_ffi_set_network_options_json`
+- `luaskills_ffi_github_mirror_catalog_json`
+- `luaskills_ffi_normalize_github_mirror_json`
+- `luaskills_ffi_probe_github_mirrors_json`
+
+网络、镜像、检查更新与更换来源的请求格式见 [Skill 来源策略、官方 Hub 与进度事件](skill-source-policy-and-hub.md) 第 2、6、7 节。
 
 system 版本的 `_json` 生命周期接口，以及可见性查询、prompt completion 接口必须在 JSON 请求中由宿主注入 `authority`：
 

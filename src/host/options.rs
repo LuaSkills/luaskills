@@ -5,6 +5,59 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 
+/// Secret text supplied by the host, such as a GitHub token, that `Debug` never prints.
+/// 宿主提供的机密文本（例如 GitHub 令牌），`Debug` 永不打印其内容。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
+pub struct LuaRuntimeSecretString(String);
+
+impl LuaRuntimeSecretString {
+    /// Wrap one secret value supplied by the host.
+    /// 包装一个由宿主提供的机密值。
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Return the secret text for the single place that must send it.
+    /// 仅为必须发送机密的唯一位置返回机密文本。
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for LuaRuntimeSecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LuaRuntimeSecretString(<redacted>)")
+    }
+}
+
+/// Network policy the host may replace at runtime without rebuilding the engine.
+/// 宿主可在运行时整体替换、无需重建引擎的网络策略。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
+pub struct LuaRuntimeNetworkOptions {
+    /// Whether dependency and skill installation may download from the network.
+    /// 依赖与技能安装是否允许从网络下载。
+    pub allow_network_download: bool,
+    /// Optional GitHub site base URL, such as a mirror prefix, used to rewrite release download URLs.
+    /// 可选的 GitHub 站点基址（例如镜像前缀），用于改写 Release 下载地址。
+    #[serde(default)]
+    pub github_base_url: Option<String>,
+    /// Optional GitHub API base URL used to resolve release metadata.
+    /// 可选的 GitHub API 基址，用于解析 Release 元数据。
+    #[serde(default)]
+    pub github_api_base_url: Option<String>,
+    /// Optional GitHub token, sent only to the official `https://api.github.com` host.
+    /// 可选的 GitHub 令牌，只发送给官方 `https://api.github.com` 主机。
+    #[serde(default)]
+    pub github_token: Option<LuaRuntimeSecretString>,
+    /// Optional official LuaSkills Hub base URL used by managed Hub installs.
+    /// 受管 Hub 安装使用的可选官方 LuaSkills Hub 基址。
+    #[serde(default)]
+    pub official_skill_hub_base_url: Option<String>,
+}
+
 /// Fixed directory layout derived from one LuaSkills runtime root.
 /// 从单个 LuaSkills 运行时根目录推导出的固定目录布局。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -399,6 +452,10 @@ pub struct LuaRuntimeHostOptions {
     /// Optional GitHub API base URL override used to resolve release metadata.
     /// 可选的 GitHub API 基址覆盖，用于解析 release 元数据。
     pub github_api_base_url: Option<String>,
+    /// Optional GitHub token, sent only to the official `https://api.github.com` host.
+    /// 可选的 GitHub 令牌，只发送给官方 `https://api.github.com` 主机。
+    #[serde(default)]
+    pub github_token: Option<LuaRuntimeSecretString>,
     /// Optional official LuaSkills Hub base URL used by managed Hub installs.
     /// 受管 Hub 安装使用的可选官方 LuaSkills Hub 基址。
     #[serde(default)]
@@ -497,6 +554,28 @@ impl LuaRuntimeHostOptions {
         self.dependency_dir_name = "dependencies".to_string();
         self.state_dir_name = "state".to_string();
         self.database_dir_name = "databases".to_string();
+    }
+
+    /// Return the network policy currently carried by these host options.
+    /// 返回当前宿主选项携带的网络策略。
+    pub fn network_options(&self) -> LuaRuntimeNetworkOptions {
+        LuaRuntimeNetworkOptions {
+            allow_network_download: self.allow_network_download,
+            github_base_url: self.github_base_url.clone(),
+            github_api_base_url: self.github_api_base_url.clone(),
+            github_token: self.github_token.clone(),
+            official_skill_hub_base_url: self.official_skill_hub_base_url.clone(),
+        }
+    }
+
+    /// Replace every network field with one complete network policy.
+    /// 用一份完整网络策略替换全部网络字段。
+    pub fn set_network_options(&mut self, network: LuaRuntimeNetworkOptions) {
+        self.allow_network_download = network.allow_network_download;
+        self.github_base_url = network.github_base_url;
+        self.github_api_base_url = network.github_api_base_url;
+        self.github_token = network.github_token;
+        self.official_skill_hub_base_url = network.official_skill_hub_base_url;
     }
 
     /// Return a normalized copy where `runtime_root` owns legacy derived paths and explicit managed roots remain intact.
@@ -600,9 +679,42 @@ mod tests {
         DEFAULT_MANAGED_RUNTIME_PERSISTENT_SESSION_LIMIT_PER_ENGINE,
         DEFAULT_MANAGED_RUNTIME_WORKER_IDLE_TTL_SECS,
         DEFAULT_MANAGED_RUNTIME_WORKER_POOL_MAX_SIZE_PER_ENVIRONMENT, LuaRuntimeCapabilityOptions,
-        LuaRuntimeHostOptions, LuaRuntimeManagedRuntimeConfig,
+        LuaRuntimeHostOptions, LuaRuntimeManagedRuntimeConfig, LuaRuntimeNetworkOptions,
+        LuaRuntimeSecretString,
     };
     use serde_json::json;
+
+    /// The GitHub token travels as a plain JSON string but never appears in `Debug` output.
+    /// GitHub 令牌以普通 JSON 字符串传输，但永不出现在 `Debug` 输出中。
+    #[test]
+    fn github_token_is_plain_json_and_redacted_in_debug() {
+        let network: LuaRuntimeNetworkOptions = serde_json::from_value(json!({
+            "allow_network_download": true,
+            "github_token": "ghp_fixture_secret"
+        }))
+        .expect("network options with a token should parse");
+        assert_eq!(
+            network
+                .github_token
+                .as_ref()
+                .map(LuaRuntimeSecretString::expose),
+            Some("ghp_fixture_secret")
+        );
+        assert_eq!(
+            serde_json::to_value(&network).expect("serialize network options")["github_token"],
+            json!("ghp_fixture_secret")
+        );
+        let mut host = LuaRuntimeHostOptions::default();
+        host.set_network_options(network.clone());
+        for rendered in [format!("{network:?}"), format!("{host:?}")] {
+            assert!(
+                !rendered.contains("ghp_fixture_secret"),
+                "token leaked: {rendered}"
+            );
+            assert!(rendered.contains("<redacted>"));
+        }
+        assert_eq!(host.network_options(), network);
+    }
     use std::path::PathBuf;
 
     /// Verify capability payloads now require an explicit managed io compatibility flag.

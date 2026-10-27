@@ -109,6 +109,9 @@ pub struct FfiLuaRuntimeHostOptions {
     /// Optional GitHub API base URL.
     /// 可选 GitHub API 基址。
     pub github_api_base_url: *const c_char,
+    /// Optional GitHub token, sent only to the official `https://api.github.com` host.
+    /// 可选 GitHub 令牌，只发送给官方 `https://api.github.com` 主机。
+    pub github_token: *const c_char,
     /// Optional official LuaSkills Hub base URL.
     /// 可选官方 LuaSkills Hub 基址。
     pub official_skill_hub_base_url: *const c_char,

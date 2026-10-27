@@ -1810,6 +1810,41 @@ Notes:
 - In a System Plugin lease eval, these legacy Skill dependency-root fields remain `nil`. Managed Python/Node status, invoke, and session APIs instead resolve the exact `dependencies_file` bound by `system_package`; do not use `vulcan.deps.*` to infer whether a System package has declared dependencies.
 - Skills should rely on these protocol-exposed paths and should not guess the host's physical directory layout.
 
+### 13.1 Shipping Native Libraries Inside The Skill Package
+
+A dependency whose `source.type` is `bundled` takes its payload from the skill package itself, so installing it never needs GitHub or any network access. Each platform entry names the payload with `path` (relative to the skill directory; it may not leave the directory, including through links) and may pin it with `sha256`. Put every platform's library in the same package:
+
+```yaml
+ffi_dependencies:
+  - name: demo-native
+    version: "1.0.0"
+    source:
+      type: bundled
+    packages:
+      windows-x64:
+        archive_type: raw
+        path: native/windows-x64/demo_native.dll
+        sha256: "<64 hex characters>"
+        exports:
+          - archive_path: demo_native.dll
+            target_path: lib/demo_native.dll
+      linux-x64:
+        archive_type: raw
+        path: native/linux-x64/libdemo_native.so
+        exports:
+          - archive_path: libdemo_native.so
+            target_path: lib/libdemo_native.so
+```
+
+Bundled payloads are installed into the same layout as downloaded ones, so Lua code loads them the same way regardless of source:
+
+```lua
+local base = vulcan.path.join(vulcan.deps.ffi_path, "demo-native", "1.0.0", platform_key)
+local lib = ffi.load(vulcan.path.join(base, "lib", "demo_native.dll"))
+```
+
+`archive_type` may also be `zip` or `tar_gz` when the package ships an archive. `sha256` is accepted on every source type; for `github_release` it must agree with the digest GitHub reports for the asset.
+
 ## 14. `vulcan.sqlite.*`
 
 `vulcan.sqlite` is a SQLite binding isolated to the **current skill scope**.

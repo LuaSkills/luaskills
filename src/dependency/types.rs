@@ -31,6 +31,10 @@ pub enum DependencySourceType {
     Url,
     #[serde(rename = "skilllist", alias = "skill_list")]
     SkillList,
+    /// Payload shipped inside the skill package itself; installing it never touches the network.
+    /// 随技能包自身分发的载荷；安装时从不访问网络。
+    #[serde(rename = "bundled")]
+    Bundled,
 }
 
 /// One dependency detection result returned before install or skip decisions.
@@ -60,6 +64,9 @@ pub struct ResolvedDependencyRequest {
     /// Resolved download URL used to fetch the package.
     /// 用于获取依赖包的已解析下载地址。
     pub download_url: String,
+    /// Expected SHA-256 of the downloaded payload, from the release digest or the package declaration.
+    /// 下载载荷的期望 SHA-256，来自 Release 摘要或依赖包声明。
+    pub expected_sha256: Option<String>,
     /// Optional expected display version.
     /// 可选的预期展示版本号。
     pub version: Option<String>,

@@ -27,6 +27,7 @@ fn test_manager() -> (DependencyManager, PathBuf) {
         allow_network_download: false,
         github_base_url: None,
         github_api_base_url: None,
+        github_token: None,
     };
     (DependencyManager::new(config), root)
 }
@@ -161,6 +162,8 @@ fn tool_dependency(name: &str, version: &str, platform_key: &str) -> ToolDepende
             archive_type: DependencyArchiveType::Raw,
             asset_name: None,
             url: Some("https://example.invalid/package".to_string()),
+            path: None,
+            sha256: None,
             exports: vec![DependencyExportSpec {
                 archive_path: "demo.bin".to_string(),
                 target_path: "bin/demo.bin".to_string(),
@@ -197,6 +200,8 @@ fn github_tool_dependency(
             archive_type: DependencyArchiveType::Zip,
             asset_name: Some("demo-{version}.zip".to_string()),
             url: None,
+            path: None,
+            sha256: None,
             exports: vec![DependencyExportSpec {
                 archive_path: "demo-{version}.bin".to_string(),
                 target_path: "bin/demo-{version}.bin".to_string(),
@@ -259,6 +264,7 @@ fn ensure_dependency_reuses_existing_github_release_exports_without_remote_resol
         allow_network_download: manager.config.allow_network_download,
         github_base_url: manager.config.github_base_url.clone(),
         github_api_base_url: manager.config.github_api_base_url.clone(),
+        github_token: None,
     });
     let skill_id = "demo-skill";
     let manifest = PackageDependencyManifest {
@@ -283,7 +289,7 @@ fn ensure_dependency_reuses_existing_github_release_exports_without_remote_resol
     fs::write(dependency_root.join("bin").join("demo-1.2.3.bin"), b"ready").unwrap();
 
     manager
-        .ensure_skill_dependencies(skill_id, &manifest)
+        .ensure_skill_dependencies(skill_id, &root, &manifest)
         .expect("existing exports should bypass GitHub release lookup");
 
     let _ = fs::remove_dir_all(root);
@@ -306,6 +312,7 @@ fn ensure_dependency_reuses_existing_unversioned_github_release_exports() {
         allow_network_download: manager.config.allow_network_download,
         github_base_url: manager.config.github_base_url.clone(),
         github_api_base_url: manager.config.github_api_base_url.clone(),
+        github_token: None,
     });
     let skill_id = "demo-skill";
     let manifest = PackageDependencyManifest {
@@ -326,7 +333,7 @@ fn ensure_dependency_reuses_existing_unversioned_github_release_exports() {
     fs::write(dependency_root.join("bin").join("demo-1.2.3.bin"), b"ready").unwrap();
 
     manager
-        .ensure_skill_dependencies(skill_id, &manifest)
+        .ensure_skill_dependencies(skill_id, &root, &manifest)
         .expect("existing version directories should bypass GitHub release lookup");
 
     let _ = fs::remove_dir_all(root);
@@ -372,6 +379,8 @@ fn local_unversioned_dependency_probe_requests_warns_when_version_root_is_not_di
         archive_type: DependencyArchiveType::Raw,
         asset_name: None,
         url: None,
+        path: None,
+        sha256: None,
         exports: Vec::new(),
     };
 
@@ -410,6 +419,7 @@ fn ensure_dependency_reuses_existing_github_release_tag_exports_without_remote_r
         allow_network_download: manager.config.allow_network_download,
         github_base_url: manager.config.github_base_url.clone(),
         github_api_base_url: manager.config.github_api_base_url.clone(),
+        github_token: None,
     });
     let skill_id = "demo-skill";
     let manifest = PackageDependencyManifest {
@@ -438,7 +448,7 @@ fn ensure_dependency_reuses_existing_github_release_tag_exports_without_remote_r
     .unwrap();
 
     manager
-        .ensure_skill_dependencies(skill_id, &manifest)
+        .ensure_skill_dependencies(skill_id, &root, &manifest)
         .expect("existing tag exports should bypass GitHub release lookup");
 
     let _ = fs::remove_dir_all(root);
@@ -461,6 +471,7 @@ fn ensure_dependency_reuses_existing_unversioned_github_release_tag_exports() {
         allow_network_download: manager.config.allow_network_download,
         github_base_url: manager.config.github_base_url.clone(),
         github_api_base_url: manager.config.github_api_base_url.clone(),
+        github_token: None,
     });
     let skill_id = "demo-skill";
     let manifest = PackageDependencyManifest {
@@ -489,7 +500,7 @@ fn ensure_dependency_reuses_existing_unversioned_github_release_tag_exports() {
     .unwrap();
 
     manager
-        .ensure_skill_dependencies(skill_id, &manifest)
+        .ensure_skill_dependencies(skill_id, &root, &manifest)
         .expect("existing unversioned tag exports should bypass GitHub release lookup");
 
     let _ = fs::remove_dir_all(root);
@@ -508,6 +519,7 @@ fn detect_dependency_reports_export_target_probe_errors() {
         scope: DependencyScope::Skill,
         platform_key: "test-platform".to_string(),
         download_url: String::new(),
+        expected_sha256: None,
         version: Some("1.2.3".to_string()),
         install_root: root.join("dependencies").join("tools"),
         archive_type: DependencyArchiveType::Raw,
@@ -557,6 +569,7 @@ fn detect_dependency_rejects_directory_export_target() {
         scope: DependencyScope::Skill,
         platform_key: "test-platform".to_string(),
         download_url: String::new(),
+        expected_sha256: None,
         version: Some("1.2.3".to_string()),
         install_root,
         archive_type: DependencyArchiveType::Raw,
@@ -591,7 +604,7 @@ fn ensure_skill_dependencies_validates_public_skill_id_boundary() {
     // Error proves the public manager does not depend on an engine caller to validate ownership paths.
     // Error 证明公开管理器不依赖引擎调用方来验证归属路径。
     let error = manager
-        .ensure_skill_dependencies("../outside", &manifest)
+        .ensure_skill_dependencies("../outside", &root, &manifest)
         .expect_err("traversal skill id should fail");
 
     assert!(
@@ -1235,4 +1248,118 @@ fn local_dependency_version_component_rejects_invalid_unicode_file_name() {
         local_dependency_version_component_from_file_name(std::ffi::OsString::from_vec(vec![0xff]));
 
     assert!(component.is_none());
+}
+
+/// Build one bundled FFI dependency whose raw payload lives at `path` inside the skill directory.
+/// 构造一个原始载荷位于技能目录内 `path` 的内置 FFI 依赖。
+fn bundled_ffi_dependency(
+    platform_key: &str,
+    path: &str,
+    sha256: Option<String>,
+) -> crate::skill::dependencies::FfiDependencySpec {
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        platform_key.to_string(),
+        DependencyPackageSpec {
+            archive_type: DependencyArchiveType::Raw,
+            asset_name: None,
+            url: None,
+            path: Some(path.to_string()),
+            sha256,
+            exports: vec![DependencyExportSpec {
+                archive_path: "demo.bin".to_string(),
+                target_path: "lib/demo.bin".to_string(),
+                executable: false,
+            }],
+        },
+    );
+    crate::skill::dependencies::FfiDependencySpec {
+        name: "demo-native".to_string(),
+        version: Some("1.0.0".to_string()),
+        required: true,
+        scope: DependencyScope::Skill,
+        source: DependencySourceSpec {
+            source_type: DependencySourceType::Bundled,
+            github: None,
+            url: None,
+            skilllist: None,
+        },
+        packages,
+    }
+}
+
+/// Bundled payloads install offline into the ordinary FFI layout and honor their declared digest.
+/// 内置载荷离线安装到常规 FFI 布局，并遵守声明的摘要。
+#[test]
+fn bundled_ffi_dependency_installs_offline_and_verifies_sha256() {
+    let platform_key = current_platform_key();
+    if platform_key == "unknown" {
+        return;
+    }
+    let payload = b"bundled native payload";
+    let digest = {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(payload))
+    };
+    for (label, sha256, should_install) in [
+        ("plain", None, true),
+        ("verified", Some(digest.to_ascii_uppercase()), true),
+        ("mismatch", Some("0".repeat(64)), false),
+    ] {
+        let (manager, root) = test_manager();
+        let skill_dir = root.join("skills").join("demo-skill");
+        fs::create_dir_all(skill_dir.join("native")).unwrap();
+        fs::write(skill_dir.join("native").join("demo.bin"), payload).unwrap();
+        let manifest = PackageDependencyManifest {
+            ffi_dependencies: vec![bundled_ffi_dependency(
+                platform_key,
+                "native/demo.bin",
+                sha256,
+            )],
+            ..PackageDependencyManifest::default()
+        };
+        let install_root = build_dependency_install_root(
+            &manager.config.ffi_root,
+            DependencyScope::Skill,
+            "demo-skill",
+            "demo-native",
+            Some("1.0.0"),
+            platform_key,
+        );
+        let result = manager.ensure_skill_dependencies("demo-skill", &skill_dir, &manifest);
+        if should_install {
+            result.unwrap_or_else(|error| panic!("{label}: {error}"));
+            assert_eq!(
+                fs::read(install_root.join("lib").join("demo.bin")).unwrap(),
+                payload
+            );
+        } else {
+            assert!(result.is_err(), "{label} must be rejected");
+            assert!(!install_root.join("lib").join("demo.bin").exists());
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+/// Bundled paths cannot leave the skill directory.
+/// 内置路径不能离开技能目录。
+#[test]
+fn bundled_ffi_dependency_rejects_paths_outside_the_skill() {
+    let platform_key = current_platform_key();
+    if platform_key == "unknown" {
+        return;
+    }
+    let (manager, root) = test_manager();
+    let skill_dir = root.join("skills").join("demo-skill");
+    fs::create_dir_all(&skill_dir).unwrap();
+    fs::write(root.join("skills").join("demo.bin"), b"outside").unwrap();
+    let manifest = PackageDependencyManifest {
+        ffi_dependencies: vec![bundled_ffi_dependency(platform_key, "../demo.bin", None)],
+        ..PackageDependencyManifest::default()
+    };
+    let error = manager
+        .ensure_skill_dependencies("demo-skill", &skill_dir, &manifest)
+        .expect_err("escaping bundled path must be rejected");
+    assert!(error.contains("bundled path"), "{error}");
+    let _ = fs::remove_dir_all(root);
 }

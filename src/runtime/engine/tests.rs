@@ -3029,6 +3029,7 @@ fn install_skill_rejects_root_only_runtime() {
                 skill_id: Some("vulcan-codekit".to_string()),
                 source: None,
                 source_type: SkillInstallSourceType::Github,
+                replace_source: false,
             },
         )
         .expect_err("ordinary install must reject root-only runtime");
@@ -3060,6 +3061,7 @@ fn system_install_skill_rejects_runtime_without_root() {
                 skill_id: Some("vulcan-codekit".to_string()),
                 source: None,
                 source_type: SkillInstallSourceType::Github,
+                replace_source: false,
             },
         )
         .expect_err("system install without ROOT should fail");
@@ -3235,6 +3237,7 @@ fn ordinary_explicit_root_apis_reject_root_target() {
                 skill_id: Some("vulcan-codekit".to_string()),
                 source: None,
                 source_type: SkillInstallSourceType::Github,
+                replace_source: false,
             },
         )
         .expect_err("ordinary explicit root install should reject ROOT");
@@ -3272,6 +3275,7 @@ fn root_owned_skill_id_blocks_project_user_install_update_for_all_authorities() 
                 skill_id: Some("vulcan-codekit".to_string()),
                 source: None,
                 source_type: SkillInstallSourceType::Github,
+                replace_source: false,
             },
         )
         .expect_err("ordinary install must reject ROOT-owned skill id");
@@ -3288,6 +3292,7 @@ fn root_owned_skill_id_blocks_project_user_install_update_for_all_authorities() 
                 skill_id: Some("vulcan-codekit".to_string()),
                 source: None,
                 source_type: SkillInstallSourceType::Github,
+                replace_source: false,
             },
         )
         .expect_err("system install must reject ROOT-owned skill id in PROJECT");
@@ -3306,6 +3311,7 @@ fn root_owned_skill_id_blocks_project_user_install_update_for_all_authorities() 
                 skill_id: Some("vulcan-codekit".to_string()),
                 source: None,
                 source_type: SkillInstallSourceType::Github,
+                replace_source: false,
             },
         )
         .expect_err("system update must also reject ROOT-owned skill id in PROJECT");
@@ -3324,6 +3330,7 @@ fn root_owned_skill_id_blocks_project_user_install_update_for_all_authorities() 
                 skill_id: Some("vulcan-codekit".to_string()),
                 source: None,
                 source_type: SkillInstallSourceType::Github,
+                replace_source: false,
             },
         )
         .expect_err("delegated update must reject ROOT-owned skill id in PROJECT");
@@ -3397,6 +3404,7 @@ fn delegated_authority_rejects_system_root_write() {
                 skill_id: Some("vulcan-codekit".to_string()),
                 source: None,
                 source_type: SkillInstallSourceType::Github,
+                replace_source: false,
             },
         )
         .expect_err("delegated authority must reject ROOT writes");
@@ -3435,6 +3443,7 @@ fn system_update_skill_in_root_missing_target_returns_error() {
                 skill_id: Some("vulcan-codekit".to_string()),
                 source: None,
                 source_type: SkillInstallSourceType::Github,
+                replace_source: false,
             },
         )
         .expect_err("missing explicit-root update target should fail");
@@ -3474,6 +3483,7 @@ fn system_update_skill_in_root_rejects_shadowed_fallback_target() {
                 skill_id: Some("vulcan-codekit".to_string()),
                 source: None,
                 source_type: SkillInstallSourceType::Github,
+                replace_source: false,
             },
         )
         .expect_err("shadowed fallback target should fail before update");
@@ -3513,6 +3523,7 @@ fn system_install_skill_in_root_accepts_trailing_slash_github_url_for_shadow_che
                 skill_id: None,
                 source: Some("https://github.com/LuaSkills/vulcan-codekit/".to_string()),
                 source_type: SkillInstallSourceType::Github,
+                replace_source: false,
             },
         )
         .expect_err("root install should derive source skill id before managed download");
@@ -3557,6 +3568,7 @@ fn system_update_skill_in_root_rejects_unlisted_target_before_missing_target() {
                 skill_id: Some("vulcan-codekit".to_string()),
                 source: None,
                 source_type: SkillInstallSourceType::Github,
+                replace_source: false,
             },
         )
         .expect_err("unlisted explicit update target root should be rejected");

@@ -223,6 +223,10 @@ pub struct SkillManagerConfig {
     /// 受管 GitHub 安装使用的可选 GitHub API 基址覆盖。
     #[serde(default)]
     pub github_api_base_url: Option<String>,
+    /// Optional GitHub token, attached only to requests for the official GitHub API host.
+    /// 可选的 GitHub 令牌，只附加到发往官方 GitHub API 主机的请求。
+    #[serde(default)]
+    pub github_token: Option<crate::host::options::LuaRuntimeSecretString>,
     /// Optional official LuaSkills Hub base URL used by managed Hub installs.
     /// 受管 Hub 安装使用的可选官方 LuaSkills Hub 基址。
     #[serde(default)]
@@ -251,6 +255,81 @@ pub struct SkillInstallRequest {
     /// 用于解释来源定位值的来源类型，默认使用 GitHub。
     #[serde(default)]
     pub source_type: SkillInstallSourceType,
+    /// For updates only: resolve against `source_type`/`source` and record them as the new source.
+    /// 仅用于更新：按 `source_type`/`source` 解析，并将其记录为新的安装来源。
+    ///
+    /// A source change may keep the installed version but never downgrades it.
+    /// 更换来源可以保持已安装版本，但绝不降级。
+    #[serde(default)]
+    pub replace_source: bool,
+}
+
+/// Update availability for one managed skill, resolved without downloading the package.
+/// 单个受管技能的更新可用性，解析时不下载技能包。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillUpdateCheck {
+    /// Stable skill identifier.
+    /// 稳定技能标识符。
+    pub skill_id: String,
+    /// Installed version from the install record.
+    /// 安装记录中的已安装版本。
+    pub installed_version: Option<String>,
+    /// Latest version offered by the recorded source.
+    /// 记录来源提供的最新版本。
+    pub latest_version: Option<String>,
+    /// Whether the latest version is newer than the installed one.
+    /// 最新版本是否比已安装版本更新。
+    pub update_available: bool,
+    /// Recorded install source type.
+    /// 记录的安装来源类型。
+    pub source_type: Option<SkillInstallSourceType>,
+    /// Recorded install source locator.
+    /// 记录的安装来源定位值。
+    pub source_locator: Option<String>,
+    /// Reason the check could not complete for this skill.
+    /// 此技能检查未能完成的原因。
+    pub error: Option<String>,
+}
+
+/// Source one managed update resolves against: the recorded one or a caller-chosen replacement.
+/// 单次受管更新据以解析的来源：记录中的来源或调用方选择的替换来源。
+#[derive(Debug, Clone)]
+struct ManagedUpdateTarget {
+    /// Source type used for resolution and recorded after the update.
+    /// 用于解析并在更新后记录的来源类型。
+    source_type: SkillInstallSourceType,
+    /// Source locator used for resolution and recorded after the update.
+    /// 用于解析并在更新后记录的来源定位值。
+    locator: String,
+    /// Whether the caller is replacing the recorded source.
+    /// 调用方是否正在替换记录中的来源。
+    replacing: bool,
+}
+
+impl ManagedUpdateTarget {
+    /// Decide whether the resolved version should be applied over the installed one.
+    /// 判断解析出的版本是否应覆盖已安装版本。
+    ///
+    /// A plain update needs a newer version; a source change accepts the same version and
+    /// rejects an older one instead of silently downgrading.
+    /// 普通更新需要更新的版本；更换来源接受相同版本，并拒绝更旧版本而不是静默降级。
+    fn should_apply(
+        &self,
+        skill_id: &str,
+        latest: &Version,
+        current: &Version,
+    ) -> Result<bool, String> {
+        if !self.replacing {
+            return Ok(latest > current);
+        }
+        if latest < current {
+            return Err(format!(
+                "changing the source of skill '{}' would downgrade it from {} to {}",
+                skill_id, current, latest
+            ));
+        }
+        Ok(true)
+    }
 }
 
 /// One install or update result returned by the skill manager.
@@ -498,6 +577,7 @@ impl SkillManager {
             allow_network_download: config.allow_network_download,
             github_base_url: config.github_base_url.clone(),
             github_api_base_url: config.github_api_base_url.clone(),
+            github_token: config.github_token.clone(),
         });
         Self {
             config,
@@ -824,7 +904,169 @@ impl SkillManager {
                 source_locator: None,
             }));
         }
-        self.prepare_managed_skill_update(plane, &skill_id)
+        let replacement = if request.replace_source {
+            Some(resolve_replacement_source(&skill_id, request)?)
+        } else {
+            None
+        };
+        self.prepare_managed_skill_update(plane, &skill_id, replacement)
+    }
+
+    /// Check managed skills for newer versions without downloading or staging anything.
+    /// 检查受管技能是否有新版本，不下载也不暂存任何内容。
+    ///
+    /// `skill_ids` limits the check; `None` checks every skill with an install record.
+    /// `skill_ids` 限定检查范围；`None` 表示检查所有带安装记录的技能。
+    pub fn check_skill_updates(
+        &self,
+        plane: SkillOperationPlane,
+        skill_ids: Option<&[String]>,
+    ) -> Result<Vec<SkillUpdateCheck>, String> {
+        let skill_ids = match skill_ids {
+            Some(skill_ids) => skill_ids.to_vec(),
+            None => self.install_record_skill_ids()?,
+        };
+        Ok(skill_ids
+            .iter()
+            .map(|skill_id| self.check_one_skill_update(plane, skill_id))
+            .collect())
+    }
+
+    /// Check one managed skill and fold any failure into the result.
+    /// 检查单个受管技能，并把失败折叠进结果。
+    fn check_one_skill_update(
+        &self,
+        plane: SkillOperationPlane,
+        skill_id: &str,
+    ) -> SkillUpdateCheck {
+        let mut check = SkillUpdateCheck {
+            skill_id: skill_id.to_string(),
+            installed_version: None,
+            latest_version: None,
+            update_available: false,
+            source_type: None,
+            source_locator: None,
+            error: None,
+        };
+        let record = match self.install_record(skill_id) {
+            Ok(Some(record)) if record.managed => record,
+            Ok(_) => {
+                check.error = Some(format!(
+                    "skill '{}' is not managed by the install workflow",
+                    skill_id
+                ));
+                return check;
+            }
+            Err(error) => {
+                check.error = Some(error);
+                return check;
+            }
+        };
+        check.installed_version = Some(record.version.clone());
+        check.source_type = Some(record.source.source_type);
+        check.source_locator = Some(record.source.locator.clone());
+        match self.resolve_latest_managed_version(plane, skill_id, &record) {
+            Ok(latest) => {
+                check.update_available = match (
+                    Version::parse(latest.as_str()),
+                    Version::parse(record.version.as_str()),
+                ) {
+                    (Ok(latest), Ok(current)) => latest > current,
+                    (Err(error), _) => {
+                        check.error =
+                            Some(format!("latest version '{}' is invalid: {}", latest, error));
+                        false
+                    }
+                    (_, Err(error)) => {
+                        check.error = Some(format!(
+                            "installed version '{}' is invalid: {}",
+                            record.version, error
+                        ));
+                        false
+                    }
+                };
+                check.latest_version = Some(latest);
+            }
+            Err(error) => check.error = Some(error),
+        }
+        check
+    }
+
+    /// Resolve the latest version offered by one recorded source using metadata only.
+    /// 只使用元数据解析记录来源提供的最新版本。
+    fn resolve_latest_managed_version(
+        &self,
+        plane: SkillOperationPlane,
+        skill_id: &str,
+        record: &InstalledSkillRecord,
+    ) -> Result<String, String> {
+        let locator = record.source.locator.as_str();
+        match record.source.source_type {
+            SkillInstallSourceType::Github => Ok(self
+                .downloader()
+                .resolve_github_release_asset(
+                    &crate::skill::dependencies::GithubReleaseSourceSpec {
+                        repo: locator.to_string(),
+                        tag_api: None,
+                    },
+                    &format!("{}-v{{version}}-skill.zip", skill_id),
+                    None,
+                )?
+                .version),
+            SkillInstallSourceType::OfficialHub => {
+                let manifest = self.fetch_official_hub_manifest(locator)?;
+                manifest.validate_for_skill(skill_id)?;
+                Ok(manifest.version)
+            }
+            SkillInstallSourceType::PrivateUrlManifest => {
+                self.ensure_private_url_manifest_allowed(plane, locator)?;
+                let manifest = self.fetch_private_url_manifest(locator)?;
+                manifest.validate_for_skill(skill_id)?;
+                Ok(manifest.version)
+            }
+            SkillInstallSourceType::Url => Err(format!(
+                "skill '{}' uses legacy public url source; update checks are disabled by source policy",
+                skill_id
+            )),
+        }
+    }
+
+    /// List skill ids that have an install record, in stable order.
+    /// 按稳定顺序列出带安装记录的技能标识。
+    fn install_record_skill_ids(&self) -> Result<Vec<String>, String> {
+        let root = self.install_record_root();
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(format!(
+                    "Failed to read {}: {}",
+                    render_skill_manager_path(&root),
+                    error
+                ));
+            }
+        };
+        let mut skill_ids = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "Failed to read {}: {}",
+                    render_skill_manager_path(&root),
+                    error
+                )
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("yaml") {
+                continue;
+            }
+            if let Some(skill_id) = path.file_stem().and_then(|value| value.to_str())
+                && validate_luaskills_identifier(skill_id, "skill_id").is_ok()
+            {
+                skill_ids.push(skill_id.to_string());
+            }
+        }
+        skill_ids.sort();
+        Ok(skill_ids)
     }
 
     /// Dispatch one managed update according to the persisted install source.
@@ -833,6 +1075,7 @@ impl SkillManager {
         &self,
         plane: SkillOperationPlane,
         skill_id: &str,
+        replacement: Option<(SkillInstallSourceType, String)>,
     ) -> Result<PreparedSkillApply, String> {
         let record = self.install_record(skill_id)?.ok_or_else(|| {
             format!(
@@ -846,30 +1089,43 @@ impl SkillManager {
                 skill_id
             ));
         }
+        let target = match replacement {
+            Some((source_type, locator)) => ManagedUpdateTarget {
+                source_type,
+                locator,
+                replacing: true,
+            },
+            None => ManagedUpdateTarget {
+                source_type: record.source.source_type,
+                locator: record.source.locator.clone(),
+                replacing: false,
+            },
+        };
         self.emit_progress_detail(RuntimeSkillOperationProgressDetail {
             phase: "resolving_source",
             status: "started",
             skill_id: Some(skill_id),
-            source_type: Some(record.source.source_type),
-            source_locator: Some(record.source.locator.as_str()),
+            source_type: Some(target.source_type),
+            source_locator: Some(target.locator.as_str()),
             bytes_done: None,
             bytes_total: None,
             message: Some("resolving managed skill update source".to_string()),
         });
-        match record.source.source_type {
+        match target.source_type {
             SkillInstallSourceType::Github => {
-                self.prepare_github_managed_skill_update(skill_id, record)
+                self.prepare_github_managed_skill_update(skill_id, record, &target)
             }
             SkillInstallSourceType::OfficialHub => {
-                self.prepare_official_hub_managed_skill_update(skill_id, record)
+                self.prepare_official_hub_managed_skill_update(skill_id, record, &target)
             }
             SkillInstallSourceType::Url => Err(format!(
                 "skill '{}' uses legacy public url source; automatic update is disabled by source policy",
                 skill_id
             )),
-            SkillInstallSourceType::PrivateUrlManifest => {
-                self.prepare_private_url_manifest_managed_skill_update(plane, skill_id, record)
-            }
+            SkillInstallSourceType::PrivateUrlManifest => self
+                .prepare_private_url_manifest_managed_skill_update(
+                    plane, skill_id, record, &target,
+                ),
         }
     }
 
@@ -940,6 +1196,7 @@ impl SkillManager {
         &self,
         skill_id: &str,
         record: InstalledSkillRecord,
+        target: &ManagedUpdateTarget,
     ) -> Result<PreparedSkillApply, String> {
         let current_version = Version::parse(record.version.as_str()).map_err(|error| {
             format!(
@@ -950,7 +1207,7 @@ impl SkillManager {
         let downloader = self.downloader();
         let asset = downloader.resolve_github_managed_skill_release_asset(
             &crate::skill::dependencies::GithubReleaseSourceSpec {
-                repo: record.source.locator.clone(),
+                repo: target.locator.clone(),
                 tag_api: None,
             },
             skill_id,
@@ -962,7 +1219,7 @@ impl SkillManager {
                 asset.version, skill_id, error
             )
         })?;
-        if latest_version <= current_version {
+        if !target.should_apply(skill_id, &latest_version, &current_version)? {
             return Ok(PreparedSkillApply::Immediate(SkillApplyResult {
                 skill_id: skill_id.to_string(),
                 status: "up_to_date".to_string(),
@@ -972,7 +1229,7 @@ impl SkillManager {
                 ),
                 version: Some(record.version),
                 source_type: Some(SkillInstallSourceType::Github),
-                source_locator: Some(record.source.locator),
+                source_locator: Some(target.locator.clone()),
             }));
         }
 
@@ -991,7 +1248,6 @@ impl SkillManager {
                 )
             })?,
         )?;
-        let source_locator = record.source.locator.clone();
         self.stage_skill_update_from_archive(
             skill_id,
             &archive_path,
@@ -999,7 +1255,7 @@ impl SkillManager {
             record,
             InstalledSkillSourceRecord {
                 source_type: SkillInstallSourceType::Github,
-                locator: source_locator,
+                locator: target.locator.clone(),
                 tag: Some(asset.tag_name.clone()),
             },
         )
@@ -1065,14 +1321,10 @@ impl SkillManager {
         &self,
         skill_id: &str,
         record: InstalledSkillRecord,
+        target: &ManagedUpdateTarget,
     ) -> Result<PreparedSkillApply, String> {
-        let manifest = self.fetch_official_hub_manifest(record.source.locator.as_str())?;
-        self.prepare_update_skill_from_manifest(
-            skill_id,
-            record,
-            manifest,
-            SkillInstallSourceType::OfficialHub,
-        )
+        let manifest = self.fetch_official_hub_manifest(target.locator.as_str())?;
+        self.prepare_update_skill_from_manifest(skill_id, record, manifest, target)
     }
 
     /// Stage one managed private-URL-manifest update for trusted system operations.
@@ -1082,16 +1334,12 @@ impl SkillManager {
         plane: SkillOperationPlane,
         skill_id: &str,
         record: InstalledSkillRecord,
+        target: &ManagedUpdateTarget,
     ) -> Result<PreparedSkillApply, String> {
-        self.ensure_private_url_manifest_allowed(plane, record.source.locator.as_str())?;
-        let manifest = self.fetch_private_url_manifest(record.source.locator.as_str())?;
+        self.ensure_private_url_manifest_allowed(plane, target.locator.as_str())?;
+        let manifest = self.fetch_private_url_manifest(target.locator.as_str())?;
         self.ensure_private_archive_url_allowed(manifest.archive.url.as_str())?;
-        self.prepare_update_skill_from_manifest(
-            skill_id,
-            record,
-            manifest,
-            SkillInstallSourceType::PrivateUrlManifest,
-        )
+        self.prepare_update_skill_from_manifest(skill_id, record, manifest, target)
     }
 
     /// Resolve, download, and stage one install from a validated source manifest.
@@ -1142,8 +1390,9 @@ impl SkillManager {
         skill_id: &str,
         record: InstalledSkillRecord,
         manifest: SkillSourceManifest,
-        source_type: SkillInstallSourceType,
+        target: &ManagedUpdateTarget,
     ) -> Result<PreparedSkillApply, String> {
+        let source_type = target.source_type;
         let expected_sha256 = manifest.validate_for_skill(skill_id)?;
         let current_version = Version::parse(record.version.as_str()).map_err(|error| {
             format!(
@@ -1157,7 +1406,7 @@ impl SkillManager {
                 manifest.version, skill_id, error
             )
         })?;
-        if latest_version <= current_version {
+        if !target.should_apply(skill_id, &latest_version, &current_version)? {
             return Ok(PreparedSkillApply::Immediate(SkillApplyResult {
                 skill_id: skill_id.to_string(),
                 status: "up_to_date".to_string(),
@@ -1167,7 +1416,7 @@ impl SkillManager {
                 ),
                 version: Some(record.version),
                 source_type: Some(source_type),
-                source_locator: Some(record.source.locator),
+                source_locator: Some(target.locator.clone()),
             }));
         }
         self.emit_progress_detail(RuntimeSkillOperationProgressDetail {
@@ -1175,7 +1424,7 @@ impl SkillManager {
             status: "completed",
             skill_id: Some(skill_id),
             source_type: Some(source_type),
-            source_locator: Some(record.source.locator.as_str()),
+            source_locator: Some(target.locator.as_str()),
             bytes_done: None,
             bytes_total: None,
             message: Some(format!("resolved skill version {}", manifest.version)),
@@ -1189,13 +1438,12 @@ impl SkillManager {
             },
             expected_sha256.as_str(),
         )?;
-        let source_locator = record.source.locator.clone();
         self.stage_skill_update_from_archive(
             skill_id,
             &archive_path,
             manifest.version.as_str(),
             record,
-            source_record_from_manifest(&manifest, source_type, source_locator.as_str()),
+            source_record_from_manifest(&manifest, source_type, target.locator.as_str()),
         )
     }
 
@@ -2030,6 +2278,58 @@ pub(crate) fn resolve_requested_skill_id(request: &SkillInstallRequest) -> Resul
     })?;
     validate_luaskills_identifier(&skill_id, "skill_id")?;
     Ok(skill_id)
+}
+
+/// Validate the replacement source of one source-change update and return its normalized locator.
+/// 校验一次更换来源更新的替换来源，并返回规范化后的定位值。
+fn resolve_replacement_source(
+    skill_id: &str,
+    request: &SkillInstallRequest,
+) -> Result<(SkillInstallSourceType, String), String> {
+    let source = request
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let locator = match request.source_type {
+        SkillInstallSourceType::Github => {
+            let repo =
+                normalize_github_repo_locator(source.ok_or_else(|| {
+                    "github source change requires source repository".to_string()
+                })?)?;
+            let repo_skill_id = github_repo_skill_id(&repo)?;
+            if repo_skill_id != skill_id {
+                return Err(format!(
+                    "github repository '{}' resolves to skill_id '{}' but the request targets '{}'",
+                    repo, repo_skill_id, skill_id
+                ));
+            }
+            repo
+        }
+        SkillInstallSourceType::OfficialHub => {
+            let hub_locator = source.unwrap_or(skill_id);
+            validate_luaskills_identifier(hub_locator, "official hub source skill_id")?;
+            if hub_locator != skill_id {
+                return Err(format!(
+                    "official_hub source '{}' does not match requested skill_id '{}'",
+                    hub_locator, skill_id
+                ));
+            }
+            hub_locator.to_string()
+        }
+        SkillInstallSourceType::PrivateUrlManifest => source
+            .ok_or_else(|| {
+                "private_url_manifest source change requires one manifest URL".to_string()
+            })?
+            .to_string(),
+        SkillInstallSourceType::Url => {
+            return Err(
+                "public URL skill sources are disabled by source policy; choose github, official_hub, or a host-private system manifest"
+                    .to_string(),
+            );
+        }
+    };
+    Ok((request.source_type, locator))
 }
 
 /// Normalize one GitHub repository locator into `owner/repo` form.

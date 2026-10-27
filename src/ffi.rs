@@ -15,8 +15,11 @@ use crate::runtime::path::{normalize_host_input_path_text, render_host_visible_p
 use crate::runtime_help::{RuntimeHelpDetail, RuntimeSkillHelpDescriptor};
 
 use crate::{
-    LuaEngine, RuntimeEntryDescriptor, RuntimeInvocationResult, SkillApplyResult,
-    SkillInstallRequest, SkillInstallSourceType, SkillManagementAuthority, SkillUninstallResult,
+    LuaEngine, LuaRuntimeGithubMirror, LuaRuntimeGithubMirrorProbeRequest,
+    LuaRuntimeGithubMirrorProbeResult, RuntimeEntryDescriptor, RuntimeInvocationResult,
+    SkillApplyResult, SkillInstallRequest, SkillInstallSourceType, SkillManagementAuthority,
+    SkillUninstallResult, SkillUpdateCheck, builtin_github_mirrors,
+    normalize_github_mirror_base_url, probe_github_mirrors,
 };
 
 mod requests;
@@ -466,6 +469,12 @@ pub(crate) fn exported_ffi_function_names() -> Vec<String> {
         "luaskills_ffi_update_skill_json",
         "luaskills_ffi_system_update_skill_json",
         "luaskills_ffi_system_private_update_skill_from_url_manifest_json",
+        "luaskills_ffi_check_skill_updates_json",
+        "luaskills_ffi_system_check_skill_updates_json",
+        "luaskills_ffi_set_network_options_json",
+        "luaskills_ffi_github_mirror_catalog_json",
+        "luaskills_ffi_normalize_github_mirror_json",
+        "luaskills_ffi_probe_github_mirrors_json",
         "luaskills_ffi_string_free",
         "luaskills_ffi_bytes_clone",
         "luaskills_ffi_bytes_free",
@@ -2110,6 +2119,7 @@ pub unsafe extern "C" fn luaskills_ffi_system_private_install_skill_from_url_man
         skill_id: Some(request.skill_id),
         source: Some(request.manifest_url),
         source_type: SkillInstallSourceType::PrivateUrlManifest,
+        replace_source: false,
     };
     match with_engine_mut(request.engine_id, |engine| {
         if let Some(target_root) = request.target_root.as_ref() {
@@ -2242,6 +2252,7 @@ pub unsafe extern "C" fn luaskills_ffi_system_private_update_skill_from_url_mani
         skill_id: Some(request.skill_id),
         source: Some(request.manifest_url),
         source_type: SkillInstallSourceType::PrivateUrlManifest,
+        replace_source: false,
     };
     match with_engine_mut(request.engine_id, |engine| {
         if let Some(target_root) = request.target_root.as_ref() {
@@ -2260,6 +2271,168 @@ pub unsafe extern "C" fn luaskills_ffi_system_private_update_skill_from_url_mani
         }
     }) {
         Ok(result) => ffi_ok::<SkillApplyResult>(result),
+        Err(error) => ffi_error(error),
+    }
+}
+
+/// Check managed skills of one PROJECT or USER root for newer versions via the JSON FFI surface.
+/// 通过 JSON FFI 入口检查单个 PROJECT 或 USER 根中的受管技能是否有新版本。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_check_skill_updates_json(
+    input_json: FfiBorrowedBuffer,
+) -> FfiOwnedBuffer {
+    let request = match decode_json_request::<CheckSkillUpdatesJsonRequest>(
+        input_json,
+        "luaskills_ffi_check_skill_updates_json",
+    ) {
+        Ok(request) => request,
+        Err(error) => return ffi_error(error),
+    };
+    match with_engine(request.engine_id, |engine| {
+        engine
+            .check_skill_updates_in_root(
+                &request.skill_roots,
+                &request.target_root,
+                request.skill_ids.as_deref(),
+            )
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(result) => ffi_ok::<Vec<SkillUpdateCheck>>(result),
+        Err(error) => ffi_error(error),
+    }
+}
+
+/// Check managed skills of one root for newer versions through the system plane via the JSON FFI surface.
+/// 通过 JSON FFI 入口在 system 平面检查单个根中的受管技能是否有新版本。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_system_check_skill_updates_json(
+    input_json: FfiBorrowedBuffer,
+) -> FfiOwnedBuffer {
+    let request = match decode_json_request::<CheckSkillUpdatesJsonRequest>(
+        input_json,
+        "luaskills_ffi_system_check_skill_updates_json",
+    ) {
+        Ok(request) => request,
+        Err(error) => return ffi_error(error),
+    };
+    let authority = match require_json_authority(
+        request.authority,
+        "luaskills_ffi_system_check_skill_updates_json",
+    ) {
+        Ok(authority) => authority,
+        Err(error) => return ffi_error(error),
+    };
+    match with_engine(request.engine_id, |engine| {
+        engine
+            .system_check_skill_updates_in_root(
+                &request.skill_roots,
+                &request.target_root,
+                authority,
+                request.skill_ids.as_deref(),
+            )
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(result) => ffi_ok::<Vec<SkillUpdateCheck>>(result),
+        Err(error) => ffi_error(error),
+    }
+}
+
+/// Replace the network policy of one engine; later installs, updates and downloads use it.
+/// 替换单个引擎的网络策略；之后的安装、更新与下载都使用新策略。
+///
+/// The response never echoes the token back to the caller.
+/// 响应永不把令牌回显给调用方。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_set_network_options_json(
+    input_json: FfiBorrowedBuffer,
+) -> FfiOwnedBuffer {
+    let request = match decode_json_request::<SetNetworkOptionsJsonRequest>(
+        input_json,
+        "luaskills_ffi_set_network_options_json",
+    ) {
+        Ok(request) => request,
+        Err(error) => return ffi_error(error),
+    };
+    match with_engine_mut(request.engine_id, |engine| {
+        engine.set_network_options(request.network);
+        Ok(())
+    }) {
+        Ok(()) => ffi_ok(json!({ "updated": true })),
+        Err(error) => ffi_error(error),
+    }
+}
+
+/// Return the built-in GitHub release download mirror catalog.
+/// 返回内置 GitHub Release 下载镜像目录。
+#[unsafe(no_mangle)]
+pub extern "C" fn luaskills_ffi_github_mirror_catalog_json() -> FfiOwnedBuffer {
+    ffi_ok::<Vec<LuaRuntimeGithubMirror>>(builtin_github_mirrors())
+}
+
+/// Normalize one user-entered mirror URL into a base that replaces `https://github.com`.
+/// 将用户输入的镜像地址规范化为替换 `https://github.com` 的基址。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_normalize_github_mirror_json(
+    input_json: FfiBorrowedBuffer,
+) -> FfiOwnedBuffer {
+    let request = match decode_json_request::<NormalizeGithubMirrorJsonRequest>(
+        input_json,
+        "luaskills_ffi_normalize_github_mirror_json",
+    ) {
+        Ok(request) => request,
+        Err(error) => return ffi_error(error),
+    };
+    match normalize_github_mirror_base_url(&request.url) {
+        Ok(github_base_url) => ffi_ok(json!({ "github_base_url": github_base_url })),
+        Err(error) => ffi_error(error),
+    }
+}
+
+/// Probe several GitHub release download mirrors in parallel and report their speed.
+/// 并行探测多个 GitHub Release 下载镜像并报告其速度。
+/// # Safety
+/// # 安全性
+/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
+/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
+/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
+/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_probe_github_mirrors_json(
+    input_json: FfiBorrowedBuffer,
+) -> FfiOwnedBuffer {
+    let request = match decode_json_request::<LuaRuntimeGithubMirrorProbeRequest>(
+        input_json,
+        "luaskills_ffi_probe_github_mirrors_json",
+    ) {
+        Ok(request) => request,
+        Err(error) => return ffi_error(error),
+    };
+    match probe_github_mirrors(&request) {
+        Ok(results) => ffi_ok::<Vec<LuaRuntimeGithubMirrorProbeResult>>(results),
         Err(error) => ffi_error(error),
     }
 }

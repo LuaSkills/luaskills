@@ -1,9 +1,11 @@
 use luaskills::lua_skill::validate_luaskills_identifier;
 use luaskills::runtime::render_host_visible_path;
 use luaskills::{
-    LuaEngine, LuaEngineOptions, LuaInvocationContext, LuaRuntimeHostOptions,
-    LuaRuntimeManagedRuntimeConfig, LuaVmPoolConfig, RuntimeEntryDescriptor,
-    RuntimeInvocationResult, RuntimeRequestContext, RuntimeSkillRoot, SkillMeta,
+    LuaEngine, LuaEngineOptions, LuaInvocationContext, LuaRuntimeGithubMirrorProbeRequest,
+    LuaRuntimeGithubMirrorProbeResult, LuaRuntimeGithubMirrorProbeTarget, LuaRuntimeHostOptions,
+    LuaRuntimeManagedRuntimeConfig, LuaRuntimeSecretString, LuaVmPoolConfig,
+    RuntimeEntryDescriptor, RuntimeInvocationResult, RuntimeRequestContext, RuntimeSkillRoot,
+    SkillMeta, builtin_github_mirrors, normalize_github_mirror_base_url, probe_github_mirrors,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -23,6 +25,13 @@ Usage:
   luaskills-debug list-tools --runtime-root <dir> --skill-id <id> [managed runtime root options] [--output pretty|json|content]
   luaskills-debug call --runtime-root <dir> --skill-path <dir> --tool <name> [managed runtime root options] [--args-json <json> | --args-file <path>] [--enable-host-result] [--output pretty|json|content]
   luaskills-debug call --runtime-root <dir> --skill-id <id> --tool <name> [managed runtime root options] [--args-json <json> | --args-file <path>] [--enable-host-result] [--output pretty|json|content]
+  luaskills-debug probe-mirrors [--github-mirror <id|url>]... [--output pretty|json]
+
+Network options (sync, inspect, list-tools, call):
+  --github-mirror <id|url>     Download GitHub release assets through a built-in mirror id or a mirror URL.
+  --github-token-env <name>    Read a GitHub token from this environment variable; it is sent only to api.github.com.
+
+Built-in mirror ids: github, luaskills-cn, luaskills-global, gh-proxy-com, ghfast-top, gh-llkk-cc, ghproxy-net.
 
 Managed runtime root options:
   --managed-runtime-distribution-root <dir>  Existing absolute Python/Node distribution root.
@@ -143,6 +152,156 @@ struct DebugCliCommand {
     /// Selected output mode.
     /// 当前选择的输出模式。
     output_mode: DebugOutputMode,
+    /// GitHub download mirror and token selection.
+    /// GitHub 下载镜像与令牌选择。
+    network: DebugNetworkFlags,
+}
+
+/// GitHub mirror and token flags shared by every runtime-loading subcommand.
+/// 所有加载运行时的子命令共用的 GitHub 镜像与令牌参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DebugNetworkFlags {
+    /// Base URL replacing `https://github.com` in release downloads.
+    /// 替换 Release 下载中 `https://github.com` 的基址。
+    github_base_url: Option<String>,
+    /// GitHub-compatible API base, set only by LuaSkills resource stations.
+    /// GitHub 兼容 API 基址，仅由 LuaSkills 资源站设置。
+    github_api_base_url: Option<String>,
+    /// Environment variable holding the GitHub token; the token itself never appears in arguments.
+    /// 保存 GitHub 令牌的环境变量；令牌本身永不出现在命令行参数中。
+    github_token_env: Option<String>,
+}
+
+impl DebugNetworkFlags {
+    /// Apply one `--github-mirror` value: a built-in mirror id or a mirror URL.
+    /// 应用单个 `--github-mirror` 值：内置镜像标识或镜像地址。
+    fn select_mirror(&mut self, value: &str) -> Result<(), String> {
+        let (github_base_url, github_api_base_url) = resolve_debug_mirror(value)?;
+        self.github_base_url = github_base_url;
+        self.github_api_base_url = github_api_base_url;
+        Ok(())
+    }
+
+    /// Copy the selection into host options, reading the token from its environment variable.
+    /// 将选择写入宿主选项，并从环境变量读取令牌。
+    fn apply(&self, host_options: &mut LuaRuntimeHostOptions) -> Result<(), String> {
+        host_options.github_base_url = self.github_base_url.clone();
+        host_options.github_api_base_url = self.github_api_base_url.clone();
+        host_options.github_token = match self.github_token_env.as_deref() {
+            Some(name) => {
+                let token = env::var(name)
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        format!(
+                            "environment variable '{}' does not hold a GitHub token",
+                            name
+                        )
+                    })?;
+                Some(LuaRuntimeSecretString::new(token.trim()))
+            }
+            None => None,
+        };
+        Ok(())
+    }
+}
+
+/// Resolve one mirror id or URL into download and API base URLs.
+/// 将单个镜像标识或地址解析为下载与 API 基址。
+fn resolve_debug_mirror(value: &str) -> Result<(Option<String>, Option<String>), String> {
+    let value = value.trim();
+    if let Some(mirror) = builtin_github_mirrors()
+        .into_iter()
+        .find(|mirror| mirror.id == value)
+    {
+        return Ok((mirror.github_base_url, mirror.github_api_base_url));
+    }
+    Ok((Some(normalize_github_mirror_base_url(value)?), None))
+}
+
+/// Probe the selected mirrors, or every built-in mirror, and render the measurements.
+/// 探测所选镜像（或全部内置镜像）并输出测量结果。
+fn run_probe_mirrors(args: &[String]) -> Result<(), String> {
+    let mut targets = Vec::new();
+    let mut output_mode = DebugOutputMode::Pretty;
+    let mut index = 1usize;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--github-mirror" => {
+                let value = read_cli_value(args, &mut index, flag)?;
+                let (github_base_url, _) = resolve_debug_mirror(value)?;
+                targets.push(LuaRuntimeGithubMirrorProbeTarget {
+                    id: value.trim().to_string(),
+                    github_base_url,
+                });
+            }
+            "--output" => {
+                output_mode = DebugOutputMode::parse(read_cli_value(args, &mut index, flag)?)?;
+            }
+            other => return Err(format!("Unknown option '{}'", other)),
+        }
+        index += 1;
+    }
+    if targets.is_empty() {
+        targets = builtin_github_mirrors()
+            .into_iter()
+            .map(|mirror| LuaRuntimeGithubMirrorProbeTarget {
+                id: mirror.id,
+                github_base_url: mirror.github_base_url,
+            })
+            .collect();
+    }
+    let results = probe_github_mirrors(&LuaRuntimeGithubMirrorProbeRequest {
+        targets,
+        release_path: None,
+        max_bytes: None,
+        timeout_ms: None,
+    })?;
+    match output_mode {
+        DebugOutputMode::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&results)
+                    .map_err(|error| format!("Failed to serialize probe output: {}", error))?
+            );
+            Ok(())
+        }
+        DebugOutputMode::Pretty | DebugOutputMode::Content => {
+            for result in &results {
+                println!("{}", render_probe_line(result));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Render one probe result as one aligned text line.
+/// 将单个测速结果渲染为一行对齐文本。
+fn render_probe_line(result: &LuaRuntimeGithubMirrorProbeResult) -> String {
+    let speed = result
+        .bytes_per_second
+        .map(|value| format!("{:.2} MB/s", value as f64 / 1_000_000.0))
+        .unwrap_or_else(|| "-".to_string());
+    let ttfb = result
+        .ttfb_ms
+        .map(|value| format!("{value} ms"))
+        .unwrap_or_else(|| "-".to_string());
+    let status = if result.ok && result.complete {
+        "ok"
+    } else if result.ok {
+        "partial"
+    } else {
+        "failed"
+    };
+    format!(
+        "{:<18} {:<8} ttfb {:<9} {:<12} {}",
+        result.id,
+        status,
+        ttfb,
+        speed,
+        result.error.as_deref().unwrap_or("")
+    )
 }
 
 /// Prepared debug runtime state after skill synchronization and engine loading.
@@ -290,6 +449,9 @@ fn run_debug_binary() -> Result<(), String> {
         return Ok(());
     }
 
+    if args.first().map(String::as_str) == Some("probe-mirrors") {
+        return run_probe_mirrors(&args);
+    }
     let command = parse_debug_cli(&args)?;
     match command.kind {
         DebugCommandKind::Sync => {
@@ -356,6 +518,7 @@ fn parse_debug_cli(args: &[String]) -> Result<DebugCliCommand, String> {
     let mut args_file: Option<PathBuf> = None;
     let mut enable_host_result = false;
     let mut output_mode = DebugOutputMode::Pretty;
+    let mut network = DebugNetworkFlags::default();
 
     let mut index = 1usize;
     while index < args.len() {
@@ -413,6 +576,13 @@ fn parse_debug_cli(args: &[String]) -> Result<DebugCliCommand, String> {
             "--enable-host-result" => {
                 enable_host_result = true;
             }
+            "--github-mirror" => {
+                network.select_mirror(read_cli_value(args, &mut index, flag)?)?;
+            }
+            "--github-token-env" => {
+                network.github_token_env =
+                    Some(read_cli_value(args, &mut index, flag)?.to_string());
+            }
             other => {
                 return Err(format!("Unknown option '{}'", other));
             }
@@ -455,6 +625,7 @@ fn parse_debug_cli(args: &[String]) -> Result<DebugCliCommand, String> {
         args_file,
         enable_host_result,
         output_mode,
+        network,
     })
 }
 
@@ -617,13 +788,14 @@ fn prepare_debug_runtime(command: &DebugCliCommand) -> Result<PreparedDebugRunti
         .as_deref()
         .map(absolutize_path)
         .transpose()?;
-    let host_options = build_debug_host_options(
+    let mut host_options = build_debug_host_options(
         &runtime_root,
         managed_runtime_distribution_root,
         managed_runtime_environment_root,
         command.managed_runtime_config,
         ignored_skill_ids,
     );
+    command.network.apply(&mut host_options)?;
     let pool_config = LuaVmPoolConfig {
         min_size: 1,
         max_size: 2,
@@ -1304,9 +1476,9 @@ fn render_call_output(mode: DebugOutputMode, output: &DebugCallOutput) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        DebugCliCommand, DebugCommandKind, DebugOutputMode, collect_ignored_skill_ids,
-        load_bound_skill_manifest, load_invocation_args, parse_debug_cli,
-        paths_refer_to_same_directory, prepare_debug_runtime, render_debug_path,
+        DebugCliCommand, DebugCommandKind, DebugNetworkFlags, DebugOutputMode,
+        collect_ignored_skill_ids, load_bound_skill_manifest, load_invocation_args,
+        parse_debug_cli, paths_refer_to_same_directory, prepare_debug_runtime, render_debug_path,
         resolve_debug_tool_name, sync_debug_skill,
     };
     use luaskills::{LuaInvocationContext, LuaRuntimeManagedRuntimeConfig, RuntimeEntryDescriptor};
@@ -1691,6 +1863,7 @@ mod tests {
             args_file: Some(args_file.clone()),
             enable_host_result: false,
             output_mode: DebugOutputMode::Pretty,
+            network: DebugNetworkFlags::default(),
         };
         // Error returned by the real invocation args loader.
         // 真实调用参数加载器返回的错误。
@@ -1747,6 +1920,7 @@ mod tests {
             args_file: None,
             enable_host_result: false,
             output_mode: DebugOutputMode::Pretty,
+            network: DebugNetworkFlags::default(),
         };
 
         // Error returned before remove_dir_all can see the file-backed target path.
@@ -1797,6 +1971,7 @@ mod tests {
             args_file: None,
             enable_host_result: false,
             output_mode: DebugOutputMode::Pretty,
+            network: DebugNetworkFlags::default(),
         };
 
         let prepared = prepare_debug_runtime(&command).expect("runtime should prepare");
@@ -1848,6 +2023,7 @@ mod tests {
             args_file: None,
             enable_host_result: false,
             output_mode: DebugOutputMode::Pretty,
+            network: DebugNetworkFlags::default(),
         };
 
         // Error returned before the directory manifest can reach the YAML reader.
@@ -1891,6 +2067,7 @@ mod tests {
             args_file: None,
             enable_host_result: false,
             output_mode: DebugOutputMode::Pretty,
+            network: DebugNetworkFlags::default(),
         };
         let sync_output = sync_debug_skill(&sync_command).expect("sync should succeed");
 
@@ -1907,6 +2084,7 @@ mod tests {
             args_file: None,
             enable_host_result: false,
             output_mode: DebugOutputMode::Pretty,
+            network: DebugNetworkFlags::default(),
         };
         let prepared =
             prepare_debug_runtime(&run_command).expect("pre-synced runtime should prepare");

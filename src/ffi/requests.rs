@@ -4,7 +4,7 @@ use crate::runtime::managed_runtime::ManagedRuntimeKind;
 use crate::runtime_context::RuntimeRequestContext;
 use crate::runtime_options::{LuaInvocationContext, RuntimeSkillRoot};
 use crate::{
-    LuaEngineOptions, SkillInstallRequest, SkillManagementAuthority,
+    LuaEngineOptions, LuaRuntimeNetworkOptions, SkillInstallRequest, SkillManagementAuthority,
     SkillPackageConfigDescribeMode, SkillPackageConfigInputValue, SkillUninstallOptions,
 };
 use serde::{Deserialize, Serialize};
@@ -754,4 +754,48 @@ pub(super) struct FfiDescribeJsonResult {
     /// Exported JSON entrypoint names currently provided by the library.
     /// 当前由库提供的已导出 JSON 入口点名称列表。
     pub(super) exported_functions: Vec<String>,
+}
+
+/// One JSON request that checks managed skills of one root for newer versions.
+/// 检查单个根中受管技能是否有新版本的 JSON 请求。
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct CheckSkillUpdatesJsonRequest {
+    /// Stable numeric FFI handle id of the target engine.
+    /// 目标引擎的稳定数值 FFI 句柄标识。
+    pub(super) engine_id: u64,
+    /// Ordered skill roots used to validate the target root.
+    /// 用于校验目标根的有序技能根链。
+    pub(super) skill_roots: Vec<RuntimeSkillRoot>,
+    /// Root whose install records are checked.
+    /// 其安装记录将被检查的根。
+    pub(super) target_root: RuntimeSkillRoot,
+    /// Optional skill ids to check; omitted checks every managed skill in the root.
+    /// 可选的待检查技能标识；省略时检查该根中所有受管技能。
+    #[serde(default)]
+    pub(super) skill_ids: Option<Vec<String>>,
+    /// Authority required by the system entrypoint and ignored by the ordinary one.
+    /// system 入口必填、普通入口忽略的权限等级。
+    #[serde(default)]
+    pub(super) authority: Option<SkillManagementAuthority>,
+}
+
+/// One JSON request that replaces the network policy of one engine.
+/// 替换单个引擎网络策略的 JSON 请求。
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct SetNetworkOptionsJsonRequest {
+    /// Stable numeric FFI handle id of the target engine.
+    /// 目标引擎的稳定数值 FFI 句柄标识。
+    pub(super) engine_id: u64,
+    /// New network policy, including the optional GitHub token.
+    /// 新的网络策略，包括可选的 GitHub 令牌。
+    pub(super) network: LuaRuntimeNetworkOptions,
+}
+
+/// One JSON request that normalizes one user-entered mirror URL.
+/// 规范化单个用户输入镜像地址的 JSON 请求。
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct NormalizeGithubMirrorJsonRequest {
+    /// Mirror URL as entered by the user.
+    /// 用户输入的镜像地址。
+    pub(super) url: String,
 }

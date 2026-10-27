@@ -2775,6 +2775,7 @@ fn ffi_engine_new_and_free_roundtrip() {
                 allow_network_download: false,
                 github_base_url: None,
                 github_api_base_url: None,
+                github_token: None,
                 official_skill_hub_base_url: None,
                 enable_private_url_skill_install: false,
                 private_skill_source_allowlist: Vec::new(),
@@ -3147,4 +3148,52 @@ fn with_engine_rejects_same_thread_reentry() {
         Ok(())
     });
     assert!(outer_result.is_ok());
+}
+
+/// Mirror catalog, normalization and probe validation work through the engine-free JSON entrypoints.
+/// 镜像目录、地址规范化与测速校验可通过无需引擎的 JSON 入口使用。
+#[test]
+fn github_mirror_json_entrypoints_round_trip() {
+    let exported = crate::ffi::exported_ffi_function_names();
+    for name in [
+        "luaskills_ffi_github_mirror_catalog_json",
+        "luaskills_ffi_normalize_github_mirror_json",
+        "luaskills_ffi_probe_github_mirrors_json",
+        "luaskills_ffi_set_network_options_json",
+        "luaskills_ffi_check_skill_updates_json",
+        "luaskills_ffi_system_check_skill_updates_json",
+    ] {
+        assert!(exported.iter().any(|exported| exported == name), "{name}");
+    }
+
+    let catalog =
+        unsafe { decode_response_json(super::luaskills_ffi_github_mirror_catalog_json()) };
+    assert_eq!(catalog["ok"], true);
+    assert!(
+        catalog["result"]
+            .as_array()
+            .is_some_and(|mirrors| mirrors.iter().any(|mirror| mirror["kind"] == "direct"))
+    );
+
+    let input = CString::new(r#"{"url":"https://mirror.example.cn/"}"#).unwrap();
+    let normalized = unsafe {
+        decode_response_json(super::luaskills_ffi_normalize_github_mirror_json(
+            borrowed_json_buffer(&input),
+        ))
+    };
+    assert_eq!(
+        normalized["result"]["github_base_url"],
+        "https://mirror.example.cn/https://github.com"
+    );
+
+    let targets: Vec<_> = (0..=crate::download::mirrors::MIRROR_PROBE_MAX_TARGETS)
+        .map(|index| serde_json::json!({ "id": index.to_string() }))
+        .collect();
+    let input = CString::new(serde_json::json!({ "targets": targets }).to_string()).unwrap();
+    let rejected = unsafe {
+        decode_response_json(super::luaskills_ffi_probe_github_mirrors_json(
+            borrowed_json_buffer(&input),
+        ))
+    };
+    assert_eq!(rejected["ok"], false);
 }

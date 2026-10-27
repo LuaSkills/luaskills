@@ -585,6 +585,8 @@ fn parse_host_options_with_managed_roots(
             value.github_api_base_url,
             "github_api_base_url",
         )?,
+        github_token: parse_optional_string(value.github_token, "github_token")?
+            .map(crate::host::options::LuaRuntimeSecretString::new),
         official_skill_hub_base_url: parse_optional_string(
             value.official_skill_hub_base_url,
             "official_skill_hub_base_url",
@@ -854,6 +856,7 @@ fn parse_install_request(value: &FfiSkillInstallRequest) -> Result<SkillInstallR
         skill_id: parse_optional_string(value.skill_id, "skill_id")?,
         source: parse_optional_string(value.source, "source")?,
         source_type: parse_source_type(value.source_type)?,
+        replace_source: false,
     })
 }
 
