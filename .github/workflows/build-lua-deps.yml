@@ -76,6 +76,7 @@ jobs:
           python -X utf8 -m unittest discover -s scripts/release -p test_candidate.py -v
           python -X utf8 -m unittest discover -s scripts/release -p test_sdk_prerequisites.py -v
           python -X utf8 -m unittest discover -s scripts/release -p test_sdk_recovery.py -v
+          python -X utf8 -m unittest discover -s scripts/release -p test_certum_totp.py -v
       # Exercise the real public source endpoint before native builds, packaging or draft creation.
       # 在原生构建、打包或草稿创建前验证真实公共源码端点。
       - name: Verify exact public commit archive before native builds
@@ -188,6 +189,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Locked release build failed" }
           cargo metadata --locked --format-version=1 > target/candidate-metadata.json
           if ($LASTEXITCODE -ne 0) { throw "Locked dependency metadata failed" }
+      # The Windows debug tool is signed in place before packaging, so the archive carries the signed bytes.
+      # Windows 调试工具在打包前原地签名，归档因此携带已签名字节。
+      - name: Install pinned SimplySign Desktop
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/release/sign_windows.ps1 -Phase Install -EvidenceDirectory "$env:RUNNER_TEMP/certum-evidence"
+      - name: Sign and verify the Windows debug tool with Certum
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CERTUM_TOTP_EMAIL: ${{ secrets.CERTUM_TOTP_EMAIL }}
+          CERTUM_TOTP_SECRET: ${{ secrets.CERTUM_TOTP_SECRET }}
+        run: ./scripts/release/sign_windows.ps1 -Phase Sign -EvidenceDirectory "$env:RUNNER_TEMP/certum-evidence" -Files @('target/release/luaskills-debug.exe')
       - name: Package FFI core and complete existing archive set on Windows
         if: runner.os == 'Windows'
         shell: pwsh

@@ -1,0 +1,6 @@
+{
+  "certificate_subject": "CN=陈力超, O=陈力超, L=淮北市, S=安徽省, C=CN",
+  "certificate_issuer": "CN=Certum Code Signing 2021 CA, O=Asseco Data Systems S.A., C=PL",
+  "certificate_thumbprint": "19E4E2A3EFAECB6BE966D4C89B28C2C6F5C8DEA9",
+  "gpg_primary_fingerprint": "6C0B6CA76104CB7B04C2829886D1113F5325ECAC"
+}
