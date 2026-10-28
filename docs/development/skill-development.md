@@ -1854,6 +1854,8 @@ local lib = ffi.load(vulcan.path.join(base, "lib", "demo_native.dll"))
 
 `archive_type` may also be `zip` or `tar_gz` when the package ships an archive. `sha256` is accepted on every source type; for `github_release` it must agree with the digest GitHub reports for the asset.
 
+Every dependency is `required: true` by default, and any failure to make it ready stops the skill from loading. Declare `required: false` for a dependency the skill can work without: when its payload is missing, there is no package for the current platform, or its download or install fails, the runtime logs a warning and loads the skill anyway. Check for the exported file before using an optional dependency, so the skill can report that the feature is unavailable on this platform.
+
 ## 14. `vulcan.sqlite.*`
 
 `vulcan.sqlite` is a SQLite binding isolated to the **current skill scope**.

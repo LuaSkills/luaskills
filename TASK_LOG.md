@@ -9338,3 +9338,25 @@
 
 - `test_publish_crate.py` 3 项通过，覆盖 CRLF 字节、未跟踪文件、脏提交与他人提交。
 - 已发布的 0.7.0 crate 下载核对：`Cargo.toml.orig` 与源文件为 CRLF；0.6.1 为 LF。
+
+## 2026-10-28：0.7.2 可选依赖失败不再阻止技能加载
+
+### 概述
+
+- 0.7.1 只在宿主依赖缺失与禁网两种情况下读取 `required`；内置载荷缺失、当前平台没有包条目、
+  下载或安装失败都直接返回错误，`required: false` 的依赖也会让整个技能加载失败。
+- `ensure_dependency` 现在统一判定：必需依赖传播一切失败，可选依赖只记录警告，技能照常加载。
+
+### 文件变更清单
+
+- `src/dependency/manager.rs`：原安装流程改名 `install_dependency` 且不再读取 `required`；
+  `ensure_dependency` 按 `required` 决定传播错误或记录警告。
+- `src/dependency/manager/tests.rs`：新增载荷缺失、平台无条目、下载 404 三种情况的必需/可选对照测试。
+- `docs/development/skill-development.md` 与中文版：13.1 节补充 `required` 语义。
+- `contracts/embedded/v1/*`：重新生成；`Cargo.toml`、`Cargo.lock`、八种语言 README：版本 0.7.2。
+
+### 验证记录
+
+- `dependency::` 27、`skill::` 73、`ffi` 112、`download::` 46 项通过；`cargo clippy --all-targets` 无警告。
+- demo-skill 删除 Windows 原生库后：0.7.1 调试工具报 `loaded without any callable entries`；
+  本地 0.7.2 调试工具正常调用 `hello`，`native-demo` 返回 `exists: false`。

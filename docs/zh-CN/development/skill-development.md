@@ -1858,6 +1858,8 @@ local lib = ffi.load(vulcan.path.join(base, "lib", "demo_native.dll"))
 
 包内分发压缩包时，`archive_type` 也可以是 `zip` 或 `tar_gz`。所有来源类型都接受 `sha256`；对 `github_release` 来源，它必须与 GitHub 为该资产报告的摘要一致。
 
+依赖默认是 `required: true`，任何无法就绪的情况都会阻止技能加载。技能没有它也能工作的依赖应声明 `required: false`：载荷缺失、当前平台没有对应包、下载或安装失败时，运行时只记录警告并照常加载技能。使用可选依赖前先检查导出文件是否存在，以便技能报告该功能在当前平台不可用。
+
 ## 14. `vulcan.sqlite.*`
 
 `vulcan.sqlite` 是**按当前 skill 作用域隔离**的 SQLite 绑定。

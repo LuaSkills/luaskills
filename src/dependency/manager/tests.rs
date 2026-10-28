@@ -1363,3 +1363,111 @@ fn bundled_ffi_dependency_rejects_paths_outside_the_skill() {
     assert!(error.contains("bundled path"), "{error}");
     let _ = fs::remove_dir_all(root);
 }
+
+/// Return a dependency manager like `test_manager` that may download from the network.
+/// 返回与 `test_manager` 相同但允许网络下载的依赖管理器。
+fn networked_test_manager() -> (DependencyManager, PathBuf) {
+    let (manager, root) = test_manager();
+    let mut config = manager.config.clone();
+    config.allow_network_download = true;
+    (DependencyManager::new(config), root)
+}
+
+/// Start a loopback HTTP listener that answers every request with 404; return its base URL.
+/// 启动对每个请求都回答 404 的回环 HTTP 监听器；返回其基础 URL。
+fn not_found_server() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut head = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                head.push(byte[0]);
+            }
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            );
+        }
+    });
+    url
+}
+
+/// An optional dependency that cannot be made ready only warns, while the same required
+/// dependency still fails the skill: missing bundled payload, no package for this platform, and a
+/// failed download.
+/// 无法就绪的可选依赖只记警告，同样的必需依赖仍使技能失败：内置载荷缺失、本平台无包、下载失败。
+#[test]
+fn optional_dependency_failures_warn_and_required_ones_fail() {
+    let platform_key = current_platform_key();
+    if platform_key == "unknown" {
+        return;
+    }
+    let server = not_found_server();
+    let cases: Vec<(&str, PackageDependencyManifest, bool)> = vec![
+        (
+            "missing bundled payload",
+            PackageDependencyManifest {
+                ffi_dependencies: vec![bundled_ffi_dependency(
+                    platform_key,
+                    "native/absent.bin",
+                    None,
+                )],
+                ..PackageDependencyManifest::default()
+            },
+            false,
+        ),
+        (
+            "no package for this platform",
+            PackageDependencyManifest {
+                ffi_dependencies: vec![bundled_ffi_dependency(
+                    "other-platform",
+                    "native/demo.bin",
+                    None,
+                )],
+                ..PackageDependencyManifest::default()
+            },
+            false,
+        ),
+        (
+            "failed download",
+            PackageDependencyManifest {
+                tool_dependencies: vec![{
+                    let mut dependency = tool_dependency("demo-tool", "1.0.0", platform_key);
+                    dependency.packages.get_mut(platform_key).unwrap().url =
+                        Some(format!("{server}/demo.bin"));
+                    dependency
+                }],
+                ..PackageDependencyManifest::default()
+            },
+            true,
+        ),
+    ];
+    for (label, manifest, networked) in cases {
+        for required in [true, false] {
+            let (manager, root) = if networked {
+                networked_test_manager()
+            } else {
+                test_manager()
+            };
+            let skill_dir = root.join("skills").join("demo-skill");
+            fs::create_dir_all(skill_dir.join("native")).unwrap();
+            let mut manifest = manifest.clone();
+            for dependency in &mut manifest.ffi_dependencies {
+                dependency.required = required;
+            }
+            for dependency in &mut manifest.tool_dependencies {
+                dependency.required = required;
+            }
+            let result = manager.ensure_skill_dependencies("demo-skill", &skill_dir, &manifest);
+            if required {
+                assert!(result.is_err(), "{label}: required dependency must fail");
+            } else {
+                result
+                    .unwrap_or_else(|error| panic!("{label}: optional dependency failed: {error}"));
+            }
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+}

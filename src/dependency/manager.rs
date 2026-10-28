@@ -213,6 +213,10 @@ impl DependencyManager {
     /// tool
     /// lua
     /// ffi 三类依赖共用的统一安装确保流程。
+    ///
+    /// A required dependency propagates every failure; an optional one only logs a warning so the
+    /// skill still loads without it.
+    /// 必需依赖传播一切失败；可选依赖只记录警告，使技能在缺少它时仍能加载。
     #[allow(clippy::too_many_arguments)]
     fn ensure_dependency(
         &self,
@@ -223,6 +227,48 @@ impl DependencyManager {
         version: Option<String>,
         scope: DependencyScope,
         required: bool,
+        source_type: DependencySourceType,
+        source: &crate::skill::dependencies::DependencySourceSpec,
+        package: Option<&crate::skill::dependencies::DependencyPackageSpec>,
+        platform_key: &str,
+        install_root: &Path,
+    ) -> Result<(), String> {
+        let result = self.install_dependency(
+            skill_id,
+            skill_dir,
+            kind,
+            dependency_name,
+            version,
+            scope,
+            source_type,
+            source,
+            package,
+            platform_key,
+            install_root,
+        );
+        match result {
+            Err(error) if !required => {
+                log_warn(format!(
+                    "[LuaSkills:dependency] Skill '{}' loads without optional dependency '{}' on {}: {}",
+                    skill_id, dependency_name, platform_key, error
+                ));
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    /// Reuse, install or download one dependency, failing whenever it cannot be made ready.
+    /// 复用、安装或下载单个依赖，无法就绪时一律失败。
+    #[allow(clippy::too_many_arguments)]
+    fn install_dependency(
+        &self,
+        skill_id: &str,
+        skill_dir: &Path,
+        kind: SkillDependencyKind,
+        dependency_name: &str,
+        version: Option<String>,
+        scope: DependencyScope,
         source_type: DependencySourceType,
         source: &crate::skill::dependencies::DependencySourceSpec,
         package: Option<&crate::skill::dependencies::DependencyPackageSpec>,
@@ -250,32 +296,15 @@ impl DependencyManager {
         }
 
         if scope == DependencyScope::Host {
-            if required {
-                return Err(format!(
-                    "required host dependency '{}' is missing",
-                    dependency_name
-                ));
-            }
-            log_warn(format!(
-                "[LuaSkills:dependency] Optional host dependency '{}' is missing",
-                dependency_name
-            ));
-            return Ok(());
+            return Err(format!("host dependency '{}' is missing", dependency_name));
         }
         // Bundled payloads are local files, so only remote sources depend on the network switch.
         // 内置载荷是本地文件，因此只有远程来源受网络开关约束。
         if !self.config.allow_network_download && source_type != DependencySourceType::Bundled {
-            if required {
-                return Err(format!(
-                    "required dependency '{}' is missing and network download is disabled",
-                    dependency_name
-                ));
-            }
-            log_warn(format!(
-                "[LuaSkills:dependency] Optional dependency '{}' is missing and download is disabled",
+            return Err(format!(
+                "dependency '{}' is missing and network download is disabled",
                 dependency_name
             ));
-            return Ok(());
         }
 
         let resolved_request = self.resolve_dependency_request(
