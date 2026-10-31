@@ -556,8 +556,8 @@ fn shell_command(text: &str) -> Command {
 /// Install native-command replacements in the fresh desktop `lua`; returns unit or an initialization error.
 /// 在新的桌面 `lua` 中安装原生命令替代实现；返回空值或初始化错误。
 pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
-    // This is the actual native os table loaded by Lua::unsafe_new before any skill code executes.
-    // 这是 Lua::unsafe_new 在任何技能代码执行前加载的实际原生 os 表。
+    // This is the actual native os table loaded by the core state owner before any skill code executes.
+    // 这是核心状态所有者在任何技能代码执行前加载的实际原生 os 表。
     let os: Table = lua.globals().get("os")?;
     os.set(
         "execute",

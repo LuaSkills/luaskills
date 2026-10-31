@@ -2661,7 +2661,7 @@ mod tests {
         ManagedRuntimeLeaseBinding, ManagedRuntimePackageContext,
     };
     use crate::runtime::path::render_host_visible_path;
-    use mlua::{Lua, UserData};
+    use mlua::UserData;
     use serde_json::{Value, json};
     use std::fs;
     use std::panic::{self, AssertUnwindSafe};
@@ -2777,7 +2777,7 @@ mod tests {
     /// 返回不含析构观测 userdata 的全新 VM。
     fn plain_test_lua_vm() -> LuaVm {
         LuaVm {
-            lua: Lua::new(),
+            lua: crate::runtime::lua_state::LuaState::new(mlua::StdLib::ALL_SAFE).unwrap(),
             last_used_at: Instant::now(),
         }
     }
@@ -2796,7 +2796,7 @@ mod tests {
     ) -> LuaVm {
         // Lua state that owns the drop probe until the complete VM is destroyed.
         // 持有析构探针直到完整 VM 被销毁的 Lua 状态。
-        let lua = Lua::new();
+        let lua = crate::runtime::lua_state::LuaState::new(mlua::StdLib::ALL_SAFE).unwrap();
         // Rust userdata whose destructor performs the non-blocking state-lock observation.
         // 析构函数执行非阻塞状态锁观测的 Rust userdata。
         let probe = lua

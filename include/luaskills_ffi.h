@@ -5,14 +5,14 @@
 #include <stdint.h>
 
 /*
-Standard C ABI exported by luaskills 0.7.3; compile hosts against this exact header.
-luaskills 0.7.3 导出的标准 C ABI；宿主必须使用本精确头文件重新编译。
+Standard C ABI exported by luaskills 0.7.4; compile hosts against this exact header.
+luaskills 0.7.4 导出的标准 C ABI；宿主必须使用本精确头文件重新编译。
 Retired database fields, symbols and uninstall options were removed; older layouts are incompatible.
 退役数据库字段、符号及卸载选项已删除；旧版布局不兼容。
 */
 
 /*
- Integration contract for v0.7.3:
+ Integration contract for v0.7.4:
 - This header is the low-level standard ABI for controlled host integrations.
 - Public high-level JSON FFI declarations are provided by luaskills_json_ffi.h.
 - Returned memory must be released only with the matching luaskills free function.
@@ -21,7 +21,7 @@ Retired database fields, symbols and uninstall options were removed; older layou
 - Callbacks must not unwind across the C ABI boundary.
 - Same-thread reentry into the same engine is not supported.
 - Skills are treated as trusted code by default; this ABI does not promise sandbox isolation.
-v0.7.3 集成契约：
+v0.7.4 集成契约：
 - 当前头文件是面向受控宿主集成的低层标准 ABI。
 - 公共高层 JSON FFI 声明位于 luaskills_json_ffi.h。
 - 所有返回内存都只能使用匹配的 luaskills 释放函数处理。

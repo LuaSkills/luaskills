@@ -1,6 +1,6 @@
 [package]
 name = "luaskills"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -65,7 +65,9 @@ libc = "0.2"
 # Match the consuming host's schema engine and disable ambient network/file retrieval.
 # 对齐消费宿主的 Schema 引擎，并禁用环境网络及文件检索。
 jsonschema = { version = "=0.49.9", default-features = false }
-mlua = { version = "0.12.0-rc.1", features = ["luajit52", "vendored", "serialize", "send"] }
+# Keep the audited external-state lifetime contract identical for FFI builds and Rust consumers.
+# 使 FFI 构建与 Rust 消费者使用相同的已审计外部状态生命周期契约。
+mlua = { version = "=0.12.0", features = ["luajit52", "vendored", "serialize", "send"] }
 notify = "8.2.0"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 # Match the host's SQLite binding and bundle the engine for portable durable operation journals.

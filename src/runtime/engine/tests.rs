@@ -6540,7 +6540,7 @@ fn lua_vm_pool_reaps_idle_vm_outside_state_lock() {
     let (observation_tx, observation_rx) = mpsc::channel();
     // Lua state that owns the drop probe through its globals table.
     // 通过全局表持有析构探针的 Lua 状态。
-    let lua = Lua::new();
+    let lua = crate::runtime::lua_state::LuaState::new(mlua::StdLib::ALL_SAFE).unwrap();
     // Userdata wrapper retained until the complete Lua VM is destroyed.
     // 保留到完整 Lua 虚拟机析构时的用户数据包装。
     let probe = lua
@@ -6601,7 +6601,7 @@ fn lua_vm_pool_recovers_after_poisoned_state_lock_and_wait() {
         // 恢复后的池状态保护对象，用于发布一个可用虚拟机。
         let mut state = notifier_pool.lock_state();
         state.available.push(LuaVm {
-            lua: unsafe { mlua::Lua::unsafe_new() },
+            lua: crate::runtime::lua_state::LuaState::new(mlua::StdLib::ALL).unwrap(),
             last_used_at: Instant::now(),
         });
         notifier_pool.condvar.notify_one();

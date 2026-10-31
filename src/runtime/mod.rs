@@ -13,6 +13,9 @@ pub(crate) mod file_system;
 pub(crate) mod file_watcher;
 pub mod help;
 pub mod logging;
+/// Native LuaJIT allocation and exclusive state ownership.
+/// 原生 LuaJIT 分配与独占状态所有权。
+pub(crate) mod lua_state;
 pub mod managed_io;
 pub(crate) mod managed_package;
 pub mod managed_runtime;

@@ -12,8 +12,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use mlua::{
-    Function as LuaFunction, HookTriggers, Lua, LuaOptions, StdLib, Table as LuaTable,
-    Value as LuaValue, VmState, ffi,
+    Function as LuaFunction, HookTriggers, Lua, StdLib, Table as LuaTable, Value as LuaValue,
+    VmState, ffi,
 };
 
 use crate::host::options::RuntimeSkillRoot;
@@ -1764,8 +1764,8 @@ const SKILL_CONFIG_VALIDATOR_TIMEOUT: Duration = Duration::from_millis(100);
 /// 单个校验器允许返回的结构化问题最大数量。
 const SKILL_CONFIG_VALIDATOR_MAX_ISSUES: usize = 1_024;
 
-/// Track validator allocations when LuaJIT rejects mlua's initial allocator.
-/// 当 LuaJIT 拒绝 mlua 的初始分配器时跟踪校验器分配。
+/// Track validator allocations while retaining LuaJIT's address-constrained allocator.
+/// 跟踪校验器分配，同时保留 LuaJIT 地址受限分配器。
 struct ValidatorAllocatorBudget {
     /// Original allocator retained for low-address LuaJIT allocations.
     /// 保留用于 LuaJIT 低地址分配的原始分配器。
@@ -1808,8 +1808,8 @@ unsafe extern "C" fn validator_budget_allocator(
     result
 }
 
-/// Restore the original allocator before mlua closes its LuaJIT state.
-/// 在 mlua 关闭 LuaJIT 状态前恢复原始分配器。
+/// Restore the original allocator before the core owner closes its LuaJIT state.
+/// 在核心所有者关闭 LuaJIT 状态前恢复原始分配器。
 struct ValidatorAllocatorGuard<'lua> {
     /// Lua state that owns the allocator being intercepted.
     /// 被拦截分配器所属的 Lua 状态。
@@ -1820,8 +1820,8 @@ struct ValidatorAllocatorGuard<'lua> {
 }
 
 impl ValidatorAllocatorGuard<'_> {
-    /// Install the budget only after mlua reports its allocator unavailable.
-    /// 仅在 mlua 报告自身分配器不可用后安装预算。
+    /// Wrap lua's current allocator with limit bytes and return a guard restoring it on drop.
+    /// 使用 limit 字节预算包装 lua 当前分配器，返回释放时恢复原分配器的保护对象。
     fn install(lua: &Lua, limit: usize) -> ValidatorAllocatorGuard<'_> {
         let mut original_userdata = std::ptr::null_mut();
         let original = lua
@@ -1851,27 +1851,14 @@ impl Drop for ValidatorAllocatorGuard<'_> {
     }
 }
 
-/// Enforce the validator memory ceiling with the available allocator strategy.
-/// 使用可用的分配器策略强制执行校验器内存上限。
+/// Wrap the native state's allocator with the validator ceiling and return its restoration guard.
+/// 使用校验器上限包装原生状态分配器，并返回恢复保护对象。
 fn install_validator_memory_limit(
-    lua: &Lua,
-) -> Result<Option<ValidatorAllocatorGuard<'_>>, String> {
-    match lua.set_memory_limit(SKILL_CONFIG_VALIDATOR_MAX_MEMORY_BYTES) {
-        Ok(_) => Ok(None),
-        Err(mlua::Error::MemoryControlNotAvailable)
-            if cfg!(all(target_os = "linux", target_arch = "aarch64")) =>
-        {
-            // LuaJIT may reject Rust's high-address allocator on Linux ARM64.
-            // Linux ARM64 上 LuaJIT 可能拒绝 Rust 的高地址分配器。
-            Ok(Some(ValidatorAllocatorGuard::install(
-                lua,
-                SKILL_CONFIG_VALIDATOR_MAX_MEMORY_BYTES,
-            )))
-        }
-        Err(error) => Err(format!(
-            "CONFIG_VALIDATOR_UNAVAILABLE: memory limit cannot be enforced: {error}"
-        )),
-    }
+    lua: &crate::runtime::lua_state::LuaState,
+) -> ValidatorAllocatorGuard<'_> {
+    // Every core-owned state uses the native allocator; wrap that exact allocator without switching strategies.
+    // 每个核心状态都使用原生分配器；直接包装该精确分配器，不再切换策略。
+    ValidatorAllocatorGuard::install(lua, SKILL_CONFIG_VALIDATOR_MAX_MEMORY_BYTES)
 }
 
 /// Execute one optional package business validator in an isolated capability-free Lua state.
@@ -1910,12 +1897,10 @@ fn run_business_validator(
             error
         )
     })?;
-    let lua = Lua::new_with(
-        StdLib::TABLE | StdLib::STRING | StdLib::MATH,
-        LuaOptions::default(),
-    )
-    .map_err(|error| format!("CONFIG_VALIDATOR_UNAVAILABLE: {error}"))?;
-    let _allocator_guard = install_validator_memory_limit(&lua)?;
+    let lua =
+        crate::runtime::lua_state::LuaState::new(StdLib::TABLE | StdLib::STRING | StdLib::MATH)
+            .map_err(|error| format!("CONFIG_VALIDATOR_UNAVAILABLE: {error}"))?;
+    let _allocator_guard = install_validator_memory_limit(&lua);
     let globals = lua.globals();
     for forbidden in [
         "dofile", "loadfile", "load", "require", "package", "io", "os", "debug", "ffi", "jit",
@@ -2219,11 +2204,9 @@ mod tests {
     /// 验证后备分配器拒绝大型 Lua 分配并恢复原始分配器。
     #[test]
     fn validator_fallback_allocator_enforces_hard_limit_and_restores() {
-        let lua = Lua::new_with(
-            StdLib::TABLE | StdLib::STRING | StdLib::MATH,
-            LuaOptions::default(),
-        )
-        .expect("create isolated validator state");
+        let lua =
+            crate::runtime::lua_state::LuaState::new(StdLib::TABLE | StdLib::STRING | StdLib::MATH)
+                .expect("create isolated validator state");
         let baseline = lua.used_memory();
         let guard = ValidatorAllocatorGuard::install(&lua, baseline + 64 * 1_024);
         let error = lua
@@ -2232,6 +2215,14 @@ mod tests {
             .expect_err("allocator must reject an allocation above its limit");
         assert!(error.to_string().contains("memory"), "{error}");
         drop(guard);
+        // The exact allocation rejected under the budget succeeds after restoration.
+        // 预算下被拒绝的同一分配在恢复原分配器后必须成功。
+        assert_eq!(
+            lua.load("return #string.rep('x', 512 * 1024)")
+                .eval::<usize>()
+                .unwrap(),
+            512 * 1024
+        );
         assert_eq!(lua.load("return 42").eval::<i32>().unwrap(), 42);
     }
 

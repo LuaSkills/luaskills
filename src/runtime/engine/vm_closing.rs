@@ -10,7 +10,8 @@ pub(crate) const HOST_CALL_WHILE_CLOSING: &str = "host functions are unavailable
 
 /// Run pending finalizers on a live `lua` before the last handle drops and `lua_close` runs.
 /// 在最后一个句柄释放、`lua_close` 运行之前，于存活的 `lua` 上运行待执行终结器。
-pub(crate) fn prepare_lua_close(lua: &Lua) {
+#[cfg(test)]
+fn prepare_lua_close(lua: &Lua) {
     if let Err(error) = lua.gc_collect() {
         log_error(format!("Lua VM finalization before close failed: {error}"));
     }
@@ -18,15 +19,24 @@ pub(crate) fn prepare_lua_close(lua: &Lua) {
 
 /// Refuse a host call once the instance is closing.
 /// 实例关闭后拒绝宿主调用。
-/// mlua releases the instance before `lua_close` and its value handles panic from then on, so a host
-/// function fails here before it converts arguments or touches any Lua value.
-/// mlua 在 `lua_close` 之前释放实例，此后其值句柄会 panic，因此宿主函数在转换参数或访问任何 Lua 值之前于此失败。
+/// Core-owned states close admission before `lua_close`; registry destruction then invalidates mlua handles.
+/// 核心状态在 `lua_close` 前关闭准入；注册表销毁随后使 mlua 句柄失效。
+/// Refuse the call before converting arguments or touching a Lua value in either closing phase.
+/// 在关闭的任一阶段，都必须在转换参数或访问 Lua 值之前拒绝调用。
 /// LuaJIT disables hooks while finalizers run, so this check cannot be a call hook.
 /// LuaJIT 在终结器运行期间禁用钩子，因此该检查不能用调用钩子实现。
 fn ensure_open(lua: &Lua) -> mlua::Result<()> {
+    // Owned mlua states lose their weak owner at close; external core states additionally mark admission closed.
+    // mlua 自有状态在关闭时失去弱所有者；核心外部状态还会显式标记准入关闭。
     match lua.weak().try_upgrade() {
-        Some(_) => Ok(()),
-        None => Err(mlua::Error::runtime(HOST_CALL_WHILE_CLOSING)),
+        Some(_)
+            if lua
+                .app_data_ref::<crate::runtime::lua_state::Closing>()
+                .is_none() =>
+        {
+            Ok(())
+        }
+        _ => Err(mlua::Error::runtime(HOST_CALL_WHILE_CLOSING)),
     }
 }
 
@@ -172,7 +182,7 @@ mod tests {
     fn lua_close_finalizers_never_enter_host_functions() {
         let calls = Arc::new(AtomicUsize::new(0));
         let refused = Arc::new(Mutex::new(Vec::<String>::new()));
-        let lua = Lua::new();
+        let lua = crate::runtime::lua_state::LuaState::new(mlua::StdLib::ALL_SAFE).unwrap();
         let counter = Arc::clone(&calls);
         lua.globals()
             .set(

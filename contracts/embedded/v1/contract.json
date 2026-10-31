@@ -198,7 +198,7 @@
     "title": "EmbeddedCoreDescription",
     "type": "object"
   },
-  "core_version": "0.7.3",
+  "core_version": "0.7.4",
   "error_response": {
     "$defs": {
       "EmbeddedError": {
@@ -333,11 +333,11 @@
     "type": "object"
   },
   "generator": {
-    "cargo_lock_sha256": "d7bb10ba0485de4e344c3eb29e72556cfd207218fffdd72c3c3a003e40c93f05",
+    "cargo_lock_sha256": "c324810241d7b05f931e98005decf58103916f2108f4719319e4942a49fc7337",
     "name": "luaskills/generate_embedded_contract",
     "schema_draft": "2020-12",
     "source_sha256": "f31dc521eeff41b774bddf11408f2a8dd2c1d6bb77c8650bfc3bfb7fa5e621d1",
-    "source_version": "0.7.3"
+    "source_version": "0.7.4"
   },
   "json_vectors": {
     "invalid": [

@@ -244,6 +244,16 @@ jobs:
         shell: pwsh
         run: cargo test --locked --doc -j 4 -- --test-threads=1
 
+      # Non-PIE hosts combine low main heaps with high worker arenas on ARM64; PIE tests alone miss GC64 truncation.
+      # ARM64 非 PIE 宿主混用低地址主堆与高地址线程区域；仅运行 PIE 测试无法覆盖 GC64 截断。
+      - name: Verify native allocator under ARM64 non-PIE heap reuse
+        if: matrix.platform == 'linux-arm64'
+        shell: bash
+        env:
+          RUSTFLAGS: "-C relocation-model=static -C link-arg=-no-pie"
+          CARGO_TARGET_DIR: target/allocator-nonpie
+        run: cargo test --locked --lib runtime::lua_state::tests -j 4 -- --test-threads=1 --nocapture
+
   ffi-examples:
     name: FFI examples on Python 3.14 and Node 24
     runs-on: ubuntu-24.04

@@ -507,16 +507,10 @@ fn default_runlua_vm_pool_config() -> LuaVmPoolConfig {
 /// Runtime state of a single Lua VM instance.
 /// 单个 Lua 虚拟机实例的运行时状态。
 struct LuaVm {
-    lua: Lua,
+    /// Exclusive native-allocated state; temporary Lua handles cannot own its lifetime.
+    /// 独占的原生分配状态；临时 Lua 句柄不能拥有其生命周期。
+    lua: crate::runtime::lua_state::LuaState,
     last_used_at: Instant,
-}
-
-impl Drop for LuaVm {
-    /// Run pending finalizers while the instance is alive, then refuse host functions during `lua_close`.
-    /// 在实例存活时运行待执行终结器，然后在 `lua_close` 期间拒绝宿主函数。
-    fn drop(&mut self) {
-        vm_closing::prepare_lua_close(&self.lua);
-    }
 }
 
 /// Complete dependency context required to construct one isolated runlua-compatible VM.
@@ -3122,10 +3116,10 @@ struct ManagedRuntimeTransactionContextSlot {
 
 /// RAII Lua transaction scope restoring the previous app-data context on every exit path.
 /// 在每条退出路径上恢复此前应用数据上下文的 RAII Lua 事务作用域。
-struct LuaManagedRuntimeTransactionScopeGuard {
+struct LuaManagedRuntimeTransactionScopeGuard<'lua> {
     /// Lua VM whose host-private transaction slot is temporarily replaced.
     /// 宿主私有事务槽被临时替换的 Lua VM。
-    lua: Lua,
+    lua: &'lua Lua,
     /// Exact transaction context active before this scope.
     /// 当前作用域前活动的精确事务上下文。
     previous: Option<ManagedRuntimeTransactionContext>,
@@ -3190,25 +3184,22 @@ fn replace_lua_managed_runtime_transaction(
         .and_then(|slot| slot.context)
 }
 
-impl LuaManagedRuntimeTransactionScopeGuard {
+impl<'lua> LuaManagedRuntimeTransactionScopeGuard<'lua> {
     /// Install one optional transaction context until this guard is dropped.
     /// 安装一个可选事务上下文，直到当前保护对象被释放。
-    fn install(lua: &Lua, context: Option<ManagedRuntimeTransactionContext>) -> Self {
+    fn install(lua: &'lua Lua, context: Option<ManagedRuntimeTransactionContext>) -> Self {
         // Exact previous context captured for nested or repeated execution safety.
         // 为嵌套或重复执行安全捕获的精确此前上下文。
         let previous = replace_lua_managed_runtime_transaction(lua, context);
-        Self {
-            lua: lua.clone(),
-            previous,
-        }
+        Self { lua, previous }
     }
 }
 
-impl Drop for LuaManagedRuntimeTransactionScopeGuard {
+impl Drop for LuaManagedRuntimeTransactionScopeGuard<'_> {
     /// Restore the exact previous transaction context without running Lua code.
     /// 在不执行 Lua 代码的情况下恢复精确此前事务上下文。
     fn drop(&mut self) {
-        replace_lua_managed_runtime_transaction(&self.lua, self.previous);
+        replace_lua_managed_runtime_transaction(self.lua, self.previous);
     }
 }
 
@@ -6506,8 +6497,10 @@ fn finish_pooled_vm_request_scope<T>(
 
 /// RAII guard that restores the outer `vulcan` execution context after one nested `vulcan.call`.
 /// 在一次嵌套 `vulcan.call` 之后恢复外层 `vulcan` 执行上下文的 RAII 守卫。
-struct LuaNestedCallScopeGuard {
-    lua: Lua,
+struct LuaNestedCallScopeGuard<'lua> {
+    /// Borrow the active owner; nested restoration cannot keep a closed state alive.
+    /// 借用活动所有者；嵌套恢复不能保留已关闭的状态。
+    lua: &'lua Lua,
     host_options: Arc<LuaRuntimeHostOptions>,
     sqlite_host: Option<Arc<SqliteSkillHost>>,
     /// Captured outer state restored after the nested call finishes.
@@ -6518,25 +6511,25 @@ struct LuaNestedCallScopeGuard {
 
 /// Prepared nested call scope and inherited invocation context for one `vulcan.call`.
 /// 单次 `vulcan.call` 已准备好的嵌套调用作用域与继承调用上下文。
-struct PreparedLuaNestedCallScope {
+struct PreparedLuaNestedCallScope<'lua> {
     /// Guard that owns the captured outer `vulcan` state and restores it after the nested call.
     /// 持有已捕获外层 `vulcan` 状态并在嵌套调用后恢复它的守卫。
-    guard: LuaNestedCallScopeGuard,
+    guard: LuaNestedCallScopeGuard<'lua>,
     /// Invocation context inherited from the outer `vulcan.context` snapshot.
     /// 从外层 `vulcan.context` 快照继承得到的调用上下文。
     invocation_context: LuaInvocationContext,
 }
 
-impl LuaNestedCallScopeGuard {
+impl<'lua> LuaNestedCallScopeGuard<'lua> {
     /// Capture the current outer `vulcan` execution state before entering one nested skill.
     /// 在进入一次嵌套技能调用之前捕获当前外层 `vulcan` 执行状态。
     fn new(
-        lua: &Lua,
+        lua: &'lua Lua,
         host_options: Arc<LuaRuntimeHostOptions>,
         sqlite_host: Option<Arc<SqliteSkillHost>>,
     ) -> Result<Self, String> {
         Ok(Self {
-            lua: lua.clone(),
+            lua,
             host_options,
             sqlite_host,
             previous_state: capture_lua_nested_outer_state(lua)?,
@@ -6590,13 +6583,13 @@ impl LuaNestedCallScopeGuard {
     /// Returns: `Ok(())` after all `vulcan` subcontexts are populated, or an error string for the failed step.
     /// 返回：所有 `vulcan` 子上下文填充成功后返回 `Ok(())`，否则返回失败步骤的错误字符串。
     fn enter_nested_call(&self, target: LuaNestedCallTarget<'_>) -> Result<(), String> {
-        LuaEngine::populate_vulcan_request_context(&self.lua, Some(target.invocation_context))?;
+        LuaEngine::populate_vulcan_request_context(self.lua, Some(target.invocation_context))?;
         // Build the internal context from target identity while preserving outer luaexec markers.
         // 使用目标身份构建内部上下文，同时保留外层 luaexec 标记。
         let nested_internal_context =
             build_lua_nested_internal_execution_context(&target, self.previous_internal_context());
-        populate_vulcan_internal_execution_context(&self.lua, &nested_internal_context)?;
-        populate_lua_nested_resource_contexts(&self.lua, self.host_options.as_ref(), target)?;
+        populate_vulcan_internal_execution_context(self.lua, &nested_internal_context)?;
+        populate_lua_nested_resource_contexts(self.lua, self.host_options.as_ref(), target)?;
         Ok(())
     }
 
@@ -6605,18 +6598,18 @@ impl LuaNestedCallScopeGuard {
     fn restore_previous_state(&self) -> Result<(), String> {
         // Exact outer package restored before any fallible Lua-state restoration step.
         // 在任何可能失败的 Lua 状态恢复步骤前恢复精确外层包。
-        replace_lua_managed_package_context(&self.lua, self.previous_state.managed_package.clone());
-        self.previous_state.core_state.restore(&self.lua)?;
+        replace_lua_managed_package_context(self.lua, self.previous_state.managed_package.clone());
+        self.previous_state.core_state.restore(self.lua)?;
         restore_lua_nested_provider_contexts(
-            &self.lua,
+            self.lua,
             self.sqlite_host.as_ref(),
             &self.previous_state.sqlite_skill_name,
         )?;
-        restore_vulcan_context_snapshot(&self.lua, &self.previous_state.context)?;
-        populate_vulcan_internal_execution_context(&self.lua, self.previous_internal_context())?;
-        restore_vulcan_file_context_snapshot(&self.lua, &self.previous_state.file_context)?;
+        restore_vulcan_context_snapshot(self.lua, &self.previous_state.context)?;
+        populate_vulcan_internal_execution_context(self.lua, self.previous_internal_context())?;
+        restore_vulcan_file_context_snapshot(self.lua, &self.previous_state.file_context)?;
         restore_lua_nested_dependency_context(
-            &self.lua,
+            self.lua,
             self.host_options.as_ref(),
             &self.previous_state.file_context,
             self.previous_internal_context(),
@@ -6673,7 +6666,7 @@ fn prepare_lua_nested_call_scope(
     lua: &Lua,
     host_options: Arc<LuaRuntimeHostOptions>,
     sqlite_host: Option<Arc<SqliteSkillHost>>,
-) -> mlua::Result<PreparedLuaNestedCallScope> {
+) -> mlua::Result<PreparedLuaNestedCallScope<'_>> {
     // Capture the outer state before deriving any nested invocation context from it.
     // 在从外层状态推导任何嵌套调用上下文之前先捕获外层状态。
     let guard = LuaNestedCallScopeGuard::new(lua, host_options, sqlite_host)
@@ -6687,7 +6680,7 @@ fn prepare_lua_nested_call_scope(
     })
 }
 
-impl Drop for LuaNestedCallScopeGuard {
+impl Drop for LuaNestedCallScopeGuard<'_> {
     fn drop(&mut self) {
         if !self.active {
             return;
@@ -6717,7 +6710,7 @@ impl LuaVmLease {
     fn lua(&self) -> Result<&Lua, String> {
         self.vm
             .as_ref()
-            .map(|vm| &vm.lua)
+            .map(|vm| &*vm.lua)
             .ok_or_else(|| "pooled Lua VM lease has already been retired".to_string())
     }
 
@@ -9151,7 +9144,8 @@ impl LuaEngine {
     ) -> Result<LuaVm, String> {
         // Fresh independent Lua state compiled from one immutable shared load generation.
         // 基于一个不可变共享加载代编译的全新独立 Lua 状态。
-        let lua = unsafe { Lua::unsafe_new() };
+        let lua = crate::runtime::lua_state::LuaState::new(mlua::StdLib::ALL)
+            .map_err(|error| error.to_string())?;
         lua.set_app_data(Arc::clone(&self.managed_runtime_services));
         lua.set_app_data(Arc::clone(&self.managed_runtime_workers));
         Self::setup_package_paths(&lua, self.host_options.as_ref())
@@ -9215,7 +9209,8 @@ impl LuaEngine {
             managed_runtime_services,
             managed_runtime_workers,
         } = context;
-        let lua = unsafe { Lua::unsafe_new() };
+        let lua = crate::runtime::lua_state::LuaState::new(mlua::StdLib::ALL)
+            .map_err(|error| error.to_string())?;
         lua.set_app_data(managed_runtime_services);
         lua.set_app_data(managed_runtime_workers);
         Self::setup_package_paths(&lua, host_options.as_ref())
