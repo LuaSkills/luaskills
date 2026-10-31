@@ -196,7 +196,7 @@ try {
     $Output = Invoke-CheckedProcess `
         -FilePath "cargo" `
         -ArgumentList @(
-            "run", "--bin", "luaskills-debug", "--",
+            "run", "--features", "debug-sqlite", "--bin", "luaskills-debug", "--",
             "call",
             "--runtime-root", $RuntimeRootPath,
             "--managed-runtime-distribution-root", $DistributionRootPath,

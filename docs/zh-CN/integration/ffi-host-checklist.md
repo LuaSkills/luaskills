@@ -80,19 +80,12 @@
   - `resources/luaskills-packages/help/packages` 必须存在
   - `resources/luaskills-packages/help/modules` 必须存在
   - `licenses/luaskills-packages/index.json` 必须存在
-- 已经决定数据库 provider 模式：
-  - `dynamic_library`
-  - `host_callback`
-  - `space_controller`
+- 已注册 SQLite 宿主回调，并明确选择 `standard` 或 `json` 传输。
 - 如果要用 callback：
   - 全局 provider/service callback 必须先注册，再创建 engine
   - 按 engine 绑定的受管会话 wake callback 必须在 engine 创建后注册
   - TypeScript / Python 宿主优先使用 SDK 的 `set_*_provider_json_callback`，不要在业务代码里手写 buffer clone
   - 若要让 Lua 调用宿主工具，需注册 `luaskills_ffi_set_host_tool_json_callback`
-- 如果要用 `space_controller`：
-  - 已确认 `endpoint / auto_spawn / executable_path / process_mode`
-- 如果连接远端 controller：
-  - 必须关闭 `auto_spawn`
 - 如果宿主准备接 `system_runtime_lease`：
   - 已接受固定的 `runtime_root/system_lua_lib` 作为默认 system Lua 库目录
   - 每次 `create` 都会传入严格 `system_package = { id, root, dependencies_file }`
@@ -130,7 +123,6 @@
 - `install / update / uninstall`
 - 数据库 provider callback
 - `vulcan.host.*` 宿主工具桥接 callback
-- `space_controller`
 
 正式宿主构造 skill roots 时，建议先固定三层语义：
 

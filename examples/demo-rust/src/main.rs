@@ -55,8 +55,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     host_options.dependency_dir_name = "dependencies".to_string();
     host_options.state_dir_name = "state".to_string();
     host_options.database_dir_name = "databases".to_string();
-    host_options.space_controller.executable_path =
-        Some(runtime_root.join("bin").join(vldb_controller_binary_name()));
 
     // HostToolGuard keeps the demo host-tool callback installed for this process scope only.
     // HostToolGuard 只在当前进程作用域内保持 demo 宿主工具回调已安装。
@@ -301,14 +299,4 @@ fn demo_embedding_for(input: &str) -> Vec<f64> {
             rounded_value
         })
         .collect()
-}
-
-/// Return the platform-specific vldb-controller executable name.
-/// 返回平台相关的 vldb-controller 可执行文件名。
-fn vldb_controller_binary_name() -> &'static str {
-    if cfg!(windows) {
-        "vldb-controller.exe"
-    } else {
-        "vldb-controller"
-    }
 }

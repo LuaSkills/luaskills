@@ -94,10 +94,6 @@ fn test_uninstall_result(skill_removed: bool) -> SkillUninstallResult {
     SkillUninstallResult {
         skill_id: "vulcan-codekit".to_string(),
         skill_removed,
-        sqlite_removed: false,
-        lancedb_removed: false,
-        sqlite_retained: false,
-        lancedb_retained: false,
         message: if skill_removed {
             "skill package removed".to_string()
         } else {
@@ -1652,8 +1648,6 @@ fn uninstall_returns_safe_default_database_flags() {
         .uninstall_skill("vulcan-codekit")
         .expect("uninstall should succeed");
     assert!(result.skill_removed);
-    assert!(!result.sqlite_removed);
-    assert!(!result.lancedb_removed);
     assert!(!skill_root.join("vulcan-codekit").exists());
 
     let _ = std::fs::remove_dir_all(&temp_root);

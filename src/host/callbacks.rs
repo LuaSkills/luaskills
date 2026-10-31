@@ -558,8 +558,17 @@ fn lock_callback_registry<T>(
 /// `registry` selects the concrete process-wide callback storage, and `callback` is the new value.
 /// `registry` 选择具体的进程级回调存储，`callback` 是新的回调值。
 fn set_callback_registry_value<T>(registry: &'static Mutex<Option<T>>, callback: Option<T>) {
-    let mut guard = lock_callback_registry(registry);
-    *guard = callback;
+    // Extract the previous owner without executing host-controlled destructors under this lock.
+    // 取出旧所有者，不在此锁内执行宿主控制的析构方法。
+    let previous = {
+        // Only publication of the replacement requires the registry mutex.
+        // 仅发布替换值需要注册表互斥锁。
+        let mut guard = lock_callback_registry(registry);
+        std::mem::replace(&mut *guard, callback)
+    };
+    // Host callback owners may reenter registration during destruction.
+    // 宿主回调所有者可能在析构期间重入注册接口。
+    drop(previous);
 }
 
 /// Clone the callback currently stored inside one process-wide callback registry.
@@ -1044,6 +1053,59 @@ mod tests {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    /// Observe the progress registry lock while a host callback owner is destroyed.
+    /// 在宿主回调所有者析构时观察进度注册表锁。
+    struct CallbackDropProbe {
+        /// Records lock availability without blocking when the regression is present.
+        /// 记录锁可用性，在回归问题存在时不发生阻塞。
+        unlocked: Arc<AtomicBool>,
+    }
+
+    impl Drop for CallbackDropProbe {
+        /// Record whether the exact callback registry can be acquired; return no value.
+        /// 记录能否取得精确回调注册表的锁；无返回值。
+        fn drop(&mut self) {
+            // Poisoning still yields an acquired guard; WouldBlock identifies destruction under lock.
+            // 中毒仍会产生已取得的保护对象；WouldBlock 表明在锁内析构。
+            let available = !matches!(
+                skill_operation_progress_callback_registry().try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            self.unlocked.store(available, Ordering::SeqCst);
+        }
+    }
+
+    /// The shared host registration path must release captured owners after releasing its registry lock.
+    /// 共享宿主注册路径必须在释放注册表锁后释放捕获的所有者。
+    #[test]
+    fn callback_replacement_drops_host_state_outside_lock() {
+        // Serialize global registration and retain its original callback for restoration.
+        // 串行化全局注册，并保留原回调用于恢复。
+        let _serial = progress_callback_test_guard();
+        // The snapshot preserves unrelated registrations while this fixture runs.
+        // 快照在此夹具运行期间保留无关注册。
+        let previous = clone_callback_registry_value(skill_operation_progress_callback_registry());
+        // The observation remains available after its callback-owned probe is destroyed.
+        // 回调拥有的探针析构后，观测值仍然可用。
+        let unlocked = Arc::new(AtomicBool::new(false));
+        // Only the closure will own this destruction probe.
+        // 仅闭包拥有此析构探针。
+        let probe = CallbackDropProbe {
+            unlocked: Arc::clone(&unlocked),
+        };
+        set_skill_operation_progress_callback(Some(Arc::new(move |_| {
+            // Retain the complete owner for as long as the callback exists.
+            // 在回调存在期间保留完整所有者。
+            let _owner = &probe;
+        })));
+        set_skill_operation_progress_callback(None);
+        set_skill_operation_progress_callback(previous);
+        assert!(
+            unlocked.load(Ordering::SeqCst),
+            "host callback was dropped under its registry lock"
+        );
     }
 
     /// Verify skill operation id timestamps accept normal post-epoch system times.

@@ -154,16 +154,7 @@ function main(): void {
     enable_private_url_skill_install: "uint8_t",
     private_skill_source_allowlist: "void *",
     private_skill_source_allowlist_len: "size_t",
-    sqlite_library_path: "str",
-    sqlite_provider_mode: "int32_t",
     sqlite_callback_mode: "int32_t",
-    lancedb_library_path: "str",
-    lancedb_provider_mode: "int32_t",
-    lancedb_callback_mode: "int32_t",
-    space_controller_endpoint: "str",
-    space_controller_auto_spawn: "uint8_t",
-    space_controller_executable_path: "str",
-    space_controller_process_mode: "int32_t",
     cache_config: "void *",
     runlua_pool_config: "void *",
     reserved_entry_names: "void *",
@@ -252,12 +243,23 @@ function main(): void {
     len: "size_t",
   });
 
+  // Describe the optional host result; invocation_result_free owns its buffers.
+  // 描述可选宿主结果；其缓冲区由 invocation_result_free 负责释放。
+  const FfiRuntimeHostResult = koffi.struct("FfiRuntimeHostResult", {
+    kind: FfiOwnedBuffer,
+    payload_json: FfiOwnedBuffer,
+    payload_bytes: "size_t",
+  });
+
   const FfiRuntimeInvocationResult = koffi.struct("FfiRuntimeInvocationResult", {
     content: FfiOwnedBuffer,
     overflow_mode: "int32_t",
     template_hint: FfiOwnedBuffer,
     content_bytes: "size_t",
     content_lines: "size_t",
+    // Preserve the trailing nullable pointer in the public C result layout.
+    // 保留公开 C 结果布局末尾的可空指针。
+    host_result: koffi.pointer(FfiRuntimeHostResult),
   });
 
   const freeBuffer = library.func("void luaskills_ffi_buffer_free(FfiOwnedBuffer value)");
@@ -318,16 +320,7 @@ function main(): void {
           enable_private_url_skill_install: 0,
           private_skill_source_allowlist: null,
           private_skill_source_allowlist_len: 0,
-          sqlite_library_path: null,
-          sqlite_provider_mode: 0,
           sqlite_callback_mode: 0,
-          lancedb_library_path: null,
-          lancedb_provider_mode: 0,
-          lancedb_callback_mode: 0,
-          space_controller_endpoint: null,
-          space_controller_auto_spawn: 0,
-          space_controller_executable_path: null,
-          space_controller_process_mode: 0,
           cache_config: null,
           runlua_pool_config: null,
           reserved_entry_names: null,

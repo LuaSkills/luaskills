@@ -22,10 +22,13 @@ normalize_output_dir() {
   # 在 tar 看到冒号前，将 Windows 盘符路径转换为 shell 原生路径。
   local raw_path="$1"
   case "$raw_path" in
-    [A-Za-z]:/*)
+    [A-Za-z]:/*|[A-Za-z]:\\*)
       local drive_lower rest
       drive_lower="$(printf '%s' "${raw_path:0:1}" | tr '[:upper:]' '[:lower:]')"
       rest="${raw_path:3}"
+      # Native Windows callers supply backslashes; tar must receive a shell-local path without a drive colon.
+      # 原生 Windows 调用方提供反斜杠；tar 必须接收没有盘符冒号的 shell 本地路径。
+      rest="${rest//\\//}"
       if [ -d "/mnt/$drive_lower" ]; then
         printf '/mnt/%s/%s\n' "$drive_lower" "$rest"
       else
@@ -102,16 +105,15 @@ write_debug_runtime_setup_scripts() {
   local package_root="$1"
 
   if platform_is_windows; then
-    cat > "$package_root/setup_runtime.ps1" <<PS1
+    # Windows PowerShell 5 needs a BOM to decode bilingual scripts reliably.
+    # Windows PowerShell 5 需要 BOM 才能可靠解码双语脚本。
+    printf '\357\273\277' > "$package_root/setup_runtime.ps1"
+    cat >> "$package_root/setup_runtime.ps1" <<PS1
 param(
     # Dependency target to fetch for this debug package.
     # 当前调试包需要拉取的依赖目标。
-    [ValidateSet("all", "lua", "vldb", "vldb-controller", "vldb-direct")]
-    [string]\$Target = "lua",
-    # Optional database dependency preset used only by all/vldb targets.
-    # 仅 all/vldb 目标使用的可选数据库依赖预设。
-    [ValidateSet("none", "vldb-controller", "vldb-direct", "host-callback")]
-    [string]\$Database = "none"
+    [ValidateSet("all", "lua")]
+    [string]\$Target = "lua"
 )
 
 \$ErrorActionPreference = "Stop"
@@ -125,7 +127,7 @@ param(
 \$RuntimeRoot = Join-Path \$PackageRoot "runtime"
 
 New-Item -ItemType Directory -Force -Path \$RuntimeRoot | Out-Null
-powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path \$PackageRoot "scripts\\deps\\fetch_deps.ps1") -Target \$Target -Database \$Database -RuntimeRoot \$RuntimeRoot
+powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path \$PackageRoot "scripts\\deps\\fetch_deps.ps1") -Target \$Target -RuntimeRoot \$RuntimeRoot
 \$FetchExitCode = \$LASTEXITCODE
 if (\$FetchExitCode -ne 0) {
     exit \$FetchExitCode
@@ -141,12 +143,8 @@ REM Target 选择要下载的依赖分组。
 set "TARGET=%~1"
 if "%TARGET%"=="" set "TARGET=lua"
 
-REM Database selects the optional database dependency preset.
-REM Database 选择可选数据库依赖预设。
-set "DATABASE=%~2"
-if "%DATABASE%"=="" set "DATABASE=none"
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup_runtime.ps1" -Target "%TARGET%" -Database "%DATABASE%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup_runtime.ps1" -Target "%TARGET%"
 if errorlevel 1 (
   echo Failed to prepare debug runtime dependencies.
   pause
@@ -223,7 +221,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PACKAGE_ROOT_WIN="$(to_windows_path "$PACKAGE_ROOT")"
 TARGET="${1:-all}"
-DATABASE="${2:-vldb-controller}"
 RUNTIME_ROOT="${RUNTIME_ROOT:-$PACKAGE_ROOT/runtime}"
 RUNTIME_ROOT_WIN="$(to_windows_path "$RUNTIME_ROOT")"
 POWERSHELL_HOST="$(resolve_powershell_host)"
@@ -236,8 +233,6 @@ FORWARDED_ARGS=(
   "${PACKAGE_ROOT_WIN}\scripts\deps\fetch_deps.ps1"
   -Target
   "$TARGET"
-  -Database
-  "$DATABASE"
   -RuntimeRoot
   "$RUNTIME_ROOT_WIN"
 )
@@ -259,11 +254,10 @@ set -euo pipefail
 
 PACKAGE_ROOT="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 TARGET="\${1:-lua}"
-DATABASE="\${2:-none}"
 RUNTIME_ROOT="\${RUNTIME_ROOT:-\$PACKAGE_ROOT/runtime}"
 
 mkdir -p "\$RUNTIME_ROOT"
-RUNTIME_ROOT="\$RUNTIME_ROOT" bash "\$PACKAGE_ROOT/scripts/deps/fetch_deps.sh" "\$TARGET" "\$DATABASE"
+RUNTIME_ROOT="\$RUNTIME_ROOT" bash "\$PACKAGE_ROOT/scripts/deps/fetch_deps.sh" "\$TARGET"
 echo "Debug runtime dependencies are ready under \$RUNTIME_ROOT"
 SH
     chmod +x "$package_root/setup_runtime.sh"
@@ -274,9 +268,8 @@ set -euo pipefail
 
 PACKAGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET="${1:-lua}"
-DATABASE="${2:-none}"
 
-exec bash "$PACKAGE_ROOT/setup_runtime.sh" "$TARGET" "$DATABASE"
+exec bash "$PACKAGE_ROOT/setup_runtime.sh" "$TARGET"
 SH
     chmod +x "$package_root/upgrade_deps.sh"
     return
@@ -294,16 +287,13 @@ PACKAGE_ROOT="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 # Target 选择当前调试包需要拉取的依赖分组。
 TARGET="\${1:-lua}"
 
-# Database selects the optional database dependency preset used by all/vldb targets.
-# Database 选择 all/vldb 目标使用的可选数据库依赖预设。
-DATABASE="\${2:-none}"
 
 # RuntimeRoot receives Lua runtime packages and optional native helpers.
 # RuntimeRoot 接收 Lua runtime packages 与可选原生辅助工具。
 RUNTIME_ROOT="\${RUNTIME_ROOT:-\$PACKAGE_ROOT/runtime}"
 
 mkdir -p "\$RUNTIME_ROOT"
-RUNTIME_ROOT="\$RUNTIME_ROOT" bash "\$PACKAGE_ROOT/scripts/deps/fetch_deps.sh" "\$TARGET" "\$DATABASE"
+RUNTIME_ROOT="\$RUNTIME_ROOT" bash "\$PACKAGE_ROOT/scripts/deps/fetch_deps.sh" "\$TARGET"
 echo "Debug runtime dependencies are ready under \$RUNTIME_ROOT"
 SH
   chmod +x "$package_root/setup_runtime.sh"
@@ -320,11 +310,8 @@ PACKAGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Target 选择要下载的依赖分组。
 TARGET="${1:-lua}"
 
-# Database selects the optional database dependency preset.
-# Database 选择可选数据库依赖预设。
-DATABASE="${2:-none}"
 
-bash "$PACKAGE_ROOT/setup_runtime.sh" "$TARGET" "$DATABASE"
+bash "$PACKAGE_ROOT/setup_runtime.sh" "$TARGET"
 SH
   chmod +x "$package_root/upgrade_deps.sh"
 }
@@ -335,7 +322,10 @@ write_debug_launcher_scripts() {
   local package_root="$1"
 
   if platform_is_windows; then
-    cat > "$package_root/debug.ps1" <<'PS1'
+    # Windows PowerShell 5 needs a BOM to decode bilingual scripts reliably.
+    # Windows PowerShell 5 需要 BOM 才能可靠解码双语脚本。
+    printf '\357\273\277' > "$package_root/debug.ps1"
+    cat >> "$package_root/debug.ps1" <<'PS1'
 param(
     # Debug command forwarded to luaskills-debug.
     # 转发给 luaskills-debug 的调试命令。
@@ -437,8 +427,8 @@ if ($SkillId) {
 if ($Tool) {
     $ForwardedArgs += @("--tool", $Tool)
 }
-if ($ArgsJson) {
-    $ForwardedArgs += @("--args-json", $ArgsJson)
+if ($ArgsJson -and $ArgsFile) {
+    throw "Use either -ArgsJson or -ArgsFile, not both."
 }
 if ($ArgsFile) {
     $ForwardedArgs += @("--args-file", (Resolve-Path -LiteralPath $ArgsFile).Path)
@@ -450,8 +440,30 @@ if ($EnableHostResult) {
     $ForwardedArgs += "--enable-host-result"
 }
 
-& $BinaryPath @ForwardedArgs
-exit $LASTEXITCODE
+# Windows PowerShell 5 re-quotes native arguments and can corrupt JSON; use a private UTF-8 file.
+# Windows PowerShell 5 会重新引用原生参数并破坏 JSON；使用私有 UTF-8 文件传输。
+$InlineArgsFile = $null
+# Restore the caller's encoding after reading the debugger's UTF-8 output.
+# 读取调试器 UTF-8 输出后恢复调用方编码。
+$PreviousOutputEncoding = [Console]::OutputEncoding
+try {
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    if ($ArgsJson) {
+        $InlineArgsFile = [System.IO.Path]::GetTempFileName()
+        [System.IO.File]::WriteAllText($InlineArgsFile, $ArgsJson, [System.Text.UTF8Encoding]::new($false))
+        $ForwardedArgs += @("--args-file", $InlineArgsFile)
+    }
+    & $BinaryPath @ForwardedArgs
+    # Capture the executable result before cleanup can change native exit state.
+    # 在清理可能改变原生退出状态前捕获可执行程序结果。
+    $DebugExitCode = $LASTEXITCODE
+} finally {
+    [Console]::OutputEncoding = $PreviousOutputEncoding
+    if ($null -ne $InlineArgsFile) {
+        Remove-Item -LiteralPath $InlineArgsFile -Force
+    }
+}
+exit $DebugExitCode
 PS1
   cat > "$package_root/debug.bat" <<'BAT'
 @echo off
@@ -526,8 +538,19 @@ PACKAGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEBUG_PS1_WIN="$(to_windows_path "$PACKAGE_ROOT/debug.ps1")"
 POWERSHELL_HOST="$(resolve_powershell_host)"
 FORWARDED_ARGS=()
+# Only a file created here is removed; PowerShell's native argument marshalling must not rewrite JSON.
+# 仅删除此处创建的文件；不能让 PowerShell 原生参数封送改写 JSON。
+INLINE_ARGS_FILE=""
+# Track the two documented input transports and reject conflicting options.
+# 记录两种文档化输入传输方式并拒绝冲突选项。
+HAS_ARGS_JSON="false"
+HAS_ARGS_FILE="false"
+# Preserve the inline payload until parsing has validated all options.
+# 保留内联内容，直到解析验证全部选项。
+ARGS_JSON=""
+trap '[ -z "$INLINE_ARGS_FILE" ] || rm -f -- "$INLINE_ARGS_FILE"' EXIT
 
-if [ "${1:-}" = "inspect" ] || [ "${1:-}" = "list-tools" ] || [ "${1:-}" = "call" ]; then
+if [ "${1:-}" = "sync" ] || [ "${1:-}" = "inspect" ] || [ "${1:-}" = "list-tools" ] || [ "${1:-}" = "call" ]; then
   FORWARDED_ARGS+=("-Command" "$1")
   shift
 fi
@@ -538,18 +561,59 @@ while [ "$#" -gt 0 ]; do
       FORWARDED_ARGS+=("-SkillPath" "$(to_windows_path "${2:?--skill-path requires a value}")")
       shift 2
       ;;
+    -SkillId|--skill-id)
+      FORWARDED_ARGS+=("-SkillId" "${2:?--skill-id requires a value}")
+      shift 2
+      ;;
     -ArgsFile|--args-file)
+      HAS_ARGS_FILE="true"
       FORWARDED_ARGS+=("-ArgsFile" "$(to_windows_path "${2:?--args-file requires a value}")")
       shift 2
       ;;
-    *)
-      FORWARDED_ARGS+=("$1")
+    -ArgsJson|--args-json)
+      HAS_ARGS_JSON="true"
+      ARGS_JSON="${2:?--args-json requires a value}"
+      shift 2
+      ;;
+    -Tool|--tool)
+      FORWARDED_ARGS+=("-Tool" "${2:?--tool requires a value}")
+      shift 2
+      ;;
+    -Output|--output)
+      FORWARDED_ARGS+=("-Output" "${2:?--output requires a value}")
+      shift 2
+      ;;
+    -EnableHostResult|--enable-host-result)
+      FORWARDED_ARGS+=("-EnableHostResult")
       shift
+      ;;
+    -Command)
+      FORWARDED_ARGS+=("-Command" "${2:?-Command requires a value}")
+      shift 2
+      ;;
+    -h|--help)
+      "$PACKAGE_ROOT/bin/luaskills-debug.exe" --help
+      exit 0
+      ;;
+    *)
+      echo "Unknown debug launcher argument: $1" >&2
+      exit 2
       ;;
   esac
 done
 
-exec "$POWERSHELL_HOST" -NoProfile -ExecutionPolicy Bypass -File "$DEBUG_PS1_WIN" "${FORWARDED_ARGS[@]}"
+if [ "$HAS_ARGS_JSON" = "true" ] && [ "$HAS_ARGS_FILE" = "true" ]; then
+  echo "Use either --args-json or --args-file, not both." >&2
+  exit 2
+fi
+if [ "$HAS_ARGS_JSON" = "true" ]; then
+  INLINE_ARGS_FILE="$(mktemp)"
+  printf '%s' "$ARGS_JSON" > "$INLINE_ARGS_FILE"
+  FORWARDED_ARGS+=("-ArgsFile" "$(to_windows_path "$INLINE_ARGS_FILE")")
+fi
+# Keep the wrapper alive so its EXIT trap removes the private input file even after a failed call.
+# 保持包装器存活，使 EXIT trap 即使在调用失败后也删除私有输入文件。
+"$POWERSHELL_HOST" -NoProfile -ExecutionPolicy Bypass -File "$DEBUG_PS1_WIN" "${FORWARDED_ARGS[@]}"
 SH
     chmod +x "$package_root/debug.sh"
     return
@@ -731,11 +795,11 @@ write_debug_package_readme() {
     printf '## Quick Start\n\n'
     printf '```%s\n%s\n%s\n%s\n%s\n```\n\n' "$shell_name" "$setup_command" "$inspect_command" "$list_command" "$call_command"
     printf 'The default setup command fetches the `lua` target and stages `runtime/lua_packages/`, `runtime/libs/`, `runtime/resources/`, and `runtime/licenses/` metadata. It does not download the extra LuaSkills FFI SDK.\n\n'
-    printf 'Use `all` only when you also need database helper binaries. The Lua setup path stays metadata-complete so packaged-runtime manifest validation remains consistent.\n\n'
+    printf 'SQLite is built into this debugger host. Skills declaring `sqlite.enable: true` can use `execute_script`, `execute_batch`, and `query_json` without a controller or database DLL. Databases persist under `runtime/databases/sqlite/<skill-id>/<skill-id>.sqlite3`.\n\n'
     printf '## 中文说明\n\n'
     printf '这个包是独立的 skill 调试工作台。解压后先执行初始化脚本拉取 Lua runtime packages，然后把一个 skill 目录放到 `skills/` 下，就可以通过 `debug` 启动脚本执行 `inspect`、`list-tools` 或 `call`。\n\n'
     printf '```%s\n%s\n%s\n%s\n%s\n```\n\n' "$shell_name" "$setup_command" "$inspect_command" "$list_command" "$call_command"
-    printf '默认初始化会把 `runtime/lua_packages/`、`runtime/libs/`、`runtime/resources/` 与 `runtime/licenses/` 元数据放进调试工作区，不会额外下载 LuaSkills FFI SDK。只有需要数据库辅助进程时才建议执行 `all`。\n'
+    printf '默认初始化会把 `runtime/lua_packages/`、`runtime/libs/`、`runtime/resources/` 与 `runtime/licenses/` 元数据放进调试工作区，不会额外下载 LuaSkills FFI SDK。SQLite 已由调试工具自身提供，不需要控制器或数据库动态库。\n'
   } > "$package_root/README.md"
 }
 
@@ -779,7 +843,7 @@ MD
 DEBUG_BINARY_NAME="$(debug_binary_name)"
 DEBUG_BINARY_PATH="target/release/$DEBUG_BINARY_NAME"
 if [ ! -f "$DEBUG_BINARY_PATH" ]; then
-  echo "Missing release debug binary: $DEBUG_BINARY_PATH. Run 'cargo build --release --bin luaskills-debug' first." >&2
+  echo "Missing release debug binary: $DEBUG_BINARY_PATH. Run 'cargo build --release --features debug-sqlite --bin luaskills-debug' first." >&2
   exit 1
 fi
 
@@ -814,7 +878,7 @@ cat > "$PACKAGE_ROOT/debug-tool-manifest.json" <<JSON
   "skills_dir": "skills",
   "release_tag": "${RELEASE_TAG}",
   "default_fetch_target": "lua",
-  "fetch_targets": ["lua", "all", "vldb", "vldb-controller", "vldb-direct"]
+  "fetch_targets": ["lua", "all"]
 }
 JSON
 

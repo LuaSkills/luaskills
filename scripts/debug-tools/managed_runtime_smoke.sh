@@ -163,7 +163,7 @@ echo "Calling managed runtime debug skill"
 # 非默认 B3-B7 值用于证明宿主初始化策略能够传递到真实 Python/Node 调用。
 OUTPUT="$(
   cd "$REPO_ROOT"
-  cargo run --bin luaskills-debug -- \
+  cargo run --features debug-sqlite --bin luaskills-debug -- \
     call \
     --runtime-root "$RUNTIME_ROOT" \
     --managed-runtime-distribution-root "$DISTRIBUTION_ROOT" \

@@ -583,12 +583,7 @@ export class StandardFixtureRuntimeClient {
           github_api_base_url: null,
           github_token: null,
           default_text_encoding: defaultTextEncoding,
-          sqlite_library_path: null,
-          sqlite_provider_mode: "dynamic_library",
           sqlite_callback_mode: "standard",
-          lancedb_library_path: null,
-          lancedb_provider_mode: "dynamic_library",
-          lancedb_callback_mode: "standard",
           cache_config: null,
           runlua_pool_config: null,
           reserved_entry_names: [],
@@ -1186,12 +1181,10 @@ export class SystemEngineJsonClient {
     skillId: string,
     skillRoots?: JsonMap[],
     targetRoot?: JsonMap,
-    options: JsonMap = {},
   ): JsonMap {
     const payload: JsonMap = {
       skill_roots: this.resolveSkillRoots(skillRoots),
       skill_id: skillId,
-      options,
     };
     if (targetRoot !== undefined) {
       payload.target_root = targetRoot;

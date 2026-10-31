@@ -65,15 +65,6 @@ int32_t luaskills_ffi_set_sqlite_provider_json_callback(
     FfiOwnedBuffer *error_out
 );
 
-/*
-Register or clear the LanceDB JSON callback before engine creation.
-在创建 engine 前注册或清理 LanceDB JSON callback。
-*/
-int32_t luaskills_ffi_set_lancedb_provider_json_callback(
-    FfiJsonProviderCallback callback,
-    void *user_data,
-    FfiOwnedBuffer *error_out
-);
 
 /*
 Register or clear the host-tool JSON callback used by Lua vulcan.host.*.

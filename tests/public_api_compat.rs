@@ -287,4 +287,30 @@ fn handwritten_ffi_bindings_match_public_v1_layouts() {
         typescript_struct_fields(primary_typescript_binding, "FfiLuaEngineOptionsV3"),
         "typescript/demo.ts V3 engine options",
     );
+
+    // Invocation layouts must include the nested host result even when demos only print text.
+    // 即使演示仅输出文本，调用结果布局也必须包含嵌套宿主结果。
+    for struct_name in ["FfiRuntimeHostResult", "FfiRuntimeInvocationResult"] {
+        // Derive expected fields from the public contract instead of duplicating its definition.
+        // 从公开契约派生预期字段，避免重复定义契约。
+        let fields = c_struct_fields(header, struct_name);
+        assert_binding_layout(
+            &fields,
+            python_struct_fields(primary_python_binding, struct_name),
+            &format!("python/demo.py {struct_name}"),
+        );
+        for (label, source) in [
+            ("typescript/demo.ts", primary_typescript_binding),
+            (
+                "typescript/lifecycle_demo.ts",
+                include_str!("../examples/ffi/typescript/lifecycle_demo.ts"),
+            ),
+        ] {
+            assert_binding_layout(
+                &fields,
+                typescript_struct_fields(source, struct_name),
+                &format!("{label} {struct_name}"),
+            );
+        }
+    }
 }

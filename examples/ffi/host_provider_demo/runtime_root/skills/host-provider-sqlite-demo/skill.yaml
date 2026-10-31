@@ -3,7 +3,6 @@ version: 0.1.0
 enable: true
 sqlite:
   enable: true
-  log_level: info
 help:
   main:
     description: Host-provider SQLite demo help entry.

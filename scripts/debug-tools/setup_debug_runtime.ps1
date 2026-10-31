@@ -1,12 +1,8 @@
 ﻿param(
     # Dependency target to fetch for local debug runs.
     # 本地调试运行需要拉取的依赖目标。
-    [ValidateSet("all", "lua", "vldb", "vldb-controller", "vldb-direct")]
+    [ValidateSet("all", "lua")]
     [string]$Target = "lua",
-    # Optional database dependency preset used only by all/vldb targets.
-    # 仅 all/vldb 目标使用的可选数据库依赖预设。
-    [ValidateSet("none", "vldb-controller", "vldb-direct", "host-callback")]
-    [string]$Database = "none",
     # Runtime root that receives debug dependencies.
     # 接收调试依赖的运行根目录。
     [string]$RuntimeRoot = "output"
@@ -57,7 +53,7 @@ $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($PSCommandPath) { Spli
 $ProjectRoot = Resolve-ProjectRoot -ScriptDirectory $ScriptDir
 $RuntimeRootPath = if ([System.IO.Path]::IsPathRooted($RuntimeRoot)) { $RuntimeRoot } else { Join-Path $ProjectRoot $RuntimeRoot }
 New-Item -ItemType Directory -Force -Path $RuntimeRootPath | Out-Null
-powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot "scripts\deps\fetch_deps.ps1") -Target $Target -Database $Database -RuntimeRoot $RuntimeRootPath
+powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot "scripts\deps\fetch_deps.ps1") -Target $Target -RuntimeRoot $RuntimeRootPath
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }

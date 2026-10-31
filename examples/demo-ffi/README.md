@@ -20,4 +20,4 @@ examples/ffi/standard_runtime/runtime_root
 bash examples/demo-ffi/run.sh all
 ```
 
-`lua` 目标会安装 Lua runtime 包到 demo 运行根，`vldb` 目标会把 `vldb-controller(.exe)` 放入 demo 运行根的 `bin/` 目录。
+`lua` 和 `all` 目标仅安装 Lua runtime 包到 demo 运行根。数据库由宿主注册并管理。

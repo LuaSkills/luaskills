@@ -431,20 +431,6 @@ pub struct PreparedSkillUninstall {
     pub(crate) previous_install_record: Option<InstalledSkillRecord>,
 }
 
-/// Optional database cleanup switches accepted by skill uninstall operations.
-/// 技能卸载操作接受的可选数据库清理开关集合。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SkillUninstallOptions {
-    /// Remove the SQLite database directory owned by the target skill when true.
-    /// 为 true 时删除目标技能拥有的 SQLite 数据目录。
-    #[serde(default)]
-    pub remove_sqlite: bool,
-    /// Remove the LanceDB database directory owned by the target skill when true.
-    /// 为 true 时删除目标技能拥有的 LanceDB 数据目录。
-    #[serde(default)]
-    pub remove_lancedb: bool,
-}
-
 /// Structured uninstall result that reports whether code and databases were removed or retained.
 /// 结构化卸载结果，用于报告代码与数据库是被删除还是被保留。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -455,18 +441,6 @@ pub struct SkillUninstallResult {
     /// Whether the skill package directory itself was removed.
     /// skill 包目录本身是否已经被删除。
     pub skill_removed: bool,
-    /// Whether the SQLite database directory was removed explicitly.
-    /// SQLite 数据目录是否已被显式删除。
-    pub sqlite_removed: bool,
-    /// Whether the LanceDB database directory was removed explicitly.
-    /// LanceDB 数据目录是否已被显式删除。
-    pub lancedb_removed: bool,
-    /// Whether the SQLite database directory was intentionally retained.
-    /// SQLite 数据目录是否被有意保留。
-    pub sqlite_retained: bool,
-    /// Whether the LanceDB database directory was intentionally retained.
-    /// LanceDB 数据目录是否被有意保留。
-    pub lancedb_retained: bool,
     /// Human-readable explanation of the uninstall result.
     /// 当前卸载结果的人类可读说明文本。
     pub message: String,
@@ -823,10 +797,6 @@ impl SkillManager {
             result: SkillUninstallResult {
                 skill_id: skill_id.to_string(),
                 skill_removed,
-                sqlite_removed: false,
-                lancedb_removed: false,
-                sqlite_retained: false,
-                lancedb_retained: false,
                 message: if skill_removed {
                     "skill package removed".to_string()
                 } else {

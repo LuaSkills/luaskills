@@ -1,7 +1,7 @@
 ﻿param(
     # Dependency target to fetch before running the demo.
     # 运行 demo 前需要拉取的依赖目标。
-    [ValidateSet("none", "all", "lua", "vldb")]
+    [ValidateSet("none", "all", "lua")]
     [string]$Fetch = "none"
 )
 

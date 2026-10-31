@@ -38,7 +38,6 @@ use crate::host::callbacks::{
     try_has_model_embed_callback, try_has_model_llm_callback, try_has_skill_management_callback,
 };
 use crate::host::database::RuntimeDatabaseProviderCallbacks;
-use crate::lancedb_host::{LanceDbSkillBinding, LanceDbSkillHost, disabled_skill_status_json};
 use crate::lua_skill::{SkillMeta, validate_luaskills_identifier, validate_luaskills_version};
 use crate::runtime::config::{SkillConfigDeleteResult, SkillConfigEntry, SkillConfigWriteResult};
 use crate::runtime::config_service::{
@@ -85,17 +84,17 @@ use crate::runtime_help::{
 };
 use crate::runtime_logging::{error as log_error, info as log_info, warn as log_warn};
 use crate::runtime_options::{
-    LuaInvocationContext, LuaRuntimeHostOptions, LuaRuntimeManagedRuntimeConfig,
-    LuaRuntimeNetworkOptions, RuntimeSkillRoot,
+    LuaInvocationContext, LuaRuntimeHostMode, LuaRuntimeHostOptions,
+    LuaRuntimeManagedRuntimeConfig, LuaRuntimeNetworkOptions, RuntimeSkillRoot,
 };
 use crate::runtime_result::RuntimeInvocationResult;
 use crate::skill::dependencies::PackageDependencyManifest;
 use crate::skill::manager::{
     PreparedSkillApply, ResolvedSkillInstance, SkillApplyResult, SkillInstallRequest,
     SkillManagementAuthority, SkillManager, SkillManagerConfig, SkillOperationPlane,
-    SkillUninstallOptions, SkillUninstallResult, SkillUpdateCheck,
-    collect_effective_skill_instances_from_roots, resolve_declared_skill_instance_from_roots,
-    resolve_effective_skill_instance_from_roots, resolve_requested_skill_id,
+    SkillUninstallResult, SkillUpdateCheck, collect_effective_skill_instances_from_roots,
+    resolve_declared_skill_instance_from_roots, resolve_effective_skill_instance_from_roots,
+    resolve_requested_skill_id,
 };
 use crate::sqlite_host::{
     SqliteSkillBinding, SqliteSkillHost,
@@ -142,7 +141,6 @@ struct LoadedSkill {
     /// Trusted managed-runtime package context built by the skill loader.
     /// 由 Skill 加载器构造的可信受管运行时包上下文。
     managed_package: Arc<ManagedRuntimePackageContext>,
-    lancedb_binding: Option<Arc<LanceDbSkillBinding>>,
     sqlite_binding: Option<Arc<SqliteSkillBinding>>,
     resolved_entry_names: HashMap<String, String>,
 }
@@ -539,9 +537,6 @@ struct RunLuaVmBuildContext<'a> {
     /// Runtime Skill roots used for dependency context resolution.
     /// 用于依赖上下文解析的运行时 Skill 根。
     runtime_skill_roots: Vec<RuntimeSkillRoot>,
-    /// Optional LanceDB host bridge visible to nested calls.
-    /// 嵌套调用可见的可选 LanceDB 宿主桥接。
-    lancedb_host: Option<Arc<LanceDbSkillHost>>,
     /// Optional SQLite host bridge visible to nested calls.
     /// 嵌套调用可见的可选 SQLite 宿主桥接。
     sqlite_host: Option<Arc<SqliteSkillHost>>,
@@ -573,7 +568,6 @@ impl<'a> RunLuaVmBuildContext<'a> {
             host_options: Arc::clone(&engine.host_options),
             skill_config_service: Arc::clone(&engine.skill_config_service),
             runtime_skill_roots: engine.runtime_skill_roots.clone(),
-            lancedb_host: engine.lancedb_host.clone(),
             sqlite_host: engine.sqlite_host.clone(),
             managed_runtime_services: Arc::clone(&engine.managed_runtime_services),
             managed_runtime_workers: Arc::clone(&engine.managed_runtime_workers),
@@ -814,7 +808,6 @@ pub struct LuaEngine {
     /// Package-aware configuration service shared by host and Lua access paths.
     /// 由宿主与 Lua 访问路径共享的包级配置服务。
     skill_config_service: Arc<SkillPackageConfigService>,
-    lancedb_host: Option<Arc<LanceDbSkillHost>>,
     sqlite_host: Option<Arc<SqliteSkillHost>>,
     database_provider_callbacks: Arc<RuntimeDatabaseProviderCallbacks>,
     native_library_search_guard: NativeLibrarySearchGuard,
@@ -878,11 +871,14 @@ fn resolve_engine_managed_runtime_roots(
     host_options: &LuaRuntimeHostOptions,
 ) -> Result<Option<Arc<ManagedRuntimeRoots>>, String> {
     match host_options.runtime_root.as_deref() {
-        Some(runtime_root) => Ok(Some(Arc::new(ManagedRuntimeRoots::new(
-            runtime_root,
-            host_options.managed_runtime_distribution_root.as_deref(),
-            host_options.managed_runtime_environment_root.as_deref(),
-        )?))),
+        Some(runtime_root) => Ok(Some(Arc::new(
+            ManagedRuntimeRoots::new(
+                runtime_root,
+                host_options.managed_runtime_distribution_root.as_deref(),
+                host_options.managed_runtime_environment_root.as_deref(),
+            )?
+            .with_host_mode(host_options.host_mode),
+        ))),
         None if host_options.managed_runtime_distribution_root.is_some()
             || host_options.managed_runtime_environment_root.is_some() =>
         {
@@ -1895,10 +1891,6 @@ struct LuaCallDispatchEntry {
 /// Provider bindings resolved for one nested `vulcan.call` target.
 /// 为单个嵌套 `vulcan.call` 目标解析出的 provider binding。
 struct LuaCallProviderBindings {
-    /// LanceDB binding resolved for the nested target owner skill.
-    /// 为嵌套目标所属 skill 解析出的 LanceDB binding。
-    lancedb: Option<Arc<LanceDbSkillBinding>>,
-
     /// SQLite binding resolved for the nested target owner skill.
     /// 为嵌套目标所属 skill 解析出的 SQLite binding。
     sqlite: Option<Arc<SqliteSkillBinding>>,
@@ -1946,29 +1938,22 @@ impl LuaCallDispatchEntry {
 /// The owner_skill_name parameter is the skill id that owns the nested target.
 /// owner_skill_name 参数是拥有嵌套目标的 skill id。
 ///
-/// The lancedb_host parameter is the optional shared LanceDB host.
-/// lancedb_host 参数是可选的共享 LanceDB 宿主。
 ///
 /// The sqlite_host parameter is the optional shared SQLite host.
 /// sqlite_host 参数是可选的共享 SQLite 宿主。
 ///
-/// Return both provider bindings that should be installed before entering the nested target.
-/// 返回进入嵌套目标前应安装的两个 provider binding。
+/// Return the SQLite provider binding that should be installed before entering the nested target.
+/// 返回进入嵌套目标前应安装的SQLite provider binding。
 fn resolve_lua_call_provider_bindings(
     owner_skill_name: &str,
-    lancedb_host: Option<&Arc<LanceDbSkillHost>>,
     sqlite_host: Option<&Arc<SqliteSkillHost>>,
 ) -> Result<LuaCallProviderBindings, String> {
-    let lancedb = match lancedb_host {
-        Some(host) => host.binding_for_skill(owner_skill_name)?,
-        None => None,
-    };
     let sqlite = match sqlite_host {
         Some(host) => host.binding_for_skill(owner_skill_name)?,
         None => None,
     };
 
-    Ok(LuaCallProviderBindings { lancedb, sqlite })
+    Ok(LuaCallProviderBindings { sqlite })
 }
 
 /// Build the immutable `vulcan.call` dispatcher entries from the loaded runtime registry.
@@ -2324,9 +2309,6 @@ struct LuaNestedCallTarget<'a> {
     /// Inherited invocation context passed into the nested skill.
     /// 传入嵌套 skill 的继承调用上下文。
     invocation_context: &'a LuaInvocationContext,
-    /// LanceDB binding resolved for the owning skill before entering the call.
-    /// 进入调用前为所属 skill 解析出的 LanceDB 绑定。
-    lancedb_binding: Option<Arc<LanceDbSkillBinding>>,
     /// SQLite binding resolved for the owning skill before entering the call.
     /// 进入调用前为所属 skill 解析出的 SQLite 绑定。
     sqlite_binding: Option<Arc<SqliteSkillBinding>>,
@@ -2360,7 +2342,6 @@ fn build_lua_nested_call_target<'a>(
         owner_managed_package: &dispatch_entry.owner_managed_package,
         entry_path: &dispatch_entry.entry_path,
         invocation_context,
-        lancedb_binding: provider_bindings.lancedb,
         sqlite_binding: provider_bindings.sqlite,
     }
 }
@@ -2417,11 +2398,6 @@ fn populate_lua_nested_resource_contexts(
         lua,
         host_options,
         Some(target.owner_skill_dir),
-        Some(target.owner_skill_name),
-    )?;
-    LuaEngine::populate_vulcan_lancedb_context(
-        lua,
-        target.lancedb_binding,
         Some(target.owner_skill_name),
     )?;
     LuaEngine::populate_vulcan_sqlite_context(
@@ -2751,9 +2727,6 @@ struct LuaNestedOuterStateSnapshot {
     /// Captured request/client/tool/host result context.
     /// 已捕获的请求、客户端、工具与宿主结果上下文。
     context: VulcanContextSnapshot,
-    /// Captured LanceDB provider skill marker.
-    /// 已捕获的 LanceDB provider skill 标记。
-    lancedb_skill_name: String,
     /// Captured SQLite provider skill marker.
     /// 已捕获的 SQLite provider skill 标记。
     sqlite_skill_name: String,
@@ -2781,7 +2754,6 @@ fn capture_lua_nested_outer_state(lua: &Lua) -> Result<LuaNestedOuterStateSnapsh
     Ok(LuaNestedOuterStateSnapshot {
         core_state: VulcanCoreModuleState::capture(lua)?,
         context: capture_vulcan_context_snapshot(lua)?,
-        lancedb_skill_name: capture_provider_skill_marker(&vulcan, "__lancedb_skill_name")?,
         sqlite_skill_name: capture_provider_skill_marker(&vulcan, "__sqlite_skill_name")?,
         internal_context: capture_vulcan_internal_execution_context(lua)?,
         file_context: capture_vulcan_file_context(lua)?,
@@ -4513,14 +4485,19 @@ fn managed_runtime_worker_key(
 /// 从已准备好的命令启动一个新的受管运行时 worker。
 #[cfg(test)]
 fn spawn_managed_runtime_worker(command: &mut Command) -> Result<ManagedRuntimeWorker, String> {
-    spawn_managed_runtime_worker_with_snapshot(command, None)
+    spawn_managed_runtime_worker_with_snapshot(command, None, LuaRuntimeHostMode::Console)
 }
 
 /// Spawn one Worker while retaining its immutable package snapshot through partial rollback.
 /// 启动一个 Worker，并让其不可变包快照跨越部分回滚继续保留。
+/// `command` supplies the child, `package_snapshot` retains its source, and `host_mode` selects window policy.
+/// `command` 提供子进程，`package_snapshot` 保留其源码，`host_mode` 选择窗口策略。
+/// Returns a managed worker with connected protocol streams or a rollback-complete launch error.
+/// 返回连接协议流的受管工作进程，或已完成回滚的启动错误。
 fn spawn_managed_runtime_worker_with_snapshot(
     command: &mut Command,
     package_snapshot: Option<Arc<ManagedPackageSnapshot>>,
+    host_mode: LuaRuntimeHostMode,
 ) -> Result<ManagedRuntimeWorker, String> {
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
@@ -4533,6 +4510,7 @@ fn spawn_managed_runtime_worker_with_snapshot(
         command,
         "managed runtime worker",
         attach_keepalive,
+        host_mode,
     )?;
     let (stdin, stdout, stderr) =
         match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
@@ -5742,6 +5720,7 @@ fn invoke_managed_python(lua: &Lua, spec: LuaValue) -> Result<LuaValue, mlua::Er
             spawn_managed_runtime_worker_with_snapshot(
                 &mut command,
                 Some(Arc::clone(&package_snapshot)),
+                plan.managed_runtime_roots.host_mode(),
             )
         },
     )
@@ -5835,6 +5814,7 @@ fn invoke_managed_node(lua: &Lua, spec: LuaValue) -> Result<LuaValue, mlua::Erro
             spawn_managed_runtime_worker_with_snapshot(
                 &mut command,
                 Some(Arc::clone(&package_snapshot)),
+                plan.managed_runtime_roots.host_mode(),
             )
         },
     )
@@ -6321,12 +6301,6 @@ fn capture_provider_skill_marker(vulcan: &Table, marker_key: &str) -> Result<Str
 /// Provider contexts resolved from captured outer provider skill markers during nested restore.
 /// 嵌套恢复期间根据已捕获的外层 provider skill 标记解析出的 provider 上下文。
 struct RestoredLuaProviderContexts<'a> {
-    /// LanceDB binding restored for the captured outer skill marker.
-    /// 为已捕获外层 skill 标记恢复的 LanceDB binding。
-    lancedb_binding: Option<Arc<LanceDbSkillBinding>>,
-    /// LanceDB skill name restored into the provider marker.
-    /// 恢复到 provider 标记中的 LanceDB skill 名称。
-    lancedb_skill_name: Option<&'a str>,
     /// SQLite binding restored for the captured outer skill marker.
     /// 为已捕获外层 skill 标记恢复的 SQLite binding。
     sqlite_binding: Option<Arc<SqliteSkillBinding>>,
@@ -6338,14 +6312,10 @@ struct RestoredLuaProviderContexts<'a> {
 /// Resolve provider bindings and skill names needed to restore outer provider contexts.
 /// 解析恢复外层 provider 上下文所需的 provider binding 与 skill 名称。
 ///
-/// The `lancedb_host` parameter is the optional shared LanceDB host captured by the guard.
-/// `lancedb_host` 参数是 guard 捕获的可选共享 LanceDB 宿主。
 ///
 /// The `sqlite_host` parameter is the optional shared SQLite host captured by the guard.
 /// `sqlite_host` 参数是 guard 捕获的可选共享 SQLite 宿主。
 ///
-/// The `lancedb_skill_marker` parameter is the captured LanceDB provider skill marker.
-/// `lancedb_skill_marker` 参数是捕获到的 LanceDB provider skill 标记。
 ///
 /// The `sqlite_skill_marker` parameter is the captured SQLite provider skill marker.
 /// `sqlite_skill_marker` 参数是捕获到的 SQLite provider skill 标记。
@@ -6353,23 +6323,12 @@ struct RestoredLuaProviderContexts<'a> {
 /// Return the provider bindings and marker skill names that should be restored together.
 /// 返回应一起恢复的 provider binding 与标记 skill 名称。
 fn resolve_restored_lua_provider_contexts<'a>(
-    lancedb_host: Option<&Arc<LanceDbSkillHost>>,
     sqlite_host: Option<&Arc<SqliteSkillHost>>,
-    lancedb_skill_marker: &'a str,
     sqlite_skill_marker: &'a str,
 ) -> Result<RestoredLuaProviderContexts<'a>, String> {
-    // Normalize the LanceDB marker once so lookup and marker restore share one identity.
-    // 只归一化一次 LanceDB 标记，确保查找与标记恢复共享同一身份。
-    let lancedb_skill_name = non_empty_skill_name(lancedb_skill_marker);
     // Normalize the SQLite marker once so lookup and marker restore share one identity.
     // 只归一化一次 SQLite 标记，确保查找与标记恢复共享同一身份。
     let sqlite_skill_name = non_empty_skill_name(sqlite_skill_marker);
-    // Resolve the LanceDB binding only when both the host and captured skill marker exist.
-    // 仅当宿主与已捕获 skill 标记同时存在时解析 LanceDB binding。
-    let lancedb_binding = match (lancedb_host, lancedb_skill_name) {
-        (Some(host), Some(skill_name)) => host.binding_for_skill(skill_name)?,
-        _ => None,
-    };
     // Resolve the SQLite binding only when both the host and captured skill marker exist.
     // 仅当宿主与已捕获 skill 标记同时存在时解析 SQLite binding。
     let sqlite_binding = match (sqlite_host, sqlite_skill_name) {
@@ -6378,8 +6337,6 @@ fn resolve_restored_lua_provider_contexts<'a>(
     };
 
     Ok(RestoredLuaProviderContexts {
-        lancedb_binding,
-        lancedb_skill_name,
         sqlite_binding,
         sqlite_skill_name,
     })
@@ -6391,39 +6348,25 @@ fn resolve_restored_lua_provider_contexts<'a>(
 /// The `lua` parameter is the VM whose provider tables should be restored.
 /// `lua` 参数是需要恢复 provider 表的 VM。
 ///
-/// The `lancedb_host` parameter is the optional shared LanceDB host captured by the guard.
-/// `lancedb_host` 参数是 guard 捕获的可选共享 LanceDB 宿主。
 ///
 /// The `sqlite_host` parameter is the optional shared SQLite host captured by the guard.
 /// `sqlite_host` 参数是 guard 捕获的可选共享 SQLite 宿主。
 ///
-/// The `lancedb_skill_marker` parameter is the captured LanceDB provider skill marker.
-/// `lancedb_skill_marker` 参数是捕获到的 LanceDB provider skill 标记。
 ///
 /// The `sqlite_skill_marker` parameter is the captured SQLite provider skill marker.
 /// `sqlite_skill_marker` 参数是捕获到的 SQLite provider skill 标记。
 ///
-/// Return `Ok(())` after both provider tables and skill markers are restored.
-/// 两个 provider 表与 skill 标记均恢复后返回 `Ok(())`。
+/// Return `Ok(())` after the SQLite provider table and skill markers are restored.
+/// SQLite provider 表与 skill 标记均恢复后返回 `Ok(())`。
 fn restore_lua_nested_provider_contexts(
     lua: &Lua,
-    lancedb_host: Option<&Arc<LanceDbSkillHost>>,
     sqlite_host: Option<&Arc<SqliteSkillHost>>,
-    lancedb_skill_marker: &str,
     sqlite_skill_marker: &str,
 ) -> Result<(), String> {
     let RestoredLuaProviderContexts {
-        lancedb_binding,
-        lancedb_skill_name,
         sqlite_binding,
         sqlite_skill_name,
-    } = resolve_restored_lua_provider_contexts(
-        lancedb_host,
-        sqlite_host,
-        lancedb_skill_marker,
-        sqlite_skill_marker,
-    )?;
-    LuaEngine::populate_vulcan_lancedb_context(lua, lancedb_binding, lancedb_skill_name)?;
+    } = resolve_restored_lua_provider_contexts(sqlite_host, sqlite_skill_marker)?;
     LuaEngine::populate_vulcan_sqlite_context(lua, sqlite_binding, sqlite_skill_name)?;
     Ok(())
 }
@@ -6566,7 +6509,6 @@ fn finish_pooled_vm_request_scope<T>(
 struct LuaNestedCallScopeGuard {
     lua: Lua,
     host_options: Arc<LuaRuntimeHostOptions>,
-    lancedb_host: Option<Arc<LanceDbSkillHost>>,
     sqlite_host: Option<Arc<SqliteSkillHost>>,
     /// Captured outer state restored after the nested call finishes.
     /// 嵌套调用结束后需要恢复的外层状态快照。
@@ -6591,13 +6533,11 @@ impl LuaNestedCallScopeGuard {
     fn new(
         lua: &Lua,
         host_options: Arc<LuaRuntimeHostOptions>,
-        lancedb_host: Option<Arc<LanceDbSkillHost>>,
         sqlite_host: Option<Arc<SqliteSkillHost>>,
     ) -> Result<Self, String> {
         Ok(Self {
             lua: lua.clone(),
             host_options,
-            lancedb_host,
             sqlite_host,
             previous_state: capture_lua_nested_outer_state(lua)?,
             active: true,
@@ -6669,9 +6609,7 @@ impl LuaNestedCallScopeGuard {
         self.previous_state.core_state.restore(&self.lua)?;
         restore_lua_nested_provider_contexts(
             &self.lua,
-            self.lancedb_host.as_ref(),
             self.sqlite_host.as_ref(),
-            &self.previous_state.lancedb_skill_name,
             &self.previous_state.sqlite_skill_name,
         )?;
         restore_vulcan_context_snapshot(&self.lua, &self.previous_state.context)?;
@@ -6725,8 +6663,6 @@ impl LuaNestedCallScopeGuard {
 /// The `host_options` parameter is the shared runtime host options captured by the dispatcher.
 /// `host_options` 参数是 dispatcher 捕获的共享运行时宿主选项。
 ///
-/// The `lancedb_host` parameter is the optional shared LanceDB host captured by the dispatcher.
-/// `lancedb_host` 参数是 dispatcher 捕获的可选共享 LanceDB 宿主。
 ///
 /// The `sqlite_host` parameter is the optional shared SQLite host captured by the dispatcher.
 /// `sqlite_host` 参数是 dispatcher 捕获的可选共享 SQLite 宿主。
@@ -6736,12 +6672,11 @@ impl LuaNestedCallScopeGuard {
 fn prepare_lua_nested_call_scope(
     lua: &Lua,
     host_options: Arc<LuaRuntimeHostOptions>,
-    lancedb_host: Option<Arc<LanceDbSkillHost>>,
     sqlite_host: Option<Arc<SqliteSkillHost>>,
 ) -> mlua::Result<PreparedLuaNestedCallScope> {
     // Capture the outer state before deriving any nested invocation context from it.
     // 在从外层状态推导任何嵌套调用上下文之前先捕获外层状态。
-    let guard = LuaNestedCallScopeGuard::new(lua, host_options, lancedb_host, sqlite_host)
+    let guard = LuaNestedCallScopeGuard::new(lua, host_options, sqlite_host)
         .map_err(mlua::Error::runtime)?;
     // Derive the inherited invocation context from the captured outer request data.
     // 从已捕获的外层请求数据推导继承调用上下文。
@@ -7268,7 +7203,14 @@ impl LuaEngine {
     }
 
     /// Create a new LuaEngine with LuaJIT VM and registered globals.
-    pub fn new(options: LuaEngineOptions) -> Result<Self, Box<dyn std::error::Error>> {
+    /// Create an engine from `options` and immutable instance `providers`; return the engine or initialization error.
+    /// 从 `options` 和不可变实例 `providers` 创建引擎；返回引擎或初始化错误。
+    /// No process-global callback is read or changed; reloads retain the same provider owners.
+    /// 不读取或修改进程全局回调；重载保留相同的 provider 所有者。
+    pub fn new_with_database_providers(
+        options: LuaEngineOptions,
+        providers: RuntimeDatabaseProviderCallbacks,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let LuaEngineOptions {
             pool_config,
             host_options,
@@ -7300,8 +7242,7 @@ impl LuaEngine {
         }
         let native_library_search_guard =
             NativeLibrarySearchGuard::new(&host_options).map_err(std::io::Error::other)?;
-        let database_provider_callbacks =
-            Arc::new(RuntimeDatabaseProviderCallbacks::capture_process_defaults());
+        let database_provider_callbacks = Arc::new(providers);
         // Engine-owned lifecycle service shared by every VM created from this engine.
         // 由当前引擎创建的每个 VM 共享的引擎所有生命周期服务。
         let managed_runtime_services =
@@ -7337,12 +7278,22 @@ impl LuaEngine {
                 )
                 .map_err(std::io::Error::other)?,
             ),
-            lancedb_host: None,
             sqlite_host: None,
             database_provider_callbacks,
             native_library_search_guard,
             host_options: Arc::new(host_options),
         })
+    }
+
+    /// Create an engine from `options` using a snapshot of legacy process callback defaults.
+    /// 从 `options` 创建引擎，并快照旧版进程回调默认值。
+    /// Return the initialized engine or an initialization error; existing FFI constructors use this path.
+    /// 返回已初始化引擎或初始化错误；现有 FFI 构造入口使用此路径。
+    pub fn new(options: LuaEngineOptions) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_database_providers(
+            options,
+            RuntimeDatabaseProviderCallbacks::capture_process_defaults(),
+        )
     }
 
     /// Build the shared runtime root used by host-managed sibling directories.
@@ -7371,11 +7322,10 @@ impl LuaEngine {
     ) -> Result<Arc<ManagedRuntimeRoots>, String> {
         match self.managed_runtime_roots.as_ref() {
             Some(roots) => Ok(Arc::clone(roots)),
-            None => Ok(Arc::new(ManagedRuntimeRoots::new(
-                runtime_root,
-                None,
-                None,
-            )?)),
+            None => Ok(Arc::new(
+                ManagedRuntimeRoots::new(runtime_root, None, None)?
+                    .with_host_mode(self.host_options.host_mode),
+            )),
         }
     }
 
@@ -7430,13 +7380,6 @@ impl LuaEngine {
             .any(|ignored| ignored.trim() == skill_id)
     }
 
-    /// Build the sibling database root for one named skill root.
-    /// 为单个命名技能根构造同级数据库根目录。
-    fn database_root_for(&self, skill_root: &RuntimeSkillRoot) -> PathBuf {
-        self.runtime_root_for(skill_root)
-            .join(self.host_options.database_dir_name.as_str())
-    }
-
     /// Create an empty reload candidate that preserves immutable host policy and callback snapshots.
     /// 创建一个空的重载候选引擎，并保留不可变宿主策略与回调快照。
     fn empty_reload_candidate(&self) -> Result<Self, Box<dyn std::error::Error>> {
@@ -7467,7 +7410,6 @@ impl LuaEngine {
                 )
                 .map_err(std::io::Error::other)?,
             ),
-            lancedb_host: None,
             sqlite_host: None,
             database_provider_callbacks: self.database_provider_callbacks.clone(),
             native_library_search_guard: NativeLibrarySearchGuard::new(&self.host_options)
@@ -7487,7 +7429,6 @@ impl LuaEngine {
         self.public_runtime_sessions = next.public_runtime_sessions;
         self.managed_runtime_roots = next.managed_runtime_roots;
         self.skill_config_service = next.skill_config_service;
-        self.lancedb_host = next.lancedb_host;
         self.sqlite_host = next.sqlite_host;
         self.database_provider_callbacks = next.database_provider_callbacks;
         self.native_library_search_guard = next.native_library_search_guard;
@@ -7524,18 +7465,6 @@ impl LuaEngine {
             .host_options
             .host_provided_ffi_root
             .clone()
-            .or_else(|| {
-                self.host_options
-                    .lancedb_library_path
-                    .as_ref()
-                    .and_then(|path| path.parent().map(Path::to_path_buf))
-            })
-            .or_else(|| {
-                self.host_options
-                    .sqlite_library_path
-                    .as_ref()
-                    .and_then(|path| path.parent().map(Path::to_path_buf))
-            })
             .unwrap_or_else(|| runtime_root.join("libs"));
         let download_cache_root = self
             .host_options
@@ -8162,31 +8091,6 @@ impl LuaEngine {
         Ok(())
     }
 
-    /// Remove one optional skill-owned database directory when the caller explicitly requests it.
-    /// 调用方显式请求时删除单个技能拥有的可选数据库目录。
-    fn remove_skill_database_dir(
-        &self,
-        database_root: &Path,
-        skill_id: &str,
-        remove_requested: bool,
-        database_label: &str,
-    ) -> Result<(bool, bool), Box<dyn std::error::Error>> {
-        if !remove_requested {
-            return Ok((false, true));
-        }
-        let database_dir = database_root.join(database_label).join(skill_id);
-        match fs::remove_dir_all(&database_dir) {
-            Ok(()) => Ok((true, false)),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok((false, false)),
-            Err(error) => Err(format!(
-                "failed to remove {database_label} directory {}: {}",
-                render_log_friendly_path(&database_dir),
-                error
-            )
-            .into()),
-        }
-    }
-
     /// Execute one uninstall action with explicit database-retention semantics and then reload the runtime view.
     /// 以显式数据库保留语义执行一次卸载动作，并在完成后重载运行时视图。
     fn uninstall_skill_and_reload(
@@ -8194,9 +8098,8 @@ impl LuaEngine {
         plane: SkillOperationPlane,
         skill_roots: &[RuntimeSkillRoot],
         skill_id: &str,
-        options: &SkillUninstallOptions,
     ) -> Result<SkillUninstallResult, Box<dyn std::error::Error>> {
-        self.uninstall_skill_and_reload_in_root(plane, skill_roots, None, skill_id, options)
+        self.uninstall_skill_and_reload_in_root(plane, skill_roots, None, skill_id)
     }
 
     /// Execute one uninstall action against an optional explicit target root and then reload the full runtime view.
@@ -8207,7 +8110,6 @@ impl LuaEngine {
         skill_roots: &[RuntimeSkillRoot],
         target_root: Option<&RuntimeSkillRoot>,
         skill_id: &str,
-        options: &SkillUninstallOptions,
     ) -> Result<SkillUninstallResult, Box<dyn std::error::Error>> {
         Self::validate_formal_skill_root_chain(skill_roots)
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
@@ -8343,61 +8245,6 @@ impl LuaEngine {
                 result.message, error
             );
         }
-        let (sqlite_removed, sqlite_retained) = match self.remove_skill_database_dir(
-            &self.database_root_for(&resolved_root),
-            skill_id,
-            options.remove_sqlite,
-            "sqlite",
-        ) {
-            Ok(result) => result,
-            Err(error) => {
-                log_warn(format!(
-                    "[LuaSkills:uninstall] SQLite cleanup warning for skill '{}': {}",
-                    skill_id, error
-                ));
-                result.message = format!(
-                    "{} (warning: sqlite cleanup failed: {})",
-                    result.message, error
-                );
-                (false, false)
-            }
-        };
-        let (lancedb_removed, lancedb_retained) = match self.remove_skill_database_dir(
-            &self.database_root_for(&resolved_root),
-            skill_id,
-            options.remove_lancedb,
-            "lancedb",
-        ) {
-            Ok(result) => result,
-            Err(error) => {
-                log_warn(format!(
-                    "[LuaSkills:uninstall] LanceDB cleanup warning for skill '{}': {}",
-                    skill_id, error
-                ));
-                result.message = format!(
-                    "{} (warning: lancedb cleanup failed: {})",
-                    result.message, error
-                );
-                (false, false)
-            }
-        };
-        result.sqlite_removed = sqlite_removed;
-        result.sqlite_retained = sqlite_retained;
-        result.lancedb_removed = lancedb_removed;
-        result.lancedb_retained = lancedb_retained;
-        let summary = format!(
-            "skill package removed={} sqlite_removed={} sqlite_retained={} lancedb_removed={} lancedb_retained={}",
-            result.skill_removed,
-            result.sqlite_removed,
-            result.sqlite_retained,
-            result.lancedb_removed,
-            result.lancedb_retained
-        );
-        result.message = if result.message.is_empty() {
-            summary
-        } else {
-            format!("{}; {}", summary, result.message)
-        };
         self.emit_skill_lifecycle_event(SkillLifecycleEventDraft {
             plane,
             action: crate::skill::manager::SkillLifecycleAction::Uninstall,
@@ -8743,9 +8590,8 @@ impl LuaEngine {
         &mut self,
         skill_roots: &[RuntimeSkillRoot],
         skill_id: &str,
-        options: &SkillUninstallOptions,
     ) -> Result<SkillUninstallResult, Box<dyn std::error::Error>> {
-        self.uninstall_skill_and_reload(SkillOperationPlane::Skills, skill_roots, skill_id, options)
+        self.uninstall_skill_and_reload(SkillOperationPlane::Skills, skill_roots, skill_id)
     }
 
     /// Uninstall one skill through the ordinary skills plane from an explicit PROJECT or USER root.
@@ -8755,7 +8601,6 @@ impl LuaEngine {
         skill_roots: &[RuntimeSkillRoot],
         target_root: &RuntimeSkillRoot,
         skill_id: &str,
-        options: &SkillUninstallOptions,
     ) -> Result<SkillUninstallResult, Box<dyn std::error::Error>> {
         Self::validate_formal_skill_root_chain(skill_roots)
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
@@ -8770,7 +8615,6 @@ impl LuaEngine {
             skill_roots,
             Some(target_root),
             skill_id,
-            options,
         )
     }
 
@@ -8781,13 +8625,11 @@ impl LuaEngine {
         skill_roots: &[RuntimeSkillRoot],
         authority: SkillManagementAuthority,
         skill_id: &str,
-        options: &SkillUninstallOptions,
     ) -> Result<SkillUninstallResult, Box<dyn std::error::Error>> {
         self.uninstall_skill_and_reload(
             Self::operation_plane_for_authority(authority),
             skill_roots,
             skill_id,
-            options,
         )
     }
 
@@ -8799,7 +8641,6 @@ impl LuaEngine {
         target_root: &RuntimeSkillRoot,
         authority: SkillManagementAuthority,
         skill_id: &str,
-        options: &SkillUninstallOptions,
     ) -> Result<SkillUninstallResult, Box<dyn std::error::Error>> {
         Self::validate_formal_skill_root_chain(skill_roots)
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
@@ -8812,13 +8653,7 @@ impl LuaEngine {
         )
         .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
         let plane = Self::operation_plane_for_authority(authority);
-        self.uninstall_skill_and_reload_in_root(
-            plane,
-            skill_roots,
-            Some(target_root),
-            skill_id,
-            options,
-        )
+        self.uninstall_skill_and_reload_in_root(plane, skill_roots, Some(target_root), skill_id)
     }
 
     /// Preflight one install request through the ordinary skills plane and return a structured result.
@@ -9237,40 +9072,6 @@ impl LuaEngine {
             )?;
         }
 
-        let effective_lancedb = meta.effective_lancedb();
-        let lancedb_binding = if effective_lancedb.enable {
-            if self.lancedb_host.is_none() {
-                self.lancedb_host = Some(Arc::new(
-                    LanceDbSkillHost::new(
-                        self.host_options.as_ref().clone(),
-                        self.database_provider_callbacks.clone(),
-                    )
-                    .map_err(|error| {
-                        format!("Failed to initialize LanceDB skill host: {}", error)
-                    })?,
-                ));
-            }
-
-            let host = self
-                .lancedb_host
-                .as_ref()
-                .ok_or("LanceDB skill host missing after initialization")?
-                .clone();
-
-            Some(
-                host.register_skill(root_name, meta.effective_skill_id(), dir, effective_lancedb)
-                    .map_err(|error| {
-                        format!(
-                            "Failed to register LanceDB for skill {}: {}",
-                            meta.effective_skill_id(),
-                            error
-                        )
-                    })?,
-            )
-        } else {
-            None
-        };
-
         let effective_sqlite = meta.effective_sqlite();
         let sqlite_binding = if effective_sqlite.enable {
             if self.sqlite_host.is_none() {
@@ -9292,7 +9093,7 @@ impl LuaEngine {
                 .clone();
 
             Some(
-                host.register_skill(root_name, meta.effective_skill_id(), dir, effective_sqlite)
+                host.register_skill(root_name, meta.effective_skill_id(), dir)
                     .map_err(|error| {
                         format!(
                             "Failed to register SQLite for skill {}: {}",
@@ -9333,7 +9134,6 @@ impl LuaEngine {
                 root_name: root_name.to_string(),
                 entry_sources,
                 managed_package,
-                lancedb_binding,
                 sqlite_binding,
                 resolved_entry_names: HashMap::new(),
             },
@@ -9377,7 +9177,6 @@ impl LuaEngine {
             skills.as_ref(),
             entry_registry.as_ref(),
             self.host_options.clone(),
-            self.lancedb_host.clone(),
             self.sqlite_host.clone(),
         )?;
         Ok(LuaVm {
@@ -9412,7 +9211,6 @@ impl LuaEngine {
             host_options,
             skill_config_service,
             runtime_skill_roots,
-            lancedb_host,
             sqlite_host,
             managed_runtime_services,
             managed_runtime_workers,
@@ -9435,7 +9233,6 @@ impl LuaEngine {
             skills,
             entry_registry,
             host_options,
-            lancedb_host,
             sqlite_host,
         )?;
         Ok(LuaVm {
@@ -9459,7 +9256,6 @@ impl LuaEngine {
             host_options: Arc::clone(&self.host_options),
             skill_config_service: Arc::clone(&self.skill_config_service),
             runtime_skill_roots: Vec::new(),
-            lancedb_host: None,
             sqlite_host: None,
             managed_runtime_services: Arc::clone(&self.managed_runtime_services),
             managed_runtime_workers: Arc::clone(&self.managed_runtime_workers),
@@ -10142,222 +9938,6 @@ impl LuaEngine {
         Ok(())
     }
 
-    /// Populate the skill-scoped LanceDB host interface into the `vulcan` module.
-    /// 将按 skill 作用域隔离的 LanceDB 宿主接口注入到 `vulcan` 模块中。
-    fn populate_vulcan_lancedb_context(
-        lua: &Lua,
-        binding: Option<Arc<LanceDbSkillBinding>>,
-        current_skill_name: Option<&str>,
-    ) -> Result<(), String> {
-        // Create the provider table and persist the active skill marker in one setup step.
-        // 在一个 setup 步骤中创建 provider 表并持久化当前 skill 标记。
-        let (vulcan, lancedb_table) = create_provider_context_table(
-            lua,
-            "lancedb",
-            "__lancedb_skill_name",
-            current_skill_name,
-        )?;
-
-        if let Some(binding) = binding {
-            lancedb_table
-                .set("enabled", true)
-                .map_err(|error| format!("Failed to set vulcan.lancedb.enabled: {}", error))?;
-            let info_binding = binding.clone();
-            register_provider_json_noarg_method(
-                lua,
-                &lancedb_table,
-                "info",
-                "vulcan.lancedb.info",
-                "vulcan.lancedb.info",
-                move || info_binding.info_json(),
-            )?;
-
-            let status_binding = binding.clone();
-            register_provider_json_noarg_method(
-                lua,
-                &lancedb_table,
-                "status",
-                "vulcan.lancedb.status",
-                "vulcan.lancedb.status",
-                move || status_binding.status_json(),
-            )?;
-
-            let create_binding = binding.clone();
-            register_provider_json_method(
-                lua,
-                &lancedb_table,
-                "lancedb",
-                "create_table",
-                move |input_json| create_binding.create_table_json(input_json),
-            )?;
-
-            let upsert_binding = binding.clone();
-            let vector_upsert_fn = lua
-                .create_host_function(move |lua, input: LuaValue| {
-                    let mut input_json =
-                        provider_input_table_to_json(input, "lancedb.vector_upsert")?;
-                    let input_object = input_json.as_object_mut().ok_or_else(|| {
-                        mlua::Error::runtime("lancedb.vector_upsert input must be an object")
-                    })?;
-
-                    let payload_value = if let Some(rows) = input_object.remove("rows") {
-                        input_object
-                            .entry("input_format".to_string())
-                            .or_insert_with(|| Value::String("json".to_string()));
-                        rows
-                    } else if let Some(data) = input_object.remove("data") {
-                        data
-                    } else {
-                        return Err(mlua::Error::runtime(
-                            "lancedb.vector_upsert requires rows or data",
-                        ));
-                    };
-
-                    let payload_bytes = match payload_value {
-                        Value::String(text) => {
-                            if !input_object.contains_key("input_format") {
-                                input_object.insert(
-                                    "input_format".to_string(),
-                                    Value::String("arrow_ipc".to_string()),
-                                );
-                            }
-                            text.into_bytes()
-                        }
-                        Value::Array(_) | Value::Object(_) => {
-                            if !input_object.contains_key("input_format") {
-                                input_object.insert(
-                                    "input_format".to_string(),
-                                    Value::String("json".to_string()),
-                                );
-                            }
-                            serde_json::to_vec(&payload_value).map_err(|error| {
-                                mlua::Error::runtime(format!(
-                                    "failed to encode lancedb upsert payload: {}",
-                                    error
-                                ))
-                            })?
-                        }
-                        _ => {
-                            return Err(mlua::Error::runtime(
-                                "lancedb.vector_upsert payload must be string",
-                            ));
-                        }
-                    };
-
-                    let result = upsert_binding
-                        .vector_upsert_json(&input_json, &payload_bytes)
-                        .map_err(mlua::Error::runtime)?;
-                    json_value_to_lua(lua, &result).map_err(mlua::Error::external)
-                })
-                .map_err(|error| {
-                    format!("Failed to create vulcan.lancedb.vector_upsert: {}", error)
-                })?;
-            lancedb_table
-                .set("vector_upsert", vector_upsert_fn)
-                .map_err(|error| {
-                    format!("Failed to set vulcan.lancedb.vector_upsert: {}", error)
-                })?;
-
-            let search_binding = binding.clone();
-            let vector_search_fn = lua
-                .create_host_function(move |lua, input: LuaValue| {
-                    let mut input_json =
-                        provider_input_table_to_json(input, "lancedb.vector_search")?;
-                    let input_object = input_json.as_object_mut().ok_or_else(|| {
-                        mlua::Error::runtime("lancedb.vector_search input must be an object")
-                    })?;
-                    input_object
-                        .entry("output_format".to_string())
-                        .or_insert_with(|| Value::String("json".to_string()));
-
-                    let (meta, raw_bytes) = search_binding
-                        .vector_search_json(&input_json)
-                        .map_err(mlua::Error::runtime)?;
-                    let result_table =
-                        json_to_lua_table_inner(lua, &meta).map_err(mlua::Error::external)?;
-
-                    if meta
-                        .get("format")
-                        .and_then(Value::as_str)
-                        .map(|value| value == "json")
-                        .unwrap_or(false)
-                    {
-                        let rows_json: Value =
-                            serde_json::from_slice(&raw_bytes).map_err(|error| {
-                                mlua::Error::runtime(format!(
-                                    "failed to parse LanceDB JSON rows: {}",
-                                    error
-                                ))
-                            })?;
-                        result_table
-                            .set(
-                                "data_json",
-                                json_value_to_lua(lua, &rows_json)
-                                    .map_err(mlua::Error::external)?,
-                            )
-                            .map_err(mlua::Error::external)?;
-                    } else {
-                        result_table
-                            .set(
-                                "data",
-                                LuaValue::String(
-                                    lua.create_string(&raw_bytes)
-                                        .map_err(mlua::Error::external)?,
-                                ),
-                            )
-                            .map_err(mlua::Error::external)?;
-                    }
-                    Ok(LuaValue::Table(result_table))
-                })
-                .map_err(|error| {
-                    format!("Failed to create vulcan.lancedb.vector_search: {}", error)
-                })?;
-            lancedb_table
-                .set("vector_search", vector_search_fn)
-                .map_err(|error| {
-                    format!("Failed to set vulcan.lancedb.vector_search: {}", error)
-                })?;
-
-            let delete_binding = binding.clone();
-            register_provider_json_method(
-                lua,
-                &lancedb_table,
-                "lancedb",
-                "delete",
-                move |input_json| delete_binding.delete_json(input_json),
-            )?;
-
-            let drop_binding = binding;
-            register_provider_json_method(
-                lua,
-                &lancedb_table,
-                "lancedb",
-                "drop_table",
-                move |input_json| drop_binding.drop_table_json(input_json),
-            )?;
-        } else {
-            install_disabled_provider_context(
-                lua,
-                &lancedb_table,
-                "lancedb",
-                disabled_skill_status_json(current_skill_name),
-                "current skill has not enabled lancedb",
-                &[
-                    "create_table",
-                    "vector_upsert",
-                    "vector_search",
-                    "delete",
-                    "drop_table",
-                ],
-            )?;
-        }
-
-        // Publish the populated provider table only after all enabled or disabled methods are ready.
-        // 仅在全部启用或禁用方法准备完成后发布已填充的 provider 表。
-        install_provider_context_table(&vulcan, "lancedb", lancedb_table)?;
-        Ok(())
-    }
-
     /// Populate the skill-scoped SQLite host interface into the `vulcan` module.
     /// 将按 skill 作用域隔离的 SQLite 宿主接口注入到 `vulcan` 模块中。
     fn populate_vulcan_sqlite_context(
@@ -10631,11 +10211,6 @@ impl LuaEngine {
             Some(&skill.dir),
             Some(skill_name),
         )?;
-        Self::populate_vulcan_lancedb_context(
-            lua,
-            skill.lancedb_binding.clone(),
-            Some(skill_name),
-        )?;
         Self::populate_vulcan_sqlite_context(lua, skill.sqlite_binding.clone(), Some(skill_name))?;
         Ok(())
     }
@@ -10675,7 +10250,6 @@ impl LuaEngine {
             }
             AnonymousLuaManagedPackageContext::PreserveCurrent => {}
         }
-        Self::populate_vulcan_lancedb_context(lua, None, None)?;
         Self::populate_vulcan_sqlite_context(lua, None, None)?;
         Ok(())
     }
@@ -10869,7 +10443,6 @@ impl LuaEngine {
         skills_map: &HashMap<String, LoadedSkill>,
         entry_registry: &BTreeMap<String, ResolvedEntryTarget>,
         host_options: Arc<LuaRuntimeHostOptions>,
-        lancedb_host: Option<Arc<LanceDbSkillHost>>,
         sqlite_host: Option<Arc<SqliteSkillHost>>,
     ) -> Result<(), String> {
         let vulcan: Table = lua
@@ -10891,21 +10464,13 @@ impl LuaEngine {
                 let PreparedLuaNestedCallScope {
                     guard: nested_scope_guard,
                     invocation_context: nested_invocation_context,
-                } = prepare_lua_nested_call_scope(
-                    lua,
-                    host_options.clone(),
-                    lancedb_host.clone(),
-                    sqlite_host.clone(),
-                )?;
+                } = prepare_lua_nested_call_scope(lua, host_options.clone(), sqlite_host.clone())?;
                 dispatch_entry.reject_forbidden_luaexec_call(
                     nested_scope_guard.previous_internal_context(),
                 )?;
-                let provider_bindings = resolve_lua_call_provider_bindings(
-                    owner_skill_name,
-                    lancedb_host.as_ref(),
-                    sqlite_host.as_ref(),
-                )
-                .map_err(mlua::Error::runtime)?;
+                let provider_bindings =
+                    resolve_lua_call_provider_bindings(owner_skill_name, sqlite_host.as_ref())
+                        .map_err(mlua::Error::runtime)?;
                 nested_scope_guard
                     .enter_nested_call(build_lua_nested_call_target(
                         dispatch_entry,
@@ -11065,7 +10630,14 @@ impl LuaEngine {
         let context = lua.create_table()?;
         let deps = lua.create_table()?;
         let default_text_encoding = resolve_host_default_text_encoding(host_options)?;
-        let vulcan_io = create_vulcan_io_table(lua, default_text_encoding)?;
+        // The host mode is captured by each VM bridge and cannot be overridden by Lua arguments.
+        // 每个虚拟机桥接捕获宿主模式，Lua 参数无法覆盖它。
+        let host_mode = host_options.host_mode;
+        #[cfg(windows)]
+        if host_mode == LuaRuntimeHostMode::Desktop {
+            crate::runtime::native_process::install(lua)?;
+        }
+        let vulcan_io = create_vulcan_io_table(lua, default_text_encoding, host_mode)?;
 
         let runtime_log_fn =
             lua.create_host_function(|_, (level, msg): (LuaValue, LuaValue)| {
@@ -11444,7 +11016,7 @@ impl LuaEngine {
             if let Some(remaining) = logical_cwd::remaining_timeout_ms(lua)? {
                 request.cap_timeout(remaining);
             }
-            let result = execute_exec_request(request);
+            let result = execute_exec_request(request, host_mode);
             exec_result_to_lua_table(lua, result)
         })?;
         process.set("exec", exec_fn)?;
@@ -11466,7 +11038,7 @@ impl LuaEngine {
         process.set("which", which_fn)?;
         process.set(
             "session",
-            create_process_session_table(lua, default_text_encoding)?,
+            create_process_session_table(lua, default_text_encoding, host_mode)?,
         )?;
 
         let os_info_fn = lua.create_host_function(|lua, ()| {

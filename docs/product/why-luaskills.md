@@ -42,7 +42,7 @@ It standardizes:
 - Strict help trees.
 - Runtime context injection.
 - Skill dependency path injection.
-- SQLite and LanceDB provider routing.
+- SQLite provider routing.
 - Root layering for system, project, and user skills.
 - Rust, C ABI, and public `_json` FFI integration.
 
@@ -55,7 +55,7 @@ The result is a runtime that can power command palettes, MCP tools, desktop apps
 | Runtime core | Load skills, reload roots, list entries, and call skill functions. |
 | Skill authoring | Write Lua entries with stable `vulcan.*` APIs and structured help. |
 | Product control | Keep policy, permissions, budgets, UI, and authority in the host. |
-| Data-aware skills | Route SQLite and LanceDB through runtime-managed or host-owned providers. |
+| Data-aware skills | Route SQLite through host-owned callbacks. |
 | Multi-language hosts | Integrate from Rust, C ABI, TypeScript, Python, Go, or mixed systems. |
 | Ecosystem growth | Use real examples and templates instead of inventing every package shape. |
 

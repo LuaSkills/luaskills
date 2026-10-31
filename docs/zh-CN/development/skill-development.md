@@ -27,12 +27,11 @@
 - `vulcan.context.*`
 - `vulcan.deps.*`
 - `vulcan.sqlite.*`
-- `vulcan.lancedb.*`
 
 同时还有两个重要事实：
 
 1. 当前运行时默认把 skill 当作**受信代码**执行，不提供沙箱安全承诺。
-2. `vulcan.context.*`、`vulcan.deps.*`、`vulcan.sqlite.*`、`vulcan.lancedb.*` 中有一部分内容依赖宿主或当前 skill 绑定状态，不能假设始终存在有效值。
+2. `vulcan.context.*`、`vulcan.deps.*`、`vulcan.sqlite.*` 中有一部分内容依赖宿主或当前 skill 绑定状态，不能假设始终存在有效值。
 3. 宿主可以通过 `LuaRuntimeHostOptions.ignored_skill_ids` 强制忽略某些 skill，被忽略的 skill 不会进入依赖准备、数据库绑定或 entry 注册阶段。
 
 ## 2.1 Skill 命名与发布包规则
@@ -202,7 +201,6 @@ Windows 宿主取得的规范路径可能采用 `\\?\C:\...` 或 `\\?\UNC\server
 | `vulcan.context` | 请求与当前入口上下文 | 是 | 多数值由宿主注入 |
 | `vulcan.deps` | 当前 skill 依赖根路径 | 是 | 未解析到当前 skill 时可能为 `nil` |
 | `vulcan.sqlite` | 当前 skill 的 SQLite 绑定 | 条件可用 | 未启用时仍有 `enabled/status/info` |
-| `vulcan.lancedb` | 当前 skill 的 LanceDB 绑定 | 条件可用 | 未启用时仍有 `enabled/status/info` |
 
 ## 3.1 托管 IO 与进程编码
 
@@ -335,7 +333,7 @@ return vulcan.json.encode({
 
 - 宿主已经提供了更强的原生、gRPC 或 VMM 能力实现
 - 默认 skill 包与宿主现有功能重复
-- 某个数据库型 skill 的能力已被宿主侧服务替代，不希望继续启动 SQLite / LanceDB 绑定
+- 某个数据库型 skill 的能力已被宿主侧服务替代，不希望继续启动 SQLite 绑定
 
 匹配规则：
 
@@ -347,7 +345,7 @@ return vulcan.json.encode({
 
 - 命中忽略列表后，整个 skill 会被跳过
 - 不准备 `dependencies.yaml`
-- 不绑定 SQLite / LanceDB
+- 不绑定 SQLite
 - 不注册任何 entry
 - 不会出现在 `list_entries` 或 `vulcan.call` 可调用目标中
 
@@ -1864,6 +1862,8 @@ local lib = ffi.load(vulcan.path.join(base, "lib", "demo_native.dll"))
 
 `vulcan.sqlite` 是**按当前 skill 作用域隔离**的 SQLite 绑定。
 
+技能清单的 `sqlite` 对象仅接受 `enable`，日志及慢日志策略由宿主管理；未知字段会被拒绝。`info()` 和 `status()` 只报告绑定元信息，其中 `initialized` 表示绑定就绪，不表示数据库已经打开，也不保证宿主实现全部动作。具体操作是否受支持，由宿主执行时明确返回结果或错误。
+
 ### 14.1 当前字段与方法
 
 - `vulcan.sqlite.enabled`
@@ -1939,60 +1939,6 @@ local lib = ffi.load(vulcan.path.join(base, "lib", "demo_native.dll"))
   - [宿主数据库 Provider 对接说明](../integration/host-database-provider-guide.md)
 - 如果你是 skill 作者而不是宿主实现者，建议优先参考对应记忆类 skill 的现有调用示例，而不是猜测 SQL provider 的自定义返回字段。
 
-## 15. `vulcan.lancedb.*`
-
-`vulcan.lancedb` 是**按当前 skill 作用域隔离**的 LanceDB 绑定。
-
-### 15.1 当前字段与方法
-
-- `vulcan.lancedb.enabled`
-- `vulcan.lancedb.info()`
-- `vulcan.lancedb.status()`
-- `vulcan.lancedb.create_table(input)`
-- `vulcan.lancedb.vector_upsert(input)`
-- `vulcan.lancedb.vector_search(input)`
-- `vulcan.lancedb.delete(input)`
-- `vulcan.lancedb.drop_table(input)`
-
-| 类别 | API | 入参 | 返回值 | 说明 |
-| --- | --- | --- | --- | --- |
-| 固定探测 | `enabled` | 无 | `boolean` | 当前 skill 是否已绑定 LanceDB |
-| 固定探测 | `info()` | 无 | `table` | 绑定信息；至少可用于探测是否可用 |
-| 固定探测 | `status()` | 无 | `table` | 当前状态；至少可用于探测是否可用 |
-| provider 转发 | `create_table(input)` | `input: table` | provider 定义 | 创建表 |
-| provider 转发 | `vector_upsert(input)` | `input: table` | provider 定义 | 写入或更新向量数据 |
-| provider 转发 | `vector_search(input)` | `input: table` | provider 定义 | 向量检索 |
-| provider 转发 | `delete(input)` | `input: table` | provider 定义 | 删除数据 |
-| provider 转发 | `drop_table(input)` | `input: table` | provider 定义 | 删除表 |
-
-### 15.2 行为规则
-
-- `enabled = true` 表示当前 skill 已绑定 LanceDB 能力。
-- `info()` / `status()` 总是存在。
-- 当 LanceDB 未启用时：
-  - `enabled = false`
-  - `info()` / `status()` 会返回禁用状态描述
-  - 其余方法会直接报错：`current skill has not enabled lancedb`
-
-稳定开发约束：
-
-- `input` 应传单个 Lua table。
-- 具体业务字段与返回值由 LanceDB provider 定义；LuaSkills 只做转发与能力守卫。
-- 宿主/provider 同样会拿到稳定绑定上下文，例如 `space_label`、`binding_tag`、`database_kind` 等。
-
-### 15.3 特别说明
-
-`vector_search(input)` 的结果里可能出现两种载荷形态：
-
-- `data_json`
-- `data`
-
-当返回格式是 JSON 时，结果表里会放 `data_json`；否则会放原始二进制字符串 `data`。
-
-具体输入输出字段请结合宿主的 LanceDB provider 契约与：
-
-- [宿主数据库 Provider 对接说明](../integration/host-database-provider-guide.md)
-
 ## 16. 常见开发建议
 
 ### 16.1 先探测，再调用
@@ -2018,7 +1964,6 @@ return {
 
 - `vulcan.runtime.internal.*`
 - `vulcan.__sqlite_skill_name`
-- `vulcan.__lancedb_skill_name`
 
 ### 16.3 不要猜测宿主目录布局
 
@@ -2045,7 +1990,7 @@ return {
 
 1. 本文档：了解当前 `vulcan.*` 真实能力面
 2. [README.zh-CN.md](../../../README.zh-CN.md)：理解运行时定位与宿主边界
-3. [宿主数据库 Provider 对接说明](../integration/host-database-provider-guide.md)：了解 SQLite / LanceDB 与宿主的对接契约
+3. [宿主数据库 Provider 对接说明](../integration/host-database-provider-guide.md)：了解 SQLite 与宿主的对接契约
 
 如果后续你要做宿主集成而不是写 skill，请改看：
 

@@ -39,7 +39,7 @@ Skill 作者最应该记住的边界是：依赖 `vulcan.context.*` 与 `vulcan.
 - [FFI 宿主接入检查清单](integration/ffi-host-checklist.md)：最短联调路径与自检项。
 - [FFI 对接文档](integration/ffi-integration-guide.md)：标准 C ABI 与公共 `_json` FFI 的完整参数、内存、线程与生命周期规则。
 - [宿主指定受管运行时根目录](integration/managed-runtime-host-roots.md)：数据根、发行根与环境根，资源策略与解析器。
-- [宿主数据库 Provider 对接说明](integration/host-database-provider-guide.md)：SQLite / LanceDB 的动态库、宿主回调与 space controller 模式。
+- 可选 SQLite，由宿主注册回调提供
 - [Skill Root 层级与管理边界](integration/skill-root-layer-policy.md)：`ROOT` / `PROJECT` / `USER`。
 - [Skill 来源策略、官方 Hub 与进度事件](integration/skill-source-policy-and-hub.md)
 - [Skill 包级配置声明、运行时控制与宿主对接](integration/skill-config-system-design.md)
@@ -47,7 +47,7 @@ Skill 作者最应该记住的边界是：依赖 `vulcan.context.*` 与 `vulcan.
 - 英文概览：[运行时架构](../integration/runtime-model.md)、[FFI 与对接总览](../integration/ffi-overview.md)、[技能包配置宿主契约](../integration/package-configuration.md)、[数据库 Provider 概览](../integration/database-providers.md)
 - 机器契约：[嵌入式运行时](../../contracts/embedded-runtime.md)、[嵌入式 FFI](../../contracts/embedded-ffi.md)、[System 租约执行](../../contracts/system-lease-execution.md)
 
-第一次接入时建议先跑通 `version -> engine_new -> load_from_roots -> list_entries -> call_skill -> run_lua -> engine_free`，再接 lifecycle、query helper、install/update/uninstall、provider callback 或 `space_controller`。
+第一次接入时建议先跑通 `version -> engine_new -> load_from_roots -> list_entries -> call_skill -> run_lua -> engine_free`，再接 lifecycle、query helper、install/update/uninstall、provider callback。
 
 ## SDK
 
@@ -67,7 +67,7 @@ Skill 作者最应该记住的边界是：依赖 `vulcan.context.*` 与 `vulcan.
 - [FFI Demo Runtime](../../examples/ffi/demo_runtime/README.md)
 - [Host Callback Demo](../../examples/ffi/host_provider_demo/README.md)
 - [LuaSkills FFI Demo](../../examples/demo-ffi/README.md)
-- `cargo run --bin luaskills-debug -- inspect --runtime-root <目录> --skill-path <目录>`：把单个 skill 同步进真实 `runtime_root` 后按宿主方式加载。
+- `cargo run --features debug-sqlite --bin luaskills-debug -- inspect --runtime-root <目录> --skill-path <目录>`：把单个 skill 同步进真实 `runtime_root` 后按宿主方式加载。
 
 ## 维护者
 

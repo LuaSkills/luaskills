@@ -1,31 +1,23 @@
-//! Explicit disk history; records never become live operations merely by reopening the journal.
-//! 显式磁盘历史；重新打开日志绝不使记录自动成为活动操作。
+//! Host-owned operation history, independent from any database implementation.
+//! 由宿主拥有的操作历史，独立于任何数据库实现。
 
 mod reconciliation;
-mod recovery;
-mod storage;
-#[cfg(test)]
-mod tests;
+#[cfg(any(test, feature = "sqlite-journal"))]
+mod sqlite;
 mod worker;
 
+#[cfg(any(test, feature = "sqlite-journal"))]
+use super::EmbeddedErrorCode;
+use super::{EffectState, EmbeddedError, EmbeddedResult, HostEffectPhase, OperationSnapshot};
 pub use reconciliation::{
     HostEffectReconciliation, OperationReconciliation, ReconciledExecution, ResolvedEffectState,
 };
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 pub use worker::{
     JournalWritePhase, JournalWriteReceipt, JournalWriteSnapshot, OperationJournalWorker,
     OperationJournalWorkerConfig, OperationJournalWorkerStatus,
 };
-
-use super::value_size::json_size;
-use super::{
-    EffectState, EmbeddedError, EmbeddedErrorCode, EmbeddedResult, HostEffectPhase,
-    OperationSnapshot,
-};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
 
 /// Explicit retention budgets; SQLite journal/cache overhead is separate from the database-file cap.
 /// 显式保留预算；SQLite 日志及缓存开销与数据库文件上限分开计算。
@@ -65,404 +57,223 @@ pub struct JournalOperation {
     pub reconciliation: Option<OperationReconciliation>,
 }
 
-/// Single connection and sticky unproven-commit failure protected by the journal's own lock.
-/// 日志专用锁保护的单连接及不可自动清除的提交未证实故障。
-struct JournalState {
-    /// The exclusive connection is absent only while explicit storage recovery remains incomplete.
-    /// 仅在显式存储恢复尚未完成时缺少独占连接。
-    connection: Option<Connection>,
-    /// Uncertain commit/rollback blocks reads and writes until explicit validated recovery.
-    /// 不确定提交或回滚阻止读写，直至显式验证恢复。
-    failure: Option<EmbeddedError>,
-    /// Test-only transaction outcome applied before the wrapper consumes its confirmation.
-    /// 包装器消费确认前应用的仅测试事务结果。
-    #[cfg(test)]
-    lost_confirmation: Option<bool>,
+/// Durable history supplied by a trusted host; each method must be atomic and bounded by host limits.
+/// 可信宿主提供的持久历史；每个方法必须保持原子性并受宿主上限约束。
+/// Success confirms durable storage. Uncertain commits must block access until explicit recovery.
+/// 成功表示已确认持久存储。不确定提交必须阻止访问，直到显式恢复。
+/// Hosts preserve identities, immutable contexts, finalization rules and existing records without eviction.
+/// 宿主保留身份、不可变上下文、终态规则及既有记录，不自动淘汰。
+pub trait OperationJournalBackend: Send + Sync {
+    /// Validate identity syntax and size without I/O; return admission failure before queue allocation.
+    /// 无 I/O 地校验身份语法和大小；在队列分配前返回入场错误。
+    fn validate_key(&self, runtime_id: &str, operation_id: &str) -> EmbeddedResult<()>;
+    /// Store `snapshot` for `runtime_id` at the successor of `previous`; return durable evidence.
+    /// 将 `runtime_id` 的 `snapshot` 存储为 `previous` 的后继；返回持久证据。
+    /// `None` inserts revision one; `reconcile` permits only an identical already-committed successor.
+    /// `None` 插入修订一；`reconcile` 仅允许确认完全相同的已提交后继。
+    fn write_checkpoint(
+        &self,
+        runtime_id: &str,
+        previous: Option<u64>,
+        snapshot: &OperationSnapshot,
+        reconcile: bool,
+    ) -> EmbeddedResult<JournalOperation>;
+
+    /// Read exact `runtime_id` and `operation_id`; return retained evidence or confirmed absence.
+    /// 读取精确 `runtime_id` 和 `operation_id`；返回保留证据或确认的缺失。
+    fn get(&self, runtime_id: &str, operation_id: &str)
+    -> EmbeddedResult<Option<JournalOperation>>;
+
+    /// Read the next binary-ordered identity after `after`; `None` starts enumeration or ends results.
+    /// 读取 `after` 之后按二进制排序的身份；参数 `None` 开始枚举，结果 `None` 表示结束。
+    fn next(&self, after: Option<(&str, &str)>) -> EmbeddedResult<Option<JournalOperation>>;
+
+    /// Remove exact terminal/reconciled evidence at `expected_revision`; return success only after commit.
+    /// 删除 `expected_revision` 处的精确终态或已对账证据；仅在提交后返回成功。
+    /// Unfinished or unknown effects require final host reconciliation before deletion.
+    /// 未完成或未知副作用必须经过最终宿主对账才能删除。
+    fn forget(
+        &self,
+        runtime_id: &str,
+        operation_id: &str,
+        expected_revision: u64,
+    ) -> EmbeddedResult<()>;
+
+    /// Attach `resolution` to the exact identity/revision; return its durable successor revision.
+    /// 为精确身份及修订附加 `resolution`；返回其持久后继修订。
+    /// Exact retries acknowledge the same successor; other revisions and attestations conflict.
+    /// 精确重试确认同一后继；其他修订和证明发生冲突。
+    fn reconcile(
+        &self,
+        runtime_id: &str,
+        operation_id: &str,
+        expected_revision: u64,
+        resolution: &OperationReconciliation,
+    ) -> EmbeddedResult<u64>;
+
+    /// Validate retained storage after uncertainty; return whether recovery was required and completed.
+    /// 不确定状态后校验保留存储；返回是否需要且已完成恢复。
+    /// Never retry business work, create replacement storage or silently clear evidence.
+    /// 绝不重试业务工作、创建替代存储或静默清除证据。
+    fn recover_storage(&self) -> EmbeddedResult<bool>;
 }
 
-/// Bounded synchronous history owned by a trusted host; callers must not hold scheduler locks.
-/// 由可信宿主拥有的有界同步历史；调用方不得持有调度器锁。
-/// One owner opens a local database in a host-controlled directory; plugins never choose this path.
-/// 单个所有者打开宿主管理目录内的本地数据库；插件不得选择此路径。
+/// Engine-independent journal handle retaining one exact host backend for all worker operations.
+/// 独立于引擎的日志句柄，为全部工作线程操作保留同一个精确宿主后端。
 pub struct OperationJournal {
-    /// Original absolute host-owned database path; recovery never selects another file or creates a replacement.
-    /// 原始绝对宿主数据库路径；恢复绝不选择其他文件或创建替代文件。
-    path: PathBuf,
-    /// Validated immutable limits shared by every read and mutation.
-    /// 所有读取及变更共享的已校验不可变上限。
-    config: OperationJournalConfig,
-    /// Serializes disk transactions independently from runtime metadata locks.
-    /// 独立于运行时元数据锁，串行化磁盘事务。
-    state: Mutex<JournalState>,
+    /// Host-owned persistence implementation retained until all journal users release it.
+    /// 保留至全部日志使用者释放的宿主持久化实现。
+    backend: Arc<dyn OperationJournalBackend>,
+    /// Real SQLite storage retained only for deterministic test fault controls.
+    /// 仅为确定性测试故障控制保留的真实 SQLite 存储。
+    #[cfg(test)]
+    test_sqlite: Option<Arc<sqlite::OperationJournal>>,
 }
 
 impl OperationJournal {
-    /// Hold the actual storage gate for deterministic operation-observation concurrency tests.
-    /// 持有真实存储门禁，用于确定性的操作观测并发测试。
-    #[cfg(test)]
-    pub(crate) fn block_for_test(&self) -> impl Drop + '_ {
-        self.state.lock().expect("test journal lock is healthy")
+    /// Check exact identity limits without storage access; return the host's admission result.
+    /// 不访问存储地检查精确身份上限；返回宿主入场结果。
+    fn validate_key(&self, runtime_id: &str, operation_id: &str) -> EmbeddedResult<()> {
+        self.backend.validate_key(runtime_id, operation_id)
     }
 
-    /// Open absolute local `path` under `config`, validating every retained record before returning.
-    /// 按 `config` 打开绝对本地 `path`，返回前校验所有保留记录。
-    /// Existing unknown formats, corruption, insufficient limits and another owner fail explicitly.
-    /// 已有未知格式、损坏、上限不足或其他所有者都会明确失败。
-    pub fn open(path: &Path, config: OperationJournalConfig) -> EmbeddedResult<Self> {
-        // Preserve the original path and exclusive ownership across later explicit recovery.
-        // 跨后续显式恢复保留原始路径及独占所有权。
-        let connection = storage::open(path, config)?;
-        // Publish no journal until every stored record has been validated.
-        // 全部存储记录通过校验前不发布日志。
-        let journal = Self {
-            path: path.to_owned(),
-            config,
-            state: Mutex::new(JournalState {
-                connection: Some(connection),
-                failure: None,
-                #[cfg(test)]
-                lost_confirmation: None,
-            }),
-        };
-        {
-            // Validation uses the same bounded reader as explicit recovery.
-            // 校验使用与显式恢复相同的有界读取器。
-            let state = journal.lock()?;
-            journal.validate_contents(state.connection())?;
+    /// Persist the worker's exact candidate with its explicit retry policy; return durable evidence.
+    /// 按工作线程的显式重试策略持久化精确候选；返回持久证据。
+    fn write_checkpoint(
+        &self,
+        runtime_id: &str,
+        previous: Option<u64>,
+        snapshot: &OperationSnapshot,
+        reconcile: bool,
+    ) -> EmbeddedResult<JournalOperation> {
+        self.backend
+            .write_checkpoint(runtime_id, previous, snapshot, reconcile)
+    }
+    /// Retain `backend` without opening files; return an owner that forwards to the host implementation.
+    /// 保留 `backend` 而不打开文件；返回向宿主实现转发的所有者。
+    pub fn from_backend(backend: Arc<dyn OperationJournalBackend>) -> Self {
+        Self {
+            backend,
+            #[cfg(test)]
+            test_sqlite: None,
         }
-        Ok(journal)
     }
 
-    /// Retain `snapshot` for exact `runtime_id` at revision one; duplicate identities never overwrite.
-    /// 以修订号一保留精确 `runtime_id` 的 `snapshot`；重复身份绝不覆盖。
+    /// Open host-selected SQLite `path` under `config`; return validated ownership or an explicit error.
+    /// 按 `config` 打开宿主选择的 SQLite `path`；返回已校验所有权或明确错误。
+    /// Requires the explicit `sqlite-journal` adapter; the default library exposes only host registration.
+    /// 需要显式 `sqlite-journal` 适配器；默认库仅暴露宿主注册。
+    #[cfg(any(test, feature = "sqlite-journal"))]
+    pub fn open(path: &std::path::Path, config: OperationJournalConfig) -> EmbeddedResult<Self> {
+        // Keep the existing format and exclusive-open validation in the optional adapter.
+        // 在可选适配器中保留既有格式和独占打开校验。
+        let backend = Arc::new(sqlite::OperationJournal::open(path, config)?);
+        Ok(Self {
+            backend: backend.clone(),
+            #[cfg(test)]
+            test_sqlite: Some(backend),
+        })
+    }
+
+    /// Insert `snapshot` under exact `runtime_id`; return revision-one evidence or an explicit conflict.
+    /// 按精确 `runtime_id` 插入 `snapshot`；返回修订一证据或明确冲突。
     pub fn insert(
         &self,
         runtime_id: &str,
         snapshot: &OperationSnapshot,
     ) -> EmbeddedResult<JournalOperation> {
-        self.write_checkpoint(runtime_id, None, snapshot, false)
+        self.backend
+            .write_checkpoint(runtime_id, None, snapshot, false)
     }
 
-    /// Replace the exact record only at `expected_revision`, returning the new durable revision.
-    /// 仅在 `expected_revision` 匹配时替换精确记录，返回新的持久修订号。
-    /// The trusted execution/reconciliation owner supplies state; this store never infers effect outcomes.
-    /// 状态由可信执行或对账所有者提供；存储层绝不推断副作用结果。
+    /// Replace exact `expected_revision` for `runtime_id`; return the durable successor of `snapshot`.
+    /// 替换 `runtime_id` 的精确 `expected_revision`；返回 `snapshot` 的持久后继。
     pub fn replace(
         &self,
         runtime_id: &str,
         expected_revision: u64,
         snapshot: &OperationSnapshot,
     ) -> EmbeddedResult<JournalOperation> {
-        self.write_checkpoint(runtime_id, Some(expected_revision), snapshot, false)
+        self.backend
+            .write_checkpoint(runtime_id, Some(expected_revision), snapshot, false)
     }
 
-    /// Read historical evidence by exact identity; absence does not prove that execution never occurred.
-    /// 按精确身份读取历史证据；不存在不证明从未执行。
+    /// Commit the original scheduler candidate; return evidence, allowing only an identical retry.
+    /// 提交调度器原始候选；返回证据，仅允许完全相同的重试。
+    pub(in crate::runtime::embedded) fn checkpoint(
+        &self,
+        runtime_id: &str,
+        previous: Option<u64>,
+        snapshot: &OperationSnapshot,
+    ) -> EmbeddedResult<JournalOperation> {
+        self.backend
+            .write_checkpoint(runtime_id, previous, snapshot, true)
+    }
+
+    /// Read exact `runtime_id` and `operation_id`; return historical evidence or absence.
+    /// 读取精确 `runtime_id` 和 `operation_id`；返回历史证据或缺失。
     pub fn get(
         &self,
         runtime_id: &str,
         operation_id: &str,
     ) -> EmbeddedResult<Option<JournalOperation>> {
-        self.validate_key(runtime_id, operation_id)?;
-        self.read(self.lock()?.connection(), runtime_id, operation_id)
+        self.backend.get(runtime_id, operation_id)
     }
 
-    /// Return one historical row after exact `(runtime_id, operation_id)` in binary key order.
-    /// 按二进制键序返回精确 `(runtime_id, operation_id)` 之后的一条历史记录。
-    /// Pass `None` to start recovery enumeration; concurrent edits are not a multi-call snapshot.
-    /// 传入 `None` 开始恢复枚举；并发编辑不构成跨调用快照。
+    /// Enumerate one record after `after`; return the next binary-ordered identity or exhaustion.
+    /// 枚举 `after` 之后的一条记录；返回下一个二进制排序身份或结束。
     pub fn next(&self, after: Option<(&str, &str)>) -> EmbeddedResult<Option<JournalOperation>> {
-        if let Some((runtime_id, operation_id)) = after {
-            self.validate_key(runtime_id, operation_id)?;
-        }
-        let state = self.lock()?;
-        let result = match after {
-            None => state.connection().query_row("SELECT runtime_id, operation_id, revision, document, digest FROM operations ORDER BY runtime_id, operation_id LIMIT 1", [], |row| Ok(self.decode(row))),
-            Some((runtime_id, operation_id)) => state.connection().query_row("SELECT runtime_id, operation_id, revision, document, digest FROM operations WHERE (runtime_id, operation_id) > (?1, ?2) ORDER BY runtime_id, operation_id LIMIT 1", params![runtime_id, operation_id], |row| Ok(self.decode(row))),
-        };
-        result.optional().map_err(storage::error)?.transpose()
+        self.backend.next(after)
     }
 
-    /// Delete only terminal reconciled evidence at the exact revision; unresolved evidence retains capacity.
-    /// 仅按精确修订号删除终态且已对账的证据；未解决证据继续占有容量。
+    /// Forget exact identity at `expected_revision`; return the host's durable deletion result.
+    /// 遗忘 `expected_revision` 处的精确身份；返回宿主的持久删除结果。
     pub fn forget(
         &self,
         runtime_id: &str,
         operation_id: &str,
         expected_revision: u64,
     ) -> EmbeddedResult<()> {
-        self.validate_key(runtime_id, operation_id)?;
-        self.transaction(|connection| {
-            let record = self.expect(connection, runtime_id, operation_id, expected_revision)?;
-            if record.reconciliation.is_none()
-                && (!record.snapshot.phase.is_terminal()
-                    || record.snapshot.effects == EffectState::Unknown
-                    || record.snapshot.host_effects.iter().any(|effect| {
-                        effect.phase != HostEffectPhase::Completed
-                            || effect.effects == EffectState::Unknown
-                    }))
-            {
-                return Err(EmbeddedError::new(
-                    EmbeddedErrorCode::Busy,
-                    "unresolved operation history cannot be forgotten",
-                ));
-            }
-            connection
-                .execute(
-                    "DELETE FROM operations WHERE runtime_id=?1 AND operation_id=?2",
-                    params![runtime_id, operation_id],
-                )
-                .map_err(storage::error)?;
-            Ok(())
-        })
+        self.backend
+            .forget(runtime_id, operation_id, expected_revision)
     }
 
-    /// Execute one `mutation` atomically; preserve uncertain commit/rollback failures without retrying.
-    /// 原子执行一次 `mutation`；保留不确定的提交或回滚故障，不重试。
-    fn transaction(
+    /// Apply final `resolution` to exact identity/revision; return the durable successor revision.
+    /// 为精确身份及修订应用最终 `resolution`；返回持久后继修订。
+    pub fn reconcile(
         &self,
-        mutation: impl FnOnce(&Connection) -> EmbeddedResult<()>,
-    ) -> EmbeddedResult<()> {
-        let mut state = self.lock()?;
-        // Capture the one-shot test outcome before borrowing the transaction fields.
-        // 借用事务字段前捕获单次测试结果。
-        #[cfg(test)]
-        let lost_confirmation = state.lost_confirmation.take();
-        let JournalState {
-            connection,
-            failure,
-            ..
-        } = &mut *state;
-        let transaction = connection
-            .as_mut()
-            .expect("healthy journal retains its exclusive connection")
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(storage::error)?;
-        match mutation(&transaction) {
-            Ok(()) => {
-                // Execute a real test transaction outcome before its wrapper attempts to confirm it.
-                // 在包装器尝试确认前执行真实的测试事务结果。
-                #[cfg(test)]
-                if let Some(committed) = lost_confirmation {
-                    transaction
-                        .execute_batch(if committed { "COMMIT" } else { "ROLLBACK" })
-                        .map_err(storage::error)?;
-                }
-                match transaction.commit() {
-                    Ok(()) => Ok(()),
-                    Err(_) => {
-                        let error = uncertain();
-                        *failure = Some(error.clone());
-                        Err(error)
-                    }
-                }
-            }
-            // SQLITE_FULL and selected I/O errors may already have rolled back the transaction.
-            // SQLITE_FULL 及部分 I/O 错误可能已经回滚事务。
-            // This connection is exclusively owned and mutation closures never commit themselves.
-            // 此连接被独占，且变更闭包绝不自行提交。
-            Err(error) if transaction.is_autocommit() => Err(error),
-            Err(error) => match transaction.rollback() {
-                Ok(()) => Err(error),
-                Err(_) => {
-                    let error = uncertain();
-                    *failure = Some(error.clone());
-                    Err(error)
-                }
-            },
-        }
-    }
-
-    /// Validate and encode `record` within the configured byte budget before starting a transaction.
-    /// 开始事务前，在配置字节预算内校验并编码 `record`。
-    fn encode(&self, record: &JournalOperation) -> EmbeddedResult<Vec<u8>> {
-        self.validate_key(&record.runtime_id, &record.snapshot.operation_id)?;
-        json_size(record, self.config.max_record_bytes)?;
-        serde_json::to_vec(record)
-            .map_err(|_| EmbeddedError::invalid("operation history serialization failed"))
-    }
-
-    /// Reject empty or over-budget lookup identities before SQLite allocates their bound parameters.
-    /// SQLite 分配绑定参数前，拒绝空或超出预算的查询身份。
-    fn validate_key(&self, runtime_id: &str, operation_id: &str) -> EmbeddedResult<()> {
-        if runtime_id.is_empty() || operation_id.is_empty() {
-            return Err(EmbeddedError::invalid(
-                "operation history identities must not be empty",
-            ));
-        }
-        if runtime_id.len() > self.config.max_record_bytes
-            || operation_id.len() > self.config.max_record_bytes
-        {
-            return Err(capacity());
-        }
-        Ok(())
-    }
-
-    /// Read a single row using `connection`, checking its bounded encoding, digest and redundant identity.
-    /// 使用 `connection` 读取单行，检查其有界编码、摘要及冗余身份。
-    fn read(
-        &self,
-        connection: &Connection,
         runtime_id: &str,
         operation_id: &str,
-    ) -> EmbeddedResult<Option<JournalOperation>> {
-        connection.query_row("SELECT runtime_id, operation_id, revision, document, digest FROM operations WHERE runtime_id=?1 AND operation_id=?2",
-            params![runtime_id, operation_id], |row| Ok(self.decode(row))).optional().map_err(storage::error)?.transpose()
+        expected_revision: u64,
+        resolution: &OperationReconciliation,
+    ) -> EmbeddedResult<u64> {
+        self.backend
+            .reconcile(runtime_id, operation_id, expected_revision, resolution)
     }
 
-    /// Require the original key and revision before changing or deleting a record.
-    /// 变更或删除记录前，要求原始键与修订号一致。
-    fn expect(
-        &self,
-        connection: &Connection,
-        runtime_id: &str,
-        operation_id: &str,
-        revision: u64,
-    ) -> EmbeddedResult<JournalOperation> {
-        let record = self
-            .read(connection, runtime_id, operation_id)?
-            .ok_or_else(|| {
-                EmbeddedError::new(
-                    EmbeddedErrorCode::NotFound,
-                    "operation history was not found",
-                )
-            })?;
-        if record.revision != revision {
-            return Err(EmbeddedError::new(
-                EmbeddedErrorCode::StaleGeneration,
-                "operation history revision changed",
-            ));
-        }
-        Ok(record)
+    /// Request validated recovery of the same backend; return whether recovery completed.
+    /// 请求校验恢复同一个后端；返回是否完成了恢复。
+    pub fn recover_storage(&self) -> EmbeddedResult<bool> {
+        self.backend.recover_storage()
     }
 
-    /// Decode borrowed SQLite row bytes, allocating JSON only after size and checksum validation.
-    /// 解码借用的 SQLite 行字节，仅在大小及摘要校验后分配 JSON。
-    fn decode(&self, row: &rusqlite::Row<'_>) -> EmbeddedResult<JournalOperation> {
-        let document = row
-            .get_ref(3)
-            .map_err(storage::error)?
-            .as_blob()
-            .map_err(|_| corrupt())?;
-        if document.len() > self.config.max_record_bytes {
-            return Err(capacity());
-        }
-        let digest = row
-            .get_ref(4)
-            .map_err(storage::error)?
-            .as_blob()
-            .map_err(|_| corrupt())?;
-        if Sha256::digest(document).as_slice() != digest {
-            return Err(corrupt());
-        }
-        let record: JournalOperation = serde_json::from_slice(document).map_err(|_| corrupt())?;
-        let runtime_id = row
-            .get_ref(0)
-            .map_err(storage::error)?
-            .as_str()
-            .map_err(|_| corrupt())?;
-        let operation_id = row
-            .get_ref(1)
-            .map_err(storage::error)?
-            .as_str()
-            .map_err(|_| corrupt())?;
-        let revision: i64 = row.get(2).map_err(storage::error)?;
-        if runtime_id.is_empty()
-            || operation_id.is_empty()
-            || record.runtime_id != runtime_id
-            || record.snapshot.operation_id != operation_id
-            || revision <= 0
-            || record.revision != revision as u64
-        {
-            return Err(corrupt());
-        }
-        validate_callers(runtime_id, &record.snapshot).map_err(|_| corrupt())?;
-        if let Some(reconciliation) = &record.reconciliation {
-            if record.revision < 2 {
-                return Err(corrupt());
-            }
-            reconciliation
-                .validate(&record.snapshot)
-                .map_err(|_| corrupt())?;
-        }
-        Ok(record)
+    /// Hold the real adapter gate for tests; return a guard that releases it on drop.
+    /// 为测试持有真实适配器门禁；返回释放时解除门禁的保护对象。
+    #[cfg(test)]
+    pub(crate) fn block_for_test(&self) -> impl Drop + '_ {
+        self.test_sqlite
+            .as_ref()
+            .expect("SQLite test adapter")
+            .block_for_test()
     }
 
-    /// Acquire journal ownership; poisoning never becomes a guessed successful checkpoint.
-    /// 获取日志所有权；锁中毒绝不转化为猜测的成功检查点。
-    fn lock(&self) -> EmbeddedResult<MutexGuard<'_, JournalState>> {
-        let state = self.state.lock().map_err(|_| {
-            EmbeddedError::new(
-                EmbeddedErrorCode::Internal,
-                "operation history lock is poisoned",
-            )
-        })?;
-        // A failed rollback may leave connection-local uncommitted bytes; never label them durable.
-        // 回滚失败可能留下连接内未提交字节；绝不将其标记为持久证据。
-        if let Some(error) = &state.failure {
-            return Err(error.clone());
-        }
-        if state.connection.is_none() {
-            return Err(uncertain());
-        }
-        Ok(state)
+    /// Lose the next real SQLite confirmation according to `committed`; used only by storage tests.
+    /// 根据 `committed` 丢失下次真实 SQLite 确认；仅用于存储测试。
+    #[cfg(test)]
+    pub(crate) fn lose_next_confirmation_for_test(&self, committed: bool) {
+        self.test_sqlite
+            .as_ref()
+            .expect("SQLite test adapter")
+            .lose_next_confirmation_for_test(committed);
     }
-}
-
-/// Validate each original caller against the stored runtime and operation before accepting or restoring evidence.
-/// 接纳或恢复证据前，对照存储的运行时及操作校验每个原始调用方。
-/// Return an explicit identity error; no current plugin registration supplies missing historical fields.
-/// 返回明确身份错误；不从当前插件注册补充缺失的历史字段。
-fn validate_callers(runtime_id: &str, snapshot: &OperationSnapshot) -> EmbeddedResult<()> {
-    snapshot.validate_finalization()?;
-    snapshot
-        .context
-        .validate(runtime_id, &snapshot.operation_id)?;
-    // Each retained effect carries its own original authority, including low-level host-managed calls.
-    // 每条保留副作用携带其自身原始权威，包括低层宿主管理调用。
-    for effect in &snapshot.host_effects {
-        effect.caller.validate(runtime_id)?;
-        if snapshot
-            .context
-            .caller()
-            .is_some_and(|caller| caller != &effect.caller)
-        {
-            return Err(EmbeddedError::invalid(
-                "historical effect caller contradicts its operation context",
-            ));
-        }
-        if effect.caller.operation_id != snapshot.operation_id {
-            return Err(EmbeddedError::invalid(
-                "historical effect caller does not match its operation",
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Return a bounded retention error without exposing database paths or application values.
-/// 返回有界保留错误，不暴露数据库路径或应用值。
-fn capacity() -> EmbeddedError {
-    EmbeddedError::new(
-        EmbeddedErrorCode::CapacityExceeded,
-        "operation history exceeds configured retention limits",
-    )
-}
-
-/// Return a corruption diagnostic; no migration, clearing or replay is attempted.
-/// 返回损坏诊断；不尝试迁移、清空或重放。
-fn corrupt() -> EmbeddedError {
-    EmbeddedError::new(
-        EmbeddedErrorCode::Internal,
-        "operation history record is corrupt",
-    )
-}
-
-/// Return the sticky uncertainty state requiring retained evidence and explicit recovery.
-/// 返回要求保留证据并显式恢复的持续不确定状态。
-fn uncertain() -> EmbeddedError {
-    EmbeddedError::new(
-        EmbeddedErrorCode::Internal,
-        "operation history commit is uncertain; close and reconcile before further mutations",
-    )
 }

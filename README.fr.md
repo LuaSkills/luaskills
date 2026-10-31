@@ -58,7 +58,7 @@ LuaSkills fait tourner le système de skills de [Vulcan Code](https://github.com
 - C ABI standard et FFI publique `_json` pour tous les autres langages
 - `runtime_lease` public et `system_runtime_lease` lié à une autorité pour des VM Lua persistantes
 - Résultats structurés `host_result`, à commencer par les éditions `change_set` de niveau IDE
-- SQLite et LanceDB optionnels via bibliothèques dynamiques, callbacks hôte ou space controller
+- SQLite optionnel via des callbacks enregistrés par l’hôte
 
 ### 📦 SDK
 
@@ -79,7 +79,7 @@ LuaSkills fait tourner le système de skills de [Vulcan Code](https://github.com
 │  policy · UI · permissions   │  C ABI  │  skill loader · help · lifecycle     │
 │  budgets · model providers   │◀───────▶│  LuaJIT VMs · leases · vulcan.* APIs │
 │  host tools · storage        │  JSON   │  managed Python / Node · deps        │
-│                              │  FFI    │  config stores · SQLite / LanceDB    │
+│                              │  FFI    │  config stores · SQLite    │
 └──────────────────────────────┘         └──────────────────────────────────────┘
                                                           │
                                               skills/<skill_id>/skill.yaml
@@ -90,7 +90,7 @@ LuaSkills fait tourner le système de skills de [Vulcan Code](https://github.com
 | `src/runtime` | Moteur, VM Lua, leases, contexte, aide, résultats, runtimes gérés |
 | `src/skill` | Manifestes, racines, configuration et cycle de vie |
 | `src/dependency`, `src/download` | Résolution des dépendances, téléchargements et extraction d’archives |
-| `src/providers` | Liaisons SQLite et LanceDB |
+| `src/providers` | Liaisons SQLite |
 | `src/ffi`, `src/ffi_standard`, `src/ffi_embedded` | FFI publique `_json`, C ABI standard et transport du runtime embarqué |
 | `include/` | En-têtes C pour les hôtes FFI |
 | `contracts/` | Contrats machine partagés avec les SDK |
@@ -102,7 +102,7 @@ LuaSkills fait tourner le système de skills de [Vulcan Code](https://github.com
 
 ```toml
 [dependencies]
-luaskills = "0.7.2"
+luaskills = "0.7.3"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md) montre `call_skill` et le pont d’outils `vulcan.host.*`.
@@ -123,7 +123,7 @@ Voir le [SDK overview](docs/sdk/index.md) et le [FFI overview](docs/integration/
 Partez de [demo-skill](https://github.com/LuaSkills/demo-skill), puis lisez le [Skill development manual](docs/development/skill-development.md). Pour déboguer un skill avec une arborescence de runtime réelle :
 
 ```bash
-cargo run --bin luaskills-debug -- call \
+cargo run --features debug-sqlite --bin luaskills-debug -- call \
   --runtime-root D:/runtime \
   --skill-path D:/skills/demo-skill \
   --tool ping \
@@ -158,14 +158,12 @@ cargo run --bin luaskills-debug -- call \
 
 | Composant | Version |
 | --- | --- |
-| Cœur LuaSkills et FFI SDK | `0.7.2` |
+| Cœur LuaSkills et FFI SDK | `0.7.3` |
 | SDK TypeScript, Python et Go | Lignes de version indépendantes ; voir le [SDK overview](docs/sdk/index.md#versions) |
 | Paquets du runtime Lua | série compatible `0.1` |
 | Python / uv gérés | `3.14.6` / `0.11.28` |
 | Node.js / pnpm gérés | `24.18.0` / `11.11.0` |
 | Valeurs par défaut du runtime géré | `workers=4 / idle=60s / sessions=256 / buffer=1MiB/stream / invoke=unlimited` |
-| vldb-controller | `0.2.3` |
-| vldb-sqlite / vldb-lancedb | `0.1.6` / `0.1.5` |
 
 Les valeurs par défaut des scripts se trouvent dans `scripts/deps/`. Les publications suivent le [processus de release](scripts/release/README.md) : d’abord les paquets du runtime, puis la release du cœur sur cinq plateformes, ensuite le crate, enfin les SDK.
 

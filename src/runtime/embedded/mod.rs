@@ -42,9 +42,9 @@ pub use governor::{ExecutionPermit, PoolGovernor, PoolUsage, VmAllocationState, 
 pub(crate) use identity::IdentityKind;
 pub use journal::{
     HostEffectReconciliation, JournalOperation, JournalWritePhase, JournalWriteReceipt,
-    JournalWriteSnapshot, OperationJournal, OperationJournalConfig, OperationJournalWorker,
-    OperationJournalWorkerConfig, OperationJournalWorkerStatus, OperationReconciliation,
-    ReconciledExecution, ResolvedEffectState,
+    JournalWriteSnapshot, OperationJournal, OperationJournalBackend, OperationJournalConfig,
+    OperationJournalWorker, OperationJournalWorkerConfig, OperationJournalWorkerStatus,
+    OperationReconciliation, ReconciledExecution, ResolvedEffectState,
 };
 pub(crate) use module::PreparedModuleDefinition;
 pub use module::{ModuleDefinition, ModuleExport, ModuleFinalizer, ModuleInvocation};

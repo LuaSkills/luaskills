@@ -18,6 +18,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Only declared source inputs trigger source rehashing; OUT_DIR never becomes an input to itself.
     // 仅声明的源码输入触发重新计算；OUT_DIR 绝不成为其自身输入。
     let package = PathBuf::from(required("CARGO_MANIFEST_DIR")?);
+    // Only the standalone MSVC debugger opts into UTF-8 Win32 paths; embedded hosts own their process settings.
+    // 仅独立 MSVC 调试器启用 UTF-8 Win32 路径；嵌入式宿主自行拥有进程设置。
+    if env::var_os("CARGO_FEATURE_DEBUG_SQLITE").is_some()
+        && required("CARGO_CFG_TARGET_OS")? == "windows"
+        && required("CARGO_CFG_TARGET_ENV")? == "msvc"
+    {
+        println!("cargo::rustc-link-arg-bin=luaskills-debug=/MANIFEST:EMBED");
+        println!(
+            "cargo::rustc-link-arg-bin=luaskills-debug=/MANIFESTINPUT:{}",
+            package.join("src/bin/luaskills-debug.manifest").display()
+        );
+    }
     for input in identity::INPUT_ROOTS {
         println!("cargo::rerun-if-changed={input}");
     }

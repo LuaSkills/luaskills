@@ -322,20 +322,18 @@ write_packaged_demo_readme() {
   # 写入匹配发布 demo 包目录结构的包根 README。
   local mode="$1"
   local package_root="$2"
-  local shell_name run_command fetch_all_command fetch_lua_command fetch_vldb_command mode_description examples_section
+  local shell_name run_command fetch_all_command fetch_lua_command mode_description examples_section
 
   if platform_is_windows; then
     shell_name="powershell"
     run_command='.\run.ps1'
     fetch_all_command='.\upgrade_deps.bat'
     fetch_lua_command='.\upgrade_deps.bat lua'
-    fetch_vldb_command='.\upgrade_deps.bat vldb'
   else
     shell_name="bash"
     run_command="./run.sh"
     fetch_all_command="./upgrade_deps.sh"
     fetch_lua_command="./upgrade_deps.sh lua"
-    fetch_vldb_command="./upgrade_deps.sh vldb"
   fi
 
   if [ "$mode" = "ffi" ]; then
@@ -365,7 +363,7 @@ write_packaged_demo_readme() {
     printf '`run` 脚本只负责运行 demo，不会自动下载依赖。首次使用或升级依赖时请先执行：\n\n'
     printf '```%s\n%s\n```\n\n' "$shell_name" "$fetch_all_command"
     printf '也可以按需单独拉取：\n\n'
-    printf '```%s\n%s\n%s\n```\n\n' "$shell_name" "$fetch_lua_command" "$fetch_vldb_command"
+    printf '```%s\n%s\n```\n\n' "$shell_name" "$fetch_lua_command"
     printf 'Windows 包包含 `run.ps1`、`upgrade_deps.bat` 与 `scripts/deps/fetch_deps.ps1`；FFI 包额外包含 `scripts/ffi/fetch_ffi.ps1`。Linux/macOS 包使用对应 `.sh` 脚本。\n\n'
     printf 'Windows packages include `run.ps1`, `upgrade_deps.bat`, and `scripts/deps/fetch_deps.ps1`; FFI packages also include `scripts/ffi/fetch_ffi.ps1`. Linux and macOS packages use the matching `.sh` scripts.\n'
   } > "$package_root/README.md"
@@ -457,7 +455,7 @@ cat > "$PACKAGE_ROOT/demo-manifest.json" <<JSON
   "mode": "${MODE}",
   "runtime_root": "runtime",
   "release_tag": "${RELEASE_TAG}",
-  "fetch_targets": ["all", "lua", "vldb"]
+  "fetch_targets": ["all", "lua"]
 }
 JSON
 

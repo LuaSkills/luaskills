@@ -1,6 +1,6 @@
 [package]
 name = "luaskills"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -34,9 +34,20 @@ include = [
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [features]
+# Opt into the host-selected SQLite operation-journal adapter; the default runtime links no SQLite.
+# 显式启用宿主选择的 SQLite 操作日志适配器；默认运行时不链接 SQLite。
+sqlite-journal = ["dep:rusqlite"]
+# Link SQLite only when building the standalone debugger as a database-providing host.
+# 仅在将独立调试工具构建为数据库宿主时链接 SQLite。
+debug-sqlite = ["dep:rusqlite", "rusqlite/hooks"]
 # Generate offline embedded contracts from the exact Rust serialization types only when requested.
 # 仅在显式请求时，从精确 Rust 序列化类型生成离线嵌入式契约。
 contract-generation = ["dep:schemars"]
+
+[[bin]]
+name = "luaskills-debug"
+path = "src/bin/luaskills-debug.rs"
+required-features = ["debug-sqlite"]
 
 [[bin]]
 name = "generate_embedded_contract"
@@ -54,13 +65,12 @@ libc = "0.2"
 # Match the consuming host's schema engine and disable ambient network/file retrieval.
 # 对齐消费宿主的 Schema 引擎，并禁用环境网络及文件检索。
 jsonschema = { version = "=0.49.9", default-features = false }
-libloading = "0.8"
 mlua = { version = "0.12.0-rc.1", features = ["luajit52", "vendored", "serialize", "send"] }
 notify = "8.2.0"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 # Match the host's SQLite binding and bundle the engine for portable durable operation journals.
 # 对齐宿主的 SQLite 绑定并捆绑引擎，用于可移植的持久操作日志。
-rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "limits"] }
+rusqlite = { version = "=0.40.2", optional = true, default-features = false, features = ["bundled", "limits"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -73,7 +83,6 @@ tar = "0.4.46"
 # Enable runtime-independent terminal observation without introducing another executor.
 # 启用不依赖运行时的终态观测，不引入另一执行器。
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
-vldb-controller-client = "0.2.3"
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 
 # Reuse the existing hashing and JSON crates for deterministic local build metadata.
@@ -82,5 +91,10 @@ zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 serde_json = "1"
 
+[dev-dependencies]
+# Exercise persisted-format compatibility and real commit recovery without linking SQLite in production.
+# 验证持久格式兼容与真实提交恢复，不在生产默认构建中链接 SQLite。
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "limits"] }
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

@@ -42,7 +42,7 @@ LuaSkills 给宿主提供一层运行时契约，而不是一堆口头约定。
 - strict help 树。
 - 运行时上下文注入。
 - skill 依赖路径注入。
-- SQLite / LanceDB Provider 路由。
+- SQLite Provider 路由。
 - system、project、user skill root 分层。
 - Rust、C ABI、公共 `_json` FFI 等接入面。
 
@@ -55,7 +55,7 @@ LuaSkills 给宿主提供一层运行时契约，而不是一堆口头约定。
 | Runtime Core | 加载 skill、重载 root、列出 entry、调用 skill 函数。 |
 | Skill Authoring | Skill 作者用稳定的 `vulcan.*` API 与结构化 help 编写能力。 |
 | Product Control | 权限、预算、UI、authority、用户提示继续由宿主控制。 |
-| Data-aware Skills | SQLite / LanceDB 可以走 runtime 动态库，也可以交给宿主 provider 或 space controller。 |
+| Data-aware Skills | SQLite 由宿主注册回调管理。 |
 | Multi-language Hosts | Rust、C ABI、TypeScript、Python、Go 或混合宿主都能接入同一套模型。 |
 | Ecosystem Growth | 用真实示例和模板沉淀 skill 形态，而不是每个项目重新发明目录结构。 |
 

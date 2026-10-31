@@ -58,7 +58,7 @@ fn source_demo_launchers_reference_existing_dependency_fetchers() {
     ];
     // supported_targets is the complete launcher-level dependency target contract.
     // supported_targets 是完整的启动器级依赖目标契约。
-    const SUPPORTED_TARGETS: [&str; 4] = ["none", "all", "lua", "vldb"];
+    const SUPPORTED_TARGETS: [&str; 3] = ["none", "all", "lua"];
 
     // Each tuple verifies both path resolution and unchanged parameter forwarding without network access.
     // 每个元组均在不访问网络的情况下验证路径解析和参数透传保持不变。

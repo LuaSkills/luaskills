@@ -100,7 +100,7 @@ Call the example through the normal `luaskills-debug` path:
 通过正式 `luaskills-debug` 路径调用示例：
 
 ```powershell
-cargo run --bin luaskills-debug -- call --runtime-root target/managed-runtime-fetch-check-uv01128-all --skill-path examples/managed_runtime/managed-child-runtime-debug --tool smoke --args-json '{"text":"debug-call"}' --output content
+cargo run --features debug-sqlite --bin luaskills-debug -- call --runtime-root target/managed-runtime-fetch-check-uv01128-all --skill-path examples/managed_runtime/managed-child-runtime-debug --tool smoke --args-json '{"text":"debug-call"}' --output content
 ```
 
 The `smoke` entry returns JSON text containing:

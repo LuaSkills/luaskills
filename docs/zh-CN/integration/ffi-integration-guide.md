@@ -94,7 +94,6 @@
 当宿主需要自己接管：
 
 - SQLite
-- LanceDB
 
 时，当前协议同样保留两层回调形式：
 
@@ -521,32 +520,6 @@ System Plugin 租约不把整个 `system_lua_lib` 当成一个共享包。每次
 
 旧字段 `temp_dir`、`resources_dir`、`lua_packages_dir`、`host_provided_tool_root`、`host_provided_lua_root`、`host_provided_ffi_root`、`download_cache_root`、`dependency_dir_name`、`state_dir_name` 与 `database_dir_name` 仍属于既有运行时布局接口。技能配置不沿用这套推导：宿主必须单独提供绝对用户级 `skill_config_root`，没有旧单文件配置字段或路径猜测。JSON FFI 直接在 host options 里传 `runtime_root`；标准 C ABI 使用对应版本结构传入运行时与受管根。
 
-### 7.1.1 Space Controller 额外前置要求
-
-当 SQLite 或 LanceDB 的 provider mode 选择 `space_controller` 时，宿主还需要额外准备：
-
-- `LuaRuntimeHostOptions.space_controller.endpoint`
-  - 可选
-  - 缺失时默认使用共享端点 `http://127.0.0.1:19801`
-- `LuaRuntimeHostOptions.space_controller.auto_spawn`
-  - 是否允许自动唤起 controller
-  - 若为 `true`，`endpoint` 必须使用本地可绑定地址格式，例如 `19801`、`:19801`、`127.0.0.1:19801`、`localhost:19801` 或 `[::1]:19801`
-- `LuaRuntimeHostOptions.space_controller.executable_path`
-  - 可选
-  - 指向宿主已经复制到本地稳定目录的 `vldb-controller` 可执行文件
-- `LuaRuntimeHostOptions.space_controller.process_mode`
-  - `service`
-  - `managed`
-
-这里要特别注意：
-
-- `luaskills` 代码层通过 crates.io 版本 `vldb-controller-client = 0.2.3` 固定依赖 controller Rust SDK
-- 当前上游 Rust SDK 在注册阶段使用 `client_name`，具体 `client_session_id` 由 SDK 内部自动管理并自动回放附着与 backend 期望状态
-- `v0.2.1` 额外修复了共享本地 endpoint 在 `auto_spawn` 场景下的重复拉起协调风险
-- 真正被拉起的 controller 服务程序，不是通过 Cargo 把二进制嵌进宿主，而是由宿主自行复制并管理
-- 也就是说，**Rust SDK 走 crates.io 固定版本，controller 可执行文件走宿主本地复制路径**
-- 如果宿主要连接远端 controller 或使用远端主机名端点，必须关闭 `auto_spawn`，避免把远端地址错误地当成本地 bind 地址去拉起新进程
-
 ### 7.1.2 callback 注册前置要求
 
 若宿主准备使用：
@@ -670,11 +643,7 @@ System Plugin 租约不把整个 `system_lua_lib` 当成一个共享包。每次
 - 路径字段
 - `allow_network_download`
 - GitHub base URL
-- SQLite / LanceDB 动态库路径
-- `sqlite_provider_mode`
 - `sqlite_callback_mode`
-- `lancedb_provider_mode`
-- `lancedb_callback_mode`
 - `runlua_pool_config`
 - `reserved_entry_names`
 - `ignored_skill_ids`
@@ -705,25 +674,7 @@ System Plugin 租约不把整个 `system_lua_lib` 当成一个共享包。每次
 
 - `protected_skill_ids` 已移除。三层模型下默认保护边界是 `ROOT` 层归属，不再通过 skill id 清单声明保护。
 
-数据库后端模式规则如下：
-
-- `dynamic_library`
-  - lib 自己加载数据库动态库
-- `host_callback`
-  - lib 把数据库请求回调给宿主
-- `space_controller`
-  - lib 把数据库请求转发给外部空间控制器
-
-当 provider mode 为 `host_callback` 时，还必须继续指定 callback mode：
-
-- `standard`
-- `json`
-
-也就是说：
-
-- provider mode 决定数据库请求走哪一类后端
-- callback mode 只在 `host_callback` 模式下决定“用标准回调还是 JSON 回调”
-- SQLite 与 LanceDB 可以分别设置成不同组合
+SQLite 仅使用宿主回调。`sqlite_callback_mode` 选择 `standard` 或 `json`；显式实例注册入口为 `luaskills_ffi_engine_new_with_database_providers_v1`。详见[宿主注册说明](host-database-provider-guide.md)。
 
 说明：
 
@@ -747,7 +698,7 @@ System Plugin 租约不把整个 `system_lua_lib` 当成一个共享包。每次
 
 - `ignored_skill_ids` 匹配 skill 目录派生出的 `skill_id`
 - 命中后该 skill 会在加载早期被跳过
-- 被跳过的 skill 不会触发依赖准备、SQLite/LanceDB 绑定或 entry 注册
+- 被跳过的 skill 不会触发依赖准备、SQLite 绑定或 entry 注册
 - 该字段适合宿主已经用原生、gRPC、VMM 或其他实现替代某个默认 skill 包时使用
 - 这不是 skill 自声明的 capability 判定，也不会自动推断宿主已有能力
 
@@ -807,6 +758,22 @@ runtime-config(action, skill_id?, key?, value?, values?, expected_revision?, mod
 
 - `pool`
 - `host`
+
+### 8.4.1 桌面与命令行宿主模式（V4）
+
+创建引擎前选择宿主模式，配置按引擎隔离，不在运行中切换：
+
+| 接入方式 | 桌面模式 | 命令行模式及默认值 |
+| --- | --- | --- |
+| Rust `LuaRuntimeHostOptions.host_mode` | `LuaRuntimeHostMode::Desktop` | `LuaRuntimeHostMode::Console` |
+| JSON `host_options.host_mode` | `"desktop"` | `"console"`；省略时采用此值 |
+| C `FfiLuaEngineOptionsV4.host_mode` | `LUASKILLS_HOST_MODE_DESKTOP`（1） | `LUASKILLS_HOST_MODE_CONSOLE`（0） |
+
+V4 结构体的 `base` 完整嵌入 `FfiLuaEngineOptionsV3`，新增 `int32_t host_mode`，通过 `luaskills_ffi_engine_new_v4` 创建。先初始化整个 V4 结构体，再填写 V3 原有必需路径和配置，最后指定模式。非法模式返回标准错误并清零输出句柄。V1–V3 结构体、导出签名及内存所有权保持不变，旧接口继续默认命令行模式。
+
+Windows 桌面模式对 LuaSkills 自有进程统一应用 `CREATE_NO_WINDOW`，包括 Job 脱离失败后的重试、`vulcan.process.exec`、管道、持久会话、Python/Node 工作进程和会话、uv/pnpm 环境安装。原生 `os.execute` 保留退出三元组；原生 `io.popen` 保留流式读写、文本与二进制模式、标准文件操作及进程树回收。`enable_managed_io_compat` 仍独立决定是否使用原有只读托管管道。非 Windows 平台接受该配置，进程行为保持原样。
+
+覆盖范围包括 LuaSkills 自有启动路径。被调用程序主动创建窗口、独立控制台，以及通过 LuaJIT FFI 直接调用操作系统的行为不受此设置约束。
 
 ### 8.5 `FfiRuntimeSkillRoot`
 
@@ -879,16 +846,9 @@ runtime-config(action, skill_id?, key?, value?, values?, expected_revision?, mod
 - `FFI_SOURCE_TYPE_GITHUB`
 - `FFI_SOURCE_TYPE_URL`
 
-### 8.8 `FfiSkillUninstallOptions`
+### 8.8 卸载边界
 
-作用：
-
-- 描述一次卸载时是否删除数据库
-
-字段：
-
-- `remove_sqlite`
-- `remove_lancedb`
+卸载接口仅处理技能代码和依赖，不删除宿主数据库。原数据库清理选项及结果字段已移除；标准 C 卸载入口不再接收清理选项指针，JSON 卸载请求不再接收 `options`。请使用 0.7.3 头文件重新编译宿主。
 
 ## 9. 接口目录总览
 
@@ -900,6 +860,8 @@ runtime-config(action, skill_id?, key?, value?, values?, expected_revision?, mod
 - `luaskills_ffi_describe`
 - `luaskills_ffi_engine_new`
 - `luaskills_ffi_engine_new_v2`
+- `luaskills_ffi_engine_new_v3`
+- `luaskills_ffi_engine_new_v4`
 - `luaskills_ffi_engine_free`
 
 公共 `_json` FFI 接口：
@@ -2003,9 +1965,9 @@ FFI 宿主接入时，推荐优先使用 `RuntimeSkillRoot[]`。
 - 快速接入
 - 动态值很多的场景
 
-TypeScript / Node.js 宿主建议优先使用独立仓库 [`luaskills-sdk-typescript`](https://github.com/LuaSkills/luaskills-sdk-typescript) 中的 `@luaskills/sdk`。SDK 仍然走公共 `_json` FFI，但会统一处理动态库加载、`FfiBorrowedBuffer` / `FfiOwnedBuffer`、JSON 包络、engine 生命周期、authority、root helper、skill-config、lifecycle 管理入口，以及 SQLite / LanceDB 的 JSON provider callback 注册与清理。
+TypeScript / Node.js 宿主建议优先使用独立仓库 [`luaskills-sdk-typescript`](https://github.com/LuaSkills/luaskills-sdk-typescript) 中的 `@luaskills/sdk`。SDK 仍然走公共 `_json` FFI，但会统一处理动态库加载、`FfiBorrowedBuffer` / `FfiOwnedBuffer`、JSON 包络、engine 生命周期、authority、root helper、skill-config、lifecycle 管理入口，以及 SQLite 的 JSON provider callback 注册与清理。
 
-Python 宿主建议优先使用独立仓库 [`luaskills-sdk-python`](https://github.com/LuaSkills/luaskills-sdk-python) 中的 `luaskills-sdk`。SDK 仍然走公共 `_json` FFI，但会统一处理 `ctypes` 动态库加载、buffer 释放、JSON 包络、authority、root helper、skill-config、lifecycle 管理入口，以及 SQLite / LanceDB 的 JSON provider callback 注册与清理。
+Python 宿主建议优先使用独立仓库 [`luaskills-sdk-python`](https://github.com/LuaSkills/luaskills-sdk-python) 中的 `luaskills-sdk`。SDK 仍然走公共 `_json` FFI，但会统一处理 `ctypes` 动态库加载、buffer 释放、JSON 包络、authority、root helper、skill-config、lifecycle 管理入口，以及 SQLite 的 JSON provider callback 注册与清理。
 
 Go 宿主如果希望用 Go module 封装主链，建议优先使用独立仓库 [`luaskills-sdk-go`](https://github.com/LuaSkills/luaskills-sdk-go)。该 SDK 使用 cgo 调公共 `_json` FFI，调用方需要显式配置 `CGO_ENABLED=1`、C 编译器、链接库搜索路径与运行时动态库路径。Go 的 provider callback 当前保留为显式边界 API：需要正式使用 `host_callback + json` 时，应由宿主工程实现受控 cgo callback bridge，或先使用 TypeScript / Python SDK 承担 JSON callback。
 
@@ -2148,7 +2110,7 @@ Go 宿主如果希望用 Go module 封装主链，建议优先使用独立仓库
   - [examples/ffi/standard_runtime/README.md](../../../examples/ffi/standard_runtime/README.md)
 - 想看公共 `_json` FFI 驱动的动态安装烟测：
   - [examples/ffi/demo_runtime/README.md](../../../examples/ffi/demo_runtime/README.md)
-- 想看宿主接管 SQLite / LanceDB provider：
+- 想看宿主接管 SQLite provider：
   - [examples/ffi/host_provider_demo/README.md](../../../examples/ffi/host_provider_demo/README.md)
 
 建议阅读顺序：

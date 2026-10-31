@@ -7,11 +7,16 @@ use luaskills::{
     RuntimeEntryDescriptor, RuntimeInvocationResult, RuntimeRequestContext, RuntimeSkillRoot,
     SkillMeta, builtin_github_mirrors, normalize_github_mirror_base_url, probe_github_mirrors,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+// The debugger owns its SQLite backend and registers it through the public host interface.
+// 调试工具拥有自己的 SQLite 后端，并通过公开宿主接口注册。
+mod debug_sqlite;
 
 /// Default help text rendered by the standalone LuaSkills debug binary.
 /// 独立 LuaSkills 调试二进制程序输出的默认帮助文本。
@@ -33,9 +38,29 @@ Network options (sync, inspect, list-tools, call):
 
 Built-in mirror ids: github, gh-proxy-com, ghfast-top, gh-llkk-cc, ghproxy-net.
 
+Host context options (call):
+  --context-file <path>     JSON file holding request_context, client_budget, and tool_config; omitted
+                            members keep the default profile described below.
+  --client-budget <json>    JSON object injected into vulcan.context.client_budget.
+  --tool-config <json>      JSON object injected into vulcan.context.tool_config.
+
+Host context defaults:
+  Every call receives the context shape a host injects for one single-command developer invocation.
+  request_id is luaskills-debug; client_name and matched_client_pattern are luaskills-debug; client_budget
+  carries tool_result and file_read scopes that each allow 200000 bytes with unlimited lines (-1).
+  A skill that reads vulcan.context.client_budget therefore sees a usable budget instead of an empty object.
+  --context-file replaces the whole default profile; --client-budget and --tool-config then override single
+  members and are mutually exclusive with --context-file. --enable-host-result only adds the host_result
+  client capability and never changes the injected budget.
+
 Managed runtime root options:
   --managed-runtime-distribution-root <dir>  Existing absolute Python/Node distribution root.
   --managed-runtime-environment-root <dir>   Absolute writable managed environment root.
+
+SQLite:
+  Skills with sqlite.enable: true automatically receive the debugger's local SQLite host.
+  Data stays under <runtime-root>/databases/sqlite/<skill-id>/<skill-id>.sqlite3.
+  execute_script, execute_batch and query_json are supported; no controller or database DLL is needed.
 
 Managed runtime resource options:
   --managed-runtime-worker-pool-max-size <count>       Maximum Workers per environment pool.
@@ -50,6 +75,7 @@ Examples:
   luaskills-debug inspect --runtime-root D:\runtime --skill-id vulcan-file
   luaskills-debug list-tools --runtime-root D:\runtime --skill-path D:\skills\vulcan-file --output content
   luaskills-debug call --runtime-root D:\runtime --skill-id vulcan-file --tool read --args-json "{\"path\":\"D:/demo.txt\"}"
+  luaskills-debug call --runtime-root D:\runtime --skill-id vulcan-codekit --tool vulcan-codekit-rg --args-json "{\"dir\":\".\"}"
 "#;
 
 /// Supported top-level debug subcommands.
@@ -149,6 +175,9 @@ struct DebugCliCommand {
     /// Whether the host_result bridge should be explicitly enabled for this invocation.
     /// 当前调用是否应显式开启 host_result 桥接。
     enable_host_result: bool,
+    /// Host context overrides applied on top of the developer default profile.
+    /// 在开发者默认配置之上应用的宿主上下文覆盖。
+    host_context: DebugHostContextFlags,
     /// Selected output mode.
     /// 当前选择的输出模式。
     output_mode: DebugOutputMode,
@@ -198,6 +227,49 @@ impl DebugNetworkFlags {
         };
         Ok(())
     }
+}
+
+/// Host context overrides supplied by the developer for one debug call.
+/// 开发者为单次调试调用提供的宿主上下文覆盖值。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DebugHostContextFlags {
+    /// JSON file holding the complete host context object.
+    /// 保存完整宿主上下文对象的 JSON 文件。
+    context_file: Option<PathBuf>,
+    /// Inline JSON object replacing the default `client_budget`.
+    /// 替换默认 `client_budget` 的内联 JSON 对象。
+    client_budget_json: Option<String>,
+    /// Inline JSON object replacing the default `tool_config`.
+    /// 替换默认 `tool_config` 的内联 JSON 对象。
+    tool_config_json: Option<String>,
+}
+
+impl DebugHostContextFlags {
+    /// Return whether the developer supplied at least one host context override.
+    /// 返回开发者是否提供了至少一个宿主上下文覆盖值。
+    fn has_overrides(&self) -> bool {
+        self.context_file.is_some()
+            || self.client_budget_json.is_some()
+            || self.tool_config_json.is_some()
+    }
+}
+
+/// Complete host context payload resolved from the developer default profile and explicit overrides.
+/// 由开发者默认配置与显式覆盖值解析出的完整宿主上下文载荷。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct DebugHostContext {
+    /// Optional request metadata injected as `vulcan.context.request_context`.
+    /// 作为 `vulcan.context.request_context` 注入的可选请求元数据。
+    #[serde(default)]
+    request_context: Option<RuntimeRequestContext>,
+    /// Budget object injected as `vulcan.context.client_budget`.
+    /// 作为 `vulcan.context.client_budget` 注入的预算对象。
+    #[serde(default)]
+    client_budget: Value,
+    /// Tool configuration object injected as `vulcan.context.tool_config`.
+    /// 作为 `vulcan.context.tool_config` 注入的工具配置对象。
+    #[serde(default)]
+    tool_config: Value,
 }
 
 /// Resolve one mirror id or URL into the download base URL; `None` keeps GitHub.
@@ -471,7 +543,8 @@ fn run_debug_binary() -> Result<(), String> {
             let resolved_tool_name =
                 resolve_debug_tool_name(&prepared.entries, &requested_tool_name)?;
             let args_value = load_invocation_args(&command)?;
-            let invocation_context = build_debug_invocation_context(command.enable_host_result);
+            let invocation_context =
+                resolve_debug_host_context(&command.host_context, command.enable_host_result)?;
             let result = prepared.engine.call_skill(
                 &resolved_tool_name,
                 &args_value,
@@ -511,6 +584,7 @@ fn parse_debug_cli(args: &[String]) -> Result<DebugCliCommand, String> {
     let mut args_json: Option<String> = None;
     let mut args_file: Option<PathBuf> = None;
     let mut enable_host_result = false;
+    let mut host_context = DebugHostContextFlags::default();
     let mut output_mode = DebugOutputMode::Pretty;
     let mut network = DebugNetworkFlags::default();
 
@@ -570,6 +644,18 @@ fn parse_debug_cli(args: &[String]) -> Result<DebugCliCommand, String> {
             "--enable-host-result" => {
                 enable_host_result = true;
             }
+            "--context-file" => {
+                host_context.context_file =
+                    Some(PathBuf::from(read_cli_value(args, &mut index, flag)?));
+            }
+            "--client-budget" => {
+                host_context.client_budget_json =
+                    Some(read_cli_value(args, &mut index, flag)?.to_string());
+            }
+            "--tool-config" => {
+                host_context.tool_config_json =
+                    Some(read_cli_value(args, &mut index, flag)?.to_string());
+            }
             "--github-mirror" => {
                 network.select_mirror(read_cli_value(args, &mut index, flag)?)?;
             }
@@ -604,6 +690,23 @@ fn parse_debug_cli(args: &[String]) -> Result<DebugCliCommand, String> {
     if kind == DebugCommandKind::Call && tool_name.is_none() {
         return Err("call requires --tool".to_string());
     }
+    // Host context overrides only exist for call, so reject them elsewhere instead of ignoring them.
+    // 宿主上下文覆盖仅对 call 有效，其他子命令一律拒绝而不是静默忽略。
+    if kind != DebugCommandKind::Call && host_context.has_overrides() {
+        return Err(
+            "--context-file, --client-budget, and --tool-config are only valid for call"
+                .to_string(),
+        );
+    }
+    // A complete context file and a single-member override describe the same context differently.
+    // 完整上下文文件与单成员覆盖以不同方式描述同一上下文，不能同时使用。
+    if host_context.context_file.is_some()
+        && (host_context.client_budget_json.is_some() || host_context.tool_config_json.is_some())
+    {
+        return Err(
+            "--context-file cannot be combined with --client-budget or --tool-config".to_string(),
+        );
+    }
     managed_runtime_config.validate()?;
 
     Ok(DebugCliCommand {
@@ -618,6 +721,7 @@ fn parse_debug_cli(args: &[String]) -> Result<DebugCliCommand, String> {
         args_json,
         args_file,
         enable_host_result,
+        host_context,
         output_mode,
         network,
     })
@@ -795,8 +899,13 @@ fn prepare_debug_runtime(command: &DebugCliCommand) -> Result<PreparedDebugRunti
         max_size: 2,
         idle_ttl_secs: 30,
     };
-    let mut engine = LuaEngine::new(LuaEngineOptions::new(pool_config, host_options))
-        .map_err(|error| error.to_string())?;
+    // Give this engine its own SQLite owner; global callback state cannot replace it.
+    // 为此引擎提供独立 SQLite 所有者；全局回调状态不能替换它。
+    let mut engine = LuaEngine::new_with_database_providers(
+        LuaEngineOptions::new(pool_config, host_options),
+        debug_sqlite::database_callbacks(),
+    )
+    .map_err(|error| error.to_string())?;
     let skill_roots = [RuntimeSkillRoot {
         name: "ROOT".to_string(),
         skills_dir: runtime_root.join("skills"),
@@ -983,7 +1092,7 @@ fn synchronize_skill_into_runtime_root(
             )
         })?;
     }
-    copy_directory_recursive(source_skill_path, &target_skill_path)?;
+    copy_directory_recursive(source_skill_path, &target_skill_path, true)?;
     Ok(target_skill_path)
 }
 
@@ -1064,9 +1173,75 @@ fn same_directory_candidate_path_is_directory(
     }
 }
 
+/// Directory names that the debug sync skips at every depth of one source skill package.
+/// 调试同步在源 skill 包任意深度都会跳过的目录名称。
+///
+/// These are build, checkout, and debug-wrapper artifacts that are never skill content wherever they
+/// appear: a nested Rust crate such as `codekit-ffi/target` is as large as a root one, and a
+/// `.luaskills-debug` runtime copied into itself nests one level deeper on every sync.
+/// 这些是构建、检出与调试封装产物，出现在任何位置都不是 skill 内容：嵌套 Rust crate 的
+/// `codekit-ffi/target` 与根目录的一样庞大，而被复制进自身的 `.luaskills-debug` 每同步一次就多嵌套一层。
+const DEBUG_SYNC_EXCLUDED_ANY_DEPTH: [&str; 6] = [
+    "target",
+    ".git",
+    ".svn",
+    "node_modules",
+    "__pycache__",
+    ".luaskills-debug",
+];
+
+/// Directory names that the debug sync skips only directly under the source package root.
+/// 调试同步仅在源包根目录下一层跳过的目录名称。
+///
+/// At the package root these names are packaging output (`dist`, `out`), scratch space (`temp`), or
+/// directories that the debug runtime root owns as siblings of `skills/` (`state`, `databases`,
+/// `dependencies`, `lua_packages`, `libs`). Deeper in the package the same names are ordinary skill
+/// content such as `runtime/libs/`, so they are copied to keep the synchronized skill identical to an
+/// installed one.
+/// 在包根目录下，这些名称是打包产物（`dist`、`out`）、临时目录（`temp`），或由调试运行时根目录作为
+/// `skills/` 同级目录拥有的目录（`state`、`databases`、`dependencies`、`lua_packages`、`libs`）。
+/// 在更深层级，同名目录是普通 skill 内容（例如 `runtime/libs/`），因此会照常复制，使同步结果与
+/// 正式安装保持一致。
+const DEBUG_SYNC_EXCLUDED_AT_PACKAGE_ROOT: [&str; 8] = [
+    "dist",
+    "out",
+    "temp",
+    "state",
+    "databases",
+    "dependencies",
+    "lua_packages",
+    "libs",
+];
+
+/// Return whether one source entry is an artifact that debug sync must skip at its depth.
+/// 返回单个源条目在其所在深度是否为调试同步必须跳过的产物。
+///
+/// `at_package_root` is true only for entries directly under the source skill package root.
+/// 仅当条目直接位于源 skill 包根目录下时，`at_package_root` 为 true。
+fn debug_sync_skips_entry(
+    file_type: &fs::FileType,
+    file_name: &OsStr,
+    at_package_root: bool,
+) -> bool {
+    if file_type.is_dir() {
+        let matches_any = |names: &[&str]| names.iter().any(|name| file_name == OsStr::new(name));
+        return matches_any(&DEBUG_SYNC_EXCLUDED_ANY_DEPTH)
+            || (at_package_root && matches_any(&DEBUG_SYNC_EXCLUDED_AT_PACKAGE_ROOT));
+    }
+    file_type.is_file() && file_name == OsStr::new(".DS_Store")
+}
+
 /// Recursively copy one directory tree while rejecting symbolic links for predictable debug behavior.
 /// 递归复制单个目录树，并拒绝符号链接以保证调试行为可预测。
-fn copy_directory_recursive(source: &Path, target: &Path) -> Result<(), String> {
+///
+/// `at_package_root` is true for the top-level call on the source skill package and false for every
+/// recursive call, so root-only exclusions never apply to nested skill content.
+/// 对源 skill 包的顶层调用传 true，所有递归调用传 false，使仅限根目录的排除规则不会作用于嵌套内容。
+fn copy_directory_recursive(
+    source: &Path,
+    target: &Path,
+    at_package_root: bool,
+) -> Result<(), String> {
     fs::create_dir_all(target).map_err(|error| {
         format!(
             "Failed to create synchronized skill directory '{}': {}",
@@ -1096,15 +1271,20 @@ fn copy_directory_recursive(source: &Path, target: &Path) -> Result<(), String> 
                 error
             )
         })?;
-        let destination = target.join(entry.file_name());
         if file_type.is_symlink() {
             return Err(format!(
                 "Symbolic-link entry '{}' is not supported by luaskills-debug",
                 render_debug_path(&entry.path())
             ));
         }
+        // Build and checkout artifacts are skipped before any recursion or copy work happens.
+        // 构建与检出产物在发生任何递归或复制之前被跳过。
+        if debug_sync_skips_entry(&file_type, &entry.file_name(), at_package_root) {
+            continue;
+        }
+        let destination = target.join(entry.file_name());
         if file_type.is_dir() {
-            copy_directory_recursive(&entry.path(), &destination)?;
+            copy_directory_recursive(&entry.path(), &destination, false)?;
         } else if file_type.is_file() {
             fs::copy(entry.path(), &destination).map_err(|error| {
                 format!(
@@ -1303,22 +1483,123 @@ fn load_invocation_args(command: &DebugCliCommand) -> Result<Value, String> {
     }
 }
 
-/// Build the invocation context used by the debug call command.
-/// 构建调试调用命令使用的调用上下文。
-fn build_debug_invocation_context(enable_host_result: bool) -> LuaInvocationContext {
-    if !enable_host_result {
-        return LuaInvocationContext::empty();
+/// Default inline budget in bytes injected by the debug binary, matching the host default for one tool result.
+/// 调试二进制程序默认注入的内联预算字节数，与宿主单次工具结果的默认值一致。
+const DEBUG_DEFAULT_CLIENT_BUDGET_BYTES: u64 = 200_000;
+
+/// Unlimited line budget marker shared with the host budget snapshot.
+/// 与宿主预算快照共用的无限行标记。
+const DEBUG_UNLIMITED_BUDGET_LINES: i64 = -1;
+
+/// Client name reported by the debug binary inside the injected host context.
+/// 调试二进制程序在注入宿主上下文中上报的客户端名称。
+const DEBUG_HOST_CONTEXT_CLIENT_NAME: &str = "luaskills-debug";
+
+/// Build the developer default host context for one debug call.
+/// 构建单次调试调用使用的开发者默认宿主上下文。
+///
+/// The shape mirrors what a host injects: one request context plus a budget object holding both scopes.
+/// 结构与宿主注入保持一致：一份请求上下文，外加同时包含两个场景的预算对象。
+fn build_default_debug_host_context() -> DebugHostContext {
+    let request_context = RuntimeRequestContext {
+        request_id: Some(DEBUG_HOST_CONTEXT_CLIENT_NAME.to_string()),
+        client_name: Some(DEBUG_HOST_CONTEXT_CLIENT_NAME.to_string()),
+        ..RuntimeRequestContext::default()
+    };
+    let scope = json!({
+        "bytes": DEBUG_DEFAULT_CLIENT_BUDGET_BYTES,
+        "lines": DEBUG_UNLIMITED_BUDGET_LINES,
+    });
+    let client_budget = json!({
+        "client_name": DEBUG_HOST_CONTEXT_CLIENT_NAME,
+        "matched_client_pattern": DEBUG_HOST_CONTEXT_CLIENT_NAME,
+        "tool_result": scope,
+        "file_read": scope,
+        "tool_config": {},
+    });
+    DebugHostContext {
+        request_context: Some(request_context),
+        client_budget,
+        tool_config: json!({}),
+    }
+}
+
+/// Parse one JSON object supplied through a host context CLI flag.
+/// 解析通过宿主上下文命令行参数提供的单个 JSON 对象。
+fn parse_debug_context_object(flag: &str, raw_value: &str) -> Result<Value, String> {
+    let value: Value = serde_json::from_str(raw_value)
+        .map_err(|error| format!("{flag} requires one JSON object: {error}"))?;
+    if !value.is_object() {
+        return Err(format!("{flag} requires one JSON object"));
+    }
+    Ok(value)
+}
+
+/// Load the complete host context object from the developer-supplied JSON file.
+/// 从开发者提供的 JSON 文件中加载完整宿主上下文对象。
+fn load_debug_host_context_file(context_file: &Path) -> Result<DebugHostContext, String> {
+    let context_text = fs::read_to_string(context_file).map_err(|error| {
+        format!(
+            "Failed to read context file '{}': {}",
+            render_debug_path(context_file),
+            error
+        )
+    })?;
+    let mut context: DebugHostContext = serde_json::from_str(&context_text).map_err(|error| {
+        format!(
+            "Failed to parse context file '{}': {}",
+            render_debug_path(context_file),
+            error
+        )
+    })?;
+    // Non-object member payloads are normalized the same way LuaInvocationContext normalizes them.
+    // 非对象成员载荷按 LuaInvocationContext 的同一规则归一化。
+    if !context.client_budget.is_object() {
+        context.client_budget = json!({});
+    }
+    if !context.tool_config.is_object() {
+        context.tool_config = json!({});
+    }
+    Ok(context)
+}
+
+/// Resolve the effective host context for one call from the default profile and explicit overrides.
+/// 基于默认配置与显式覆盖值解析单次调用的生效宿主上下文。
+fn resolve_debug_host_context(
+    flags: &DebugHostContextFlags,
+    enable_host_result: bool,
+) -> Result<LuaInvocationContext, String> {
+    let mut context = match &flags.context_file {
+        Some(context_file) => load_debug_host_context_file(context_file)?,
+        None => build_default_debug_host_context(),
+    };
+
+    if let Some(client_budget_json) = &flags.client_budget_json {
+        context.client_budget = parse_debug_context_object("--client-budget", client_budget_json)?;
+    }
+    if let Some(tool_config_json) = &flags.tool_config_json {
+        context.tool_config = parse_debug_context_object("--tool-config", tool_config_json)?;
     }
 
-    let request_context = RuntimeRequestContext {
-        client_capabilities: json!({
+    // The host_result capability is a request-scope addition and never rewrites the budget payload.
+    // host_result 能力属于请求层附加项，绝不改写预算载荷。
+    if enable_host_result {
+        let mut request_context = context
+            .request_context
+            .unwrap_or_else(RuntimeRequestContext::default);
+        request_context.client_capabilities = json!({
             "host_result": {
                 "enabled": true
             }
-        }),
-        ..RuntimeRequestContext::default()
-    };
-    LuaInvocationContext::new(Some(request_context), json!({}), json!({}))
+        });
+        context.request_context = Some(request_context);
+    }
+
+    Ok(LuaInvocationContext::new(
+        context.request_context,
+        context.client_budget,
+        context.tool_config,
+    ))
 }
 
 /// Build one structured inspect output payload from the prepared runtime state.
@@ -1470,16 +1751,30 @@ fn render_call_output(mode: DebugOutputMode, output: &DebugCallOutput) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        DebugCliCommand, DebugCommandKind, DebugNetworkFlags, DebugOutputMode,
-        collect_ignored_skill_ids, load_bound_skill_manifest, load_invocation_args,
-        parse_debug_cli, paths_refer_to_same_directory, prepare_debug_runtime, render_debug_path,
-        resolve_debug_tool_name, sync_debug_skill,
+        DEBUG_DEFAULT_CLIENT_BUDGET_BYTES, DEBUG_UNLIMITED_BUDGET_LINES, DebugCliCommand,
+        DebugCommandKind, DebugHostContextFlags, DebugNetworkFlags, DebugOutputMode,
+        collect_ignored_skill_ids, debug_sync_skips_entry, load_bound_skill_manifest,
+        load_invocation_args, parse_debug_cli, paths_refer_to_same_directory,
+        prepare_debug_runtime, render_debug_path, resolve_debug_host_context,
+        resolve_debug_tool_name, sync_debug_skill, synchronize_skill_into_runtime_root,
     };
     use luaskills::{LuaInvocationContext, LuaRuntimeManagedRuntimeConfig, RuntimeEntryDescriptor};
+    use serde_json::json;
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Synchronize one fixture skill through the real debug sync path and return the copied location.
+    /// 通过真实调试同步路径同步单个夹具 skill，并返回复制后的位置。
+    fn sync_skill_for_test(
+        runtime_root: &Path,
+        source_skill_path: &Path,
+        skill_id: &str,
+    ) -> PathBuf {
+        synchronize_skill_into_runtime_root(runtime_root, source_skill_path, skill_id)
+            .expect("debug sync should succeed")
+    }
 
     /// Build one minimal runtime entry descriptor for parser and resolver tests.
     /// 为参数解析与工具解析测试构造一个最小运行时入口描述。
@@ -1571,6 +1866,367 @@ mod tests {
             Some(Path::new("D:/skills/demo-skill"))
         );
         assert!(command.enable_host_result);
+    }
+
+    /// Verify the default host context injects a usable budget object into both scopes.
+    /// 验证默认宿主上下文向两个场景都注入可用的预算对象。
+    #[test]
+    fn resolve_debug_host_context_injects_default_budget_scopes() {
+        let context = resolve_debug_host_context(&DebugHostContextFlags::default(), false)
+            .expect("default host context should resolve");
+
+        for scope in ["tool_result", "file_read"] {
+            assert_eq!(
+                context.client_budget[scope]["bytes"],
+                json!(DEBUG_DEFAULT_CLIENT_BUDGET_BYTES),
+                "scope {scope} should carry the default byte budget"
+            );
+            assert_eq!(
+                context.client_budget[scope]["lines"],
+                json!(DEBUG_UNLIMITED_BUDGET_LINES),
+                "scope {scope} should carry the unlimited line budget"
+            );
+        }
+        assert!(
+            context.tool_config.is_object(),
+            "tool_config must stay an object with no declared scope"
+        );
+        assert!(context.tool_config.get("budget_scope").is_none());
+        assert_eq!(
+            context
+                .request_context
+                .as_ref()
+                .and_then(|request| request.client_name.as_deref()),
+            Some("luaskills-debug")
+        );
+    }
+
+    /// Verify enabling host_result adds the capability without disturbing the injected budget.
+    /// 验证开启 host_result 只追加能力，不扰动已注入的预算。
+    #[test]
+    fn resolve_debug_host_context_keeps_budget_when_host_result_is_enabled() {
+        let without_capability =
+            resolve_debug_host_context(&DebugHostContextFlags::default(), false)
+                .expect("default host context should resolve");
+        let with_capability = resolve_debug_host_context(&DebugHostContextFlags::default(), true)
+            .expect("host result host context should resolve");
+
+        assert_eq!(
+            without_capability.client_budget, with_capability.client_budget,
+            "enabling host_result must not rewrite the budget payload"
+        );
+        assert_eq!(
+            with_capability
+                .request_context
+                .as_ref()
+                .map(|request| request.client_capabilities.clone()),
+            Some(json!({"host_result": {"enabled": true}}))
+        );
+    }
+
+    /// Verify a complete context file replaces the default profile member by member.
+    /// 验证完整上下文文件会逐成员替换默认配置。
+    #[test]
+    fn resolve_debug_host_context_uses_complete_context_file() {
+        let runtime_root = make_temp_runtime_root();
+        fs::create_dir_all(&runtime_root).expect("create temporary context directory");
+        let context_file = runtime_root.join("host-context.json");
+        fs::write(
+            &context_file,
+            serde_json::to_string_pretty(&json!({
+                "client_budget": {
+                    "client_name": "fixture-client",
+                    "tool_result": {"bytes": 4096, "lines": 20},
+                    "file_read": {"bytes": 8192, "lines": -1}
+                },
+                "tool_config": {"budget_scope": "file_read"}
+            }))
+            .expect("fixture context should serialize"),
+        )
+        .expect("context file should be written");
+        let flags = DebugHostContextFlags {
+            context_file: Some(context_file),
+            ..DebugHostContextFlags::default()
+        };
+
+        let context =
+            resolve_debug_host_context(&flags, false).expect("context file should resolve");
+
+        assert_eq!(
+            context.client_budget["client_name"],
+            json!("fixture-client")
+        );
+        assert_eq!(context.client_budget["tool_result"]["bytes"], json!(4096));
+        assert_eq!(context.client_budget["file_read"]["lines"], json!(-1));
+        assert_eq!(context.tool_config["budget_scope"], json!("file_read"));
+
+        remove_temp_directory(&runtime_root);
+    }
+
+    /// Verify single-member overrides replace one member and leave the other default intact.
+    /// 验证单成员覆盖只替换单个成员，其余成员保持默认。
+    #[test]
+    fn resolve_debug_host_context_applies_single_member_override() {
+        let flags = DebugHostContextFlags {
+            client_budget_json: Some(r#"{"tool_result":{"bytes":1024,"lines":5}}"#.to_string()),
+            ..DebugHostContextFlags::default()
+        };
+
+        let context = resolve_debug_host_context(&flags, false).expect("override should resolve");
+
+        assert_eq!(context.client_budget["tool_result"]["bytes"], json!(1024));
+        assert!(
+            context.client_budget.get("file_read").is_none(),
+            "a client_budget override is authoritative and must not be merged with the default"
+        );
+    }
+
+    /// Verify a non-object override payload is rejected instead of being silently normalized.
+    /// 验证非对象覆盖载荷会被拒绝，而不是被静默归一化。
+    #[test]
+    fn resolve_debug_host_context_rejects_non_object_override() {
+        let flags = DebugHostContextFlags {
+            tool_config_json: Some("[1,2]".to_string()),
+            ..DebugHostContextFlags::default()
+        };
+
+        let error = match resolve_debug_host_context(&flags, false) {
+            Ok(_) => panic!("non-object tool config should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains("--tool-config requires one JSON object"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Verify the parser accepts every host context flag and records it on the call command.
+    /// 验证解析器接受全部宿主上下文参数并记录到 call 命令上。
+    #[test]
+    fn parse_debug_cli_accepts_host_context_flags() {
+        let args = vec![
+            "call".to_string(),
+            "--runtime-root".to_string(),
+            "D:/runtime".to_string(),
+            "--skill-id".to_string(),
+            "demo-skill".to_string(),
+            "--tool".to_string(),
+            "ping".to_string(),
+            "--context-file".to_string(),
+            "D:/fixtures/host-context.json".to_string(),
+        ];
+        let command = parse_debug_cli(&args).expect("parse call command with context file");
+        assert_eq!(
+            command.host_context.context_file.as_deref(),
+            Some(Path::new("D:/fixtures/host-context.json"))
+        );
+
+        let override_args = vec![
+            "call".to_string(),
+            "--runtime-root".to_string(),
+            "D:/runtime".to_string(),
+            "--skill-id".to_string(),
+            "demo-skill".to_string(),
+            "--tool".to_string(),
+            "ping".to_string(),
+            "--client-budget".to_string(),
+            r#"{"tool_result":{"bytes":1,"lines":1}}"#.to_string(),
+            "--tool-config".to_string(),
+            r#"{"budget_scope":"file_read"}"#.to_string(),
+        ];
+        let override_command =
+            parse_debug_cli(&override_args).expect("parse call command with member overrides");
+        assert_eq!(
+            override_command.host_context.client_budget_json.as_deref(),
+            Some(r#"{"tool_result":{"bytes":1,"lines":1}}"#)
+        );
+        assert_eq!(
+            override_command.host_context.tool_config_json.as_deref(),
+            Some(r#"{"budget_scope":"file_read"}"#)
+        );
+    }
+
+    /// Verify host context flags are rejected on subcommands that never build an invocation context.
+    /// 验证在从不构建调用上下文的子命令上会拒绝宿主上下文参数。
+    #[test]
+    fn parse_debug_cli_rejects_host_context_flags_off_call() {
+        let args = vec![
+            "list-tools".to_string(),
+            "--runtime-root".to_string(),
+            "D:/runtime".to_string(),
+            "--skill-path".to_string(),
+            "D:/skills/demo-skill".to_string(),
+            "--client-budget".to_string(),
+            r#"{"tool_result":{"bytes":1,"lines":1}}"#.to_string(),
+        ];
+        let error = match parse_debug_cli(&args) {
+            Ok(_) => panic!("host context flags should be rejected outside call"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains("are only valid for call"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Verify a context file cannot be combined with single-member overrides.
+    /// 验证上下文文件不能与单成员覆盖同时使用。
+    #[test]
+    fn parse_debug_cli_rejects_context_file_with_member_override() {
+        let args = vec![
+            "call".to_string(),
+            "--runtime-root".to_string(),
+            "D:/runtime".to_string(),
+            "--skill-id".to_string(),
+            "demo-skill".to_string(),
+            "--tool".to_string(),
+            "ping".to_string(),
+            "--context-file".to_string(),
+            "D:/fixtures/host-context.json".to_string(),
+            "--tool-config".to_string(),
+            r#"{"budget_scope":"file_read"}"#.to_string(),
+        ];
+        let error = match parse_debug_cli(&args) {
+            Ok(_) => panic!("context file with member override should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains("cannot be combined with"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Verify debug sync skips build and checkout artifacts that would otherwise dominate the cycle.
+    /// 验证调试同步会跳过本该主导调试周期的构建与检出产物。
+    #[test]
+    fn debug_sync_skips_build_and_checkout_artifacts() {
+        let runtime_root = make_temp_runtime_root();
+        let source_skill_path = runtime_root.join("source-skill");
+        fs::create_dir_all(source_skill_path.join("runtime")).expect("create asset directory");
+        fs::write(source_skill_path.join("skill.yaml"), b"name: demo-skill")
+            .expect("write skill manifest");
+        fs::write(source_skill_path.join("runtime/entry.lua"), b"return {}")
+            .expect("write runtime asset");
+        let root_excluded = [
+            "target",
+            ".git",
+            ".luaskills-debug",
+            "dist",
+            "node_modules",
+            "temp",
+            "state",
+            "libs",
+        ];
+        for excluded in root_excluded {
+            let excluded_path = source_skill_path.join(excluded);
+            fs::create_dir_all(&excluded_path).expect("create excluded directory");
+            fs::write(excluded_path.join("artifact.bin"), b"build output")
+                .expect("write excluded artifact");
+        }
+
+        let synced_skill_path =
+            sync_skill_for_test(&runtime_root, &source_skill_path, "demo-skill");
+
+        assert!(
+            synced_skill_path.join("skill.yaml").is_file(),
+            "the manifest must still be synchronized"
+        );
+        assert!(
+            synced_skill_path.join("runtime/entry.lua").is_file(),
+            "the runtime asset must still be synchronized"
+        );
+        for excluded in root_excluded {
+            assert!(
+                !synced_skill_path.join(excluded).exists(),
+                "excluded directory {excluded} must not be copied"
+            );
+        }
+
+        remove_temp_directory(&runtime_root);
+    }
+
+    /// Verify depth-aware exclusion: nested runtime-root names are copied, nested build artifacts are not.
+    /// 验证按深度排除：嵌套的运行时根目录同名目录照常复制，嵌套的构建产物仍被跳过。
+    #[test]
+    fn debug_sync_applies_root_only_exclusions_at_package_root() {
+        let runtime_root = make_temp_runtime_root();
+        let source_skill_path = runtime_root.join("source-skill");
+        fs::create_dir_all(&source_skill_path).expect("create source skill directory");
+        fs::write(source_skill_path.join("skill.yaml"), b"name: demo-skill")
+            .expect("write skill manifest");
+        let nested_content = [
+            "runtime/libs",
+            "runtime/state",
+            "runtime/dist",
+            "runtime/dependencies",
+        ];
+        let nested_artifacts = [
+            "codekit-ffi/target",
+            "runtime/.git",
+            "runtime/.luaskills-debug",
+        ];
+        for relative in nested_content.iter().chain(nested_artifacts.iter()) {
+            let directory = source_skill_path.join(relative);
+            fs::create_dir_all(&directory).expect("create nested directory");
+            fs::write(directory.join("entry.lua"), b"return {}").expect("write nested file");
+        }
+
+        let synced_skill_path =
+            sync_skill_for_test(&runtime_root, &source_skill_path, "demo-skill");
+
+        for relative in nested_content {
+            assert!(
+                synced_skill_path.join(relative).join("entry.lua").is_file(),
+                "nested skill content {relative} must be copied; root-only exclusions must not apply below the package root"
+            );
+        }
+        for relative in nested_artifacts {
+            assert!(
+                !synced_skill_path.join(relative).exists(),
+                "nested artifact {relative} must be skipped at every depth"
+            );
+        }
+
+        remove_temp_directory(&runtime_root);
+    }
+
+    /// Verify the skip rule reads the entry kind so a same-named file is still copied.
+    /// 验证跳过规则依据条目类型判断，同名文件仍会被复制。
+    #[test]
+    fn debug_sync_skip_rule_matches_directory_names_only() {
+        let runtime_root = make_temp_runtime_root();
+        let directory_path = runtime_root.join("target");
+        fs::create_dir_all(&directory_path).expect("create excluded directory");
+        let file_path = runtime_root.join("dist");
+        fs::write(&file_path, b"a plain file named like an artifact directory")
+            .expect("write same-named file");
+
+        let directory_type = fs::metadata(&directory_path)
+            .expect("inspect directory")
+            .is_dir();
+        assert!(
+            directory_type,
+            "fixture prerequisite: target must be a directory"
+        );
+        let directory_file_type = fs::symlink_metadata(&directory_path)
+            .expect("inspect directory type")
+            .file_type();
+        assert!(
+            debug_sync_skips_entry(&directory_file_type, std::ffi::OsStr::new("target"), true),
+            "a directory named target must be skipped"
+        );
+        let file_file_type = fs::symlink_metadata(&file_path)
+            .expect("inspect file type")
+            .file_type();
+        assert!(
+            !debug_sync_skips_entry(&file_file_type, std::ffi::OsStr::new("dist"), true),
+            "a plain file named dist must not be skipped"
+        );
+
+        remove_temp_directory(&runtime_root);
     }
 
     /// Verify the parser accepts run commands against a previously synchronized skill id.
@@ -1856,6 +2512,7 @@ mod tests {
             args_json: None,
             args_file: Some(args_file.clone()),
             enable_host_result: false,
+            host_context: DebugHostContextFlags::default(),
             output_mode: DebugOutputMode::Pretty,
             network: DebugNetworkFlags::default(),
         };
@@ -1913,6 +2570,7 @@ mod tests {
             args_json: None,
             args_file: None,
             enable_host_result: false,
+            host_context: DebugHostContextFlags::default(),
             output_mode: DebugOutputMode::Pretty,
             network: DebugNetworkFlags::default(),
         };
@@ -1964,6 +2622,7 @@ mod tests {
             args_json: Some(r#"{"note":"from-debug-bin"}"#.to_string()),
             args_file: None,
             enable_host_result: false,
+            host_context: DebugHostContextFlags::default(),
             output_mode: DebugOutputMode::Pretty,
             network: DebugNetworkFlags::default(),
         };
@@ -2016,6 +2675,7 @@ mod tests {
             args_json: None,
             args_file: None,
             enable_host_result: false,
+            host_context: DebugHostContextFlags::default(),
             output_mode: DebugOutputMode::Pretty,
             network: DebugNetworkFlags::default(),
         };
@@ -2060,6 +2720,7 @@ mod tests {
             args_json: None,
             args_file: None,
             enable_host_result: false,
+            host_context: DebugHostContextFlags::default(),
             output_mode: DebugOutputMode::Pretty,
             network: DebugNetworkFlags::default(),
         };
@@ -2077,6 +2738,7 @@ mod tests {
             args_json: Some(r#"{"note":"from-synced-runtime"}"#.to_string()),
             args_file: None,
             enable_host_result: false,
+            host_context: DebugHostContextFlags::default(),
             output_mode: DebugOutputMode::Pretty,
             network: DebugNetworkFlags::default(),
         };

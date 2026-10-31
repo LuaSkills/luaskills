@@ -168,9 +168,14 @@ fn ffi_string_clone_rejects_invalid_utf8_text() {
     assert!(cloned.is_null());
 }
 
+mod host_database;
 /// Build one empty standard FFI host-options value with null pointers and disabled optional features.
 /// 构建一个指针为空且可选功能关闭的标准 FFI host-options 空值。
 ///
+/// Versioned host mode tests share the existing borrowed-options fixtures.
+/// 版本化宿主模式测试共享现有借用选项夹具。
+mod host_mode;
+
 /// Return a host-options baseline that tests may customize field by field.
 /// 返回测试可逐字段定制的 host-options 基准值。
 fn empty_ffi_runtime_host_options() -> FfiLuaRuntimeHostOptions {
@@ -197,16 +202,7 @@ fn empty_ffi_runtime_host_options() -> FfiLuaRuntimeHostOptions {
         enable_private_url_skill_install: 0,
         private_skill_source_allowlist: ptr::null(),
         private_skill_source_allowlist_len: 0,
-        sqlite_library_path: ptr::null(),
-        sqlite_provider_mode: FFI_PROVIDER_MODE_DYNAMIC_LIBRARY,
         sqlite_callback_mode: FFI_CALLBACK_MODE_STANDARD,
-        lancedb_library_path: ptr::null(),
-        lancedb_provider_mode: FFI_PROVIDER_MODE_DYNAMIC_LIBRARY,
-        lancedb_callback_mode: FFI_CALLBACK_MODE_STANDARD,
-        space_controller_endpoint: ptr::null(),
-        space_controller_auto_spawn: 0,
-        space_controller_executable_path: ptr::null(),
-        space_controller_process_mode: FFI_SPACE_CONTROLLER_PROCESS_MODE_SERVICE,
         cache_config: ptr::null(),
         runlua_pool_config: ptr::null(),
         reserved_entry_names: ptr::null(),

@@ -5,7 +5,7 @@ use crate::runtime_context::RuntimeRequestContext;
 use crate::runtime_options::{LuaInvocationContext, RuntimeSkillRoot};
 use crate::{
     LuaEngineOptions, LuaRuntimeNetworkOptions, SkillInstallRequest, SkillManagementAuthority,
-    SkillPackageConfigDescribeMode, SkillPackageConfigInputValue, SkillUninstallOptions,
+    SkillPackageConfigDescribeMode, SkillPackageConfigInputValue,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -671,6 +671,7 @@ pub(super) struct EnableSkillJsonRequest {
 /// One JSON request used to uninstall one skill in one ordered root chain.
 /// 用于在一条有序根链中卸载单个技能的 JSON 请求。
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct UninstallSkillJsonRequest {
     /// Stable numeric FFI handle id of the target engine.
     /// 目标引擎的稳定数值 FFI 句柄标识。
@@ -685,10 +686,6 @@ pub(super) struct UninstallSkillJsonRequest {
     /// 高级 SDK 封装使用的可选显式目标根。
     #[serde(default)]
     pub(super) target_root: Option<RuntimeSkillRoot>,
-    /// Optional database cleanup switches applied after uninstall commit succeeds.
-    /// 在卸载提交成功后应用的可选数据库清理开关。
-    #[serde(default)]
-    pub(super) options: SkillUninstallOptions,
     /// Optional authority required by system JSON entrypoints and ignored by ordinary entrypoints.
     /// system JSON 入口必填、普通入口忽略的可选权限等级。
     #[serde(default)]

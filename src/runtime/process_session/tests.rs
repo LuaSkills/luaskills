@@ -592,6 +592,7 @@ fn make_core_launch_options(buffer_limit_bytes: usize) -> ManagedProcessSessionL
     // Encoding 是 Lua 公共进程会话已经使用的平台默认编码。
     let encoding = default_runtime_text_encoding();
     ManagedProcessSessionLaunchOptions {
+        host_mode: LuaRuntimeHostMode::Console,
         stdout_encoding: encoding,
         stderr_encoding: encoding,
         stdin_encoding: encoding,
@@ -1076,9 +1077,13 @@ fn one_shot_finalization_terminates_inherited_pipe_descendant_after_root_exit() 
         .stderr(Stdio::null());
     // Complete managed ownership tuple used by the production one-shot finalizer.
     // 生产单次执行收尾器使用的完整受管所有权元组。
-    let (mut child, process_tree, reaper_permit) =
-        ManagedChildProcessTree::spawn_with_keepalive(&mut command, "one-shot test", None)
-            .expect("spawn one-shot descendant fixture");
+    let (mut child, process_tree, reaper_permit) = ManagedChildProcessTree::spawn_with_keepalive(
+        &mut command,
+        "one-shot test",
+        None,
+        LuaRuntimeHostMode::Console,
+    )
+    .expect("spawn one-shot descendant fixture");
     // WindowsPidPath is keyed by the exact managed root and bypasses libtest output capture.
     // WindowsPidPath 以精确受管根进程为键，并绕过 libtest 输出捕获。
     #[cfg(windows)]

@@ -102,7 +102,7 @@ impl OperationReconciliation {
     /// 对照未改变的 `snapshot` 校验此完整证明；拒绝证据缺失及矛盾。
     /// Actual external truth and stopped-owner proof remain responsibilities of the authorized host.
     /// 实际外部事实和所有者已停止的证明仍由已授权宿主负责。
-    pub(super) fn validate(&self, snapshot: &OperationSnapshot) -> EmbeddedResult<()> {
+    pub fn validate(&self, snapshot: &OperationSnapshot) -> EmbeddedResult<()> {
         if self.resolution_id.trim().is_empty()
             || self.resolver.trim().is_empty()
             || self.evidence.trim().is_empty()
@@ -158,57 +158,4 @@ pub(super) fn present_reconciliation<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<OperationReconciliation>, D::Error> {
     Option::<OperationReconciliation>::deserialize(deserializer)
-}
-
-impl OperationJournal {
-    /// Attach final `resolution` to exact original identity at `expected_revision`, returning its durable revision.
-    /// 在 `expected_revision` 处为精确原身份附加最终 `resolution`，返回其持久修订。
-    /// The trusted caller must prove all original execution and external owners stopped before calling this blocking API.
-    /// 可信调用方必须在调用此阻塞 API 前证明全部原执行及外部所有者已停止。
-    /// Exact retries acknowledge the same successor; every different attestation or revision is a conflict.
-    /// 精确重试确认同一后继；任何不同证明或修订均为冲突。
-    pub fn reconcile(
-        &self,
-        runtime_id: &str,
-        operation_id: &str,
-        expected_revision: u64,
-        resolution: &OperationReconciliation,
-    ) -> EmbeddedResult<u64> {
-        self.validate_key(runtime_id, operation_id)?;
-        json_size(resolution, self.config.max_record_bytes)?;
-        if expected_revision == 0 || expected_revision >= i64::MAX as u64 {
-            return Err(EmbeddedError::invalid(
-                "operation history revision is exhausted or invalid",
-            ));
-        }
-        // One successor revision is shared by first commit and exact lost-confirmation acknowledgement.
-        // 首次提交及精确确认丢失后的确认共享唯一后继修订。
-        let revision = expected_revision + 1;
-        self.transaction(|connection| {
-            // The original record is selected under the same transaction as the final attestation write.
-            // 原始记录在与最终证明写入相同的事务中选取。
-            let mut record = self.read(connection, runtime_id, operation_id)?.ok_or_else(|| {
-                EmbeddedError::new(EmbeddedErrorCode::NotFound, "operation history was not found")
-            })?;
-            if record.revision == revision && record.reconciliation.as_ref() == Some(resolution) {
-                return Ok(());
-            }
-            if record.revision != expected_revision {
-                return Err(EmbeddedError::new(EmbeddedErrorCode::StaleGeneration, "operation history revision changed"));
-            }
-            if record.reconciliation.is_some() {
-                return Err(EmbeddedError::new(EmbeddedErrorCode::AlreadyCompleted, "operation history already has a final reconciliation"));
-            }
-            resolution.validate(&record.snapshot)?;
-            record.revision = revision;
-            record.reconciliation = Some(resolution.clone());
-            // Original snapshot, caller and effect identities are never rewritten by reconciliation.
-            // 对账绝不重写原始快照、调用方和副作用身份。
-            let document = self.encode(&record)?;
-            connection.execute("UPDATE operations SET revision=?3, document=?4, digest=?5 WHERE runtime_id=?1 AND operation_id=?2",
-                params![runtime_id, operation_id, revision as i64, document, Sha256::digest(&document).as_slice()]).map_err(storage::error)?;
-            Ok(())
-        })?;
-        Ok(revision)
-    }
 }

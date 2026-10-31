@@ -58,7 +58,7 @@ LuaSkills は [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) のスキ
 - その他の言語向けの標準 C ABI と公開 `_json` FFI
 - 永続 Lua VM のための公開 `runtime_lease` と権限に結び付いた `system_runtime_lease`
 - 構造化された `host_result` の返却。最初の種類は IDE 品質の `change_set` 編集
-- 動的ライブラリ、ホストコールバック、space controller による SQLite / LanceDB（任意）
+- 動的ライブラリ、ホストコールバック、space controller による SQLite（任意）
 
 ### 📦 SDK
 
@@ -79,7 +79,7 @@ LuaSkills は [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) のスキ
 │  policy · UI · permissions   │  C ABI  │  skill loader · help · lifecycle     │
 │  budgets · model providers   │◀───────▶│  LuaJIT VMs · leases · vulcan.* APIs │
 │  host tools · storage        │  JSON   │  managed Python / Node · deps        │
-│                              │  FFI    │  config stores · SQLite / LanceDB    │
+│                              │  FFI    │  config stores · SQLite    │
 └──────────────────────────────┘         └──────────────────────────────────────┘
                                                           │
                                               skills/<skill_id>/skill.yaml
@@ -90,7 +90,7 @@ LuaSkills は [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) のスキ
 | `src/runtime` | エンジン、Lua VM、リース、コンテキスト、ヘルプ、結果、管理ランタイム |
 | `src/skill` | マニフェスト、ルート、設定、ライフサイクル管理 |
 | `src/dependency`、`src/download` | 依存関係の解決、ダウンロード、アーカイブ展開 |
-| `src/providers` | SQLite と LanceDB のバインディング |
+| `src/providers` | SQLite のバインディング |
 | `src/ffi`、`src/ffi_standard`、`src/ffi_embedded` | 公開 `_json` FFI、標準 C ABI、組み込みランタイム転送 |
 | `include/` | FFI ホスト向け C ヘッダー |
 | `contracts/` | SDK と共有する機械可読な契約 |
@@ -102,7 +102,7 @@ LuaSkills は [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) のスキ
 
 ```toml
 [dependencies]
-luaskills = "0.7.2"
+luaskills = "0.7.3"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md) に `call_skill` と `vulcan.host.*` ツールブリッジの例があります。
@@ -123,7 +123,7 @@ luaskills = "0.7.2"
 [demo-skill](https://github.com/LuaSkills/demo-skill) から始め、[Skill development manual](docs/development/skill-development.md) を読んでください。実際のランタイム構成で 1 つのスキルをデバッグするには：
 
 ```bash
-cargo run --bin luaskills-debug -- call \
+cargo run --features debug-sqlite --bin luaskills-debug -- call \
   --runtime-root D:/runtime \
   --skill-path D:/skills/demo-skill \
   --tool ping \
@@ -158,14 +158,12 @@ cargo run --bin luaskills-debug -- call \
 
 | コンポーネント | バージョン |
 | --- | --- |
-| LuaSkills コアと FFI SDK | `0.7.2` |
+| LuaSkills コアと FFI SDK | `0.7.3` |
 | TypeScript・Python・Go SDK | 独立したバージョン系列。[SDK overview](docs/sdk/index.md#versions) を参照 |
 | Lua ランタイムパッケージ | 互換 `0.1` 系列 |
 | 管理 Python / uv | `3.14.6` / `0.11.28` |
 | 管理 Node.js / pnpm | `24.18.0` / `11.11.0` |
 | 管理ランタイムの既定値 | `workers=4 / idle=60s / sessions=256 / buffer=1MiB/stream / invoke=unlimited` |
-| vldb-controller | `0.2.3` |
-| vldb-sqlite / vldb-lancedb | `0.1.6` / `0.1.5` |
 
 スクリプトの既定値は `scripts/deps/` にあります。リリースは[リリース手順](scripts/release/README.md)に従い、ランタイムパッケージ、5 プラットフォームのコアリリース、crate、SDK の順に進みます。
 

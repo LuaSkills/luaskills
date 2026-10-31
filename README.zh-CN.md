@@ -58,7 +58,7 @@ LuaSkills 是 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) 技能系
 - 其他语言使用标准 C ABI 与公共 `_json` FFI
 - 公共 `runtime_lease` 与授权绑定的 `system_runtime_lease` 提供持久 Lua VM
 - 结构化 `host_result` 返回，首个结果类型是 IDE 级的 `change_set` 编辑
-- 可选 SQLite 与 LanceDB，支持动态库、宿主回调或 space controller 模式
+- 可选 SQLite，由宿主注册回调提供
 
 ### 📦 SDK
 
@@ -79,7 +79,7 @@ LuaSkills 是 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) 技能系
 │  策略 · 界面 · 权限           │  C ABI  │  技能加载 · 帮助 · 生命周期           │
 │  预算 · 模型供应商            │◀───────▶│  LuaJIT VM · 租约 · vulcan.* API      │
 │  宿主工具 · 存储              │  JSON   │  受管 Python / Node · 依赖            │
-│                              │  FFI    │  配置存储 · SQLite / LanceDB          │
+│                              │  FFI    │  配置存储 · SQLite          │
 └──────────────────────────────┘         └──────────────────────────────────────┘
                                                           │
                                               skills/<skill_id>/skill.yaml
@@ -90,7 +90,7 @@ LuaSkills 是 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) 技能系
 | `src/runtime` | 引擎、Lua VM、租约、上下文、帮助、结果、受管运行时 |
 | `src/skill` | 清单、根目录、配置与生命周期管理 |
 | `src/dependency`、`src/download` | 依赖解析、下载与归档解压 |
-| `src/providers` | SQLite 与 LanceDB 绑定 |
+| `src/providers` | SQLite 绑定 |
 | `src/ffi`、`src/ffi_standard`、`src/ffi_embedded` | 公共 `_json` FFI、标准 C ABI 与嵌入式运行时传输 |
 | `include/` | FFI 宿主使用的 C 头文件 |
 | `contracts/` | 与 SDK 共享的机器契约 |
@@ -102,10 +102,12 @@ LuaSkills 是 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) 技能系
 
 ```toml
 [dependencies]
-luaskills = "0.7.2"
+luaskills = "0.7.3"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md) 演示 `call_skill` 与 `vulcan.host.*` 工具桥接。
+
+桌面宿主应在创建引擎前设置 `LuaRuntimeHostOptions.host_mode = LuaRuntimeHostMode::Desktop`；JSON 使用 `"host_mode": "desktop"`，标准 C 接口使用 `luaskills_ffi_engine_new_v4` 与 `LUASKILLS_HOST_MODE_DESKTOP`。默认 `Console`（`"console"`）保持现有行为。在 Windows 上，桌面模式隐藏 LuaSkills 自有命令、管道、会话、受管 Python/Node 工作进程和环境安装进程的控制台窗口，包含原生 `os.execute` 与 `io.popen`。配置按引擎隔离，详见 [FFI 宿主模式契约](docs/zh-CN/integration/ffi-integration-guide.md#841-桌面与命令行宿主模式v4)。
 
 ### 其他语言
 
@@ -123,7 +125,7 @@ luaskills = "0.7.2"
 从 [demo-skill](https://github.com/LuaSkills/demo-skill) 开始，再阅读 [Lua Skill 开发手册](docs/zh-CN/development/skill-development.md)。用真实运行时布局调试单个技能：
 
 ```bash
-cargo run --bin luaskills-debug -- call \
+cargo run --features debug-sqlite --bin luaskills-debug -- call \
   --runtime-root D:/runtime \
   --skill-path D:/skills/demo-skill \
   --tool ping \
@@ -158,14 +160,12 @@ cargo run --bin luaskills-debug -- call \
 
 | 组件 | 版本 |
 | --- | --- |
-| LuaSkills 核心与 FFI SDK | `0.7.2` |
+| LuaSkills 核心与 FFI SDK | `0.7.3` |
 | TypeScript、Python、Go SDK | 各自独立的版本线，见 [SDK 总览](docs/zh-CN/sdk/index.md#版本规则) |
 | Lua 运行时包 | 兼容 `0.1` 系列 |
 | 受管 Python / uv | `3.14.6` / `0.11.28` |
 | 受管 Node.js / pnpm | `24.18.0` / `11.11.0` |
 | 受管运行时默认值 | `workers=4 / idle=60s / sessions=256 / buffer=1MiB/stream / invoke=unlimited` |
-| vldb-controller | `0.2.3` |
-| vldb-sqlite / vldb-lancedb | `0.1.6` / `0.1.5` |
 
 脚本默认值位于 `scripts/deps/`；除非宿主安装并声明了其他受支持的精确版本，`dependencies.yaml` 必须声明上表中的受管运行时与包管理器版本。发布遵循[发布流程](scripts/release/README.md)：先运行时包，再五平台核心 Release，然后 crate，最后 SDK。
 

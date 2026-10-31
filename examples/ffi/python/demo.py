@@ -54,16 +54,7 @@ class FfiLuaRuntimeHostOptions(ctypes.Structure):
         ("enable_private_url_skill_install", ctypes.c_uint8),
         ("private_skill_source_allowlist", ctypes.POINTER(ctypes.c_char_p)),
         ("private_skill_source_allowlist_len", ctypes.c_size_t),
-        ("sqlite_library_path", ctypes.c_char_p),
-        ("sqlite_provider_mode", ctypes.c_int32),
         ("sqlite_callback_mode", ctypes.c_int32),
-        ("lancedb_library_path", ctypes.c_char_p),
-        ("lancedb_provider_mode", ctypes.c_int32),
-        ("lancedb_callback_mode", ctypes.c_int32),
-        ("space_controller_endpoint", ctypes.c_char_p),
-        ("space_controller_auto_spawn", ctypes.c_uint8),
-        ("space_controller_executable_path", ctypes.c_char_p),
-        ("space_controller_process_mode", ctypes.c_int32),
         ("cache_config", ctypes.c_void_p),
         ("runlua_pool_config", ctypes.c_void_p),
         ("reserved_entry_names", ctypes.POINTER(ctypes.c_char_p)),
@@ -184,6 +175,23 @@ class FfiLuaInvocationContext(ctypes.Structure):
     ]
 
 
+class FfiRuntimeHostResult(ctypes.Structure):
+    """
+    Describe the optional structured host result owned by the invocation result.
+    描述由调用结果拥有的可选结构化宿主结果。
+    Read kind, JSON payload and its byte count; release through invocation_result_free.
+    读取类型、JSON 载荷及字节数；通过 invocation_result_free 统一释放。
+    """
+
+    # Preserve the exact public C field order and native widths.
+    # 保持公开 C 接口的精确字段顺序和原生宽度。
+    _fields_ = [
+        ("kind", FfiOwnedBuffer),
+        ("payload_json", FfiOwnedBuffer),
+        ("payload_bytes", ctypes.c_size_t),
+    ]
+
+
 class FfiRuntimeInvocationResult(ctypes.Structure):
     """
     Plain invocation-result object returned by the standard invocation API.
@@ -196,6 +204,9 @@ class FfiRuntimeInvocationResult(ctypes.Structure):
         ("template_hint", FfiOwnedBuffer),
         ("content_bytes", ctypes.c_size_t),
         ("content_lines", ctypes.c_size_t),
+        # This nullable result belongs to the enclosing invocation allocation.
+        # 此可空结果归属于外层调用结果的分配对象。
+        ("host_result", ctypes.POINTER(FfiRuntimeHostResult)),
     ]
 
 
@@ -448,16 +459,7 @@ def main() -> None:
     host.enable_private_url_skill_install = 0
     host.private_skill_source_allowlist = None
     host.private_skill_source_allowlist_len = 0
-    host.sqlite_library_path = None
-    host.sqlite_provider_mode = 0
     host.sqlite_callback_mode = 0
-    host.lancedb_library_path = None
-    host.lancedb_provider_mode = 0
-    host.lancedb_callback_mode = 0
-    host.space_controller_endpoint = None
-    host.space_controller_auto_spawn = 0
-    host.space_controller_executable_path = None
-    host.space_controller_process_mode = 0
     host.cache_config = None
     host.runlua_pool_config = None
     host.reserved_entry_names = None

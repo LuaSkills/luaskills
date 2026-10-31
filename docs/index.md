@@ -42,7 +42,7 @@ For products that embed the runtime.
 - [FFI and integration overview](integration/ffi-overview.md): integration layers, the first integration sequence, and key FFI rules.
 - [Host-selected managed runtime roots](integration/managed-runtime-host-roots.md): independent data, distribution, and environment roots, resource policy, and resolvers. [中文](zh-CN/integration/managed-runtime-host-roots.md)
 - [Package configuration host contract](integration/package-configuration.md): declarations, stores, revisions, disclosure, and events.
-- [Database providers](integration/database-providers.md): SQLite and LanceDB ownership modes.
+- [Database providers](integration/database-providers.md): SQLite ownership modes.
 - Chinese references:
   - [FFI integration guide](zh-CN/integration/ffi-integration-guide.md)
   - [FFI host checklist](zh-CN/integration/ffi-host-checklist.md)
@@ -71,7 +71,7 @@ For products that embed the runtime.
 - [FFI demo runtime](../examples/ffi/demo_runtime/README.md)
 - [Host provider demo](../examples/ffi/host_provider_demo/README.md)
 - [FFI demo package](../examples/demo-ffi/README.md)
-- `cargo run --bin luaskills-debug -- inspect --runtime-root <dir> --skill-path <dir>`: syncs one skill into a real `runtime_root` and loads it the way a host would.
+- `cargo run --features debug-sqlite --bin luaskills-debug -- inspect --runtime-root <dir> --skill-path <dir>`: syncs one skill into a real `runtime_root` and loads it the way a host would.
 
 ## Maintainers
 

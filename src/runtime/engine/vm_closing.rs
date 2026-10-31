@@ -82,6 +82,17 @@ impl HostFunctions for Lua {
 /// Userdata method registration that refuses calls while the VM closes; the only allowed way to add methods.
 /// 在 VM 关闭期间拒绝调用的 userdata 方法注册；添加方法的唯一允许方式。
 pub(crate) trait HostMethods<T> {
+    /// Register a function receiving explicit userdata, checking VM lifetime before argument conversion.
+    /// 注册接收显式 userdata 的函数，在转换参数前检查虚拟机生命周期。
+    /// `name` identifies the method and `function` returns its Lua results or error from the supplied arguments.
+    /// `name` 标识方法，`function` 根据传入参数返回 Lua 结果或错误。
+    #[cfg(windows)]
+    fn add_host_function<F, A, R>(&mut self, name: impl Into<String>, function: F)
+    where
+        F: Fn(&Lua, A) -> mlua::Result<R> + MaybeSend + 'static,
+        A: FromLuaMulti,
+        R: IntoLuaMulti;
+
     /// Same as `UserDataMethods::add_method`, refusing calls while the VM closes.
     /// 与 `UserDataMethods::add_method` 相同，但在 VM 关闭期间拒绝调用。
     fn add_host_method<M, A, R>(&mut self, name: impl Into<String>, method: M)
@@ -101,6 +112,26 @@ pub(crate) trait HostMethods<T> {
 
 #[allow(clippy::disallowed_methods)]
 impl<T, U: UserDataMethods<T>> HostMethods<T> for U {
+    /// Install the explicit-userdata function through the same close gate as ordinary methods.
+    /// 通过与普通方法相同的关闭闸门安装显式 userdata 函数。
+    /// `name` labels argument errors; `function` owns the implementation; returns unit after registration.
+    /// `name` 标识参数错误；`function` 拥有实现；注册后返回空值。
+    #[cfg(windows)]
+    fn add_host_function<F, A, R>(&mut self, name: impl Into<String>, function: F)
+    where
+        F: Fn(&Lua, A) -> mlua::Result<R> + MaybeSend + 'static,
+        A: FromLuaMulti,
+        R: IntoLuaMulti,
+    {
+        // The label is retained until argument conversion has passed the lifetime gate.
+        // 标签保留到参数转换通过生命周期闸门之后。
+        let label = name.into();
+        self.add_function(label.clone(), move |lua, args: MultiValue| {
+            ensure_open(lua)?;
+            function(lua, A::from_lua_args(args, 1, Some(&label), lua)?)
+        });
+    }
+
     fn add_host_method<M, A, R>(&mut self, name: impl Into<String>, method: M)
     where
         M: Fn(&Lua, &T, A) -> mlua::Result<R> + MaybeSend + 'static,

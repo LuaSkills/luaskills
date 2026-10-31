@@ -29,12 +29,10 @@ The current skill runtime exposes these top-level capabilities:
 - `vulcan.context.*`
 - `vulcan.deps.*`
 - `vulcan.sqlite.*`
-- `vulcan.lancedb.*`
 
 Three important facts:
 
 1. The runtime currently treats skills as **trusted code** by default and does not provide a sandbox security promise.
-2. Some values under `vulcan.context.*`, `vulcan.deps.*`, `vulcan.sqlite.*`, and `vulcan.lancedb.*` depend on host injection or current-skill binding state. Do not assume they are always valid.
 3. Hosts can force-skip skills through `LuaRuntimeHostOptions.ignored_skill_ids`. Ignored skills do not prepare dependencies, bind databases, or register entries.
 
 ## 2.1 Skill Naming And Release Package Rules
@@ -204,7 +202,6 @@ On Windows, a host may obtain a canonical path in `\\?\C:\...` or `\\?\UNC\serve
 | `vulcan.context` | Request and current-entry context | Yes | Most values are host-injected |
 | `vulcan.deps` | Current skill dependency root paths | Yes | May be `nil` without a resolved skill context |
 | `vulcan.sqlite` | Current skill SQLite binding | Conditional | `enabled/status/info` still exist when disabled |
-| `vulcan.lancedb` | Current skill LanceDB binding | Conditional | `enabled/status/info` still exist when disabled |
 
 ## 3.1 Managed IO And Process Encoding
 
@@ -336,7 +333,7 @@ Typical scenarios:
 
 - The host already provides a stronger native, gRPC, or VMM implementation.
 - A default skill package overlaps with existing host functionality.
-- A database-backed skill has been replaced by a host-side service, so SQLite or LanceDB binding should not start.
+- A database-backed skill has been replaced by a host-side service, so SQLite binding should not start.
 
 Matching rules:
 
@@ -348,7 +345,7 @@ Runtime effects:
 
 - The whole skill is skipped when the ignore list matches.
 - `dependencies.yaml` is not prepared.
-- SQLite and LanceDB are not bound.
+- SQLite are not bound.
 - No entries are registered.
 - The skill does not appear in `list_entries` and cannot be called through `vulcan.call`.
 
@@ -1860,6 +1857,8 @@ Every dependency is `required: true` by default, and any failure to make it read
 
 `vulcan.sqlite` is a SQLite binding isolated to the **current skill scope**.
 
+The manifest's `sqlite` object accepts only `enable`; the host owns logging and slow-query policy, and unknown fields are rejected. `info()` and `status()` report binding metadata only. `initialized` means the binding is ready, without implying an open database or support for every action. Each operation returns the host's explicit result or error.
+
 ### 14.1 Current Fields And Methods
 
 - `vulcan.sqlite.enabled`
@@ -1935,60 +1934,6 @@ Stable development constraints:
   - [Host database provider guide](../zh-CN/integration/host-database-provider-guide.md)
 - If you are a skill author rather than a host implementer, prefer existing memory-skill examples over guessing provider-specific result fields.
 
-## 15. `vulcan.lancedb.*`
-
-`vulcan.lancedb` is a LanceDB binding isolated to the **current skill scope**.
-
-### 15.1 Current Fields And Methods
-
-- `vulcan.lancedb.enabled`
-- `vulcan.lancedb.info()`
-- `vulcan.lancedb.status()`
-- `vulcan.lancedb.create_table(input)`
-- `vulcan.lancedb.vector_upsert(input)`
-- `vulcan.lancedb.vector_search(input)`
-- `vulcan.lancedb.delete(input)`
-- `vulcan.lancedb.drop_table(input)`
-
-| Category | API | Input | Return Value | Meaning |
-| --- | --- | --- | --- | --- |
-| Stable probe | `enabled` | none | `boolean` | whether the current skill has a LanceDB binding |
-| Stable probe | `info()` | none | `table` | binding information suitable for availability probing |
-| Stable probe | `status()` | none | `table` | current status suitable for availability probing |
-| Provider forward | `create_table(input)` | `input: table` | provider-defined | creates one table |
-| Provider forward | `vector_upsert(input)` | `input: table` | provider-defined | upserts vector data |
-| Provider forward | `vector_search(input)` | `input: table` | provider-defined | performs vector search |
-| Provider forward | `delete(input)` | `input: table` | provider-defined | deletes records |
-| Provider forward | `drop_table(input)` | `input: table` | provider-defined | drops one table |
-
-### 15.2 Behavior Rules
-
-- `enabled = true` means the current skill has a LanceDB binding.
-- `info()` and `status()` always exist.
-- When LanceDB is not enabled:
-  - `enabled = false`
-  - `info()` and `status()` return disabled-state descriptions
-  - other methods error directly with `current skill has not enabled lancedb`
-
-Stable development constraints:
-
-- Pass one Lua table as `input`.
-- Exact business fields and result shapes are defined by the LanceDB provider. LuaSkills only forwards the call and guards capability availability.
-- The host/provider also receives stable binding context such as `space_label`, `binding_tag`, and `database_kind`.
-
-### 15.3 Special Note
-
-`vector_search(input)` results may contain two payload forms:
-
-- `data_json`
-- `data`
-
-When the result format is JSON, the result table contains `data_json`; otherwise it contains the raw binary string `data`.
-
-For exact input and output fields, combine the host LanceDB provider contract with:
-
-- [Host database provider guide](../zh-CN/integration/host-database-provider-guide.md)
-
 ## 16. Common Development Guidance
 
 ### 16.1 Probe Before Calling
@@ -2014,7 +1959,6 @@ These are internal mechanisms and should not be long-term skill dependencies:
 
 - `vulcan.runtime.internal.*`
 - `vulcan.__sqlite_skill_name`
-- `vulcan.__lancedb_skill_name`
 
 ### 16.3 Do Not Guess Host Directory Layout
 
@@ -2041,7 +1985,7 @@ If you mainly write skills, read in this order:
 
 1. This manual: understand the actual current `vulcan.*` capability surface.
 2. [README.md](../../README.md): understand runtime positioning and host boundaries.
-3. [Host database provider guide](../zh-CN/integration/host-database-provider-guide.md): understand SQLite / LanceDB host integration contracts.
+3. [Host database provider guide](../zh-CN/integration/host-database-provider-guide.md): understand SQLite host integration contracts.
 
 If you are integrating a host rather than writing a skill, read:
 

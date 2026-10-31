@@ -204,6 +204,16 @@ jobs:
         shell: pwsh
         run: cargo clippy --locked --all-targets -j 4 -- -D warnings
 
+      # The standalone debugger explicitly owns SQLite while the default library stays host-only.
+      # 独立调试工具显式拥有 SQLite，默认库仍然仅依赖宿主注册。
+      - name: Verify SQLite debug host
+        shell: pwsh
+        run: |
+          cargo clippy --locked --features debug-sqlite --bin luaskills-debug -j 4 -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw "SQLite debug host lint failed" }
+          cargo test --locked --features debug-sqlite --bin luaskills-debug -j 4 -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "SQLite debug host tests failed" }
+
       # Derive and validate the same offline contract on all five actual target platforms.
       # 在全部五个实际目标平台上派生并校验相同离线契约。
       - name: Verify embedded contract artifact

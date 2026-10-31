@@ -31,22 +31,19 @@ pub use host::callbacks::{
     set_skill_management_callback, set_skill_operation_progress_callback,
 };
 pub use host::database::{
-    LuaRuntimeDatabaseCallbackMode, LuaRuntimeDatabaseProviderMode, RuntimeDatabaseBindingContext,
-    RuntimeDatabaseBindingContextSpec, RuntimeDatabaseKind, RuntimeLanceDbProviderAction,
-    RuntimeLanceDbProviderCallback, RuntimeLanceDbProviderJsonCallback,
-    RuntimeLanceDbProviderRequest, RuntimeLanceDbProviderResult, RuntimeSqliteProviderAction,
-    RuntimeSqliteProviderCallback, RuntimeSqliteProviderJsonCallback, RuntimeSqliteProviderRequest,
-    set_lancedb_provider_callback, set_lancedb_provider_json_callback,
-    set_sqlite_provider_callback, set_sqlite_provider_json_callback,
+    LuaRuntimeDatabaseCallbackMode, RuntimeDatabaseBindingContext,
+    RuntimeDatabaseBindingContextSpec, RuntimeDatabaseKind, RuntimeDatabaseProviderCallbacks,
+    RuntimeSqliteProviderAction, RuntimeSqliteProviderCallback, RuntimeSqliteProviderJsonCallback,
+    RuntimeSqliteProviderRequest, set_sqlite_provider_callback, set_sqlite_provider_json_callback,
 };
 pub use host::options::{
     DEFAULT_MANAGED_RUNTIME_PERSISTENT_SESSION_BUFFER_LIMIT_BYTES_PER_STREAM,
     DEFAULT_MANAGED_RUNTIME_PERSISTENT_SESSION_LIMIT_PER_ENGINE,
     DEFAULT_MANAGED_RUNTIME_WORKER_IDLE_TTL_SECS,
     DEFAULT_MANAGED_RUNTIME_WORKER_POOL_MAX_SIZE_PER_ENVIRONMENT, LuaInvocationContext,
-    LuaRuntimeCapabilityOptions, LuaRuntimeHostOptions, LuaRuntimeManagedRuntimeConfig,
-    LuaRuntimeNetworkOptions, LuaRuntimeSecretString, LuaRuntimeSpaceControllerOptions,
-    LuaRuntimeSpaceControllerProcessMode, RuntimeSkillRoot,
+    LuaRuntimeCapabilityOptions, LuaRuntimeHostMode, LuaRuntimeHostOptions,
+    LuaRuntimeManagedRuntimeConfig, LuaRuntimeNetworkOptions, LuaRuntimeSecretString,
+    RuntimeSkillRoot,
 };
 pub use runtime::cache::{
     DEFAULT_TOOL_CACHE_DEFAULT_TTL_SECS, DEFAULT_TOOL_CACHE_MAX_ENTRIES,
@@ -119,9 +116,8 @@ pub use skill::dependencies::{
 pub use skill::manager::{
     DisabledSkillRecord, ResolvedSkillInstance, SkillApplyResult, SkillInstallRequest,
     SkillLifecycleAction, SkillManagementAuthority, SkillManager, SkillManagerConfig,
-    SkillOperationPlane, SkillUninstallOptions, SkillUninstallResult, SkillUpdateCheck,
-    collect_effective_skill_instances, resolve_declared_skill_instance_from_roots,
-    resolve_effective_skill_instance,
+    SkillOperationPlane, SkillUninstallResult, SkillUpdateCheck, collect_effective_skill_instances,
+    resolve_declared_skill_instance_from_roots, resolve_effective_skill_instance,
 };
 pub use skill::manifest::{SkillHelpMeta, SkillHelpNodeMeta, SkillMeta, SkillToolMeta};
 pub use skill::source::{InstalledSkillRecord, InstalledSkillSourceRecord, SkillInstallSourceType};
@@ -136,5 +132,4 @@ pub use runtime::logging as runtime_logging;
 pub use runtime::result as runtime_result;
 pub use skill::manifest as lua_skill;
 
-pub(crate) use providers::lancedb as lancedb_host;
 pub(crate) use providers::sqlite as sqlite_host;

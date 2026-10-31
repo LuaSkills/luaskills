@@ -111,7 +111,7 @@ impl OperationSnapshot {
     /// 日志接纳或恢复前校验关闭形状及终态投影。
     /// Return an explicit error instead of treating contradictory history as authoritative evidence.
     /// 返回显式错误，不将矛盾历史视为权威证据。
-    pub(in crate::runtime::embedded) fn validate_finalization(&self) -> EmbeddedResult<()> {
+    pub fn validate_finalization(&self) -> EmbeddedResult<()> {
         let Some(finalization) = &self.finalization else {
             return Ok(());
         };
@@ -181,10 +181,7 @@ impl OperationSnapshot {
 
     /// Keep original business evidence and any returned closing outcome immutable across journal successors.
     /// 在日志后继版本中保持原业务证据及任何已返回关闭结果不可变。
-    pub(in crate::runtime::embedded) fn validate_finalization_successor(
-        &self,
-        previous: &Self,
-    ) -> EmbeddedResult<()> {
+    pub fn validate_finalization_successor(&self, previous: &Self) -> EmbeddedResult<()> {
         let Some(original) = &previous.finalization else {
             return Ok(());
         };

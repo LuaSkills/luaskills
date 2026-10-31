@@ -11,9 +11,12 @@ use std::time::{Duration, Instant};
 
 use mlua::{AnyUserData, Lua, MultiValue, Table, UserData, UserDataMethods, Value as LuaValue};
 
+use crate::LuaRuntimeHostMode;
 use crate::runtime::encoding::{RuntimeTextEncoding, decode_runtime_text, encode_runtime_text};
 use crate::runtime::engine::vm_closing::{HostFunctions, HostMethods};
 use crate::runtime::path::normalize_host_input_path_text;
+#[cfg(windows)]
+use crate::runtime::process_window::configure_command;
 
 #[cfg(unix)]
 use libc::{ESRCH, SIGKILL};
@@ -23,8 +26,6 @@ use std::mem::size_of;
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_NO_MORE_FILES, HANDLE,
@@ -144,6 +145,9 @@ pub(crate) struct ManagedProcessSessionStatus {
 /// 纯 Rust 托管进程会话核心消费的启动选项。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ManagedProcessSessionLaunchOptions {
+    /// Immutable window policy selected by the owning engine, never by a Lua request.
+    /// 由所属引擎选定的不可变窗口策略，绝不由 Lua 请求决定。
+    pub(crate) host_mode: LuaRuntimeHostMode,
     /// Encoding used for stdout decoding.
     /// stdout 解码使用的编码。
     pub(crate) stdout_encoding: RuntimeTextEncoding,
@@ -669,19 +673,25 @@ pub(crate) struct ManagedChildProcessTree {
 impl ManagedChildProcessTree {
     /// Spawn with child-dependent resources retained across every partial attachment rollback.
     /// 启动进程，并让依赖子进程的资源跨越每个部分附加回滚继续保留。
+    /// `command` supplies the process, `label` names diagnostics, `keepalive` retains resources, and `host_mode` controls windows.
+    /// `command` 提供进程，`label` 标识诊断，`keepalive` 保留资源，`host_mode` 控制窗口。
+    /// Returns the child, tree controller, and reserved reaper capacity, or a fully rolled-back launch error.
+    /// 返回子进程、进程树控制器及预留回收容量，或已完整回滚的启动错误。
     pub(crate) fn spawn_with_keepalive(
         command: &mut Command,
         label: &str,
         mut keepalive: Option<Box<dyn FnOnce() + Send>>,
+        host_mode: LuaRuntimeHostMode,
     ) -> Result<(Child, Self, DetachedChildReaperPermit), String> {
         // Breakaway request and platform spawn flags must be decided before the child exists.
         // 必须在子进程存在前确定脱离请求与平台启动标记。
-        let breakaway_requested = ProcessTreeController::prepare_command(command)?;
+        let breakaway_requested = ProcessTreeController::prepare_command(command, host_mode)?;
         // Reaper capacity is initialized and reserved before spawn, so attach failure cannot lose ownership.
         // 在启动前初始化并预留回收器容量，因此附加失败不可能丢失所有权。
         let reaper_permit = reserve_detached_child_reaper_slot()?;
-        let child = ProcessTreeController::spawn_prepared_command(command, breakaway_requested)
-            .map_err(|error| format!("spawn {label}: {error}"))?;
+        let child =
+            ProcessTreeController::spawn_prepared_command(command, breakaway_requested, host_mode)
+                .map_err(|error| format!("spawn {label}: {error}"))?;
         let controller = match ProcessTreeController::attach(&child) {
             Ok(controller) => controller,
             Err(attach_error) => {
@@ -1194,7 +1204,8 @@ impl ManagedProcessSessionCore {
         }
         // BreakawayRequested records whether Windows first attempts to leave an outer host job.
         // BreakawayRequested 记录 Windows 是否先尝试脱离外层宿主 Job。
-        let breakaway_requested = ProcessTreeController::prepare_command(&mut command)?;
+        let breakaway_requested =
+            ProcessTreeController::prepare_command(&mut command, options.host_mode)?;
         // Pre-spawn reservation makes every attach-failure timeout handoff capacity-safe.
         // 启动前预留使每次附加失败超时交接都具备容量安全性。
         let reaper_permit = reserve_detached_child_reaper_slot()?;
@@ -1204,9 +1215,12 @@ impl ManagedProcessSessionCore {
             .stderr(Stdio::piped());
         // Child is the newly spawned process that must be rolled back if tree attachment fails.
         // Child 是刚启动的进程；若进程树附加失败，必须回滚它。
-        let mut child =
-            ProcessTreeController::spawn_prepared_command(&mut command, breakaway_requested)
-                .map_err(|error| format!("spawn managed process: {error}"))?;
+        let mut child = ProcessTreeController::spawn_prepared_command(
+            &mut command,
+            breakaway_requested,
+            options.host_mode,
+        )
+        .map_err(|error| format!("spawn managed process: {error}"))?;
         // ProcessTree retains the platform controller for the whole session lifetime.
         // ProcessTree 在整个会话生命周期内保留平台进程树控制器。
         let process_tree = match attach(&child) {
@@ -1568,7 +1582,12 @@ fn rollback_managed_process_launch(
 impl ManagedProcessSession {
     /// Build and launch the pure Rust core for one parsed Lua open request.
     /// 为一个已解析 Lua 打开请求构建并启动纯 Rust 核心。
-    fn launch_core(request: ProcessSessionOpenRequest) -> mlua::Result<ManagedProcessSessionCore> {
+    /// `request` owns authorized launch/IO settings; `host_mode` comes from the engine; returns the core or a Lua error.
+    /// `request` 拥有已授权启动及 IO 设置；`host_mode` 来自引擎；返回核心或 Lua 错误。
+    fn launch_core(
+        request: ProcessSessionOpenRequest,
+        host_mode: LuaRuntimeHostMode,
+    ) -> mlua::Result<ManagedProcessSessionCore> {
         // Command receives only Lua-authorized executable, arguments, and cwd configuration.
         // Command 只接收 Lua 已授权的可执行文件、参数与 cwd 配置。
         let mut command = Command::new(&request.program);
@@ -1581,6 +1600,7 @@ impl ManagedProcessSession {
         // Options transfers encoding and buffering policy into the package-agnostic core.
         // Options 把编码与缓冲策略传入包无关核心。
         let options = ManagedProcessSessionLaunchOptions {
+            host_mode,
             stdout_encoding: request.stdout_encoding,
             stderr_encoding: request.stderr_encoding,
             stdin_encoding: request.stdin_encoding,
@@ -1599,7 +1619,7 @@ impl ManagedProcessSession {
     fn open(request: ProcessSessionOpenRequest) -> mlua::Result<Self> {
         // Core is wrapped exactly like the public userdata path, without a package cleanup.
         // Core 与公共 userdata 路径完全相同地包装，但不附加包清理。
-        let core = Self::launch_core(request)?;
+        let core = Self::launch_core(request, LuaRuntimeHostMode::Console)?;
         Ok(Self::from_core(core, None, None))
     }
 
@@ -2130,9 +2150,14 @@ pub(crate) fn create_managed_process_session_userdata(
 
 /// Build the `vulcan.process.session` Lua table.
 /// 构建 `vulcan.process.session` Lua 表。
+/// `lua` owns the table; `default_encoding` selects text defaults; `host_mode` is captured for all future opens.
+/// `lua` 拥有表；`default_encoding` 选择默认文本编码；`host_mode` 为所有后续打开操作捕获。
+/// Returns the initialized table or a Lua registration error.
+/// 返回初始化表或 Lua 注册错误。
 pub(crate) fn create_process_session_table(
     lua: &Lua,
     default_encoding: RuntimeTextEncoding,
+    host_mode: LuaRuntimeHostMode,
 ) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     table.set(
@@ -2159,7 +2184,7 @@ pub(crate) fn create_process_session_table(
             }
             // Core is wrapped by the same userdata factory used by managed runtime sessions.
             // Core 由受管运行时会话共同使用的同一个 userdata 工厂包装。
-            let core = ManagedProcessSession::launch_core(request)?;
+            let core = ManagedProcessSession::launch_core(request, host_mode)?;
             create_managed_process_session_userdata(lua, core, None, None)
         })?,
     )?;
@@ -2663,7 +2688,16 @@ fn run_live_child_watcher(queue: Arc<LiveChildWatcherQueue>) {
 impl ProcessTreeController {
     /// Prepare one command to run inside an isolated process tree.
     /// 配置命令使其运行在隔离的进程树中。
-    fn prepare_command(command: &mut Command) -> Result<bool, String> {
+    /// `command` receives lifecycle flags plus `host_mode`; returns whether Windows Job breakaway was requested.
+    /// `command` 接收生命周期标志及 `host_mode`；返回是否请求 Windows Job 脱离。
+    fn prepare_command(
+        command: &mut Command,
+        host_mode: LuaRuntimeHostMode,
+    ) -> Result<bool, String> {
+        // Cross-platform policy is deliberately inert outside Windows.
+        // 跨平台策略在 Windows 之外有意保持无操作。
+        #[cfg(not(windows))]
+        let _ = host_mode;
         #[cfg(unix)]
         {
             command.process_group(0);
@@ -2677,7 +2711,7 @@ impl ProcessTreeController {
             } else {
                 CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED
             };
-            command.creation_flags(creation_flags);
+            configure_command(command, host_mode, creation_flags);
             Ok(in_job)
         }
         #[cfg(not(any(unix, windows)))]
@@ -2689,9 +2723,14 @@ impl ProcessTreeController {
 
     /// Spawn one command that was already configured for process-tree isolation.
     /// 启动一个已经配置好进程树隔离选项的命令。
+    /// `breakaway_requested` permits the access-denied retry; both attempts preserve `host_mode` on `command`.
+    /// `breakaway_requested` 允许访问拒绝重试；两次尝试均在 `command` 上保留 `host_mode`。
+    /// Returns the child or the platform spawn error without changing non-Windows behavior.
+    /// 返回子进程或平台启动错误，不改变非 Windows 行为。
     fn spawn_prepared_command(
         command: &mut Command,
         breakaway_requested: bool,
+        host_mode: LuaRuntimeHostMode,
     ) -> Result<Child, std::io::Error> {
         #[cfg(windows)]
         {
@@ -2705,7 +2744,11 @@ impl ProcessTreeController {
                         "[LuaSkill:warn] process.session falling back to inherited host job because CREATE_BREAKAWAY_FROM_JOB was denied"
                             .to_string(),
                     );
-                    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
+                    configure_command(
+                        command,
+                        host_mode,
+                        CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED,
+                    );
                     command.spawn()
                 }
                 Err(error) => Err(error),
@@ -2713,7 +2756,7 @@ impl ProcessTreeController {
         }
         #[cfg(not(windows))]
         {
-            let _ = breakaway_requested;
+            let _ = (breakaway_requested, host_mode);
             command.spawn()
         }
     }

@@ -1,490 +1,61 @@
-# 宿主数据库 Provider 对接说明
+# SQLite 宿主注册
 
-## 1. 文档目标
+## 接入边界
 
-本文档用于说明 `luaskills` 当前如何把 SQLite / LanceDB 数据库操作交给宿主自己处理。
+从 0.7.3 起，技能数据库仅支持宿主注册的 SQLite 回调。LuaSkills 负责技能作用域、请求分发和回调生命周期；宿主负责数据库位置、连接、并发、事务、迁移、备份及资源释放。
 
-本文档重点覆盖：
+技能层 LanceDB 支持、vldb 控制器客户端、自动启动、数据库动态库加载及相关 Rust/FFI 类型和选项已直接删除，没有保留符号或兼容占位。旧数据库文件不迁移、不删除。需要向量数据库的技能可以通过宿主管理的 Node.js 或 Python 扩展实现。
 
-- 数据库 provider 模式分类
-- 回调模式分类
-- `space_label` / `binding_tag` 的语义
-- 宿主需要实现的最小必要接口
-- 独立 demo 的使用方式
+这是接口移除版本。标准 C 结构中的退役字段也已移除，必须使用本版本头文件重新编译宿主；旧 SDK 的结构声明和导出清单不能直接配合新动态库。仍在使用的 SQLite 动作编号、绑定身份、JSON 请求结构及缓冲释放规则保持不变。旧 `lancedb` 技能配置及旧数据库宿主选项会作为未知字段拒绝。
 
-## 2. 当前支持的数据库接入模式
+## Rust 实例注册
 
-当前每个数据库后端都支持三种 provider mode：
+使用 `RuntimeDatabaseProviderCallbacks::default().with_sqlite(callback)` 或 `with_sqlite_json(callback)` 构造实例能力集合，然后调用 `LuaEngine::new_with_database_providers(options, callbacks)`。
 
-- `dynamic_library`
-- `host_callback`
-- `space_controller`
+每个实例保存独立集合，重载候选继续持有同一集合。显式空集合不会继承进程全局默认值。嵌套 `vulcan.call` 临时切换到目标技能绑定，返回后恢复源技能身份。
 
-它们分别通过下列字段控制：
+`LuaRuntimeHostOptions.sqlite_callback_mode` 选择 `standard` 或 `json`，默认 `standard`。选择的传输必须有对应注册，不会尝试其他回调或数据库后端。加载器沿用逐技能失败报告行为：缺少回调的 SQLite 技能不能完成加载，其他有效技能仍可加载。
 
-- `LuaRuntimeHostOptions.sqlite_provider_mode`
-- `LuaRuntimeHostOptions.lancedb_provider_mode`
-- `LuaRuntimeHostOptions.sqlite_callback_mode`
-- `LuaRuntimeHostOptions.lancedb_callback_mode`
+原有 `set_sqlite_provider_callback` 和 `set_sqlite_provider_json_callback` 是进程级默认注册入口。使用 `LuaEngine::new` 时会捕获当时的默认回调；后续修改全局注册不会改变已经创建的引擎。
 
-这些配置是**按后端分别设置**的，也就是说 SQLite 与 LanceDB 可以使用不同模式。
+## C 接口
 
-例如：
+`FfiDatabaseProviderCallbacksV1` 包含 `user_data`、`sqlite` 和 `sqlite_json`。通过 `luaskills_ffi_engine_new_with_database_providers_v1` 传入该描述符与 `FfiLuaEngineOptionsV4`；成功返回零并输出引擎句柄，失败时句柄清零并返回自有错误缓冲。
 
-- SQLite 使用 `host_callback + json`
-- LanceDB 使用 `dynamic_library`
+描述符本身仅借用至构造调用结束；回调代码与 `user_data` 必须在引擎及所有在途调用结束之前保持有效。释放引擎之后再释放宿主数据库资源。回调不得跨 C 边界抛出异常，同线程不得重入同一个引擎。
 
-如果宿主已经把某个数据库型 skill 的能力切换到原生、gRPC、VMM 或其他实现，可以在加载前通过 `LuaRuntimeHostOptions.ignored_skill_ids` 忽略对应 skill。  
-被忽略的 skill 不会进入依赖准备、SQLite/LanceDB 绑定或 entry 注册阶段，因此不会产生数据库 provider 请求。
+结构化 SQLite 回调接收 `FfiSqliteProviderRequest`，其中包括动作整数、绑定上下文和 UTF-8 JSON 输入字节。成功通过 `response_json_out` 返回 JSON；失败通过 `error_out` 返回诊断。两个输出都必须使用 LuaSkills 分配器创建，不能直接返回宿主语言的临时字符串或内存。
 
-### `dynamic_library`
+JSON 回调接收完整请求 JSON，通过相同的 `FfiOwnedBuffer` 规则返回响应。现有进程级入口为 `luaskills_ffi_set_sqlite_provider_callback` 和 `luaskills_ffi_set_sqlite_provider_json_callback`。可使用 `luaskills_ffi_buffer_clone` 分配返回字节，收到库返回缓冲后使用 `luaskills_ffi_buffer_free` 释放。
 
-由 `luaskills` 自己加载本地动态库，并直接调用：
+## 绑定上下文与数据位置
 
-- SQLite backend
-- LanceDB backend
+请求固定包含 `action`、`binding`、`input`。`binding` 的 `space_label`、`skill_id`、`root_name`、`space_root`、`skill_dir`、`skill_dir_name`、`database_kind`、`binding_tag`、`default_database_path` 由运行时生成；技能输入不能覆盖绑定身份。
 
-这种模式下：
+SQLite 默认建议路径为技能根父目录下的 `{database_dir_name}/sqlite/{skill_id}/{skill_id}.sqlite3`；`skill_id` 来自技能目录身份，不使用清单显示名称。设置 `runtime_root` 时遵循既有固定布局，`database_dir_name` 规范化为 `databases`；未设置时沿用宿主显式目录名。`binding_tag` 沿用既有生成规则。注册回调只生成绑定，不创建数据库目录、不打开文件；实际数据库位置仍由宿主决定。
 
-- lib 自己计算默认数据库路径
-- lib 自己打开数据库
-- skill 只做表操作与向量操作
+宿主可以按绑定映射自己的私有目录，必须自己验证权限、隔离租户和管理连接。技能卸载仅处理代码及依赖，不删除数据库。原数据库清理选项和结果字段已移除；SQLite 与既有 LanceDB 数据生命周期完全由宿主负责。
 
-### `host_callback`
+## SQLite 动作
 
-由宿主注册数据库 provider 回调。
+结构化动作保留原编号 0 至 15：`execute_script`、`execute_batch`、`query_json`、`query_stream`、`query_stream_wait_metrics`、`query_stream_chunk`、`query_stream_close`、`tokenize_text`、`upsert_custom_word`、`remove_custom_word`、`list_custom_words`、`ensure_fts_index`、`rebuild_fts_index`、`upsert_fts_document`、`delete_fts_document`、`search_fts`。
 
-这种模式下：
+输入及结果业务字段由宿主契约决定；不支持的动作应明确返回错误。技能仅通过 `sqlite.enable: true` 请求绑定，调用 `vulcan.sqlite.*` 使用宿主能力。旧 `log_level`、`slow_log_enabled`、`slow_log_threshold_ms` 已移除，传入这些或其他未知 SQLite 配置字段会报错；数据库诊断属于宿主策略。
 
-- lib 不再决定数据库最终创建位置
-- lib 不再要求数据库一定落在默认 sibling 目录下
-- lib 只负责把数据库请求和稳定绑定上下文回调给宿主
-- 宿主决定：
-  - 数据库放在哪
-  - 是否共享
-  - 是否走本地文件
-  - 是否转发给别的服务
+`vulcan.sqlite.status()` 和 `info()` 只报告绑定元信息；`initialized` 表示回调绑定就绪，不代表宿主已经打开数据库。不再返回动态库路径、名称、版本、阶段、日志配置或未经宿主声明的能力列表。请求中的 `input` 是技能业务输入，外层 `binding` 才是运行时生成的身份；宿主应按外层绑定选择数据库。
 
-### `space_controller`
+## 调试工具
 
-由 lib 把数据库请求转发给外部空间控制器。
+独立调试工具 `luaskills-debug` 自己提供 SQLite 宿主，启用 SQLite 的技能可以直接执行 SQL。构建使用 `--features debug-sqlite`，不改变默认核心库的依赖。输入、事务、数据目录与支持边界见[调试工具 SQLite 宿主](debug-sqlite-host.md)。
 
-这种模式下：
+## 内部操作日志
 
-- lib 不直接打开数据库
-- lib 不依赖宿主本进程内的回调实现
-- 数据库 ownership 与共享策略由控制器负责
-- 代码层固定依赖 `vldb-controller-client`
-- controller 服务程序由宿主自行复制到本地稳定路径，再通过 `LuaRuntimeHostOptions.space_controller.executable_path` 提供给 lib
-- 如果宿主没有显式指定 `endpoint`，运行时默认使用共享端点 `http://127.0.0.1:19801`
-- 如果宿主指定了不同端点，则可切换到独立 controller 实例
-- 若 `auto_spawn=true`，则 `endpoint` 必须使用可映射为本地 bind 地址的形式，例如 `19801`、`:19801`、`127.0.0.1:19801`、`localhost:19801` 或 `[::1]:19801`
-- 若 `endpoint` 指向远端主机名或远端服务地址，则必须将 `auto_spawn` 设为 `false`，并由宿主自行保证 controller 已经可连接
+默认库不编译 SQLite 引擎。Rust 宿主实现 `OperationJournalBackend`，通过 `OperationJournal::from_backend` 和已有工作线程接口提供持久历史。宿主必须保证原子修订比较、身份及上下文不变、终态合法、容量上限、不确定提交后的阻断和显式恢复。公开校验方法 `OperationSnapshot::validate_finalization`、`validate_finalization_successor` 及 `OperationReconciliation::validate` 可用于实现相同约束。
 
-推荐理解方式：
+需要原 SQLite 操作日志格式时，宿主可显式启用 `sqlite-journal` 功能，并调用 `OperationJournal::open`。该适配器保留既有表结构、摘要、独占打开、提交确认及恢复规则，与技能 SQLite 回调完全独立。C 嵌入式运行时的路径式持久化声明同样需要此显式功能；默认构建遇到该声明会返回错误，绝不静默降级为内存存储。原日志文件无需迁移。
 
-- Rust SDK：走 crates.io 固定版本 `vldb-controller-client = 0.2.3`
-- SDK 注册时宿主名使用 `client_name`，会话主键 `client_session_id` 由 controller 分配并由 SDK 内部自动管理
-- `binding_tag` 仍保留为稳定数据库标签与诊断标签，但在 `space_controller` 模式下不会直接等同于 controller `binding_id`
-- lib 会基于稳定 `binding_tag` 与当前 controller client 会话域生成客户端隔离的 controller `binding_id`
-- `v0.2.1` 额外修复了共享本地 endpoint 在 `auto_spawn` 场景下的重复拉起协调风险
-- controller 可执行程序：走宿主本地复制与管理
-- 共享还是独占：由 `endpoint` 决定
+## 示例与后续接入
 
-## 3. 为什么要引入宿主 callback 模式
+[Python 宿主示例](../../../examples/ffi/host_provider_demo/README.md) 使用标准库 `sqlite3` 实现脚本执行和查询，不需要数据库动态库或控制器。其他动作由实际宿主按需实现。
 
-因为记忆型 skill 使用的：
-
-- SQLite
-- LanceDB
-- BM25 / FTS
-
-本质上都带有状态和共享语义。
-
-如果多个宿主进程都直接打开同一个物理数据库，就会出现：
-
-- SQLite 锁冲突
-- LanceDB 并发写入风险
-- 多进程下的共享与 ownership 混乱
-
-宿主 `host_callback` 模式的目标就是：
-
-**让 lib 保持统一的数据库调用接口，同时把真正的数据库 ownership 与数据库目录分配交给宿主。**
-
-## 4. 回调模式分类
-
-当 provider mode 选择 `host_callback` 时，还必须继续指定 callback mode：
-
-- `standard`
-- `json`
-
-它们分别通过下列字段控制：
-
-- `LuaRuntimeHostOptions.sqlite_callback_mode`
-- `LuaRuntimeHostOptions.lancedb_callback_mode`
-
-规则如下：
-
-- provider mode 不等于 callback mode
-- 只有 provider mode 为 `host_callback` 时，callback mode 才会参与分发
-- lib 不再根据“是否注册了某种回调”来推断当前模式
-- lib 始终先看宿主初始化时传入的 mode，再决定走哪条链路
-
-### `standard`
-
-- 走结构化 C ABI 回调
-- 适合 C / C++ / Go / Rust 等更偏稳定 ABI 的宿主
-
-### `json`
-
-- 走 JSON 请求 / JSON 响应回调
-- 适合 Python / Node / 快速原型验证
-
-## 5. 绑定上下文
-
-宿主 provider 回调不会只拿到一段 SQL 或一段向量请求。
-
-lib 会一并提供稳定绑定上下文：
-
-- `space_label`
-- `skill_id`
-- `binding_tag`
-- `root_name`
-- `space_root`
-- `skill_dir`
-- `skill_dir_name`
-- `database_kind`
-- `default_database_path`
-
-其中最关键的是：
-
-### `space_label`
-
-由宿主提供的稳定空间标签，例如：
-
-- `ROOT`
-- `PROJECT`
-- `USER`
-
-对于项目级接管，**宿主必须保证这个标签稳定**。  
-这是前置条件，不由 lib 自动推导。
-
-正式 skill root 层级语义固定为 `ROOT -> PROJECT -> USER`，启动或加载时必须传入 `ROOT` root。`ROOT` 是系统控制级，`PROJECT` 与 `USER` 是普通用户管理面可操作层。数据库 provider 可以继续根据 `space_label` 做隔离，但不建议把更多项目子层级暴露给用户。
-
-### `binding_tag`
-
-由 lib 统一组合：
-
-```text
-{space_label}-{skill_id}
-```
-
-例如：
-
-- `ROOT-vulcan-work-memory`
-- `PROJECT-vulcan-ai-memory`
-
-这个字段用于：
-
-- 宿主管理数据库命名空间
-- 共享数据库标签
-- 多进程稳定复用
-
-补充说明：
-
-- 在 `host_callback` 模式下，宿主可以直接基于 `binding_tag` 路由或命名真实数据库
-- 在 `space_controller` 模式下，`binding_tag` 仍然保持稳定，但 lib 会额外派生客户端隔离的 controller `binding_id`，避免不同 controller client 实例争抢同一 binding
-
-### `default_database_path`
-
-这是 lib 按内嵌旧规则推导出的默认数据库路径。
-
-它的作用只是：
-
-- 兼容
-- 诊断
-- 给宿主做参考
-
-它**不是**宿主必须使用的真实数据库路径。
-
-## 6. 标准回调模式
-
-### SQLite
-
-注册函数：
-
-- `luaskills_ffi_set_sqlite_provider_callback`
-
-头文件：
-
-- [include/luaskills_ffi.h](../../../include/luaskills_ffi.h)
-
-回调签名：
-
-- 输入：
-  - `const FfiSqliteProviderRequest *request`
-  - `void *user_data`
-- 输出：
-  - `FfiOwnedBuffer *response_json_out`
-  - `FfiOwnedBuffer *error_out`
-
-### LanceDB
-
-注册函数：
-
-- `luaskills_ffi_set_lancedb_provider_callback`
-
-头文件：
-
-- [include/luaskills_ffi.h](../../../include/luaskills_ffi.h)
-
-回调签名：
-
-- 输入：
-  - `const FfiLanceDbProviderRequest *request`
-  - `void *user_data`
-- 输出：
-  - `FfiOwnedBuffer *meta_json_out`
-  - `FfiOwnedBuffer *data_out`
-  - `FfiOwnedBuffer *error_out`
-
-### 标准回调的关键点
-
-标准模式下，请求最外层是固定 C 结构：
-
-- `action`
-- `binding`
-- `FfiBorrowedBuffer input_json`
-
-也就是说：
-
-- 外层协议是结构化的
-- 动作内部参数仍然通过 `input_json` 承载
-- `input_json` 不再依赖 NUL 终止字符串，而是显式 `ptr + len`
-
-这样可以同时满足两件事：
-
-1. 宿主拿到的是标准 ABI 请求，而不是一整坨 JSON
-2. 内层动态参数不用被硬编码成大量脆弱 C 结构
-
-### 宿主如何返回字符串和字节
-
-标准回调下，如果宿主需要返回：
-
-- `response_json_out`
-- `meta_json_out`
-- `data_out`
-
-应优先使用 `luaskills` 提供的辅助函数：
-
-- `luaskills_ffi_buffer_clone`
-- `luaskills_ffi_buffer_free`
-
-也就是说：
-
-- 标准 callback 不再要求宿主直接写 `char **` 或 `uint8_t ** + len`
-- 宿主应返回 `luaskills` 所有的 `FfiOwnedBuffer`
-- `response_json_out` 与 `meta_json_out` 中的字节内容必须是合法 UTF-8 JSON 文本
-- `data_out` 中的字节内容可为任意二进制载荷
-
-除此之外，还必须遵守以下约束：
-
-- callback 应在 `engine_new` 前注册，避免 engine 创建时拍到旧 callback 快照
-- callback 不允许把 Rust panic、C++ exception 或其他异常机制穿过 C ABI 边界
-- 若一个进程内需要多套不同数据库 callback 逻辑，应分别创建 engine，而不是依赖“创建后切换全局 callback”
-
-## 7. JSON 回调模式
-
-### SQLite
-
-注册函数：
-
-- `luaskills_ffi_set_sqlite_provider_json_callback`
-
-头文件：
-
-- [include/luaskills_json_ffi.h](../../../include/luaskills_json_ffi.h)
-
-### LanceDB
-
-注册函数：
-
-- `luaskills_ffi_set_lancedb_provider_json_callback`
-
-头文件：
-
-- [include/luaskills_json_ffi.h](../../../include/luaskills_json_ffi.h)
-
-### JSON 回调规则
-
-JSON 回调模式下，宿主收到的是一整份 JSON 请求字节缓冲。
-
-接口形态是：
-
-- 输入：
-  - `FfiBorrowedBuffer request_json`
-  - `void *user_data`
-- 输出：
-  - `FfiOwnedBuffer *response_out`
-  - `FfiOwnedBuffer *error_out`
-- 返回值：
-  - `int32_t` 状态码
-
-也就是说：
-
-- `request_json` 不是 NUL 终止字符串约定，而是 `ptr + len`
-- `response_out` 必须写入 UTF-8 JSON 文本缓冲
-- `error_out` 也应写入 UTF-8 错误文本缓冲
-- callback 成功时返回 `FFI_STATUS_OK`
-- callback 失败时返回非零状态码，并尽量写入 `error_out`
-
-例如 SQLite 请求会是：
-
-```json
-{
-  "action": "query_json",
-  "binding": {
-    "space_label": "ROOT",
-    "skill_id": "host-provider-sqlite-demo",
-    "binding_tag": "ROOT-host-provider-sqlite-demo",
-    "root_name": "ROOT",
-    "space_root": "D:/.../runtime_root/skills",
-    "skill_dir": "D:/.../runtime_root/skills/host-provider-sqlite-demo",
-    "skill_dir_name": "host-provider-sqlite-demo",
-    "database_kind": "sqlite",
-    "default_database_path": "D:/.../databases/sqlite/host-provider-sqlite-demo"
-  },
-  "input": {
-    "sql": "SELECT 1"
-  }
-}
-```
-
-宿主返回的仍然是 JSON 文本，但载体已经变成 `FfiOwnedBuffer`。
-
-所以：
-
-- JSON 模式对动态语言最友好
-- Python / Node / 轻量桥接代码最适合先走这条路径
-
-## 8. 必要接口要求
-
-当宿主选择 `host_callback` 模式时，必须实现对应数据库所需的必要动作。
-
-### SQLite 当前动作集合
-
-- `execute_script`
-- `execute_batch`
-- `query_json`
-- `query_stream`
-- `query_stream_wait_metrics`
-- `query_stream_chunk`
-- `query_stream_close`
-- `tokenize_text`
-- `upsert_custom_word`
-- `remove_custom_word`
-- `list_custom_words`
-- `ensure_fts_index`
-- `rebuild_fts_index`
-- `upsert_fts_document`
-- `delete_fts_document`
-- `search_fts`
-
-### LanceDB 当前动作集合
-
-- `create_table`
-- `vector_upsert`
-- `vector_search`
-- `delete`
-- `drop_table`
-
-如果宿主启用了某个数据库的 `host_callback` 模式，却没有注册对应回调，运行时会直接报错，不会静默回退。
-
-在 `beta` / `v0.1.0` 发布阶段，这条规则应被视为正式接入契约的一部分：
-
-- `host_callback` 不会自动补全缺失 callback
-- callback 注册顺序错误属于宿主初始化错误
-- 建议固定采用“注册 callback -> 创建 engine -> load/reload -> 调用”的启动顺序
-
-## 9. 宿主应该如何决定数据库落点
-
-宿主不应该再直接信任：
-
-- lib 默认数据库路径
-
-而应该根据：
-
-- `binding_tag`
-- `space_label`
-- `database_kind`
-
-自己决定真实数据库位置。
-
-例如宿主可以把：
-
-```text
-ROOT-vulcan-work-memory
-```
-
-映射到：
-
-```text
-C:/HostManagedData/sqlite/ROOT-vulcan-work-memory.db
-```
-
-或者：
-
-```text
-D:/project-a/.host-dbs/sqlite/PROJECT-vulcan-ai-memory.db
-```
-
-或者：
-
-- 一个统一数据库服务中的租户命名空间
-
-## 10. 独立 demo
-
-当前仓库已经提供一个独立演示：
-
-- [../examples/ffi/host_provider_demo/README.md](../../../examples/ffi/host_provider_demo/README.md)
-
-这个 demo 的特点是：
-
-- skill 依旧通过 `vulcan.sqlite.*` 调数据库
-- `luaskills` 切到 `host_callback` 模式
-- Python 宿主注册 JSON callback
-- 宿主把 SQLite 请求转发给 `vldb-sqlite`
-- 宿主最终数据库落点不使用 `default_database_path`
-- 而是使用：
-
-```text
-runtime_root/host_managed/sqlite/<binding_tag>.db
-```
-
-这正好用来验证：
-
-- 宿主接管数据库
-- lib 只提供稳定绑定标签
-- 真实数据库目录由宿主自己决定
-
-## 11. 当前最推荐的落地顺序
-
-如果宿主是动态语言或先做原型：
-
-1. 先用 JSON callback
-2. 先只接 SQLite
-3. 先验证 `binding_tag` 路由
-4. 再补 LanceDB
-
-如果宿主是 Go / C / Rust / 高性能场景：
-
-1. 用标准 callback
-2. 外层请求走结构化 ABI
-3. 内层动作参数仍走 `FfiBorrowedBuffer input_json`
-4. 用 `buffer_clone` 填充 `FfiOwnedBuffer` 返回拥有型结果
-
-## 12. 一句话总结
-
-当前 `host_callback` 模式的核心原则是：
-
-**lib 保持统一数据库接口与稳定绑定上下文，宿主负责决定数据库真实落点、真实 ownership 与真实执行后端。**
+VulcanCode 本轮不修改，待 LuaSkills 验证、打包发布后再调整依赖和宿主适配。

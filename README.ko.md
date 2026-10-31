@@ -58,7 +58,7 @@ LuaSkills는 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code)의 스킬 
 - 그 밖의 언어를 위한 표준 C ABI와 공개 `_json` FFI
 - 지속 Lua VM을 위한 공개 `runtime_lease`와 권한에 묶인 `system_runtime_lease`
 - 구조화된 `host_result` 반환, 첫 번째 종류는 IDE 수준의 `change_set` 편집
-- 동적 라이브러리, 호스트 콜백, space controller를 통한 SQLite / LanceDB(선택)
+- 동적 라이브러리, 호스트 콜백, space controller를 통한 SQLite(선택)
 
 ### 📦 SDK
 
@@ -79,7 +79,7 @@ LuaSkills는 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code)의 스킬 
 │  policy · UI · permissions   │  C ABI  │  skill loader · help · lifecycle     │
 │  budgets · model providers   │◀───────▶│  LuaJIT VMs · leases · vulcan.* APIs │
 │  host tools · storage        │  JSON   │  managed Python / Node · deps        │
-│                              │  FFI    │  config stores · SQLite / LanceDB    │
+│                              │  FFI    │  config stores · SQLite    │
 └──────────────────────────────┘         └──────────────────────────────────────┘
                                                           │
                                               skills/<skill_id>/skill.yaml
@@ -90,7 +90,7 @@ LuaSkills는 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code)의 스킬 
 | `src/runtime` | 엔진, Lua VM, 리스, 컨텍스트, 도움말, 결과, 관리형 런타임 |
 | `src/skill` | 매니페스트, 루트, 설정, 수명 주기 관리 |
 | `src/dependency`, `src/download` | 의존성 해석, 다운로드, 아카이브 추출 |
-| `src/providers` | SQLite와 LanceDB 바인딩 |
+| `src/providers` | SQLite 바인딩 |
 | `src/ffi`, `src/ffi_standard`, `src/ffi_embedded` | 공개 `_json` FFI, 표준 C ABI, 임베디드 런타임 전송 |
 | `include/` | FFI 호스트용 C 헤더 |
 | `contracts/` | SDK와 공유하는 기계 판독 계약 |
@@ -102,7 +102,7 @@ LuaSkills는 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code)의 스킬 
 
 ```toml
 [dependencies]
-luaskills = "0.7.2"
+luaskills = "0.7.3"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md)에서 `call_skill`과 `vulcan.host.*` 도구 브리지를 볼 수 있습니다.
@@ -123,7 +123,7 @@ luaskills = "0.7.2"
 [demo-skill](https://github.com/LuaSkills/demo-skill)에서 시작한 뒤 [Skill development manual](docs/development/skill-development.md)을 읽으세요. 실제 런타임 구성으로 스킬 하나를 디버그하려면:
 
 ```bash
-cargo run --bin luaskills-debug -- call \
+cargo run --features debug-sqlite --bin luaskills-debug -- call \
   --runtime-root D:/runtime \
   --skill-path D:/skills/demo-skill \
   --tool ping \
@@ -158,14 +158,12 @@ cargo run --bin luaskills-debug -- call \
 
 | 구성 요소 | 버전 |
 | --- | --- |
-| LuaSkills 코어와 FFI SDK | `0.7.2` |
+| LuaSkills 코어와 FFI SDK | `0.7.3` |
 | TypeScript, Python, Go SDK | 독립적인 버전 라인. [SDK overview](docs/sdk/index.md#versions) 참고 |
 | Lua 런타임 패키지 | 호환 `0.1` 시리즈 |
 | 관리형 Python / uv | `3.14.6` / `0.11.28` |
 | 관리형 Node.js / pnpm | `24.18.0` / `11.11.0` |
 | 관리형 런타임 기본값 | `workers=4 / idle=60s / sessions=256 / buffer=1MiB/stream / invoke=unlimited` |
-| vldb-controller | `0.2.3` |
-| vldb-sqlite / vldb-lancedb | `0.1.6` / `0.1.5` |
 
 스크립트 기본값은 `scripts/deps/`에 있습니다. 릴리스는 [릴리스 절차](scripts/release/README.md)에 따라 런타임 패키지, 5개 플랫폼 코어 릴리스, crate, SDK 순으로 진행합니다.
 

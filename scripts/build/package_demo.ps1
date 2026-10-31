@@ -420,7 +420,6 @@ function Write-PackagedDemoReadme {
     $RunCommand = if (Test-WindowsPackagePlatform -PlatformKey $Platform) { ".\run.ps1" } else { "./run.sh" }
     $FetchAllCommand = if (Test-WindowsPackagePlatform -PlatformKey $Platform) { ".\upgrade_deps.bat" } else { "./upgrade_deps.sh" }
     $FetchLuaCommand = if (Test-WindowsPackagePlatform -PlatformKey $Platform) { ".\upgrade_deps.bat lua" } else { "./upgrade_deps.sh lua" }
-    $FetchVldbCommand = if (Test-WindowsPackagePlatform -PlatformKey $Platform) { ".\upgrade_deps.bat vldb" } else { "./upgrade_deps.sh vldb" }
     $PackageFile = "luaskills-demo-$Mode-$Platform.tar.gz"
     $ModeDescription = if ($Mode -eq "ffi") {
         "This FFI demo runs examples/ffi/python/demo.py through the packaged dynamic library and also includes the C, Go, Python, TypeScript, standard runtime, install smoke test, and host provider examples."
@@ -465,7 +464,6 @@ function Write-PackagedDemoReadme {
         "",
         ('```' + $ShellName),
         $FetchLuaCommand,
-        $FetchVldbCommand,
         '```',
         "",
         "Windows packages include run.ps1, upgrade_deps.bat, and scripts/deps/fetch_deps.ps1. FFI packages also include scripts/ffi/fetch_ffi.ps1. Linux and macOS packages use the matching .sh scripts."
@@ -545,7 +543,7 @@ Write-PackagedDemoReadme -Mode $Mode -Platform $Platform -PackageRoot $PackageRo
     mode = $Mode
     runtime_root = "runtime"
     release_tag = $ReleaseTag
-    fetch_targets = @("all", "lua", "vldb")
+    fetch_targets = @("all", "lua")
 } | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $PackageRoot "demo-manifest.json") -Encoding UTF8
 
 $ArchiveName = "luaskills-demo-$Mode-$Platform.tar.gz"

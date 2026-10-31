@@ -94,6 +94,7 @@ fn managed_popen_discards_large_stderr_without_blocking_stdout() {
             timeout_ms: 30_000,
         },
         None,
+        LuaRuntimeHostMode::Console,
     )
     .expect("large stderr command must complete");
 
@@ -117,6 +118,7 @@ fn managed_popen_discards_stderr_only_output() {
             timeout_ms: 30_000,
         },
         None,
+        LuaRuntimeHostMode::Console,
     )
     .expect("stderr-only command must complete");
 
@@ -151,6 +153,7 @@ fn large_ignored_stderr_has_bounded_parent_peak_working_set() {
             timeout_ms: 120_000,
         },
         None,
+        LuaRuntimeHostMode::Console,
     )
     .expect("100 MiB ignored stderr command should complete");
     // Elapsed records the end-to-end measured duration.
@@ -230,7 +233,8 @@ fn managed_io_path_argument_rejects_unsupported_verbatim_namespace() {
 fn managed_io_read_text_decodes_gb18030() {
     let lua = Lua::new();
     let io_table =
-        create_vulcan_io_table(&lua, RuntimeTextEncoding::Utf8).expect("create vulcan.io");
+        create_vulcan_io_table(&lua, RuntimeTextEncoding::Utf8, LuaRuntimeHostMode::Console)
+            .expect("create vulcan.io");
     let path = std::env::temp_dir().join(format!(
         "luaskills_managed_io_gb18030_{}.txt",
         std::process::id()
@@ -312,8 +316,12 @@ fn managed_io_compat_state_recovers_after_poisoned_lock() {
 #[test]
 fn managed_io_read_text_uses_default_encoding() {
     let lua = Lua::new();
-    let io_table =
-        create_vulcan_io_table(&lua, RuntimeTextEncoding::Gb18030).expect("create vulcan.io");
+    let io_table = create_vulcan_io_table(
+        &lua,
+        RuntimeTextEncoding::Gb18030,
+        LuaRuntimeHostMode::Console,
+    )
+    .expect("create vulcan.io");
     let path = std::env::temp_dir().join(format!(
         "luaskills_managed_io_default_gb18030_{}.txt",
         std::process::id()
@@ -337,7 +345,8 @@ fn managed_io_read_text_uses_default_encoding() {
 fn managed_io_compat_open_reads_all() {
     let lua = Lua::new();
     let io_table =
-        create_vulcan_io_table(&lua, RuntimeTextEncoding::Utf8).expect("create vulcan.io");
+        create_vulcan_io_table(&lua, RuntimeTextEncoding::Utf8, LuaRuntimeHostMode::Console)
+            .expect("create vulcan.io");
     install_managed_io_compat(&lua, &io_table, RuntimeTextEncoding::Utf8)
         .expect("install managed io compat");
     let path = std::env::temp_dir().join(format!(
@@ -360,7 +369,8 @@ fn managed_io_compat_open_reads_all() {
 fn managed_io_compat_input_feeds_read() {
     let lua = Lua::new();
     let io_table =
-        create_vulcan_io_table(&lua, RuntimeTextEncoding::Utf8).expect("create vulcan.io");
+        create_vulcan_io_table(&lua, RuntimeTextEncoding::Utf8, LuaRuntimeHostMode::Console)
+            .expect("create vulcan.io");
     install_managed_io_compat(&lua, &io_table, RuntimeTextEncoding::Utf8)
         .expect("install managed io compat");
     let path = std::env::temp_dir().join(format!(
@@ -383,7 +393,8 @@ fn managed_io_compat_input_feeds_read() {
 fn managed_io_compat_output_receives_write() {
     let lua = Lua::new();
     let io_table =
-        create_vulcan_io_table(&lua, RuntimeTextEncoding::Utf8).expect("create vulcan.io");
+        create_vulcan_io_table(&lua, RuntimeTextEncoding::Utf8, LuaRuntimeHostMode::Console)
+            .expect("create vulcan.io");
     install_managed_io_compat(&lua, &io_table, RuntimeTextEncoding::Utf8)
         .expect("install managed io compat");
     let path = std::env::temp_dir().join(format!(
@@ -410,7 +421,8 @@ fn managed_io_compat_output_receives_write() {
 fn managed_io_compat_tmpfile_supports_update_reads() {
     let lua = Lua::new();
     let io_table =
-        create_vulcan_io_table(&lua, RuntimeTextEncoding::Utf8).expect("create vulcan.io");
+        create_vulcan_io_table(&lua, RuntimeTextEncoding::Utf8, LuaRuntimeHostMode::Console)
+            .expect("create vulcan.io");
     install_managed_io_compat(&lua, &io_table, RuntimeTextEncoding::Utf8)
         .expect("install managed io compat");
     let script = "local f = io.tmpfile(); f:write('tmp-value'); f:seek('set', 0); local value = f:read('*a'); local ok = f:close(); return value, ok";
@@ -483,7 +495,8 @@ fn managed_io_tmpfile_close_reports_delete_failure() {
 fn managed_io_open_update_mode_supports_seek_read() {
     let lua = Lua::new();
     let io_table =
-        create_vulcan_io_table(&lua, RuntimeTextEncoding::Utf8).expect("create vulcan.io");
+        create_vulcan_io_table(&lua, RuntimeTextEncoding::Utf8, LuaRuntimeHostMode::Console)
+            .expect("create vulcan.io");
     install_managed_io_compat(&lua, &io_table, RuntimeTextEncoding::Utf8)
         .expect("install managed io compat");
     let path = std::env::temp_dir().join(format!(
@@ -514,7 +527,8 @@ fn managed_io_open_append_update_creates_missing_file() {
     // Managed IO table under test.
     // 被测托管 IO 表。
     let io_table =
-        create_vulcan_io_table(&lua, RuntimeTextEncoding::Utf8).expect("create vulcan.io");
+        create_vulcan_io_table(&lua, RuntimeTextEncoding::Utf8, LuaRuntimeHostMode::Console)
+            .expect("create vulcan.io");
     // Missing file path opened through append-update mode.
     // 通过追加更新模式打开的缺失文件路径。
     let path = std::env::temp_dir().join(format!(
@@ -550,7 +564,8 @@ fn managed_io_open_append_update_rejects_directory_path() {
     // Managed IO table under test.
     // 被测托管 IO 表。
     let io_table =
-        create_vulcan_io_table(&lua, RuntimeTextEncoding::Utf8).expect("create vulcan.io");
+        create_vulcan_io_table(&lua, RuntimeTextEncoding::Utf8, LuaRuntimeHostMode::Console)
+            .expect("create vulcan.io");
     // Directory path that must not be treated as an empty append target.
     // 不能被当作空追加目标处理的目录路径。
     let path = std::env::temp_dir().join(format!(

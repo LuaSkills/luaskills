@@ -56,7 +56,7 @@ LuaSkills powers the skill system of [Vulcan Code](https://github.com/OpenVulcan
 - Standard C ABI and public `_json` FFI for every other language
 - Public `runtime_lease` and authority-bound `system_runtime_lease` for persistent Lua VMs
 - Structured `host_result` returns, starting with IDE-grade `change_set` edits
-- Optional SQLite and LanceDB through dynamic libraries, host callbacks, or a space controller
+- Optional SQLite through host-registered callbacks
 
 ### 📦 SDKs
 
@@ -77,7 +77,7 @@ LuaSkills powers the skill system of [Vulcan Code](https://github.com/OpenVulcan
 │  policy · UI · permissions   │  C ABI  │  skill loader · help · lifecycle     │
 │  budgets · model providers   │◀───────▶│  LuaJIT VMs · leases · vulcan.* APIs │
 │  host tools · storage        │  JSON   │  managed Python / Node · deps        │
-│                              │  FFI    │  config stores · SQLite / LanceDB    │
+│                              │  FFI    │  config stores · SQLite    │
 └──────────────────────────────┘         └──────────────────────────────────────┘
                                                           │
                                               skills/<skill_id>/skill.yaml
@@ -88,7 +88,7 @@ LuaSkills powers the skill system of [Vulcan Code](https://github.com/OpenVulcan
 | `src/runtime` | Engine, Lua VMs, leases, context, help, results, managed runtimes |
 | `src/skill` | Manifests, roots, configuration, and lifecycle management |
 | `src/dependency`, `src/download` | Dependency resolution, downloads, and archive extraction |
-| `src/providers` | SQLite and LanceDB bindings |
+| `src/providers` | SQLite bindings |
 | `src/ffi`, `src/ffi_standard`, `src/ffi_embedded` | Public `_json` FFI, standard C ABI, and embedded runtime transport |
 | `include/` | C headers for FFI hosts |
 | `contracts/` | Machine contracts shared with the SDKs |
@@ -100,10 +100,12 @@ LuaSkills powers the skill system of [Vulcan Code](https://github.com/OpenVulcan
 
 ```toml
 [dependencies]
-luaskills = "0.7.2"
+luaskills = "0.7.3"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md) shows `call_skill` and the `vulcan.host.*` tool bridge.
+
+Desktop hosts should set `LuaRuntimeHostOptions.host_mode = LuaRuntimeHostMode::Desktop` before engine creation. JSON uses `"host_mode": "desktop"`; standard C hosts use `luaskills_ffi_engine_new_v4` with `LUASKILLS_HOST_MODE_DESKTOP`. The default `Console` (`"console"`) preserves existing behavior. On Windows, desktop mode suppresses console windows for LuaSkills-owned command, pipe, session, managed Python/Node worker, and environment-install processes, including native `os.execute` and `io.popen`. The policy is per engine; see the [host-mode contract](docs/integration/ffi-overview.md#desktop-and-console-host-modes).
 
 ### Other languages
 
@@ -121,7 +123,7 @@ See the [SDK overview](docs/sdk/index.md) and the [FFI overview](docs/integratio
 Start from [demo-skill](https://github.com/LuaSkills/demo-skill), then read the [skill development manual](docs/development/skill-development.md). To debug one skill against a real runtime layout:
 
 ```bash
-cargo run --bin luaskills-debug -- call \
+cargo run --features debug-sqlite --bin luaskills-debug -- call \
   --runtime-root D:/runtime \
   --skill-path D:/skills/demo-skill \
   --tool ping \
@@ -129,6 +131,12 @@ cargo run --bin luaskills-debug -- call \
 ```
 
 `luaskills-debug` copies the skill into `runtime_root/skills/<skill_id>` and runs the normal `load_from_roots -> call_skill` path, so dependency roots, state, databases, and context match real host execution. It is a repository developer tool and adds no SDK or FFI API.
+
+Two details matter when a skill reads host-injected context:
+
+- Every `call` injects the context shape a host provides for one developer invocation: `request_id`, `client_name`, and `matched_client_pattern` are `luaskills-debug`, and `client_budget` carries `tool_result` and `file_read` scopes of 200000 bytes with unlimited lines. Pass `--context-file <path>`, or `--client-budget <json>` and `--tool-config <json>`, to reproduce one specific host profile instead.
+- Sync skips build, checkout, and debug-wrapper directories at every depth (`target`, `.git`, `.svn`, `node_modules`, `__pycache__`, `.luaskills-debug`) so a Rust workspace does not get copied into the runtime root. Packaging output and names the runtime root owns (`dist`, `out`, `temp`, `state`, `databases`, `dependencies`, `lua_packages`, `libs`) are skipped only directly under the package root; deeper directories with those names, such as `runtime/libs/`, are copied as ordinary skill content.
+
 
 ## Documentation
 
@@ -156,14 +164,12 @@ cargo run --bin luaskills-debug -- call \
 
 | Component | Version |
 | --- | --- |
-| LuaSkills core and FFI SDK | `0.7.2` |
+| LuaSkills core and FFI SDK | `0.7.3` |
 | TypeScript, Python, and Go SDKs | Independent version lines; see the [SDK overview](docs/sdk/index.md#versions) |
 | Lua runtime packages | compatible `0.1` series |
 | Managed Python / uv | `3.14.6` / `0.11.28` |
 | Managed Node.js / pnpm | `24.18.0` / `11.11.0` |
 | Managed runtime defaults | `workers=4 / idle=60s / sessions=256 / buffer=1MiB/stream / invoke=unlimited` |
-| vldb-controller | `0.2.3` |
-| vldb-sqlite / vldb-lancedb | `0.1.6` / `0.1.5` |
 
 Script defaults live in `scripts/deps/`; `dependencies.yaml` must declare the exact managed runtime and package-manager versions above unless the host installs and declares another supported version. Releases follow the [release workflow](scripts/release/README.md): runtime packages first, then the five-platform core release, then the crate, then the SDKs.
 

@@ -22,6 +22,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use mlua::{Function, Lua, MultiValue, Table, UserData, UserDataMethods, Value as LuaValue};
 
+use crate::LuaRuntimeHostMode;
 use crate::runtime::encoding::{RuntimeTextEncoding, decode_runtime_text, encode_runtime_text};
 use crate::runtime::engine::vm_closing::{HostFunctions, HostMethods};
 use crate::runtime::path::normalize_host_input_path_text;
@@ -733,6 +734,7 @@ impl UserData for ManagedIoFile {
 pub(crate) fn create_vulcan_io_table(
     lua: &Lua,
     default_encoding: RuntimeTextEncoding,
+    host_mode: LuaRuntimeHostMode,
 ) -> mlua::Result<Table> {
     let options = ManagedIoOptions { default_encoding };
     let io_table = lua.create_table()?;
@@ -758,7 +760,7 @@ pub(crate) fn create_vulcan_io_table(
     })?;
     let popen_options = options;
     let popen_fn = lua.create_host_function(move |lua, args: MultiValue| {
-        popen_from_args(lua, args, popen_options)
+        popen_from_args(lua, args, popen_options, host_mode)
     })?;
     let tmpfile_options = options;
     let tmpfile_fn =
@@ -1178,6 +1180,7 @@ fn popen_from_args(
     lua: &Lua,
     args: MultiValue,
     io_options: ManagedIoOptions,
+    host_mode: LuaRuntimeHostMode,
 ) -> mlua::Result<LuaValue> {
     let mut values = args.into_iter();
     let command = require_string_arg(
@@ -1219,6 +1222,7 @@ fn popen_from_args(
         &command,
         options,
         crate::runtime::engine::logical_cwd::directory(lua).as_deref(),
+        host_mode,
     )?;
     let file = ManagedIoFile::from_read_buffer(
         format!("<popen:{command}>"),
@@ -1304,10 +1308,15 @@ fn parse_timeout_ms_option(
 
 /// Run one shell command for managed popen read mode and capture output bytes.
 /// 为托管 popen 读取模式运行一个 shell 命令并捕获输出字节。
+/// `command_text` supplies shell syntax, `options` controls limits, `cwd` is the optional authorized directory,
+/// `command_text` 提供 shell 语法，`options` 控制限制，`cwd` 是可选已授权目录，
+/// and `host_mode` comes from the engine; returns captured output or a Lua launch/IO error.
+/// `host_mode` 来自引擎；返回捕获输出或 Lua 启动及 IO 错误。
 fn run_managed_popen_read(
     command_text: &str,
     options: ManagedPopenOptions,
     cwd: Option<&Path>,
+    host_mode: LuaRuntimeHostMode,
 ) -> mlua::Result<ManagedPopenOutput> {
     let mut command = create_shell_command(command_text);
     // Logical System cwd applies to the child only; select an absolute shell executable as well.
@@ -1333,9 +1342,13 @@ fn run_managed_popen_read(
         .stderr(Stdio::null());
     // Managed one-shot ownership tuple that prevents timeout and direct-exit descendants from escaping.
     // 防止超时或直接子进程退出后的后代逃逸的受管单次执行所有权元组。
-    let (mut child, process_tree, reaper_permit) =
-        ManagedChildProcessTree::spawn_with_keepalive(&mut command, "vulcan.io.popen", None)
-            .map_err(|error| mlua::Error::runtime(format!("vulcan.io.popen: {error}")))?;
+    let (mut child, process_tree, reaper_permit) = ManagedChildProcessTree::spawn_with_keepalive(
+        &mut command,
+        "vulcan.io.popen",
+        None,
+        host_mode,
+    )
+    .map_err(|error| mlua::Error::runtime(format!("vulcan.io.popen: {error}")))?;
     let stdout_handle = child.stdout.take().map(spawn_popen_pipe_reader);
     let deadline = Instant::now() + Duration::from_millis(options.timeout_ms);
     let mut timed_out = false;

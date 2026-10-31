@@ -20,12 +20,9 @@ use crate::host::callbacks::{
     set_skill_operation_progress_callback,
 };
 use crate::host::database::{
-    LuaRuntimeDatabaseCallbackMode, LuaRuntimeDatabaseProviderMode, RuntimeDatabaseBindingContext,
-    RuntimeDatabaseKind, RuntimeLanceDbProviderAction, RuntimeLanceDbProviderCallback,
-    RuntimeLanceDbProviderRequest, RuntimeLanceDbProviderResult, RuntimeSqliteProviderAction,
-    RuntimeSqliteProviderCallback, RuntimeSqliteProviderRequest, set_lancedb_provider_callback,
-    set_lancedb_provider_json_callback, set_sqlite_provider_callback,
-    set_sqlite_provider_json_callback,
+    LuaRuntimeDatabaseCallbackMode, RuntimeDatabaseBindingContext, RuntimeDatabaseKind,
+    RuntimeSqliteProviderAction, RuntimeSqliteProviderCallback, RuntimeSqliteProviderRequest,
+    set_sqlite_provider_callback, set_sqlite_provider_json_callback,
 };
 use crate::runtime::config_tool::deserialize_unique_config_values;
 use crate::runtime::logging;
@@ -38,11 +35,10 @@ use crate::runtime_help::{
 };
 use crate::runtime_options::{
     LuaInvocationContext, LuaRuntimeCapabilityOptions, LuaRuntimeHostOptions,
-    LuaRuntimeManagedRuntimeConfig, LuaRuntimeRunLuaPoolConfig, LuaRuntimeSpaceControllerOptions,
-    LuaRuntimeSpaceControllerProcessMode, RuntimeSkillRoot,
+    LuaRuntimeManagedRuntimeConfig, LuaRuntimeRunLuaPoolConfig, RuntimeSkillRoot,
 };
 use crate::runtime_result::RuntimeHostResult;
-use crate::skill::manager::{SkillInstallRequest, SkillManagementAuthority, SkillUninstallOptions};
+use crate::skill::manager::{SkillInstallRequest, SkillManagementAuthority};
 use crate::skill::source::SkillInstallSourceType;
 use crate::tool_cache::ToolCacheConfig;
 use crate::{
@@ -67,15 +63,9 @@ struct StrictSkillConfigInputValues(
 const FFI_SOURCE_TYPE_URL: i32 = 1;
 const FFI_SOURCE_TYPE_OFFICIAL_HUB: i32 = 2;
 const FFI_SOURCE_TYPE_PRIVATE_URL_MANIFEST: i32 = 3;
-const FFI_PROVIDER_MODE_DYNAMIC_LIBRARY: i32 = 0;
-const FFI_PROVIDER_MODE_HOST_CALLBACK: i32 = 1;
-const FFI_PROVIDER_MODE_SPACE_CONTROLLER: i32 = 2;
 const FFI_CALLBACK_MODE_STANDARD: i32 = 0;
 const FFI_CALLBACK_MODE_JSON: i32 = 1;
-const FFI_SPACE_CONTROLLER_PROCESS_MODE_SERVICE: i32 = 0;
-const FFI_SPACE_CONTROLLER_PROCESS_MODE_MANAGED: i32 = 1;
 const FFI_DATABASE_KIND_SQLITE: i32 = 0;
-const FFI_DATABASE_KIND_LANCEDB: i32 = 1;
 const FFI_SQLITE_PROVIDER_ACTION_EXECUTE_SCRIPT: i32 = 0;
 const FFI_SQLITE_PROVIDER_ACTION_EXECUTE_BATCH: i32 = 1;
 const FFI_SQLITE_PROVIDER_ACTION_QUERY_JSON: i32 = 2;
@@ -92,11 +82,6 @@ const FFI_SQLITE_PROVIDER_ACTION_REBUILD_FTS_INDEX: i32 = 12;
 const FFI_SQLITE_PROVIDER_ACTION_UPSERT_FTS_DOCUMENT: i32 = 13;
 const FFI_SQLITE_PROVIDER_ACTION_DELETE_FTS_DOCUMENT: i32 = 14;
 const FFI_SQLITE_PROVIDER_ACTION_SEARCH_FTS: i32 = 15;
-const FFI_LANCEDB_PROVIDER_ACTION_CREATE_TABLE: i32 = 0;
-const FFI_LANCEDB_PROVIDER_ACTION_VECTOR_UPSERT: i32 = 1;
-const FFI_LANCEDB_PROVIDER_ACTION_VECTOR_SEARCH: i32 = 2;
-const FFI_LANCEDB_PROVIDER_ACTION_DELETE: i32 = 3;
-const FFI_LANCEDB_PROVIDER_ACTION_DROP_TABLE: i32 = 4;
 /// Stable integer value for full host-system skill-management authority.
 /// 完整宿主系统技能管理权限的稳定整数值。
 const FFI_SKILL_AUTHORITY_SYSTEM: i32 = 0;
@@ -524,6 +509,7 @@ fn parse_host_options_with_managed_roots(
 ) -> Result<LuaRuntimeHostOptions, String> {
     let has_runtime_root = runtime_root.is_some();
     Ok(LuaRuntimeHostOptions {
+        host_mode: crate::LuaRuntimeHostMode::Console,
         runtime_root,
         managed_runtime_distribution_root,
         managed_runtime_environment_root,
@@ -601,49 +587,10 @@ fn parse_host_options_with_managed_roots(
             value.default_text_encoding,
             "default_text_encoding",
         )?,
-        sqlite_library_path: parse_optional_string(
-            value.sqlite_library_path,
-            "sqlite_library_path",
-        )?
-        .map(PathBuf::from),
-        sqlite_provider_mode: parse_provider_mode(
-            value.sqlite_provider_mode,
-            "sqlite_provider_mode",
-        )?,
         sqlite_callback_mode: parse_callback_mode(
             value.sqlite_callback_mode,
             "sqlite_callback_mode",
         )?,
-        lancedb_library_path: parse_optional_string(
-            value.lancedb_library_path,
-            "lancedb_library_path",
-        )?
-        .map(PathBuf::from),
-        lancedb_provider_mode: parse_provider_mode(
-            value.lancedb_provider_mode,
-            "lancedb_provider_mode",
-        )?,
-        lancedb_callback_mode: parse_callback_mode(
-            value.lancedb_callback_mode,
-            "lancedb_callback_mode",
-        )?,
-        space_controller: LuaRuntimeSpaceControllerOptions {
-            endpoint: parse_optional_string(
-                value.space_controller_endpoint,
-                "space_controller_endpoint",
-            )?,
-            auto_spawn: value.space_controller_auto_spawn != 0,
-            executable_path: parse_optional_string(
-                value.space_controller_executable_path,
-                "space_controller_executable_path",
-            )?
-            .map(PathBuf::from),
-            process_mode: parse_space_controller_process_mode(
-                value.space_controller_process_mode,
-                "space_controller_process_mode",
-            )?,
-            ..LuaRuntimeSpaceControllerOptions::default()
-        },
         cache_config: parse_cache_config(value.cache_config),
         runlua_pool_config: parse_runlua_pool_config(value.runlua_pool_config),
         reserved_entry_names: parse_string_array(
@@ -661,20 +608,6 @@ fn parse_host_options_with_managed_roots(
             enable_managed_io_compat: value.disable_managed_io_compat == 0,
         },
     })
-}
-
-/// Convert one stable integer provider-mode value into the Rust runtime enum.
-/// 将一个稳定整数 provider 模式值转换为 Rust 运行时枚举。
-fn parse_provider_mode(
-    value: i32,
-    field_name: &str,
-) -> Result<LuaRuntimeDatabaseProviderMode, String> {
-    match value {
-        FFI_PROVIDER_MODE_DYNAMIC_LIBRARY => Ok(LuaRuntimeDatabaseProviderMode::DynamicLibrary),
-        FFI_PROVIDER_MODE_HOST_CALLBACK => Ok(LuaRuntimeDatabaseProviderMode::HostCallback),
-        FFI_PROVIDER_MODE_SPACE_CONTROLLER => Ok(LuaRuntimeDatabaseProviderMode::SpaceController),
-        _ => Err(format!("Unsupported {} value '{}'", field_name, value)),
-    }
 }
 
 /// Convert one stable integer authority value into the Rust skill-management authority enum.
@@ -702,23 +635,6 @@ fn parse_callback_mode(
     match value {
         FFI_CALLBACK_MODE_STANDARD => Ok(LuaRuntimeDatabaseCallbackMode::Standard),
         FFI_CALLBACK_MODE_JSON => Ok(LuaRuntimeDatabaseCallbackMode::Json),
-        _ => Err(format!("Unsupported {} value '{}'", field_name, value)),
-    }
-}
-
-/// Convert one stable integer space-controller process-mode value into the Rust runtime enum.
-/// 将一个稳定整数空间控制器进程模式值转换为 Rust 运行时枚举。
-fn parse_space_controller_process_mode(
-    value: i32,
-    field_name: &str,
-) -> Result<LuaRuntimeSpaceControllerProcessMode, String> {
-    match value {
-        FFI_SPACE_CONTROLLER_PROCESS_MODE_SERVICE => {
-            Ok(LuaRuntimeSpaceControllerProcessMode::Service)
-        }
-        FFI_SPACE_CONTROLLER_PROCESS_MODE_MANAGED => {
-            Ok(LuaRuntimeSpaceControllerProcessMode::Managed)
-        }
         _ => Err(format!("Unsupported {} value '{}'", field_name, value)),
     }
 }
@@ -793,6 +709,29 @@ fn parse_engine_options_v3(value: &FfiLuaEngineOptionsV3) -> Result<LuaEngineOpt
     ))
 }
 
+/// Parse additive v4 options without reading beyond the separately versioned v3 prefix.
+/// 解析增量 v4 选项，不越界读取独立版本的 v3 前缀。
+/// `value` supplies the unchanged base and explicit host mode; returns validated Rust options or an error.
+/// `value` 提供不变的基础配置和显式宿主模式；返回已验证 Rust 选项或错误。
+fn parse_engine_options_v4(value: &FfiLuaEngineOptionsV4) -> Result<LuaEngineOptions, String> {
+    // Reject unknown integers rather than silently changing child-process behavior.
+    // 拒绝未知整数，避免静默改变子进程行为。
+    let host_mode = match value.host_mode {
+        0 => crate::LuaRuntimeHostMode::Console,
+        1 => crate::LuaRuntimeHostMode::Desktop,
+        other => {
+            return Err(format!(
+                "host_mode must be 0 (console) or 1 (desktop), got {other}"
+            ));
+        }
+    };
+    // The existing parser remains authoritative for every v3 field and pointer contract.
+    // 现有解析器继续作为所有 v3 字段与指针契约的权威来源。
+    let mut options = parse_engine_options_v3(&value.base)?;
+    options.host_options.host_mode = host_mode;
+    Ok(options)
+}
+
 /// Convert one C ABI root slice into one Rust runtime root vector.
 /// 将单个 C ABI 根切片转换为一个 Rust 运行时根向量。
 fn parse_skill_roots(
@@ -858,18 +797,6 @@ fn parse_install_request(value: &FfiSkillInstallRequest) -> Result<SkillInstallR
         source_type: parse_source_type(value.source_type)?,
         replace_source: false,
     })
-}
-
-/// Convert one C ABI uninstall options struct into one Rust uninstall options value.
-/// 将单个 C ABI 卸载选项结构转换为一个 Rust 卸载选项值。
-fn parse_uninstall_options(value: Option<&FfiSkillUninstallOptions>) -> SkillUninstallOptions {
-    match value {
-        Some(value) => SkillUninstallOptions {
-            remove_sqlite: value.remove_sqlite != 0,
-            remove_lancedb: value.remove_lancedb != 0,
-        },
-        None => SkillUninstallOptions::default(),
-    }
 }
 
 /// Convert one string vector into one owned C string array.
@@ -1095,10 +1022,6 @@ fn alloc_skill_uninstall_result(value: &SkillUninstallResult) -> FfiSkillUninsta
     FfiSkillUninstallResult {
         skill_id: alloc_owned_buffer_from_string(&value.skill_id),
         skill_removed: u8::from(value.skill_removed),
-        sqlite_removed: u8::from(value.sqlite_removed),
-        lancedb_removed: u8::from(value.lancedb_removed),
-        sqlite_retained: u8::from(value.sqlite_retained),
-        lancedb_retained: u8::from(value.lancedb_retained),
         message: alloc_owned_buffer_from_string(&value.message),
     }
 }
@@ -1245,52 +1168,11 @@ impl OwnedFfiSqliteProviderRequest {
     }
 }
 
-/// Owned LanceDB provider request wrapper used during one standard callback invocation.
-/// 在单次标准回调调用期间使用的拥有型 LanceDB provider 请求包装器。
-struct OwnedFfiLanceDbProviderRequest {
-    /// Owned binding context backing the request.
-    /// 为请求提供支撑的拥有型绑定上下文。
-    _binding: OwnedFfiRuntimeDatabaseBindingContext,
-    /// JSON-encoded action input payload bytes.
-    /// 以 JSON 编码的动作输入载荷字节。
-    _input_json: Vec<u8>,
-    /// Borrowed C ABI request view.
-    /// 借用式 C ABI 请求视图。
-    ffi: FfiLanceDbProviderRequest,
-}
-
-impl OwnedFfiLanceDbProviderRequest {
-    /// Build one owned LanceDB provider request wrapper from one runtime request.
-    /// 基于运行时请求构造一个拥有型 LanceDB provider 请求包装器。
-    fn from_runtime(value: &RuntimeLanceDbProviderRequest) -> Result<Self, String> {
-        let binding = OwnedFfiRuntimeDatabaseBindingContext::from_runtime(&value.binding)?;
-        let input_json = serde_json::to_vec(&value.input)
-            .map_err(|error| format!("failed to encode lancedb input json: {}", error))?;
-        let ffi = FfiLanceDbProviderRequest {
-            action: ffi_lancedb_provider_action_code(&value.action),
-            binding: binding.as_ffi(),
-            input_json: borrowed_buffer_from_bytes(&input_json),
-        };
-        Ok(Self {
-            _binding: binding,
-            _input_json: input_json,
-            ffi,
-        })
-    }
-
-    /// Borrow the underlying C ABI request pointer.
-    /// 借用底层 C ABI 请求指针。
-    fn as_ptr(&self) -> *const FfiLanceDbProviderRequest {
-        &self.ffi
-    }
-}
-
 /// Convert one runtime database kind into one stable FFI integer code.
 /// 将运行时数据库类型转换为稳定 FFI 整数编码。
 fn ffi_database_kind_code(value: RuntimeDatabaseKind) -> i32 {
     match value {
         RuntimeDatabaseKind::Sqlite => FFI_DATABASE_KIND_SQLITE,
-        RuntimeDatabaseKind::LanceDb => FFI_DATABASE_KIND_LANCEDB,
     }
 }
 
@@ -1335,18 +1217,6 @@ fn ffi_sqlite_provider_action_code(value: &RuntimeSqliteProviderAction) -> i32 {
     }
 }
 
-/// Convert one runtime LanceDB provider action into one stable FFI integer code.
-/// 将运行时 LanceDB provider 动作转换为稳定 FFI 整数编码。
-fn ffi_lancedb_provider_action_code(value: &RuntimeLanceDbProviderAction) -> i32 {
-    match value {
-        RuntimeLanceDbProviderAction::CreateTable => FFI_LANCEDB_PROVIDER_ACTION_CREATE_TABLE,
-        RuntimeLanceDbProviderAction::VectorUpsert => FFI_LANCEDB_PROVIDER_ACTION_VECTOR_UPSERT,
-        RuntimeLanceDbProviderAction::VectorSearch => FFI_LANCEDB_PROVIDER_ACTION_VECTOR_SEARCH,
-        RuntimeLanceDbProviderAction::Delete => FFI_LANCEDB_PROVIDER_ACTION_DELETE,
-        RuntimeLanceDbProviderAction::DropTable => FFI_LANCEDB_PROVIDER_ACTION_DROP_TABLE,
-    }
-}
-
 /// Invoke one host-supplied JSON provider callback and copy the returned string into Rust ownership.
 /// 调用宿主提供的 JSON provider 回调，并把返回字符串复制到 Rust 所有权下。
 fn invoke_json_provider_callback(
@@ -1375,18 +1245,24 @@ fn invoke_json_provider_callback(
         )
     };
     let callback_error =
-        take_optional_owned_ffi_string_buffer(error_out, "json host provider callback error_out")?;
+        take_optional_owned_ffi_string_buffer(error_out, "json host provider callback error_out");
     if status != FFI_STATUS_OK {
         unsafe { free_ffi_bytes(response_out.ptr, response_out.len) };
-        return Err(callback_error.unwrap_or_else(|| {
+        return Err(callback_error?.unwrap_or_else(|| {
             "json host provider callback returned failure without error message".to_string()
         }));
     }
     let response = take_optional_owned_ffi_string_buffer(
         response_out,
         "json host provider callback response_out",
-    )?
-    .ok_or_else(|| "json host provider callback returned empty response_out".to_string())?;
+    );
+    // Reclaim both owned buffers before propagating either UTF-8 decoding failure.
+    // 传播任一 UTF-8 解码失败前，回收两个自有缓冲。
+    let callback_error = callback_error?;
+    // A successful callback must return an actual JSON response buffer.
+    // 成功的回调必须返回实际 JSON 响应缓冲。
+    let response = response?
+        .ok_or_else(|| "json host provider callback returned empty response_out".to_string())?;
     if let Some(message) = callback_error
         && !message.is_empty()
     {
@@ -1555,21 +1431,26 @@ fn invoke_standard_sqlite_provider_callback(
             &mut error_out,
         )
     };
-    let callback_error = take_optional_owned_ffi_string_buffer(
-        error_out,
-        "sqlite host provider callback error_out",
-    )?;
+    let callback_error =
+        take_optional_owned_ffi_string_buffer(error_out, "sqlite host provider callback error_out");
     if status != FFI_STATUS_OK {
         unsafe { free_ffi_bytes(response_json_out.ptr, response_json_out.len) };
-        return Err(callback_error.unwrap_or_else(|| {
+        return Err(callback_error?.unwrap_or_else(|| {
             "sqlite host provider callback returned failure without error message".to_string()
         }));
     }
     let response_json = take_optional_owned_ffi_string_buffer(
         response_json_out,
         "sqlite host provider callback response_json_out",
-    )?
-    .ok_or_else(|| "sqlite host provider callback returned empty response_json_out".to_string())?;
+    );
+    // Reclaim both owned buffers before propagating either UTF-8 decoding failure.
+    // 传播任一 UTF-8 解码失败前，回收两个自有缓冲。
+    let callback_error = callback_error?;
+    // The response must exist before parsing its JSON value.
+    // 解析 JSON 值前必须存在响应。
+    let response_json = response_json?.ok_or_else(|| {
+        "sqlite host provider callback returned empty response_json_out".to_string()
+    })?;
     if let Some(message) = callback_error
         && !message.is_empty()
     {
@@ -1584,73 +1465,6 @@ fn invoke_standard_sqlite_provider_callback(
             error
         )
     })
-}
-
-/// Invoke one host-supplied standard LanceDB provider callback and decode the returned payload.
-/// 调用宿主提供的标准 LanceDB provider 回调，并解码返回的载荷。
-fn invoke_standard_lancedb_provider_callback(
-    callback: FfiLanceDbProviderCallback,
-    user_data: usize,
-    request: &RuntimeLanceDbProviderRequest,
-) -> Result<RuntimeLanceDbProviderResult, String> {
-    let request = OwnedFfiLanceDbProviderRequest::from_runtime(request)?;
-    let mut meta_json_out = FfiOwnedBuffer {
-        ptr: ptr::null_mut(),
-        len: 0,
-    };
-    let mut data_out = FfiOwnedBuffer {
-        ptr: ptr::null_mut(),
-        len: 0,
-    };
-    let mut error_out = FfiOwnedBuffer {
-        ptr: ptr::null_mut(),
-        len: 0,
-    };
-    let status = unsafe {
-        callback(
-            request.as_ptr(),
-            user_data as *mut c_void,
-            &mut meta_json_out,
-            &mut data_out,
-            &mut error_out,
-        )
-    };
-    let callback_error = take_optional_owned_ffi_string_buffer(
-        error_out,
-        "lancedb host provider callback error_out",
-    )?;
-    if status != FFI_STATUS_OK {
-        unsafe {
-            free_ffi_bytes(meta_json_out.ptr, meta_json_out.len);
-            free_ffi_bytes(data_out.ptr, data_out.len);
-        }
-        return Err(callback_error.unwrap_or_else(|| {
-            "lancedb host provider callback returned failure without error message".to_string()
-        }));
-    }
-    let meta_json = take_optional_owned_ffi_string_buffer(
-        meta_json_out,
-        "lancedb host provider callback meta_json_out",
-    )?
-    .unwrap_or_else(|| "{}".to_string());
-    let meta = serde_json::from_str::<Value>(&meta_json).map_err(|error| {
-        format!(
-            "failed to parse lancedb provider callback meta json: {}",
-            error
-        )
-    })?;
-    let bytes =
-        take_optional_owned_ffi_buffer(data_out, "lancedb host provider callback data_out")?
-            .unwrap_or_default();
-    if let Some(message) = callback_error
-        && !message.is_empty()
-    {
-        return Err(format!(
-            "lancedb host provider callback returned unexpected error text on success: {}",
-            message
-        ));
-    }
-    Ok(RuntimeLanceDbProviderResult::binary(meta, bytes))
 }
 
 /// Copy one optional owned FFI buffer into Rust ownership and free the original allocation.
@@ -1978,31 +1792,6 @@ pub unsafe extern "C" fn luaskills_ffi_set_sqlite_provider_callback(
     ffi_ok_status(error_out)
 }
 
-/// Register or clear one LanceDB standard provider callback for host-managed database integration.
-/// 为宿主管理数据库集成注册或清理一个 LanceDB 标准 provider 回调。
-/// # Safety
-/// # 安全性
-/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
-/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
-/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
-/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn luaskills_ffi_set_lancedb_provider_callback(
-    callback: Option<FfiLanceDbProviderCallback>,
-    user_data: *mut c_void,
-    error_out: *mut FfiOwnedBuffer,
-) -> i32 {
-    clear_error_out(error_out);
-    let wrapped = callback.map(|callback_fn| {
-        let user_data = user_data as usize;
-        std::sync::Arc::new(move |request: &RuntimeLanceDbProviderRequest| {
-            invoke_standard_lancedb_provider_callback(callback_fn, user_data, request)
-        }) as RuntimeLanceDbProviderCallback
-    });
-    set_lancedb_provider_callback(wrapped);
-    ffi_ok_status(error_out)
-}
-
 /// Register or clear one SQLite JSON provider callback for cross-language host integration.
 /// 为跨语言宿主集成注册或清理一个 SQLite JSON provider 回调。
 /// # Safety
@@ -2025,31 +1814,6 @@ pub unsafe extern "C" fn luaskills_ffi_set_sqlite_provider_json_callback(
         }) as crate::host::database::RuntimeSqliteProviderJsonCallback
     });
     set_sqlite_provider_json_callback(wrapped);
-    ffi_ok_status(error_out)
-}
-
-/// Register or clear one LanceDB JSON provider callback for cross-language host integration.
-/// 为跨语言宿主集成注册或清理一个 LanceDB JSON provider 回调。
-/// # Safety
-/// # 安全性
-/// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
-/// 调用方必须遵守本函数所用每个指针与借用缓冲的 LuaSkills C ABI 契约。
-/// Output slots must be writable, returned LuaSkills-owned allocations must be freed with the matching free function, registered callbacks must remain callable, and callbacks must not unwind across the FFI boundary.
-/// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn luaskills_ffi_set_lancedb_provider_json_callback(
-    callback: Option<FfiJsonProviderCallback>,
-    user_data: *mut c_void,
-    error_out: *mut FfiOwnedBuffer,
-) -> i32 {
-    clear_error_out(error_out);
-    let wrapped = callback.map(|callback_fn| {
-        let user_data = user_data as usize;
-        std::sync::Arc::new(move |request_json: &str| {
-            invoke_json_provider_callback(callback_fn, user_data, request_json)
-        }) as crate::host::database::RuntimeLanceDbProviderJsonCallback
-    });
-    set_lancedb_provider_json_callback(wrapped);
     ffi_ok_status(error_out)
 }
 
@@ -2498,6 +2262,115 @@ pub unsafe extern "C" fn luaskills_ffi_engine_new_v3(
             let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
             let mut registry = lock_ffi_engine_registry();
             registry.insert(engine_id, crate::ffi::FfiEngineSlot::new(engine));
+            unsafe { *engine_id_out = engine_id };
+            ffi_ok_status(error_out)
+        }
+        Err(error) => ffi_error_status(error_out, error.to_string()),
+    }
+}
+
+/// Create an engine with an explicit per-engine desktop or console policy through the v4 ABI.
+/// 通过 v4 ABI 创建具有显式引擎级桌面或命令行策略的引擎。
+/// `options` borrows the v4 input, `engine_id_out` receives the handle, and `error_out` receives an owned error.
+/// `options` 借用 v4 输入，`engine_id_out` 接收句柄，`error_out` 接收自有错误。
+/// Returns zero with a nonzero handle on success; failure returns nonzero and leaves the handle zero.
+/// 成功时返回零及非零句柄；失败时返回非零并保持句柄为零。
+/// # Safety
+/// # 安全性
+/// All non-null pointers and nested inputs must remain valid for the complete call under the standard ABI contract.
+/// 所有非空指针及嵌套输入必须按标准 ABI 契约在完整调用期间保持有效。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_engine_new_v4(
+    options: *const FfiLuaEngineOptionsV4,
+    engine_id_out: *mut u64,
+    error_out: *mut FfiOwnedBuffer,
+) -> i32 {
+    clear_error_out(error_out);
+    clear_out_u64(engine_id_out);
+    if options.is_null() {
+        return ffi_error_status(error_out, "options must not be null");
+    }
+    if engine_id_out.is_null() {
+        return ffi_error_status(error_out, "engine_id_out must not be null");
+    }
+    // The v4 entry is the only entry allowed to dereference the larger v4 input.
+    // v4 入口是唯一允许解引用较大 v4 输入的入口。
+    let options = match parse_engine_options_v4(unsafe { &*options }) {
+        Ok(options) => options,
+        Err(error) => return ffi_error_status(error_out, error),
+    };
+    match LuaEngine::new(options) {
+        Ok(engine) => {
+            // The handle registry owns the complete engine exactly as for earlier ABI versions.
+            // 句柄注册表与早期 ABI 版本一样拥有完整引擎。
+            let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            // The registry lock serializes handle publication across creation entry versions.
+            // 注册表锁串行化不同创建入口版本间的句柄发布。
+            let mut registry = lock_ffi_engine_registry();
+            registry.insert(engine_id, crate::ffi::FfiEngineSlot::new(engine));
+            // SAFETY: The caller supplies a valid writable output pointer checked above for null.
+            // 安全性：调用方提供有效可写输出指针，上文已检查非空。
+            unsafe { *engine_id_out = engine_id };
+            ffi_ok_status(error_out)
+        }
+        Err(error) => ffi_error_status(error_out, error.to_string()),
+    }
+}
+
+/// Create an engine from borrowed v4 options and instance database callbacks without reading global defaults.
+/// 从借用的 v4 选项和实例数据库回调创建引擎，不读取全局默认值。
+/// Return zero and write the handle on success; otherwise return an error and keep the handle zero.
+/// 成功时返回零并写入句柄；否则返回错误并保持句柄为零。
+/// # Safety
+/// # 安全性
+/// Inputs and outputs must be valid for this call; callback code/context must outlive the engine and in-flight calls.
+/// 输入输出必须在本次调用期间有效；回调代码及上下文必须存活至引擎和在途调用结束。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaskills_ffi_engine_new_with_database_providers_v1(
+    options: *const FfiLuaEngineOptionsV4,
+    callbacks: *const FfiDatabaseProviderCallbacksV1,
+    engine_id_out: *mut u64,
+    error_out: *mut FfiOwnedBuffer,
+) -> i32 {
+    clear_error_out(error_out);
+    clear_out_u64(engine_id_out);
+    if options.is_null() || callbacks.is_null() || engine_id_out.is_null() {
+        return ffi_error_status(
+            error_out,
+            "options, callbacks and engine_id_out must not be null",
+        );
+    }
+    // Parse the same v4 options as the existing constructor; never reinterpret an older layout.
+    // 与现有构造入口解析相同的 v4 选项，不重新解释旧版布局。
+    let options = match parse_engine_options_v4(unsafe { &*options }) {
+        Ok(options) => options,
+        Err(error) => return ffi_error_status(error_out, error),
+    };
+    // Copy callback pointers before publication; the input descriptor remains borrowed only for this call.
+    // 发布前复制回调指针；输入描述符只在本次调用期间借用。
+    let callbacks = unsafe { &*callbacks };
+    // Preserve the host pointer bits without transferring allocation ownership.
+    // 保留宿主指针位模式，不转移分配所有权。
+    let user_data = callbacks.user_data as usize;
+    // This collection starts empty and cannot inherit unrelated global registrations.
+    // 当前集合从空状态开始，不会继承无关全局注册。
+    let mut providers = crate::RuntimeDatabaseProviderCallbacks::default();
+    if let Some(callback) = callbacks.sqlite {
+        providers = providers.with_sqlite(std::sync::Arc::new(move |request| {
+            invoke_standard_sqlite_provider_callback(callback, user_data, request)
+        }));
+    }
+    if let Some(callback) = callbacks.sqlite_json {
+        providers = providers.with_sqlite_json(std::sync::Arc::new(move |request| {
+            invoke_json_provider_callback(callback, user_data, request)
+        }));
+    }
+    match LuaEngine::new_with_database_providers(options, providers) {
+        Ok(engine) => {
+            // Publish the complete engine through the unchanged handle registry.
+            // 通过保持不变的句柄注册表发布完整引擎。
+            let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            lock_ffi_engine_registry().insert(engine_id, crate::ffi::FfiEngineSlot::new(engine));
             unsafe { *engine_id_out = engine_id };
             ffi_ok_status(error_out)
         }
@@ -3918,7 +3791,6 @@ pub unsafe extern "C" fn luaskills_ffi_uninstall_skill(
     skill_roots: *const FfiRuntimeSkillRoot,
     skill_roots_len: usize,
     skill_id: *const c_char,
-    options: *const FfiSkillUninstallOptions,
     result_out: *mut *mut FfiSkillUninstallResult,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
@@ -3935,10 +3807,9 @@ pub unsafe extern "C" fn luaskills_ffi_uninstall_skill(
         Ok(skill_id) => skill_id,
         Err(error) => return ffi_error_status(error_out, error),
     };
-    let options = parse_uninstall_options(unsafe { options.as_ref() });
     match with_engine_mut(engine_id, |engine| {
         engine
-            .uninstall_skill(&skill_roots, &skill_id, &options)
+            .uninstall_skill(&skill_roots, &skill_id)
             .map_err(|error| error.to_string())
     }) {
         Ok(result) => {
@@ -3964,7 +3835,6 @@ pub unsafe extern "C" fn luaskills_ffi_system_uninstall_skill(
     skill_roots_len: usize,
     authority: i32,
     skill_id: *const c_char,
-    options: *const FfiSkillUninstallOptions,
     result_out: *mut *mut FfiSkillUninstallResult,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
@@ -3985,10 +3855,9 @@ pub unsafe extern "C" fn luaskills_ffi_system_uninstall_skill(
         Ok(authority) => authority,
         Err(error) => return ffi_error_status(error_out, error),
     };
-    let options = parse_uninstall_options(unsafe { options.as_ref() });
     match with_engine_mut(engine_id, |engine| {
         engine
-            .system_uninstall_skill(&skill_roots, authority, &skill_id, &options)
+            .system_uninstall_skill(&skill_roots, authority, &skill_id)
             .map_err(|error| error.to_string())
     }) {
         Ok(result) => {

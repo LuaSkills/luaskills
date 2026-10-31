@@ -28,7 +28,7 @@ LuaSkills は口頭の約束ではなく runtime contract を提供します。
 - strict help tree。
 - runtime context injection。
 - dependency path injection。
-- SQLite / LanceDB provider routing。
+- SQLite provider routing。
 - system、project、user root layering。
 - Rust、C ABI、public `_json` FFI integration。
 
@@ -39,7 +39,7 @@ LuaSkills は口頭の約束ではなく runtime contract を提供します。
 | Runtime Core | skill の読み込み、root reload、entry list、skill call。 |
 | Skill Authoring | `vulcan.*` API と構造化 help による skill 作成。 |
 | Product Control | 権限、budget、UI、authority をホスト側で制御。 |
-| Data-aware Skills | SQLite / LanceDB を runtime、host provider、space controller 経由で扱う。 |
+| Data-aware Skills | SQLite を runtime、host provider、space controller 経由で扱う。 |
 | Multi-language Hosts | Rust、C ABI、TypeScript、Python、Go から同じ skill model に接続。 |
 
 ## 重要な例

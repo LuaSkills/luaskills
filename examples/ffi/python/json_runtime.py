@@ -463,12 +463,7 @@ class StandardFixtureRuntimeClient:
                     "github_api_base_url": None,
                     "github_token": None,
                     "default_text_encoding": default_text_encoding,
-                    "sqlite_library_path": None,
-                    "sqlite_provider_mode": "dynamic_library",
                     "sqlite_callback_mode": "standard",
-                    "lancedb_library_path": None,
-                    "lancedb_provider_mode": "dynamic_library",
-                    "lancedb_callback_mode": "standard",
                     "cache_config": None,
                     "runlua_pool_config": None,
                     "reserved_entry_names": [],
@@ -1033,7 +1028,6 @@ class SystemEngineJsonClient:
         skill_id: str,
         skill_roots: list[JsonMap] | None = None,
         target_root: JsonMap | None = None,
-        options: JsonMap | None = None,
     ) -> JsonMap:
         """
         Uninstall one skill through the system JSON FFI surface.
@@ -1043,7 +1037,6 @@ class SystemEngineJsonClient:
         payload: JsonMap = {
             "skill_roots": self._resolve_skill_roots(skill_roots),
             "skill_id": skill_id,
-            "options": options or {},
         }
         if target_root is not None:
             payload["target_root"] = target_root

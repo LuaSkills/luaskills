@@ -26,7 +26,7 @@ go get github.com/LuaSkills/luaskills-sdk-go
 - 正式技能根（`ROOT`、`PROJECT`、`USER`）及带授权的安装、更新、启用、禁用与卸载。
 - `call_skill`、`run_lua`、公共 `runtime_lease` 与授权绑定的 `system_runtime_lease`。
 - 由 `contracts/skill-config/v1/contract.json` 生成的技能包配置接口（`describe`、`get`、`set`、事件）。
-- SQLite / LanceDB Provider 回调、`vulcan.host.*` 宿主工具回调与 `vulcan.models.*` 模型回调。
+- SQLite Provider 回调、`vulcan.host.*` 宿主工具回调与 `vulcan.models.*` 模型回调。
 - 宿主指定受管运行时根目录与只读运行时解析器。
 - 由 `contracts/embedded/v1/contract.json` 生成的嵌入式运行时传输层。
 - 运行时资产安装：TypeScript 与 Python CLI 的 `install-runtime`，Go 使用随附的 `scripts/deps/sync_runtime_assets.*` 脚本。

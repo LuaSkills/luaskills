@@ -198,7 +198,7 @@
     "title": "EmbeddedCoreDescription",
     "type": "object"
   },
-  "core_version": "0.7.2",
+  "core_version": "0.7.3",
   "error_response": {
     "$defs": {
       "EmbeddedError": {
@@ -333,11 +333,11 @@
     "type": "object"
   },
   "generator": {
-    "cargo_lock_sha256": "3264b46af18b3cfb31f969b1ec87c303dd4235c91efb5432a54ca9f7c8cfe9ae",
+    "cargo_lock_sha256": "d7bb10ba0485de4e344c3eb29e72556cfd207218fffdd72c3c3a003e40c93f05",
     "name": "luaskills/generate_embedded_contract",
     "schema_draft": "2020-12",
     "source_sha256": "f31dc521eeff41b774bddf11408f2a8dd2c1d6bb77c8650bfc3bfb7fa5e621d1",
-    "source_version": "0.7.2"
+    "source_version": "0.7.3"
   },
   "json_vectors": {
     "invalid": [
@@ -1573,7 +1573,7 @@
         "type": "object"
       },
       "LuaRuntimeDatabaseCallbackMode": {
-        "description": "Callback transport mode used when the database provider mode is `host_callback`.\n当数据库 provider 模式为 `host_callback` 时所使用的回调传输模式。",
+        "description": "Explicit transport for host-registered SQLite callbacks.\n宿主注册 SQLite 回调的显式传输方式。",
         "oneOf": [
           {
             "const": "standard",
@@ -1587,27 +1587,23 @@
           }
         ]
       },
-      "LuaRuntimeDatabaseProviderMode": {
-        "description": "Database access mode used by one host-facing runtime backend.\n单个宿主侧运行时后端所使用的数据库访问模式。",
+      "LuaRuntimeHostMode": {
+        "description": "Per-engine host mode controlling console windows of runtime-owned child processes.\n控制运行库所拥有子进程控制台窗口的引擎级宿主模式。",
         "oneOf": [
           {
-            "const": "dynamic_library",
-            "description": "The library loads and calls the local dynamic-library backend directly.\n由库直接加载并调用本地动态库后端。",
+            "const": "console",
+            "description": "Preserve existing console behavior without explicitly allocating a new console.\n保留现有控制台行为，不显式分配新控制台。",
             "type": "string"
           },
           {
-            "const": "host_callback",
-            "description": "The library forwards database operations into one host-registered callback bridge.\n由库把数据库操作转发给宿主已注册的回调桥接。",
-            "type": "string"
-          },
-          {
-            "const": "space_controller",
-            "description": "The library forwards database operations into one external space controller.\n由库把数据库操作转发给外部空间控制器。",
+            "const": "desktop",
+            "description": "Start Windows console children without a console window; other platforms are unchanged.\n启动 Windows 控制台子进程时不创建控制台窗口；其他平台保持原行为。",
             "type": "string"
           }
         ]
       },
       "LuaRuntimeHostOptions": {
+        "additionalProperties": false,
         "description": "Host-provided filesystem and runtime paths consumed by the LuaSkills library.\n宿主提供给 LuaSkills 库消费的文件系统与运行时路径集合。",
         "properties": {
           "allow_network_download": {
@@ -1689,6 +1685,11 @@
             "default": null,
             "description": "Optional GitHub token, sent only to the official `https://api.github.com` host.\n可选的 GitHub 令牌，只发送给官方 `https://api.github.com` 主机。"
           },
+          "host_mode": {
+            "$ref": "#/$defs/LuaRuntimeHostMode",
+            "default": "console",
+            "description": "Immutable per-engine process window policy; omitted JSON fields preserve console behavior.\n不可变的引擎级进程窗口策略；JSON 省略此字段时保留命令行行为。"
+          },
           "host_provided_ffi_root": {
             "description": "Host-managed root directory used only to probe host-provided FFI/native dependencies.\n仅用于探测宿主提供 FFI/原生依赖的宿主管理根目录。",
             "type": [
@@ -1717,23 +1718,6 @@
               "type": "string"
             },
             "type": "array"
-          },
-          "lancedb_callback_mode": {
-            "$ref": "#/$defs/LuaRuntimeDatabaseCallbackMode",
-            "default": "standard",
-            "description": "LanceDB callback transport mode selected by the host when provider mode is `host_callback`.\n当 provider 模式为 `host_callback` 时，宿主为 LanceDB 选择的回调传输模式。"
-          },
-          "lancedb_library_path": {
-            "description": "Explicit LanceDB dynamic-library path owned by the host.\n由宿主显式提供的 LanceDB 动态库路径。",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "lancedb_provider_mode": {
-            "$ref": "#/$defs/LuaRuntimeDatabaseProviderMode",
-            "default": "dynamic_library",
-            "description": "LanceDB database provider mode selected by the host.\n宿主为 LanceDB 数据库选择的 provider 模式。"
           },
           "lua_packages_dir": {
             "description": "Optional lua_packages root used to build `package.path` and `package.cpath`.\n用于拼接 `package.path` 与 `package.cpath` 的可选 lua_packages 根目录。",
@@ -1844,39 +1828,10 @@
               "null"
             ]
           },
-          "space_controller": {
-            "$ref": "#/$defs/LuaRuntimeSpaceControllerOptions",
-            "default": {
-              "auto_spawn": true,
-              "connect_timeout_secs": 5,
-              "default_lease_ttl_secs": 120,
-              "endpoint": null,
-              "executable_path": null,
-              "idle_timeout_secs": 900,
-              "lease_renew_interval_secs": 30,
-              "minimum_uptime_secs": 300,
-              "process_mode": "managed",
-              "startup_retry_interval_ms": 250,
-              "startup_timeout_secs": 15
-            },
-            "description": "Shared controller client options used when one database backend selects `space_controller`.\n当数据库后端选择 `space_controller` 时所使用的共享控制器客户端选项。"
-          },
           "sqlite_callback_mode": {
             "$ref": "#/$defs/LuaRuntimeDatabaseCallbackMode",
             "default": "standard",
             "description": "SQLite callback transport mode selected by the host when provider mode is `host_callback`.\n当 provider 模式为 `host_callback` 时，宿主为 SQLite 选择的回调传输模式。"
-          },
-          "sqlite_library_path": {
-            "description": "Explicit SQLite dynamic-library path owned by the host.\n由宿主显式提供的 SQLite 动态库路径。",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "sqlite_provider_mode": {
-            "$ref": "#/$defs/LuaRuntimeDatabaseProviderMode",
-            "default": "dynamic_library",
-            "description": "SQLite database provider mode selected by the host.\n宿主为 SQLite 数据库选择的 provider 模式。"
           },
           "state_dir_name": {
             "default": "",
@@ -1981,102 +1936,6 @@
       "LuaRuntimeSecretString": {
         "description": "Secret text supplied by the host, such as a GitHub token, that `Debug` never prints.\n宿主提供的机密文本（例如 GitHub 令牌），`Debug` 永不打印其内容。",
         "type": "string"
-      },
-      "LuaRuntimeSpaceControllerOptions": {
-        "description": "Host-provided controller client options used when one database backend chooses `space_controller`.\n当数据库后端选择 `space_controller` 时使用的宿主侧控制器客户端选项。",
-        "properties": {
-          "auto_spawn": {
-            "description": "Whether the runtime may auto-spawn the controller when the endpoint is unavailable.\n当控制器端点不可用时，运行时是否允许自动唤起控制器。",
-            "type": "boolean"
-          },
-          "connect_timeout_secs": {
-            "description": "Transport connect timeout in seconds used by the controller client proxy.\n控制器客户端代理使用的传输连接超时秒数。",
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "default_lease_ttl_secs": {
-            "description": "Default lease TTL in seconds passed to one auto-spawned controller.\n传递给自动唤起控制器的默认租约 TTL 秒数。",
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "endpoint": {
-            "description": "Optional explicit controller endpoint; when omitted the shared default endpoint is used.\n可选的显式控制器端点；缺失时使用共享默认端点。",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "executable_path": {
-            "description": "Optional local executable path copied and managed by the host.\n由宿主复制并管理的可选本地可执行文件路径。",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "idle_timeout_secs": {
-            "description": "Idle timeout in seconds passed to one auto-spawned controller.\n传递给自动唤起控制器的空闲超时秒数。",
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "lease_renew_interval_secs": {
-            "description": "Lease renew interval in seconds used by the background controller client task.\n后台控制器客户端任务使用的租约续约间隔秒数。",
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "minimum_uptime_secs": {
-            "description": "Minimum uptime in seconds passed to one auto-spawned controller.\n传递给自动唤起控制器的最小存活秒数。",
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "process_mode": {
-            "$ref": "#/$defs/LuaRuntimeSpaceControllerProcessMode",
-            "description": "Process mode used when auto-spawning one controller process.\n自动唤起控制器进程时使用的进程模式。"
-          },
-          "startup_retry_interval_ms": {
-            "description": "Startup retry interval in milliseconds used while polling one spawned controller.\n轮询已唤起控制器时使用的启动重试间隔毫秒数。",
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "startup_timeout_secs": {
-            "description": "Startup timeout in seconds used while waiting for one spawned controller to become ready.\n等待已唤起控制器就绪时使用的启动超时秒数。",
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "auto_spawn",
-          "process_mode",
-          "minimum_uptime_secs",
-          "idle_timeout_secs",
-          "default_lease_ttl_secs",
-          "connect_timeout_secs",
-          "startup_timeout_secs",
-          "startup_retry_interval_ms",
-          "lease_renew_interval_secs"
-        ],
-        "type": "object"
-      },
-      "LuaRuntimeSpaceControllerProcessMode": {
-        "description": "Process mode used when the runtime auto-spawns one local space controller process.\n运行时自动拉起本地空间控制器进程时使用的进程模式。",
-        "oneOf": [
-          {
-            "const": "service",
-            "description": "Service mode keeps the controller process alive until an external stop happens.\nService 模式会让控制器进程持续存活，直到外部显式停止。",
-            "type": "string"
-          },
-          {
-            "const": "managed",
-            "description": "Managed mode allows the controller process to stop itself after idle timeouts.\nManaged 模式允许控制器进程在空闲超时后自行停止。",
-            "type": "string"
-          }
-        ]
       },
       "LuaVmPoolConfig": {
         "description": "Pool sizing configuration for Lua virtual machines.\nLua 虚拟机池的容量配置。",

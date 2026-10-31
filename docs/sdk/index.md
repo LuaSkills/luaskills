@@ -26,7 +26,7 @@ All three SDKs wrap the public `_json` FFI and share the same host-facing model:
 - Formal skill roots (`ROOT`, `PROJECT`, `USER`) and authority-aware install, update, enable, disable, and uninstall calls.
 - `call_skill`, `run_lua`, public `runtime_lease`, and authority-bound `system_runtime_lease`.
 - Package-level skill configuration (`describe`, `get`, `set`, events) generated from `contracts/skill-config/v1/contract.json`.
-- Provider callbacks for SQLite and LanceDB, host-tool callbacks for `vulcan.host.*`, and model callbacks for `vulcan.models.*`.
+- Provider callbacks for SQLite, host-tool callbacks for `vulcan.host.*`, and model callbacks for `vulcan.models.*`.
 - Host-selected managed runtime roots and the read-only runtime resolver.
 - The embedded runtime transport generated from `contracts/embedded/v1/contract.json`.
 - Runtime asset installation: `install-runtime` (TypeScript CLI and Python CLI) or the bundled `scripts/deps/sync_runtime_assets.*` scripts (Go).

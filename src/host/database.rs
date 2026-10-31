@@ -1,31 +1,11 @@
 use crate::runtime::path::render_host_visible_path;
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-/// Database access mode used by one host-facing runtime backend.
-/// 单个宿主侧运行时后端所使用的数据库访问模式。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
-pub enum LuaRuntimeDatabaseProviderMode {
-    /// The library loads and calls the local dynamic-library backend directly.
-    /// 由库直接加载并调用本地动态库后端。
-    #[default]
-    DynamicLibrary,
-    /// The library forwards database operations into one host-registered callback bridge.
-    /// 由库把数据库操作转发给宿主已注册的回调桥接。
-    HostCallback,
-    /// The library forwards database operations into one external space controller.
-    /// 由库把数据库操作转发给外部空间控制器。
-    SpaceController,
-}
-
-/// Callback transport mode used when the database provider mode is `host_callback`.
-/// 当数据库 provider 模式为 `host_callback` 时所使用的回调传输模式。
+/// Explicit transport for host-registered SQLite callbacks.
+/// 宿主注册 SQLite 回调的显式传输方式。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "contract-generation", derive(schemars::JsonSchema))]
@@ -92,9 +72,6 @@ pub enum RuntimeDatabaseKind {
     /// SQLite / FTS / BM25 backend operations.
     /// SQLite / FTS / BM25 后端操作。
     Sqlite,
-    /// LanceDB vector backend operations.
-    /// LanceDB 向量后端操作。
-    LanceDb,
 }
 
 impl RuntimeDatabaseKind {
@@ -106,7 +83,6 @@ impl RuntimeDatabaseKind {
     fn sidecar_directory_name(self) -> &'static str {
         match self {
             RuntimeDatabaseKind::Sqlite => "sqlite",
-            RuntimeDatabaseKind::LanceDb => "lancedb",
         }
     }
 
@@ -119,14 +95,13 @@ impl RuntimeDatabaseKind {
     /// The skill_name parameter is the stable skill identifier used when a provider needs a file name.
     /// skill_name 参数是 provider 需要文件名时使用的稳定 skill 标识。
     ///
-    /// Return the default database path used by diagnostics, callbacks, and embedded providers.
-    /// 返回诊断、回调与内嵌 provider 共同使用的默认数据库路径。
+    /// Return a suggested database path for host callbacks and diagnostics without opening storage.
+    /// 返回宿主回调及诊断使用的建议数据库路径，不打开存储。
     fn default_database_path(self, provider_storage_dir: &Path, skill_name: &str) -> PathBuf {
         match self {
             RuntimeDatabaseKind::Sqlite => {
                 provider_storage_dir.join(format!("{}.sqlite3", skill_name))
             }
-            RuntimeDatabaseKind::LanceDb => provider_storage_dir.to_path_buf(),
         }
     }
 }
@@ -144,8 +119,8 @@ pub struct RuntimeDatabaseBindingContextSpec {
     /// Physical skill root label that resolved the effective skill instance.
     /// 解析出生效技能实例时命中的物理技能根标签。
     pub root_name: String,
-    /// Runtime database sidecar root used as the host/controller space root.
-    /// 作为宿主或控制器空间根使用的运行时数据库 sidecar 根目录。
+    /// Suggested database root supplied as host binding context; storage ownership stays with the host.
+    /// 作为宿主绑定上下文提供的建议数据库根；存储所有权保留在宿主。
     pub space_root: String,
     /// Physical skill directory path.
     /// 物理技能目录路径。
@@ -156,8 +131,8 @@ pub struct RuntimeDatabaseBindingContextSpec {
     /// Logical database kind requested by the current provider binding.
     /// 当前 provider 绑定请求的逻辑数据库类型。
     pub database_kind: RuntimeDatabaseKind,
-    /// Default embedded database path resolved by the library for diagnostics and fallback.
-    /// 由库按内嵌规则解析出的默认数据库路径，用于诊断和回退。
+    /// Suggested database path derived by the library; the host chooses the actual storage location.
+    /// 库派生的建议数据库路径；实际存储位置由宿主决定。
     pub default_database_path: String,
 }
 
@@ -171,8 +146,8 @@ pub(crate) struct RuntimeDatabaseBindingPlan {
     /// Provider-specific storage directory dedicated to this skill.
     /// 专属于当前 skill 的 provider 存储目录。
     pub(crate) provider_storage_dir: PathBuf,
-    /// Default database path exposed to diagnostics, callbacks, and embedded providers.
-    /// 暴露给诊断、回调与内嵌 provider 的默认数据库路径。
+    /// Suggested database path exposed to diagnostics and host callbacks without opening storage.
+    /// 暴露给诊断及宿主回调的建议数据库路径，不打开存储。
     pub(crate) default_database_path: String,
     /// Stable host-facing binding context derived from the same resolved paths.
     /// 基于同一组已解析路径派生出的稳定宿主侧绑定上下文。
@@ -195,8 +170,8 @@ pub struct RuntimeDatabaseBindingContext {
     /// Physical skill root label currently resolving the effective skill instance.
     /// 当前解析出生效技能实例时所命中的物理技能根标签。
     pub root_name: String,
-    /// Runtime database sidecar root used as the host/controller space root.
-    /// 作为宿主或控制器空间根使用的运行时数据库 sidecar 根目录。
+    /// Suggested database root supplied as host binding context; storage ownership stays with the host.
+    /// 作为宿主绑定上下文提供的建议数据库根；存储所有权保留在宿主。
     pub space_root: String,
     /// Physical skill directory path.
     /// 物理技能目录路径。
@@ -207,8 +182,8 @@ pub struct RuntimeDatabaseBindingContext {
     /// Logical database kind requested by the current provider binding.
     /// 当前 provider 绑定请求的逻辑数据库类型。
     pub database_kind: RuntimeDatabaseKind,
-    /// Default embedded database path resolved by the library for compatibility and diagnostics.
-    /// 由库按内嵌规则解析出的默认数据库路径，用于兼容和诊断。
+    /// Suggested database path derived by the library; the host chooses the actual storage location.
+    /// 库派生的建议数据库路径；实际存储位置由宿主决定。
     pub default_database_path: String,
 }
 
@@ -369,28 +344,6 @@ pub enum RuntimeSqliteProviderAction {
     SearchFts,
 }
 
-/// Structured LanceDB provider action routed through one host bridge.
-/// 通过宿主桥接路由的结构化 LanceDB provider 动作。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeLanceDbProviderAction {
-    /// Create one table.
-    /// 创建一张表。
-    CreateTable,
-    /// Upsert vectors into one table.
-    /// 向一张表写入向量。
-    VectorUpsert,
-    /// Search vectors from one table.
-    /// 从一张表检索向量。
-    VectorSearch,
-    /// Delete rows from one table.
-    /// 从一张表删除行。
-    Delete,
-    /// Drop one table.
-    /// 删除一张表。
-    DropTable,
-}
-
 /// Structured SQLite provider request delivered to one host bridge.
 /// 传递给宿主桥接的结构化 SQLite provider 请求。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -406,63 +359,43 @@ pub struct RuntimeSqliteProviderRequest {
     pub input: Value,
 }
 
-/// Structured LanceDB provider request delivered to one host bridge.
-/// 传递给宿主桥接的结构化 LanceDB provider 请求。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RuntimeLanceDbProviderRequest {
-    /// Requested LanceDB provider action.
-    /// 请求的 LanceDB provider 动作。
-    pub action: RuntimeLanceDbProviderAction,
-    /// Stable binding context of the current skill-scoped database.
-    /// 当前 skill 级数据库的稳定绑定上下文。
-    pub binding: RuntimeDatabaseBindingContext,
-    /// Action-specific JSON input payload.
-    /// 动作对应的 JSON 输入载荷。
-    pub input: Value,
-}
-
 /// Standard host callback used for one structured SQLite provider request.
 /// 用于处理结构化 SQLite provider 请求的标准宿主回调。
 pub type RuntimeSqliteProviderCallback =
     Arc<dyn Fn(&RuntimeSqliteProviderRequest) -> Result<Value, String> + Send + Sync>;
-
-/// Standard host callback used for one structured LanceDB provider request.
-/// 用于处理结构化 LanceDB provider 请求的标准宿主回调。
-pub type RuntimeLanceDbProviderCallback = Arc<
-    dyn Fn(&RuntimeLanceDbProviderRequest) -> Result<RuntimeLanceDbProviderResult, String>
-        + Send
-        + Sync,
->;
 
 /// JSON host callback used for one SQLite provider request.
 /// 用于处理 SQLite provider 请求的 JSON 宿主回调。
 pub type RuntimeSqliteProviderJsonCallback =
     Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
 
-/// JSON host callback used for one LanceDB provider request.
-/// 用于处理 LanceDB provider 请求的 JSON 宿主回调。
-pub type RuntimeLanceDbProviderJsonCallback =
-    Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
-
 /// One engine-scoped snapshot of all database provider callbacks visible at creation time.
 /// 一个在引擎创建时快照出的数据库 provider 回调集合，作用域限定为单个引擎实例。
 #[derive(Clone, Default)]
-pub(crate) struct RuntimeDatabaseProviderCallbacks {
+pub struct RuntimeDatabaseProviderCallbacks {
     /// Structured SQLite callback captured for the current engine snapshot.
     /// 当前引擎快照捕获到的结构化 SQLite 回调。
     sqlite_standard: Option<RuntimeSqliteProviderCallback>,
-    /// Structured LanceDB callback captured for the current engine snapshot.
-    /// 当前引擎快照捕获到的结构化 LanceDB 回调。
-    lancedb_standard: Option<RuntimeLanceDbProviderCallback>,
     /// JSON SQLite callback captured for the current engine snapshot.
     /// 当前引擎快照捕获到的 JSON SQLite 回调。
     sqlite_json: Option<RuntimeSqliteProviderJsonCallback>,
-    /// JSON LanceDB callback captured for the current engine snapshot.
-    /// 当前引擎快照捕获到的 JSON LanceDB 回调。
-    lancedb_json: Option<RuntimeLanceDbProviderJsonCallback>,
 }
 
 impl RuntimeDatabaseProviderCallbacks {
+    /// Register structured SQLite `callback`; return this owned collection without changing global defaults.
+    /// 注册结构化 SQLite `callback`；返回当前集合，不改变全局默认值。
+    pub fn with_sqlite(mut self, callback: RuntimeSqliteProviderCallback) -> Self {
+        self.sqlite_standard = Some(callback);
+        self
+    }
+
+    /// Register JSON SQLite `callback`; return this collection without changing global defaults.
+    /// 注册 JSON SQLite `callback`；返回当前集合，不改变全局默认值。
+    pub fn with_sqlite_json(mut self, callback: RuntimeSqliteProviderJsonCallback) -> Self {
+        self.sqlite_json = Some(callback);
+        self
+    }
+
     /// Snapshot the current process-wide callback defaults into one engine-private registry.
     /// 把当前进程级默认回调快照为一个引擎私有注册表。
     pub(crate) fn capture_process_defaults() -> Self {
@@ -470,14 +403,8 @@ impl RuntimeDatabaseProviderCallbacks {
             sqlite_standard: clone_database_provider_callback_registry_value(
                 sqlite_provider_callback_registry(),
             ),
-            lancedb_standard: clone_database_provider_callback_registry_value(
-                lancedb_provider_callback_registry(),
-            ),
             sqlite_json: clone_database_provider_callback_registry_value(
                 sqlite_provider_json_callback_registry(),
-            ),
-            lancedb_json: clone_database_provider_callback_registry_value(
-                lancedb_provider_json_callback_registry(),
             ),
         }
     }
@@ -491,18 +418,6 @@ impl RuntimeDatabaseProviderCallbacks {
         match callback_mode {
             LuaRuntimeDatabaseCallbackMode::Standard => self.sqlite_standard.is_some(),
             LuaRuntimeDatabaseCallbackMode::Json => self.sqlite_json.is_some(),
-        }
-    }
-
-    /// Return whether the snapshot contains one LanceDB callback for the requested transport mode.
-    /// 返回当前快照是否包含指定传输模式的 LanceDB 回调。
-    pub(crate) fn has_lancedb_provider_callback_for_mode(
-        &self,
-        callback_mode: LuaRuntimeDatabaseCallbackMode,
-    ) -> bool {
-        match callback_mode {
-            LuaRuntimeDatabaseCallbackMode::Standard => self.lancedb_standard.is_some(),
-            LuaRuntimeDatabaseCallbackMode::Json => self.lancedb_json.is_some(),
         }
     }
 
@@ -536,81 +451,6 @@ impl RuntimeDatabaseProviderCallbacks {
             }
         }
     }
-
-    /// Dispatch one LanceDB provider request through the callbacks captured by this snapshot.
-    /// 通过当前快照捕获的回调分发一次 LanceDB provider 请求。
-    pub(crate) fn dispatch_lancedb_provider_request(
-        &self,
-        request: &RuntimeLanceDbProviderRequest,
-        callback_mode: LuaRuntimeDatabaseCallbackMode,
-    ) -> Result<RuntimeLanceDbProviderResult, String> {
-        match callback_mode {
-            LuaRuntimeDatabaseCallbackMode::Standard => {
-                let callback = self.lancedb_standard.clone().ok_or_else(|| {
-                    "LanceDB host-callback mode requires one registered standard callback"
-                        .to_string()
-                })?;
-                callback(request)
-            }
-            LuaRuntimeDatabaseCallbackMode::Json => {
-                let callback = self.lancedb_json.clone().ok_or_else(|| {
-                    "LanceDB host-callback JSON mode requires one registered JSON callback"
-                        .to_string()
-                })?;
-                let request_json = serde_json::to_string(request).map_err(|error| {
-                    format!("failed to encode lancedb provider request: {}", error)
-                })?;
-                let response_json = callback(&request_json)?;
-                let value: Value = serde_json::from_str(&response_json).map_err(|error| {
-                    format!("failed to parse lancedb provider response json: {}", error)
-                })?;
-                let meta = value
-                    .get("meta")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Object(Default::default()));
-                let bytes = value
-                    .get("data_base64")
-                    .and_then(Value::as_str)
-                    .map(|text| {
-                        BASE64_STANDARD.decode(text.as_bytes()).map_err(|error| {
-                            format!("failed to decode lancedb provider data_base64: {}", error)
-                        })
-                    })
-                    .transpose()?
-                    .unwrap_or_default();
-                Ok(RuntimeLanceDbProviderResult::binary(meta, bytes))
-            }
-        }
-    }
-}
-
-/// Structured LanceDB provider result returned by the standard host callback.
-/// 标准宿主回调返回的结构化 LanceDB provider 结果。
-#[derive(Debug, Clone, PartialEq)]
-pub struct RuntimeLanceDbProviderResult {
-    /// Response metadata JSON.
-    /// 响应元信息 JSON。
-    pub meta: Value,
-    /// Optional raw payload bytes such as vector search result data.
-    /// 可选原始载荷字节，例如向量检索结果数据。
-    pub bytes: Vec<u8>,
-}
-
-impl RuntimeLanceDbProviderResult {
-    /// Build one result carrying only metadata JSON.
-    /// 构造一个仅携带元信息 JSON 的结果。
-    pub fn json(meta: Value) -> Self {
-        Self {
-            meta,
-            bytes: Vec::new(),
-        }
-    }
-
-    /// Build one result carrying metadata JSON plus raw bytes.
-    /// 构造一个携带元信息 JSON 和原始字节的结果。
-    pub fn binary(meta: Value, bytes: Vec<u8>) -> Self {
-        Self { meta, bytes }
-    }
 }
 
 /// Install or clear the process-wide standard SQLite provider callback.
@@ -619,26 +459,11 @@ pub fn set_sqlite_provider_callback(callback: Option<RuntimeSqliteProviderCallba
     set_database_provider_callback_registry_value(sqlite_provider_callback_registry(), callback);
 }
 
-/// Install or clear the process-wide standard LanceDB provider callback.
-/// 安装或清理进程级标准 LanceDB provider 回调。
-pub fn set_lancedb_provider_callback(callback: Option<RuntimeLanceDbProviderCallback>) {
-    set_database_provider_callback_registry_value(lancedb_provider_callback_registry(), callback);
-}
-
 /// Install or clear the process-wide JSON SQLite provider callback.
 /// 安装或清理进程级 JSON SQLite provider 回调。
 pub fn set_sqlite_provider_json_callback(callback: Option<RuntimeSqliteProviderJsonCallback>) {
     set_database_provider_callback_registry_value(
         sqlite_provider_json_callback_registry(),
-        callback,
-    );
-}
-
-/// Install or clear the process-wide JSON LanceDB provider callback.
-/// 安装或清理进程级 JSON LanceDB provider 回调。
-pub fn set_lancedb_provider_json_callback(callback: Option<RuntimeLanceDbProviderJsonCallback>) {
-    set_database_provider_callback_registry_value(
-        lancedb_provider_json_callback_registry(),
         callback,
     );
 }
@@ -666,10 +491,17 @@ fn set_database_provider_callback_registry_value<T>(
     registry: &'static Mutex<Option<T>>,
     callback: Option<T>,
 ) {
-    // Hold the registry lock only while replacing the process default callback.
-    // 仅在替换进程级默认回调期间持有注册表锁。
-    let mut guard = lock_database_provider_callback_registry(registry);
-    *guard = callback;
+    // Extract the previous owner without running host destructors under the registry lock.
+    // 取出旧所有者，不在注册表锁内运行宿主析构。
+    let previous = {
+        // The guard protects only the atomic replacement of the process default.
+        // 保护对象仅保护进程默认值的原子替换。
+        let mut guard = lock_database_provider_callback_registry(registry);
+        std::mem::replace(&mut *guard, callback)
+    };
+    // Captured host state may access registration during destruction; the lock is already released.
+    // 捕获的宿主状态可能在析构时访问注册接口；此时锁已释放。
+    drop(previous);
 }
 
 /// Clone one optional callback from a process-wide database provider registry.
@@ -695,26 +527,11 @@ fn sqlite_provider_callback_registry() -> &'static Mutex<Option<RuntimeSqlitePro
     REGISTRY.get_or_init(|| Mutex::new(None))
 }
 
-/// Return the process-wide standard LanceDB provider callback storage.
-/// 返回进程级标准 LanceDB provider 回调存储。
-fn lancedb_provider_callback_registry() -> &'static Mutex<Option<RuntimeLanceDbProviderCallback>> {
-    static REGISTRY: OnceLock<Mutex<Option<RuntimeLanceDbProviderCallback>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(None))
-}
-
 /// Return the process-wide JSON SQLite provider callback storage.
 /// 返回进程级 JSON SQLite provider 回调存储。
 fn sqlite_provider_json_callback_registry()
 -> &'static Mutex<Option<RuntimeSqliteProviderJsonCallback>> {
     static REGISTRY: OnceLock<Mutex<Option<RuntimeSqliteProviderJsonCallback>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(None))
-}
-
-/// Return the process-wide JSON LanceDB provider callback storage.
-/// 返回进程级 JSON LanceDB provider 回调存储。
-fn lancedb_provider_json_callback_registry()
--> &'static Mutex<Option<RuntimeLanceDbProviderJsonCallback>> {
-    static REGISTRY: OnceLock<Mutex<Option<RuntimeLanceDbProviderJsonCallback>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(None))
 }
 
@@ -731,6 +548,83 @@ mod tests {
     fn database_callback_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Observe whether callback-owned state is destroyed outside its registry lock.
+    /// 观察回调拥有的状态是否在其注册表锁之外析构。
+    struct CallbackDropProbe {
+        /// Exact transport whose registry must be available during destruction.
+        /// 析构期间注册表必须可用的精确传输方式。
+        json_transport: bool,
+        /// Records successful lock availability without blocking a failing regression test.
+        /// 记录锁可用性，避免失败的回归测试发生阻塞。
+        unlocked: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for CallbackDropProbe {
+        /// Query only the owning registry's lock and record the result; never block or mutate callbacks.
+        /// 仅查询所属注册表的锁并记录结果；不阻塞或修改回调。
+        fn drop(&mut self) {
+            // A poisoned guard is still acquired; only WouldBlock proves a lock is held.
+            // 中毒保护对象仍表示已经取得锁；只有 WouldBlock 证明锁正被持有。
+            let available = if self.json_transport {
+                !matches!(
+                    sqlite_provider_json_callback_registry().try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                )
+            } else {
+                !matches!(
+                    sqlite_provider_callback_registry().try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                )
+            };
+            self.unlocked
+                .store(available, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Replacing either callback must release host-owned captured values after unlocking the registry.
+    /// 替换任一回调均必须在解锁注册表后释放宿主拥有的捕获值。
+    #[test]
+    fn database_callback_replacement_drops_host_state_outside_lock() {
+        // Serialize process-default mutations and restore the original host registrations afterwards.
+        // 串行化进程默认值修改，随后恢复原宿主注册。
+        let _serial = database_callback_test_lock().lock().unwrap();
+        // The original callback owners stay alive until restoration completes.
+        // 原回调所有者保持存活，直到恢复完成。
+        let _restore = ProcessCallbackRestoreGuard::capture();
+        for json_transport in [false, true] {
+            // A false initial value also detects a destructor that was never invoked.
+            // 初始假值也能发现未被调用的析构方法。
+            let unlocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // Only the registered closure owns this probe after construction.
+            // 构造后仅注册的闭包拥有此探针。
+            let probe = CallbackDropProbe {
+                json_transport,
+                unlocked: Arc::clone(&unlocked),
+            };
+            if json_transport {
+                set_sqlite_provider_json_callback(Some(Arc::new(move |_| {
+                    // Capture the complete owner so callback replacement runs its destructor.
+                    // 捕获完整所有者，使回调替换运行其析构方法。
+                    let _owner = &probe;
+                    Ok("null".into())
+                })));
+                set_sqlite_provider_json_callback(None);
+            } else {
+                set_sqlite_provider_callback(Some(Arc::new(move |_| {
+                    // Capture the complete owner so callback replacement runs its destructor.
+                    // 捕获完整所有者，使回调替换运行其析构方法。
+                    let _owner = &probe;
+                    Ok(Value::Null)
+                })));
+                set_sqlite_provider_callback(None);
+            }
+            assert!(
+                unlocked.load(std::sync::atomic::Ordering::SeqCst),
+                "callback owner was dropped under registry lock: json={json_transport}"
+            );
+        }
     }
 
     /// Restore the process-wide callback defaults captured before one test mutates them.
@@ -752,9 +646,7 @@ mod tests {
     impl Drop for ProcessCallbackRestoreGuard {
         fn drop(&mut self) {
             set_sqlite_provider_callback(self.snapshot.sqlite_standard.clone());
-            set_lancedb_provider_callback(self.snapshot.lancedb_standard.clone());
             set_sqlite_provider_json_callback(self.snapshot.sqlite_json.clone());
-            set_lancedb_provider_json_callback(self.snapshot.lancedb_json.clone());
         }
     }
 
@@ -810,30 +702,6 @@ mod tests {
             sqlite_plan.context.database_kind,
             RuntimeDatabaseKind::Sqlite
         );
-
-        let lancedb_plan = build_runtime_database_binding_plan(
-            "ROOT",
-            "demo-skill",
-            skill_dir,
-            "databases",
-            RuntimeDatabaseKind::LanceDb,
-        )
-        .expect("lancedb binding plan");
-        let lancedb_storage_dir = database_root.join("lancedb").join("demo-skill");
-        assert_eq!(lancedb_plan.skill_dir_name, "demo-skill");
-        assert_eq!(lancedb_plan.provider_storage_dir, lancedb_storage_dir);
-        assert_eq!(
-            lancedb_plan.default_database_path,
-            render_host_visible_path(&lancedb_plan.provider_storage_dir)
-        );
-        assert_eq!(
-            lancedb_plan.context.default_database_path,
-            lancedb_plan.default_database_path
-        );
-        assert_eq!(
-            lancedb_plan.context.database_kind,
-            RuntimeDatabaseKind::LanceDb
-        );
     }
 
     /// Verify invalid skill-directory errors render paths through the host-visible formatter.
@@ -887,12 +755,12 @@ mod tests {
         );
         assert_eq!(
             require_database_provider_callback_registration(
-                "LanceDB",
+                "SQLite",
                 LuaRuntimeDatabaseCallbackMode::Json,
                 false,
             )
             .expect_err("missing JSON callback should fail"),
-            "LanceDB host-callback mode is enabled but no json callback is registered"
+            "SQLite host-callback mode is enabled but no json callback is registered"
         );
     }
 
@@ -962,14 +830,6 @@ mod tests {
         set_sqlite_provider_json_callback(Some(Arc::new(|_| {
             Ok("{\"source\":\"sqlite-json-a\"}".to_string())
         })));
-        set_lancedb_provider_callback(Some(Arc::new(|_| {
-            Ok(RuntimeLanceDbProviderResult::json(
-                json!({ "source": "lancedb-standard-a" }),
-            ))
-        })));
-        set_lancedb_provider_json_callback(Some(Arc::new(|_| {
-            Ok("{\"meta\":{\"source\":\"lancedb-json-a\"}}".to_string())
-        })));
         let snapshot_a = RuntimeDatabaseProviderCallbacks::capture_process_defaults();
 
         set_sqlite_provider_callback(Some(Arc::new(|_| {
@@ -978,25 +838,12 @@ mod tests {
         set_sqlite_provider_json_callback(Some(Arc::new(|_| {
             Ok("{\"source\":\"sqlite-json-b\"}".to_string())
         })));
-        set_lancedb_provider_callback(Some(Arc::new(|_| {
-            Ok(RuntimeLanceDbProviderResult::json(
-                json!({ "source": "lancedb-standard-b" }),
-            ))
-        })));
-        set_lancedb_provider_json_callback(Some(Arc::new(|_| {
-            Ok("{\"meta\":{\"source\":\"lancedb-json-b\"}}".to_string())
-        })));
         let snapshot_b = RuntimeDatabaseProviderCallbacks::capture_process_defaults();
 
         let sqlite_request = RuntimeSqliteProviderRequest {
             action: RuntimeSqliteProviderAction::QueryJson,
             binding: sample_binding_context(RuntimeDatabaseKind::Sqlite),
             input: json!({ "sql": "select 1" }),
-        };
-        let lancedb_request = RuntimeLanceDbProviderRequest {
-            action: RuntimeLanceDbProviderAction::VectorSearch,
-            binding: sample_binding_context(RuntimeDatabaseKind::LanceDb),
-            input: json!({ "table": "demo" }),
         };
 
         assert_eq!(
@@ -1034,47 +881,6 @@ mod tests {
                 )
                 .expect("dispatch sqlite json B"),
             json!({ "source": "sqlite-json-b" })
-        );
-
-        assert_eq!(
-            snapshot_a
-                .dispatch_lancedb_provider_request(
-                    &lancedb_request,
-                    LuaRuntimeDatabaseCallbackMode::Standard,
-                )
-                .expect("dispatch lancedb standard A")
-                .meta,
-            json!({ "source": "lancedb-standard-a" })
-        );
-        assert_eq!(
-            snapshot_a
-                .dispatch_lancedb_provider_request(
-                    &lancedb_request,
-                    LuaRuntimeDatabaseCallbackMode::Json,
-                )
-                .expect("dispatch lancedb json A")
-                .meta,
-            json!({ "source": "lancedb-json-a" })
-        );
-        assert_eq!(
-            snapshot_b
-                .dispatch_lancedb_provider_request(
-                    &lancedb_request,
-                    LuaRuntimeDatabaseCallbackMode::Standard,
-                )
-                .expect("dispatch lancedb standard B")
-                .meta,
-            json!({ "source": "lancedb-standard-b" })
-        );
-        assert_eq!(
-            snapshot_b
-                .dispatch_lancedb_provider_request(
-                    &lancedb_request,
-                    LuaRuntimeDatabaseCallbackMode::Json,
-                )
-                .expect("dispatch lancedb json B")
-                .meta,
-            json!({ "source": "lancedb-json-b" })
         );
     }
 }

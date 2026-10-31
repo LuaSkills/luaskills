@@ -16,7 +16,7 @@ LuaSkills owns:
 - `vulcan.*` and `vulcan.runtime.*` injection.
 - Standard `vulcan.models.*` API shape, argument validation, result envelopes, and caller-context forwarding.
 - Skill dependency path injection.
-- Optional SQLite and LanceDB provider routing.
+- Optional SQLite routing through registered host callbacks.
 - Lifecycle primitives such as install, update, enable, disable, and uninstall.
 
 ## Host Responsibilities

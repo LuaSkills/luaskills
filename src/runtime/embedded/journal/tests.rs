@@ -4,9 +4,13 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 
+#[path = "tests/context.rs"]
 mod context;
+#[path = "tests/identity.rs"]
 mod identity;
+#[path = "tests/reconciliation.rs"]
 mod reconciliation;
+#[path = "tests/recovery.rs"]
 mod recovery;
 
 /// Own one newly created temporary directory, isolated from other tests and user files.
@@ -55,6 +59,53 @@ fn config() -> OperationJournalConfig {
         max_record_bytes: 16 * 1024,
         max_database_bytes: 128 * 1024,
     }
+}
+
+/// Verify host-injected storage retains exact commit uncertainty, retry and reopen semantics.
+/// 验证宿主注入存储保留精确提交不确定性、重试及重新打开语义。
+#[test]
+fn embedded_journal_registered_backend_preserves_recovery() {
+    // The host owns this exact storage path and opens the adapter before registration.
+    // 宿主拥有此精确存储路径，并在注册前打开适配器。
+    let directory = Directory::new();
+    // Concrete storage remains host-owned while the generic journal retains a shared reference.
+    // 通用日志保留共享引用时，具体存储仍由宿主拥有。
+    let backend = Arc::new(OperationJournal::open(&directory.database(), config()).unwrap());
+    // Production scheduling sees only the public database-independent handle.
+    // 生产调度仅看到公开的数据库无关句柄。
+    let journal = crate::runtime::embedded::OperationJournal::from_backend(backend.clone());
+    // The original incomplete checkpoint establishes the immutable operation identity.
+    // 原始未完成检查点确立不可变操作身份。
+    let mut record = snapshot("host-owned-operation");
+    assert_eq!(journal.insert("host-runtime", &record).unwrap().revision, 1);
+    record.phase = OperationPhase::Succeeded;
+    record.effects = EffectState::Committed;
+    record.value = Some(Value::Null);
+    backend.lose_next_confirmation_for_test(true);
+    assert!(journal.replace("host-runtime", 1, &record).is_err());
+    assert!(journal.get("host-runtime", "host-owned-operation").is_err());
+    assert!(journal.recover_storage().unwrap());
+    assert_eq!(
+        journal
+            .checkpoint("host-runtime", Some(1), &record)
+            .unwrap()
+            .revision,
+        2
+    );
+    drop(journal);
+    drop(backend);
+    // Reopening the unchanged format confirms that ownership never redirected storage.
+    // 重新打开未变格式，确认所有权从未重定向存储。
+    let reopened = OperationJournal::open(&directory.database(), config()).unwrap();
+    assert_eq!(
+        reopened
+            .get("host-runtime", "host-owned-operation")
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .value,
+        Some(Value::Null)
+    );
 }
 
 /// Compare ordinary and NOFOLLOW SQLite opens through an owned parent symlink; verify canonical journal persistence.
@@ -328,7 +379,7 @@ fn embedded_journal_capacity_and_unresolved_retention() {
     record.phase = OperationPhase::Failed;
     record.effects = EffectState::Committed;
     record.host_effects.push(HostEffectRecord {
-        caller: super::super::capabilities::CapabilityCaller {
+        caller: crate::runtime::embedded::capabilities::CapabilityCaller {
             request_id: None,
             runtime_id: "runtime".into(),
             operation_id: "first".into(),
@@ -567,7 +618,7 @@ fn embedded_journal_process_exit_recovery() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "runtime::embedded::journal::tests::embedded_journal_crash_child",
+                "runtime::embedded::journal::sqlite::tests::embedded_journal_crash_child",
                 "--ignored",
                 "--nocapture",
             ])

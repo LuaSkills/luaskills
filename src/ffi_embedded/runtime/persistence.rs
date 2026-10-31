@@ -40,17 +40,29 @@ impl PersistenceOwner {
     /// Open `config` once, returning ownership before constructing any runtime that can use its writer.
     /// 按 `config` 打开一次，在构造可使用其写入者的运行时前返回所有权。
     pub(super) fn new(config: RuntimePersistenceConfig) -> EmbeddedResult<Arc<Self>> {
-        config.worker.validate()?;
-        // No worker exists if the file or retention declaration fails validation.
-        // 文件或保留声明校验失败时不存在工作线程。
-        let journal = Arc::new(OperationJournal::open(&config.path, config.journal)?);
-        // Thread construction is the final fallible step before returning its retained owner.
-        // 返回保留所有者前，线程构造是最后一个可失败步骤。
-        let writer = Arc::new(OperationJournalWorker::new(
-            Arc::clone(&journal),
-            config.worker,
-        )?);
-        Ok(Arc::new(Self { journal, writer }))
+        #[cfg(not(any(test, feature = "sqlite-journal")))]
+        {
+            // A storage declaration must never silently degrade into a memory-only runtime.
+            // 存储声明绝不能静默降级为纯内存运行时。
+            let _ = (config.path, config.journal, config.worker);
+            Err(EmbeddedError::invalid(
+                "file persistence requires the explicit sqlite-journal feature; Rust hosts can register OperationJournalBackend",
+            ))
+        }
+        #[cfg(any(test, feature = "sqlite-journal"))]
+        {
+            config.worker.validate()?;
+            // No worker exists if the file or retention declaration fails validation.
+            // 文件或保留声明校验失败时不存在工作线程。
+            let journal = Arc::new(OperationJournal::open(&config.path, config.journal)?);
+            // Thread construction is the final fallible step before returning its retained owner.
+            // 返回保留所有者前，线程构造是最后一个可失败步骤。
+            let writer = Arc::new(OperationJournalWorker::new(
+                Arc::clone(&journal),
+                config.worker,
+            )?);
+            Ok(Arc::new(Self { journal, writer }))
+        }
     }
 
     /// Request storage closure after the core has drained; return true only after real thread and receipt release.

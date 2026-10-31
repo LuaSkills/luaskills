@@ -124,36 +124,9 @@ pub struct FfiLuaRuntimeHostOptions {
     /// Number of private skill source allowlist entries.
     /// 私有技能来源允许列表条目数量。
     pub private_skill_source_allowlist_len: usize,
-    /// Optional host SQLite dynamic library path.
-    /// 可选宿主 SQLite 动态库路径。
-    pub sqlite_library_path: *const c_char,
-    /// SQLite provider mode integer where `0=dynamic_library`, `1=host_callback`, and `2=space_controller`.
-    /// SQLite provider 模式整数，其中 `0=dynamic_library`、`1=host_callback`、`2=space_controller`。
-    pub sqlite_provider_mode: i32,
     /// SQLite callback mode integer where `0=standard` and `1=json`.
     /// SQLite 回调模式整数，其中 `0=standard`、`1=json`。
     pub sqlite_callback_mode: i32,
-    /// Optional host LanceDB dynamic library path.
-    /// 可选宿主 LanceDB 动态库路径。
-    pub lancedb_library_path: *const c_char,
-    /// LanceDB provider mode integer where `0=dynamic_library` and `1=host_callback` and `2=space_controller`.
-    /// LanceDB provider 模式整数，其中 `0=dynamic_library`、`1=host_callback`、`2=space_controller`。
-    pub lancedb_provider_mode: i32,
-    /// LanceDB callback mode integer where `0=standard` and `1=json`.
-    /// LanceDB 回调模式整数，其中 `0=standard`、`1=json`。
-    pub lancedb_callback_mode: i32,
-    /// Optional shared space-controller endpoint.
-    /// 可选共享空间控制器端点。
-    pub space_controller_endpoint: *const c_char,
-    /// Whether the runtime may auto-spawn the space-controller process.
-    /// 运行时是否允许自动唤起空间控制器进程。
-    pub space_controller_auto_spawn: u8,
-    /// Optional copied local controller executable path.
-    /// 可选的本地复制控制器可执行文件路径。
-    pub space_controller_executable_path: *const c_char,
-    /// Space-controller process mode integer where `0=service` and `1=managed`.
-    /// 空间控制器进程模式整数，其中 `0=service`、`1=managed`。
-    pub space_controller_process_mode: i32,
     /// Optional tool-cache config pointer.
     /// 可选工具缓存配置指针。
     pub cache_config: *const FfiToolCacheConfig,
@@ -187,8 +160,8 @@ pub struct FfiLuaRuntimeHostOptions {
 /// 支持 runtime_root 的标准非 JSON 引擎创建使用的原生 C ABI v2 宿主选项。
 #[repr(C)]
 pub struct FfiLuaRuntimeHostOptionsV2 {
-    /// Stable v1 host options kept byte-for-byte compatible with the original standard ABI.
-    /// 与原始标准 ABI 保持逐字节兼容的稳定 v1 宿主选项。
+    /// Base host options from this release; pre-0.7.3 database layouts are incompatible.
+    /// 本版本的基础宿主选项；0.7.3 之前的数据库布局不兼容。
     pub base: FfiLuaRuntimeHostOptions,
     /// Optional canonical runtime root used to derive the fixed LuaSkills layout.
     /// 可选规范运行时根目录，用于推导固定 LuaSkills 布局。
@@ -223,8 +196,8 @@ pub struct FfiLuaRuntimeManagedRuntimeConfig {
 /// 新增独立受管根与可选 B3-B7 策略的标准非 JSON C ABI v3 宿主选项。
 #[repr(C)]
 pub struct FfiLuaRuntimeHostOptionsV3 {
-    /// Stable v2 host options kept byte-for-byte compatible with the published v2 ABI.
-    /// 与已发布 v2 ABI 保持逐字节兼容的稳定 v2 宿主选项。
+    /// V2 host options from this release, including its current base-field layout.
+    /// 本版本的 V2 宿主选项，包含其当前基础字段布局。
     pub base: FfiLuaRuntimeHostOptionsV2,
     /// Optional existing absolute root containing managed Python, Node, uv, and pnpm distributions.
     /// 包含受管 Python、Node、uv 与 pnpm 发行包的可选现有绝对根目录。
@@ -255,15 +228,22 @@ pub type FfiSqliteProviderCallback = unsafe extern "C" fn(
     error_out: *mut FfiOwnedBuffer,
 ) -> i32;
 
-/// C ABI LanceDB provider callback used by standard host integration.
-/// 标准宿主集成使用的 C ABI LanceDB provider 回调。
-pub type FfiLanceDbProviderCallback = unsafe extern "C" fn(
-    request: *const FfiLanceDbProviderRequest,
-    user_data: *mut c_void,
-    meta_json_out: *mut FfiOwnedBuffer,
-    data_out: *mut FfiOwnedBuffer,
-    error_out: *mut FfiOwnedBuffer,
-) -> i32;
+/// Immutable database callbacks for one engine; null functions leave that transport unavailable.
+/// 单个引擎的不可变数据库回调；空函数指针表示该传输不可用。
+/// The host keeps `user_data` and callback code alive until the engine and all its calls are released.
+/// 宿主必须使 `user_data` 和回调代码存活至引擎及其全部调用被释放。
+#[repr(C)]
+pub struct FfiDatabaseProviderCallbacksV1 {
+    /// Opaque host context shared by the registered callbacks; never freed by LuaSkills.
+    /// 注册回调共享的不透明宿主上下文；LuaSkills 不释放它。
+    pub user_data: *mut c_void,
+    /// Optional structured SQLite callback using the existing owned-buffer contract.
+    /// 使用既有拥有型缓冲区契约的可选结构化 SQLite 回调。
+    pub sqlite: Option<FfiSqliteProviderCallback>,
+    /// Optional JSON SQLite callback selected by the engine callback mode.
+    /// 由引擎回调模式选择的可选 JSON SQLite 回调。
+    pub sqlite_json: Option<FfiJsonProviderCallback>,
+}
 
 /// C ABI edge-triggered wake callback for engine-level managed-session events.
 /// 用于引擎级受管会话事件的 C ABI 边沿触发唤醒回调。
@@ -321,6 +301,18 @@ pub struct FfiLuaEngineOptionsV3 {
     pub host: FfiLuaRuntimeHostOptionsV3,
 }
 
+/// C ABI v4 engine options embedding the complete v3 layout from this same release.
+/// 嵌入本次相同版本完整 v3 布局的 C ABI v4 引擎选项。
+#[repr(C)]
+pub struct FfiLuaEngineOptionsV4 {
+    /// Unchanged v3 pool and host options; nested pointers remain borrowed for the creation call.
+    /// 保持不变的 v3 池与宿主选项；嵌套指针在创建调用期间保持借用。
+    pub base: FfiLuaEngineOptionsV3,
+    /// Host mode where zero preserves console behavior and one selects desktop; other values are rejected.
+    /// 宿主模式：零保留命令行行为，一选择桌面模式；拒绝其他值。
+    pub host_mode: i32,
+}
+
 /// Plain C ABI skill root used by standard non-JSON lifecycle and load calls.
 /// 标准非 JSON 生命周期与加载调用使用的原生 C ABI 技能根结构。
 #[repr(C)]
@@ -363,18 +355,6 @@ pub struct FfiSkillInstallRequest {
     pub source_type: i32,
 }
 
-/// Plain C ABI uninstall options used by standard lifecycle calls.
-/// 标准生命周期调用使用的原生 C ABI 卸载选项。
-#[repr(C)]
-pub struct FfiSkillUninstallOptions {
-    /// Remove SQLite data when non-zero.
-    /// 非零时删除 SQLite 数据。
-    pub remove_sqlite: u8,
-    /// Remove LanceDB data when non-zero.
-    /// 非零时删除 LanceDB 数据。
-    pub remove_lancedb: u8,
-}
-
 /// Plain C ABI database binding context forwarded into one host-managed database provider.
 /// 转发给宿主管理数据库 provider 的原生 C ABI 数据库绑定上下文。
 #[repr(C)]
@@ -400,11 +380,11 @@ pub struct FfiRuntimeDatabaseBindingContext {
     /// Basename of the physical skill directory.
     /// 物理技能目录名称。
     pub skill_dir_name: *const c_char,
-    /// Database kind integer where `0=sqlite` and `1=lancedb`.
-    /// 数据库类型整数，其中 `0=sqlite`、`1=lancedb`。
+    /// Database kind integer where `0=sqlite`.
+    /// 数据库类型整数，其中 `0=sqlite`。
     pub database_kind: i32,
-    /// Library-computed default embedded database path for diagnostics and fallback.
-    /// 由库计算出的默认内嵌数据库路径，用于诊断和回退。
+    /// Library-computed storage suggestion; the host chooses and manages the actual database path.
+    /// 库计算出的存储建议；实际数据库路径由宿主选择和管理。
     pub default_database_path: *const c_char,
 }
 
@@ -414,21 +394,6 @@ pub struct FfiRuntimeDatabaseBindingContext {
 pub struct FfiSqliteProviderRequest {
     /// Requested action integer defined by `FFI_SQLITE_PROVIDER_ACTION_*`.
     /// 由 `FFI_SQLITE_PROVIDER_ACTION_*` 定义的请求动作整数。
-    pub action: i32,
-    /// Stable binding context of the current skill-scoped database.
-    /// 当前 skill 级数据库的稳定绑定上下文。
-    pub binding: FfiRuntimeDatabaseBindingContext,
-    /// Action-specific input payload encoded as one borrowed JSON byte buffer.
-    /// 以借用 JSON 字节缓冲编码的动作专属输入载荷。
-    pub input_json: FfiBorrowedBuffer,
-}
-
-/// Plain C ABI LanceDB provider request delivered to one host callback.
-/// 传递给宿主回调的原生 C ABI LanceDB provider 请求。
-#[repr(C)]
-pub struct FfiLanceDbProviderRequest {
-    /// Requested action integer defined by `FFI_LANCEDB_PROVIDER_ACTION_*`.
-    /// 由 `FFI_LANCEDB_PROVIDER_ACTION_*` 定义的请求动作整数。
     pub action: i32,
     /// Stable binding context of the current skill-scoped database.
     /// 当前 skill 级数据库的稳定绑定上下文。
@@ -691,18 +656,6 @@ pub struct FfiSkillUninstallResult {
     /// Whether the skill directory was removed.
     /// 技能目录是否已被删除。
     pub skill_removed: u8,
-    /// Whether the SQLite database was removed.
-    /// SQLite 数据库是否已被删除。
-    pub sqlite_removed: u8,
-    /// Whether the LanceDB database was removed.
-    /// LanceDB 数据库是否已被删除。
-    pub lancedb_removed: u8,
-    /// Whether the SQLite database was intentionally retained.
-    /// SQLite 数据库是否被有意保留。
-    pub sqlite_retained: u8,
-    /// Whether the LanceDB database was intentionally retained.
-    /// LanceDB 数据库是否被有意保留。
-    pub lancedb_retained: u8,
     /// Human-readable message.
     /// 人类可读消息。
     pub message: FfiOwnedBuffer,

@@ -28,7 +28,7 @@ LuaSkills는 관습 모음이 아니라 runtime contract를 제공합니다.
 - strict help tree.
 - runtime context injection.
 - dependency path injection.
-- SQLite / LanceDB provider routing.
+- SQLite provider routing.
 - system, project, user root layering.
 - Rust, C ABI, public `_json` FFI integration.
 
@@ -39,7 +39,7 @@ LuaSkills는 관습 모음이 아니라 runtime contract를 제공합니다.
 | Runtime Core | skill 로드, root reload, entry list, skill call. |
 | Skill Authoring | `vulcan.*` API와 구조화된 help로 skill 작성. |
 | Product Control | 권한, budget, UI, authority를 호스트가 제어. |
-| Data-aware Skills | SQLite / LanceDB를 runtime, host provider, space controller로 연결. |
+| Data-aware Skills | SQLite를 runtime, host provider, space controller로 연결. |
 | Multi-language Hosts | Rust, C ABI, TypeScript, Python, Go에서 같은 skill model 사용. |
 
 ## 중요한 예제

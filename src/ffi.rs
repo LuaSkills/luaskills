@@ -375,6 +375,8 @@ pub(crate) fn exported_ffi_function_names() -> Vec<String> {
         "luaskills_ffi_engine_new",
         "luaskills_ffi_engine_new_v2",
         "luaskills_ffi_engine_new_v3",
+        "luaskills_ffi_engine_new_v4",
+        "luaskills_ffi_engine_new_with_database_providers_v1",
         "luaskills_ffi_engine_free",
         "luaskills_ffi_load_from_roots",
         "luaskills_ffi_reload_from_roots",
@@ -405,9 +407,7 @@ pub(crate) fn exported_ffi_function_names() -> Vec<String> {
         "luaskills_ffi_update_skill",
         "luaskills_ffi_system_update_skill",
         "luaskills_ffi_set_sqlite_provider_callback",
-        "luaskills_ffi_set_lancedb_provider_callback",
         "luaskills_ffi_set_sqlite_provider_json_callback",
-        "luaskills_ffi_set_lancedb_provider_json_callback",
         "luaskills_ffi_set_host_tool_json_callback",
         "luaskills_ffi_set_skill_operation_progress_json_callback",
         "luaskills_ffi_set_model_embed_json_callback",
@@ -1936,16 +1936,11 @@ pub unsafe extern "C" fn luaskills_ffi_uninstall_skill_json(
     match with_engine_mut(request.engine_id, |engine| {
         if let Some(target_root) = request.target_root.as_ref() {
             engine
-                .uninstall_skill_in_root(
-                    &request.skill_roots,
-                    target_root,
-                    &request.skill_id,
-                    &request.options,
-                )
+                .uninstall_skill_in_root(&request.skill_roots, target_root, &request.skill_id)
                 .map_err(|error| error.to_string())
         } else {
             engine
-                .uninstall_skill(&request.skill_roots, &request.skill_id, &request.options)
+                .uninstall_skill(&request.skill_roots, &request.skill_id)
                 .map_err(|error| error.to_string())
         }
     }) {
@@ -1988,17 +1983,11 @@ pub unsafe extern "C" fn luaskills_ffi_system_uninstall_skill_json(
                     target_root,
                     authority,
                     &request.skill_id,
-                    &request.options,
                 )
                 .map_err(|error| error.to_string())
         } else {
             engine
-                .system_uninstall_skill(
-                    &request.skill_roots,
-                    authority,
-                    &request.skill_id,
-                    &request.options,
-                )
+                .system_uninstall_skill(&request.skill_roots, authority, &request.skill_id)
                 .map_err(|error| error.to_string())
         }
     }) {

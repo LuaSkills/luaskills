@@ -19,6 +19,11 @@ on:
         default: candidate
         type: choice
         options: [candidate, draft]
+      existing_tag:
+        description: "Require an already pushed version tag matching source_sha before creating the draft"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -74,6 +79,7 @@ jobs:
         shell: bash
         run: |
           python -X utf8 -m unittest discover -s scripts/release -p test_candidate.py -v
+          python -X utf8 -m unittest discover -s scripts/release -p test_release_tag.py -v
           python -X utf8 -m unittest discover -s scripts/release -p test_sdk_prerequisites.py -v
           python -X utf8 -m unittest discover -s scripts/release -p test_sdk_recovery.py -v
           python -X utf8 -m unittest discover -s scripts/release -p test_certum_totp.py -v
@@ -187,7 +193,25 @@ jobs:
           New-Item -ItemType Directory -Path target -Force | Out-Null
           cargo --version --verbose > target/candidate-cargo-version.txt
           if ($LASTEXITCODE -ne 0) { throw "Actual release Cargo identity capture failed" }
-          cargo build --locked --release --lib --bins -j 4 --message-format=json > target/candidate-build.jsonl
+          # The debugger is a SQLite host; build it separately before the default core identity is captured.
+          # 调试工具是 SQLite 宿主；在捕获默认核心身份前单独构建。
+          # Static CRT avoids an undeclared VC++ redistributable prerequisite for the Windows debug package.
+          # 静态 CRT 避免 Windows 调试包产生未声明的 VC++ 运行库安装前提。
+          $PreviousRustFlags = $env:RUSTFLAGS
+          try {
+            if ($IsWindows) { $env:RUSTFLAGS = "$PreviousRustFlags -C target-feature=+crt-static".Trim() }
+            cargo build --locked --release --features debug-sqlite --bin luaskills-debug -j 4
+            if ($LASTEXITCODE -ne 0) { throw "SQLite debug host build failed" }
+          } finally {
+            $env:RUSTFLAGS = $PreviousRustFlags
+          }
+          if ($IsWindows) {
+            # Check actual imports before signing; default core compilation below keeps its original flags.
+            # 签名前检查真实导入；下方默认核心构建保持原始参数。
+            $DebugImports = & dumpbin /DEPENDENTS target/release/luaskills-debug.exe
+            if ($LASTEXITCODE -ne 0 -or ($DebugImports -match '(?i)(vcruntime|msvcp|msvcr)[0-9_]*\.dll')) { throw "Debug package still needs a VC++ runtime DLL" }
+          }
+          cargo build --locked --release --lib -j 4 --message-format=json > target/candidate-build.jsonl
           if ($LASTEXITCODE -ne 0) { throw "Locked release build failed" }
           cargo metadata --locked --format-version=1 > target/candidate-metadata.json
           if ($LASTEXITCODE -ne 0) { throw "Locked dependency metadata failed" }
@@ -230,6 +254,19 @@ jobs:
           bash scripts/build/package_demo.sh ffi "$LUASKILLS_CANDIDATE_PLATFORM" "v$CORE_VERSION" "$RELEASE_PACKAGE_DIR" "$SOURCE_SHA"
           bash scripts/build/package_demo.sh rust "$LUASKILLS_CANDIDATE_PLATFORM" "v$CORE_VERSION" "$RELEASE_PACKAGE_DIR" "$SOURCE_SHA"
           bash scripts/build/package_debug_tool.sh "$LUASKILLS_CANDIDATE_PLATFORM" "v$CORE_VERSION" "$RELEASE_PACKAGE_DIR"
+      # Execute the extracted launchers before checksums or uploads; SQLite must work without bootstrap.
+      # 在摘要计算或上传前执行解包启动器；SQLite 必须无需初始化即可使用。
+      - name: Verify packaged SQLite host offline on the native platform
+        shell: pwsh
+        run: |
+          python -X utf8 -m unittest discover -s scripts/release -p test_debug_package.py -v
+          if ($LASTEXITCODE -ne 0) { throw "Debug package launcher regression failed" }
+          # Use the archive just produced by this native job, including its signed executable bytes.
+          # 使用此原生作业刚生成的归档，包括其中已签名的可执行程序字节。
+          $DebugVerifyArgs = @('--archive', "$env:RELEASE_PACKAGE_DIR/luaskills-debug-tool-$env:LUASKILLS_CANDIDATE_PLATFORM.tar.gz", '--platform', $env:LUASKILLS_CANDIDATE_PLATFORM)
+          if ($IsWindows) { $DebugVerifyArgs += @('--bash', 'C:/Program Files/Git/bin/bash.exe') }
+          python -X utf8 scripts/release/verify_debug_package.py @DebugVerifyArgs
+          if ($LASTEXITCODE -ne 0) { throw "Packaged SQLite host verification failed" }
       - name: Verify complete platform archives and write immutable checksums
         shell: pwsh
         run: |
@@ -302,5 +339,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_SHA: ${{ needs.freeze.outputs.source_sha }}
           CORE_VERSION: ${{ needs.freeze.outputs.version }}
+          EXISTING_TAG: ${{ inputs.existing_tag }}
         run: |
-          python scripts/release/create_draft.py --candidate target/verified-candidate --source-commit "$SOURCE_SHA" --version "$CORE_VERSION" --source-evidence target/draft-source-evidence/draft-source-evidence.json
+          # A pre-created tag is accepted only after exact remote commit verification; releases remain immutable.
+          # 预先创建的标签仅在精确远端提交校验后被接受；发布仍保持不可变。
+          TAG_ARGS=()
+          if [ "$EXISTING_TAG" = "true" ]; then TAG_ARGS+=(--existing-tag); fi
+          python scripts/release/create_draft.py --candidate target/verified-candidate --source-commit "$SOURCE_SHA" --version "$CORE_VERSION" --source-evidence target/draft-source-evidence/draft-source-evidence.json "${TAG_ARGS[@]}"

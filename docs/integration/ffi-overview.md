@@ -28,6 +28,16 @@ Current stable host-facing features include:
 - Optional `host_result` bridging so one skill may return `content, overflow_mode, template_hint, host_result`.
 - The first canonical structured host result kind: `change_set`, now carrying explicit file lifecycle records plus hunk-level `before + delete[] + insert[] + after` blocks for IDE-grade edit results.
 
+## Desktop and Console Host Modes
+
+Set `LuaRuntimeHostOptions.host_mode` before engine creation: Rust accepts `LuaRuntimeHostMode::Desktop` or `Console`, and JSON accepts `"desktop"` or `"console"` inside `host_options`. Missing JSON values and standard C v1–v3 creation retain console mode. Invalid values are errors. Modes belong to individual engines and cannot be changed while an engine is running.
+
+Standard C v4 adds `FfiLuaEngineOptionsV4 { base: FfiLuaEngineOptionsV3, host_mode: int32_t }` and `luaskills_ffi_engine_new_v4`. Use `LUASKILLS_HOST_MODE_CONSOLE` (0) or `LUASKILLS_HOST_MODE_DESKTOP` (1). Initialize the entire v4 structure, populate the same required v3 base fields, then select the mode. Existing structure layouts, function signatures, error buffers, and handle ownership remain unchanged.
+
+On Windows, desktop mode applies `CREATE_NO_WINDOW` to LuaSkills-owned process launches, including Job breakaway retries, `vulcan.process.exec`, both pipe APIs, process sessions, managed Python/Node invokes and sessions, and uv/pnpm environment installation. Native `os.execute` retains exit triples; native `io.popen` supports streaming read/write, text/binary modes, standard file methods, and deterministic process-tree cleanup. `enable_managed_io_compat` continues to select the existing managed read-only pipe behavior independently of host mode. Other platforms accept the mode but retain their existing process behavior.
+
+The window policy covers processes launched by LuaSkills. Programs that explicitly create a window or call OS process APIs through LuaJIT FFI remain outside this policy.
+
 ## How To Choose
 
 - Rust host: call the crate directly.
@@ -49,7 +59,7 @@ For a new FFI host, stabilize the smallest runtime loop first:
 6. `run_lua`
 7. `engine_free`
 
-After that, add lifecycle operations, query helpers, installation/update flows, provider callbacks, host-tool callbacks, or `space_controller`.
+After that, add lifecycle operations, query helpers, installation/update flows, provider callbacks, host-tool callbacks,.
 
 ## System Plugin Managed-Session Quick Path
 

@@ -120,11 +120,8 @@ function Write-DebugRuntimeSetupScripts {
         $SetupScript = @'
 param(
     # Dependency target to fetch for this debug package.
-    [ValidateSet("all", "lua", "vldb", "vldb-controller", "vldb-direct")]
-    [string]$Target = "lua",
-    # Optional database dependency preset used only by all/vldb targets.
-    [ValidateSet("none", "vldb-controller", "vldb-direct", "host-callback")]
-    [string]$Database = "none"
+    [ValidateSet("all", "lua")]
+    [string]$Target = "lua"
 )
 
 $ErrorActionPreference = "Stop"
@@ -136,7 +133,7 @@ $PackageRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $RuntimeRoot = Join-Path $PackageRoot "runtime"
 
 New-Item -ItemType Directory -Force -Path $RuntimeRoot | Out-Null
-powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PackageRoot "scripts\deps\fetch_deps.ps1") -Target $Target -Database $Database -RuntimeRoot $RuntimeRoot
+powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PackageRoot "scripts\deps\fetch_deps.ps1") -Target $Target -RuntimeRoot $RuntimeRoot
 $FetchExitCode = $LASTEXITCODE
 if ($FetchExitCode -ne 0) {
     exit $FetchExitCode
@@ -144,7 +141,9 @@ if ($FetchExitCode -ne 0) {
 Write-Host "Debug runtime dependencies are ready under $RuntimeRoot"
 '@
         $SetupScript = $SetupScript.Replace("__LUASKILLS_RELEASE_TAG__", $ReleaseTag)
-        [System.IO.File]::WriteAllText((Join-Path $PackageRoot "setup_runtime.ps1"), $SetupScript, [System.Text.UTF8Encoding]::new($false))
+        # Windows PowerShell 5 needs a BOM to decode bilingual scripts reliably.
+        # Windows PowerShell 5 需要 BOM 才能可靠解码双语脚本。
+        [System.IO.File]::WriteAllText((Join-Path $PackageRoot "setup_runtime.ps1"), $SetupScript, [System.Text.UTF8Encoding]::new($true))
 
         $UpgradeScript = @'
 @echo off
@@ -154,11 +153,8 @@ REM Target selects which dependency group to download.
 set "TARGET=%~1"
 if "%TARGET%"=="" set "TARGET=lua"
 
-REM Database selects the optional database dependency preset.
-set "DATABASE=%~2"
-if "%DATABASE%"=="" set "DATABASE=none"
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup_runtime.ps1" -Target "%TARGET%" -Database "%DATABASE%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup_runtime.ps1" -Target "%TARGET%"
 if errorlevel 1 (
   echo Failed to prepare debug runtime dependencies.
   pause
@@ -236,7 +232,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PACKAGE_ROOT_WIN="$(to_windows_path "$PACKAGE_ROOT")"
 TARGET="${1:-all}"
-DATABASE="${2:-vldb-controller}"
 RUNTIME_ROOT="${RUNTIME_ROOT:-$PACKAGE_ROOT/runtime}"
 RUNTIME_ROOT_WIN="$(to_windows_path "$RUNTIME_ROOT")"
 POWERSHELL_HOST="$(resolve_powershell_host)"
@@ -248,8 +243,6 @@ FORWARDED_ARGS=(
   "${PACKAGE_ROOT_WIN}\scripts\deps\fetch_deps.ps1"
   -Target
   "$TARGET"
-  -Database
-  "$DATABASE"
   -RuntimeRoot
   "$RUNTIME_ROOT_WIN"
 )
@@ -271,11 +264,10 @@ set -euo pipefail
 
 PACKAGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET="${1:-lua}"
-DATABASE="${2:-none}"
 RUNTIME_ROOT="${RUNTIME_ROOT:-$PACKAGE_ROOT/runtime}"
 
 mkdir -p "$RUNTIME_ROOT"
-RUNTIME_ROOT="$RUNTIME_ROOT" bash "$PACKAGE_ROOT/scripts/deps/fetch_deps.sh" "$TARGET" "$DATABASE"
+RUNTIME_ROOT="$RUNTIME_ROOT" bash "$PACKAGE_ROOT/scripts/deps/fetch_deps.sh" "$TARGET"
 echo "Debug runtime dependencies are ready under $RUNTIME_ROOT"
 '@
         $SetupShellWrapper = $SetupShellWrapper.Replace("__LUASKILLS_RELEASE_TAG__", $ReleaseTag)
@@ -287,9 +279,8 @@ set -euo pipefail
 
 PACKAGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET="${1:-lua}"
-DATABASE="${2:-none}"
 
-bash "$PACKAGE_ROOT/setup_runtime.sh" "$TARGET" "$DATABASE"
+bash "$PACKAGE_ROOT/setup_runtime.sh" "$TARGET"
 '@
         [System.IO.File]::WriteAllText((Join-Path $PackageRoot "upgrade_deps.sh"), $UpgradeShellWrapper, [System.Text.UTF8Encoding]::new($false))
         return
@@ -307,16 +298,13 @@ PACKAGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Target 选择当前调试包需要拉取的依赖分组。
 TARGET="${1:-lua}"
 
-# Database selects the optional database dependency preset used by all/vldb targets.
-# Database 选择 all/vldb 目标使用的可选数据库依赖预设。
-DATABASE="${2:-none}"
 
 # RuntimeRoot receives Lua runtime packages and optional native helpers.
 # RuntimeRoot 接收 Lua runtime packages 与可选原生辅助工具。
 RUNTIME_ROOT="${RUNTIME_ROOT:-$PACKAGE_ROOT/runtime}"
 
 mkdir -p "$RUNTIME_ROOT"
-RUNTIME_ROOT="$RUNTIME_ROOT" bash "$PACKAGE_ROOT/scripts/deps/fetch_deps.sh" "$TARGET" "$DATABASE"
+RUNTIME_ROOT="$RUNTIME_ROOT" bash "$PACKAGE_ROOT/scripts/deps/fetch_deps.sh" "$TARGET"
 echo "Debug runtime dependencies are ready under $RUNTIME_ROOT"
 '@
     $SetupScript = $SetupScript.Replace("__LUASKILLS_RELEASE_TAG__", $ReleaseTag)
@@ -334,11 +322,8 @@ PACKAGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Target 选择要下载的依赖分组。
 TARGET="${1:-lua}"
 
-# Database selects the optional database dependency preset.
-# Database 选择可选数据库依赖预设。
-DATABASE="${2:-none}"
 
-bash "$PACKAGE_ROOT/setup_runtime.sh" "$TARGET" "$DATABASE"
+bash "$PACKAGE_ROOT/setup_runtime.sh" "$TARGET"
 '@
     [System.IO.File]::WriteAllText((Join-Path $PackageRoot "upgrade_deps.sh"), $UpgradeScript, [System.Text.UTF8Encoding]::new($false))
 }
@@ -487,8 +472,8 @@ if ($SkillId) {
 if ($Tool) {
     $ForwardedArgs += @("--tool", $Tool)
 }
-if ($ArgsJson) {
-    $ForwardedArgs += @("--args-json", $ArgsJson)
+if ($ArgsJson -and $ArgsFile) {
+    throw "Use either -ArgsJson or -ArgsFile, not both."
 }
 if ($ArgsFile) {
     $ForwardedArgs += @("--args-file", (Resolve-Path -LiteralPath $ArgsFile).Path)
@@ -500,10 +485,34 @@ if ($EnableHostResult) {
     $ForwardedArgs += "--enable-host-result"
 }
 
-& $BinaryPath @ForwardedArgs
-exit $LASTEXITCODE
+# Windows PowerShell 5 re-quotes native arguments and can corrupt JSON; use a private UTF-8 file.
+# Windows PowerShell 5 会重新引用原生参数并破坏 JSON；使用私有 UTF-8 文件传输。
+$InlineArgsFile = $null
+# Restore the caller's encoding after reading the debugger's UTF-8 output.
+# 读取调试器 UTF-8 输出后恢复调用方编码。
+$PreviousOutputEncoding = [Console]::OutputEncoding
+try {
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    if ($ArgsJson) {
+        $InlineArgsFile = [System.IO.Path]::GetTempFileName()
+        [System.IO.File]::WriteAllText($InlineArgsFile, $ArgsJson, [System.Text.UTF8Encoding]::new($false))
+        $ForwardedArgs += @("--args-file", $InlineArgsFile)
+    }
+    & $BinaryPath @ForwardedArgs
+    # Capture the executable result before cleanup can change native exit state.
+    # 在清理可能改变原生退出状态前捕获可执行程序结果。
+    $DebugExitCode = $LASTEXITCODE
+} finally {
+    [Console]::OutputEncoding = $PreviousOutputEncoding
+    if ($null -ne $InlineArgsFile) {
+        Remove-Item -LiteralPath $InlineArgsFile -Force
+    }
+}
+exit $DebugExitCode
 '@
-        [System.IO.File]::WriteAllText((Join-Path $PackageRoot "debug.ps1"), $LauncherScript, [System.Text.UTF8Encoding]::new($false))
+        # Windows PowerShell 5 needs a BOM to decode bilingual scripts reliably.
+        # Windows PowerShell 5 需要 BOM 才能可靠解码双语脚本。
+        [System.IO.File]::WriteAllText((Join-Path $PackageRoot "debug.ps1"), $LauncherScript, [System.Text.UTF8Encoding]::new($true))
 
         $BatchLauncher = @'
 @echo off
@@ -580,6 +589,17 @@ PACKAGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEBUG_PS1_WIN="$(to_windows_path "$PACKAGE_ROOT/debug.ps1")"
 POWERSHELL_HOST="$(resolve_powershell_host)"
 FORWARDED_ARGS=()
+# Only a file created here is removed; PowerShell's native argument marshalling must not rewrite JSON.
+# 仅删除此处创建的文件；不能让 PowerShell 原生参数封送改写 JSON。
+INLINE_ARGS_FILE=""
+# Track the two documented input transports and reject conflicting options.
+# 记录两种文档化输入传输方式并拒绝冲突选项。
+HAS_ARGS_JSON="false"
+HAS_ARGS_FILE="false"
+# Preserve the inline payload until parsing has validated all options.
+# 保留内联内容，直到解析验证全部选项。
+ARGS_JSON=""
+trap '[ -z "$INLINE_ARGS_FILE" ] || rm -f -- "$INLINE_ARGS_FILE"' EXIT
 
 if [ "${1:-}" = "sync" ] || [ "${1:-}" = "inspect" ] || [ "${1:-}" = "list-tools" ] || [ "${1:-}" = "call" ]; then
   FORWARDED_ARGS+=("-Command" "$1")
@@ -597,17 +617,54 @@ while [ "$#" -gt 0 ]; do
       shift 2
       ;;
     -ArgsFile|--args-file)
+      HAS_ARGS_FILE="true"
       FORWARDED_ARGS+=("-ArgsFile" "$(to_windows_path "${2:?--args-file requires a value}")")
       shift 2
       ;;
-    *)
-      FORWARDED_ARGS+=("$1")
+    -ArgsJson|--args-json)
+      HAS_ARGS_JSON="true"
+      ARGS_JSON="${2:?--args-json requires a value}"
+      shift 2
+      ;;
+    -Tool|--tool)
+      FORWARDED_ARGS+=("-Tool" "${2:?--tool requires a value}")
+      shift 2
+      ;;
+    -Output|--output)
+      FORWARDED_ARGS+=("-Output" "${2:?--output requires a value}")
+      shift 2
+      ;;
+    -EnableHostResult|--enable-host-result)
+      FORWARDED_ARGS+=("-EnableHostResult")
       shift
+      ;;
+    -Command)
+      FORWARDED_ARGS+=("-Command" "${2:?-Command requires a value}")
+      shift 2
+      ;;
+    -h|--help)
+      "$PACKAGE_ROOT/bin/luaskills-debug.exe" --help
+      exit 0
+      ;;
+    *)
+      echo "Unknown debug launcher argument: $1" >&2
+      exit 2
       ;;
   esac
 done
 
-exec "$POWERSHELL_HOST" -NoProfile -ExecutionPolicy Bypass -File "$DEBUG_PS1_WIN" "${FORWARDED_ARGS[@]}"
+if [ "$HAS_ARGS_JSON" = "true" ] && [ "$HAS_ARGS_FILE" = "true" ]; then
+  echo "Use either --args-json or --args-file, not both." >&2
+  exit 2
+fi
+if [ "$HAS_ARGS_JSON" = "true" ]; then
+  INLINE_ARGS_FILE="$(mktemp)"
+  printf '%s' "$ARGS_JSON" > "$INLINE_ARGS_FILE"
+  FORWARDED_ARGS+=("-ArgsFile" "$(to_windows_path "$INLINE_ARGS_FILE")")
+fi
+# Keep the wrapper alive so its EXIT trap removes the private input file even after a failed call.
+# 保持包装器存活，使 EXIT trap 即使在调用失败后也删除私有输入文件。
+"$POWERSHELL_HOST" -NoProfile -ExecutionPolicy Bypass -File "$DEBUG_PS1_WIN" "${FORWARDED_ARGS[@]}"
 '@
         [System.IO.File]::WriteAllText((Join-Path $PackageRoot "debug.sh"), $ShellLauncher, [System.Text.UTF8Encoding]::new($false))
         return
@@ -677,12 +734,15 @@ show_debug_skill_guidance() {
 }
 
 COMMAND="inspect"
-if [ "${1:-}" = "inspect" ] || [ "${1:-}" = "list-tools" ] || [ "${1:-}" = "call" ]; then
+if [ "${1:-}" = "sync" ] || [ "${1:-}" = "inspect" ] || [ "${1:-}" = "list-tools" ] || [ "${1:-}" = "call" ]; then
   COMMAND="$1"
   shift
 fi
 
 SKILL_PATH=""
+# Stored skill identity allows calls without another source-package synchronization.
+# 已存储技能标识使调用无需再次同步源码包。
+SKILL_ID=""
 TOOL=""
 ARGS_JSON=""
 ARGS_FILE=""
@@ -693,6 +753,10 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --skill-path)
       SKILL_PATH="${2:?--skill-path requires a value}"
+      shift 2
+      ;;
+    --skill-id)
+      SKILL_ID="${2:?--skill-id requires a value}"
       shift 2
       ;;
     --tool)
@@ -727,20 +791,26 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -x "$BINARY_PATH" ] || { echo "luaskills-debug executable was not found or is not executable: $BINARY_PATH" >&2; exit 1; }
-if [ ! -d "$RUNTIME_ROOT/lua_packages" ]; then
+if [ ! -f "$RUNTIME_ROOT/resources/luaskills-packages-manifest.json" ]; then
   echo "WARNING: Lua packages do not appear to be installed. Run './setup_runtime.sh' first if the skill needs packaged Lua dependencies." >&2
 fi
 
-if [ -z "$SKILL_PATH" ]; then
+if [ -z "$SKILL_PATH" ] && [ -z "$SKILL_ID" ]; then
   if ! SKILL_PATH="$(resolve_default_skill_path 2>&1)"; then
     show_debug_skill_guidance "$SKILL_PATH"
     exit 2
   fi
-else
+elif [ -n "$SKILL_PATH" ]; then
   SKILL_PATH="$(cd "$SKILL_PATH" && pwd)"
 fi
 
-FORWARDED_ARGS=("$COMMAND" "--runtime-root" "$RUNTIME_ROOT" "--skill-path" "$SKILL_PATH")
+FORWARDED_ARGS=("$COMMAND" "--runtime-root" "$RUNTIME_ROOT")
+if [ -n "$SKILL_PATH" ]; then
+  FORWARDED_ARGS+=("--skill-path" "$SKILL_PATH")
+fi
+if [ -n "$SKILL_ID" ]; then
+  FORWARDED_ARGS+=("--skill-id" "$SKILL_ID")
+fi
 if [ -n "$TOOL" ]; then
   FORWARDED_ARGS+=("--tool" "$TOOL")
 fi
@@ -816,7 +886,7 @@ function Write-DebugPackageReadme {
         '',
         'The default setup command fetches the lua target and stages runtime/lua_packages/, runtime/libs/, runtime/resources/, and runtime/licenses/ metadata. It does not download the extra LuaSkills FFI SDK.',
         '',
-        'Use all only when you also need database helper binaries. The Lua setup path stays metadata-complete so packaged-runtime manifest validation remains consistent.',
+        'SQLite is built into this debugger host. Skills declaring sqlite.enable: true can use execute_script, execute_batch, and query_json without a controller or database DLL. Databases persist under runtime/databases/sqlite/<skill-id>/<skill-id>.sqlite3.',
         ''
     )
 
@@ -846,7 +916,9 @@ if (-not $Platform) {
     }
 }
 
-$PackageRoot = "target\debug-tool-package\luaskills-debug-tool"
+# .NET file writes use the process cwd, which Set-Location does not update; keep staging absolute.
+# .NET 文件写入使用进程工作目录，Set-Location 不会更新它；保持暂存路径为绝对路径。
+$PackageRoot = Join-Path $ProjectRoot "target\debug-tool-package\luaskills-debug-tool"
 if (Test-Path -LiteralPath $PackageRoot) {
     Remove-Item -LiteralPath $PackageRoot -Recurse -Force
 }
@@ -873,7 +945,7 @@ You can also leave this folder empty and pass -SkillPath or --skill-path to the 
 $DebugBinaryName = Get-DebugBinaryName -PlatformKey $Platform
 $DebugBinaryPath = Join-Path "target\release" $DebugBinaryName
 if (-not (Test-Path -LiteralPath $DebugBinaryPath)) {
-    throw "Missing release debug binary: $DebugBinaryPath. Run 'cargo build --release --bin luaskills-debug' first."
+    throw "Missing release debug binary: $DebugBinaryPath. Run 'cargo build --release --features debug-sqlite --bin luaskills-debug' first."
 }
 
 Copy-Item -Force -LiteralPath $DebugBinaryPath -Destination (Join-Path $PackageRoot "bin\$DebugBinaryName")
@@ -897,7 +969,7 @@ Write-DebugPackageReadme -PackageRoot $PackageRoot -PlatformKey $Platform
     skills_dir = "skills"
     release_tag = $ReleaseTag
     default_fetch_target = "lua"
-    fetch_targets = @("lua", "all", "vldb", "vldb-controller", "vldb-direct")
+    fetch_targets = @("lua", "all")
 } | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $PackageRoot "debug-tool-manifest.json") -Encoding UTF8
 
 $ArchiveName = "luaskills-debug-tool-$Platform.tar.gz"

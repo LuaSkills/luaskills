@@ -10,9 +10,6 @@ REPOSITORY_ROOT="$(cd "$SCRIPT_ROOT/../.." && pwd)"
 # Target selects the asset group synchronized into the runtime root.
 # Target 选择要同步到运行根目录的资产分组。
 TARGET="${1:-all}"
-# Database selects the optional VLDB integration preset.
-# Database 选择可选的 VLDB 集成预设。
-DATABASE="${2:-${DATABASE:-vldb-controller}}"
 # RuntimeRoot receives all synchronized assets.
 # RuntimeRoot 接收全部同步资产。
 RUNTIME_ROOT="${RUNTIME_ROOT:-output}"
@@ -28,20 +25,13 @@ esac
 
 case "$TARGET" in
   all|lua)
-    RUNTIME_ROOT="$RUNTIME_ROOT" DATABASE=none "$SCRIPT_ROOT/fetch_deps.sh" lua none
+    RUNTIME_ROOT="$RUNTIME_ROOT" "$SCRIPT_ROOT/fetch_deps.sh" lua
     ;;
 esac
 
 case "$TARGET" in
-  all|vldb)
-    RUNTIME_ROOT="$RUNTIME_ROOT" DATABASE="$DATABASE" "$SCRIPT_ROOT/fetch_deps.sh" vldb "$DATABASE"
-    ;;
-  luaskills|lua)
-    ;;
-  *)
-    echo "Usage: $0 [all|luaskills|lua|vldb] [none|vldb-controller|vldb-direct|host-callback]" >&2
-    exit 2
-    ;;
+  all|luaskills|lua) ;;
+  *) echo "Usage: $0 [all|luaskills|lua]" >&2; exit 2 ;;
 esac
 
 echo "Runtime asset target '$TARGET' synchronized into $RUNTIME_ROOT"

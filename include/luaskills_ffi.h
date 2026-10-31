@@ -5,12 +5,14 @@
 #include <stdint.h>
 
 /*
-Stable standard C ABI exported by luaskills.
-luaskills 导出的稳定标准 C ABI 接口面。
+Standard C ABI exported by luaskills 0.7.3; compile hosts against this exact header.
+luaskills 0.7.3 导出的标准 C ABI；宿主必须使用本精确头文件重新编译。
+Retired database fields, symbols and uninstall options were removed; older layouts are incompatible.
+退役数据库字段、符号及卸载选项已删除；旧版布局不兼容。
 */
 
 /*
- Beta integration contract for v0.1.x:
+ Integration contract for v0.7.3:
 - This header is the low-level standard ABI for controlled host integrations.
 - Public high-level JSON FFI declarations are provided by luaskills_json_ffi.h.
 - Returned memory must be released only with the matching luaskills free function.
@@ -19,7 +21,7 @@ luaskills 导出的稳定标准 C ABI 接口面。
 - Callbacks must not unwind across the C ABI boundary.
 - Same-thread reentry into the same engine is not supported.
 - Skills are treated as trusted code by default; this ABI does not promise sandbox isolation.
-v0.1.x beta 集成契约：
+v0.7.3 集成契约：
 - 当前头文件是面向受控宿主集成的低层标准 ABI。
 - 公共高层 JSON FFI 声明位于 luaskills_json_ffi.h。
 - 所有返回内存都只能使用匹配的 luaskills 释放函数处理。
@@ -234,49 +236,12 @@ typedef struct FfiLuaRuntimeHostOptions {
     私有技能 manifest 允许前缀数量。
     */
     size_t private_skill_source_allowlist_len;
-    const char *sqlite_library_path;
     /*
-    SQLite provider mode where 0=dynamic_library, 1=host_callback, and 2=space_controller.
-    SQLite provider 模式，其中 0=dynamic_library、1=host_callback、2=space_controller。
-    */
-    int32_t sqlite_provider_mode;
-    /*
-    SQLite callback mode used only when sqlite_provider_mode=host_callback.
-    sqlite_provider_mode=host_callback 时使用的 SQLite 回调模式。
+    SQLite host callback transport mode.
+    SQLite 宿主回调传输模式。
     */
     int32_t sqlite_callback_mode;
-    const char *lancedb_library_path;
-    /*
-    LanceDB provider mode where 0=dynamic_library, 1=host_callback, and 2=space_controller.
-    LanceDB provider 模式，其中 0=dynamic_library、1=host_callback、2=space_controller。
-    */
-    int32_t lancedb_provider_mode;
-    /*
-    LanceDB callback mode used only when lancedb_provider_mode=host_callback.
-    lancedb_provider_mode=host_callback 时使用的 LanceDB 回调模式。
-    */
-    int32_t lancedb_callback_mode;
-    /*
-    Optional shared space-controller endpoint used when one provider mode is space_controller.
-    当某个 provider 模式为 space_controller 时使用的可选共享空间控制器端点。
-    */
-    const char *space_controller_endpoint;
-    /*
-    Whether the runtime may auto-spawn one space-controller process when the endpoint is unavailable.
-    当空间控制器端点不可用时，运行时是否允许自动唤起空间控制器进程。
-    */
-    uint8_t space_controller_auto_spawn;
-    /*
-    Optional copied local controller executable path managed by the host.
-    由宿主复制并管理的可选本地控制器可执行文件路径。
-    */
-    const char *space_controller_executable_path;
-    /*
-    Space-controller process mode where 0=service and 1=managed.
-    空间控制器进程模式，其中 0=service、1=managed。
-    */
-    int32_t space_controller_process_mode;
-    const FfiToolCacheConfig *cache_config;
+            const FfiToolCacheConfig *cache_config;
     /*
     Optional dedicated isolated runlua VM pool config.
     可选的隔离 runlua 虚拟机独立池配置。
@@ -313,8 +278,8 @@ typedef struct FfiLuaRuntimeHostOptions {
 
 typedef struct FfiLuaRuntimeHostOptionsV2 {
     /*
-    Stable v1 host options kept byte-for-byte compatible with the original standard ABI.
-    与原始标准 ABI 保持逐字节兼容的稳定 v1 宿主选项。
+    Base host options from this release; pre-0.7.3 database layouts are incompatible.
+    本版本的基础宿主选项；0.7.3 之前的数据库布局不兼容。
     */
     FfiLuaRuntimeHostOptions base;
     /*
@@ -359,8 +324,8 @@ typedef struct FfiLuaRuntimeManagedRuntimeConfig {
 
 typedef struct FfiLuaRuntimeHostOptionsV3 {
     /*
-    Stable v2 host options kept byte-for-byte compatible with the published v2 ABI.
-    与已发布 v2 ABI 保持逐字节兼容的稳定 v2 宿主选项。
+    V2 host options from this release, including its current base-field layout.
+    本版本的 V2 宿主选项，包含其当前基础字段布局。
     */
     FfiLuaRuntimeHostOptionsV2 base;
     /*
@@ -395,6 +360,28 @@ typedef struct FfiLuaEngineOptionsV3 {
     FfiLuaRuntimeHostOptionsV3 host;
 } FfiLuaEngineOptionsV3;
 
+/* Explicit host modes; zero preserves all pre-v4 creation defaults.
+   显式宿主模式；零保留全部 v4 之前的创建默认值。 */
+typedef enum LuaSkillsHostMode {
+    /* Preserve console inheritance without requesting a new console.
+       保留控制台继承，不请求新控制台。 */
+    LUASKILLS_HOST_MODE_CONSOLE = 0,
+    /* Suppress Windows console windows for runtime-owned child processes.
+       隐藏运行库自有子进程的 Windows 控制台窗口。 */
+    LUASKILLS_HOST_MODE_DESKTOP = 1
+} LuaSkillsHostMode;
+
+/* Additive v4 engine options; all earlier structures remain unchanged.
+   增量 v4 引擎选项；全部早期结构体保持不变。 */
+typedef struct FfiLuaEngineOptionsV4 {
+    /* Complete unchanged v3 input, with pointers borrowed for the creation call.
+       完整且不变的 v3 输入，指针在创建调用期间保持借用。 */
+    FfiLuaEngineOptionsV3 base;
+    /* LuaSkillsHostMode integer; unknown values fail instead of choosing a default.
+       LuaSkillsHostMode 整数；未知值失败，不选择默认值。 */
+    int32_t host_mode;
+} FfiLuaEngineOptionsV4;
+
 typedef struct FfiRuntimeSkillRoot {
     const char *name;
     const char *skills_dir;
@@ -418,11 +405,6 @@ enum {
     FFI_SOURCE_TYPE_PRIVATE_URL_MANIFEST = 3
 };
 
-enum {
-    FFI_PROVIDER_MODE_DYNAMIC_LIBRARY = 0,
-    FFI_PROVIDER_MODE_HOST_CALLBACK = 1,
-    FFI_PROVIDER_MODE_SPACE_CONTROLLER = 2
-};
 
 /*
 Stable callback-mode integers used when one provider mode is host_callback.
@@ -433,18 +415,9 @@ enum {
     FFI_CALLBACK_MODE_JSON = 1
 };
 
-/*
-Stable process-mode integers used when one provider mode is space_controller.
-当 provider 模式为 space_controller 时所使用的稳定进程模式整数。
-*/
-enum {
-    FFI_SPACE_CONTROLLER_PROCESS_MODE_SERVICE = 0,
-    FFI_SPACE_CONTROLLER_PROCESS_MODE_MANAGED = 1
-};
 
 enum {
     FFI_DATABASE_KIND_SQLITE = 0,
-    FFI_DATABASE_KIND_LANCEDB = 1
 };
 
 enum {
@@ -466,13 +439,6 @@ enum {
     FFI_SQLITE_PROVIDER_ACTION_SEARCH_FTS = 15
 };
 
-enum {
-    FFI_LANCEDB_PROVIDER_ACTION_CREATE_TABLE = 0,
-    FFI_LANCEDB_PROVIDER_ACTION_VECTOR_UPSERT = 1,
-    FFI_LANCEDB_PROVIDER_ACTION_VECTOR_SEARCH = 2,
-    FFI_LANCEDB_PROVIDER_ACTION_DELETE = 3,
-    FFI_LANCEDB_PROVIDER_ACTION_DROP_TABLE = 4
-};
 
 typedef struct FfiSkillInstallRequest {
     const char *skill_id;
@@ -482,10 +448,6 @@ typedef struct FfiSkillInstallRequest {
     int32_t source_type;
 } FfiSkillInstallRequest;
 
-typedef struct FfiSkillUninstallOptions {
-    uint8_t remove_sqlite;
-    uint8_t remove_lancedb;
-} FfiSkillUninstallOptions;
 
 typedef struct FfiRuntimeDatabaseBindingContext {
     const char *space_label;
@@ -505,11 +467,6 @@ typedef struct FfiSqliteProviderRequest {
     FfiBorrowedBuffer input_json;
 } FfiSqliteProviderRequest;
 
-typedef struct FfiLanceDbProviderRequest {
-    int32_t action;
-    FfiRuntimeDatabaseBindingContext binding;
-    FfiBorrowedBuffer input_json;
-} FfiLanceDbProviderRequest;
 
 typedef struct FfiStringArray {
     FfiOwnedBuffer *items;
@@ -612,10 +569,6 @@ typedef struct FfiSkillApplyResult {
 typedef struct FfiSkillUninstallResult {
     FfiOwnedBuffer skill_id;
     uint8_t skill_removed;
-    uint8_t sqlite_removed;
-    uint8_t lancedb_removed;
-    uint8_t sqlite_retained;
-    uint8_t lancedb_retained;
     FfiOwnedBuffer message;
 } FfiSkillUninstallResult;
 
@@ -629,13 +582,31 @@ typedef int32_t (*FfiSqliteProviderCallback)(
     FfiOwnedBuffer *response_json_out,
     FfiOwnedBuffer *error_out
 );
-typedef int32_t (*FfiLanceDbProviderCallback)(
-    const FfiLanceDbProviderRequest *request,
-    void *user_data,
-    FfiOwnedBuffer *meta_json_out,
-    FfiOwnedBuffer *data_out,
-    FfiOwnedBuffer *error_out
+
+/*
+JSON database callback; outputs use the same luaskills-owned allocation contract.
+JSON 数据库回调；输出使用相同的 luaskills 拥有型内存契约。
+*/
+typedef int32_t (*FfiJsonProviderCallback)(
+    FfiBorrowedBuffer request_json, void *user_data,
+    FfiOwnedBuffer *response_out, FfiOwnedBuffer *error_out
 );
+
+/*
+Immutable instance callbacks; the host retains context and code until engine calls finish.
+不可变实例回调；宿主保留上下文及代码直至引擎调用结束。
+*/
+typedef struct FfiDatabaseProviderCallbacksV1 {
+    /* Host context; LuaSkills never frees it. */
+    /* 宿主上下文；LuaSkills 不释放它。 */
+    void *user_data;
+    /* Optional structured SQLite callback. */
+    /* 可选结构化 SQLite 回调。 */
+    FfiSqliteProviderCallback sqlite;
+    /* Optional SQLite JSON callback. */
+    /* 可选 SQLite JSON 回调。 */
+    FfiJsonProviderCallback sqlite_json;
+} FfiDatabaseProviderCallbacksV1;
 
 /*
 Edge-triggered callback that only schedules host work for pending managed-session events.
@@ -692,15 +663,6 @@ Register or clear the SQLite host callback before engine creation.
 */
 int32_t luaskills_ffi_set_sqlite_provider_callback(
     FfiSqliteProviderCallback callback,
-    void *user_data,
-    FfiOwnedBuffer *error_out
-);
-/*
-Register or clear the LanceDB host callback before engine creation.
-在创建 engine 前注册或清理 LanceDB 宿主 callback。
-*/
-int32_t luaskills_ffi_set_lancedb_provider_callback(
-    FfiLanceDbProviderCallback callback,
     void *user_data,
     FfiOwnedBuffer *error_out
 );
@@ -784,6 +746,31 @@ Create one LuaSkills engine through the standard C ABI v3 surface.
 */
 int32_t luaskills_ffi_engine_new_v3(
     const FfiLuaEngineOptionsV3 *options,
+    uint64_t *engine_id_out,
+    FfiOwnedBuffer *error_out
+);
+
+/*
+Create an engine from borrowed v4 options; write its handle and return zero, or return nonzero with an owned error.
+从借用的 v4 选项创建引擎；写入句柄并返回零，或返回非零及自有错误。
+All nested pointers must remain valid during the call; free errors with luaskills_ffi_buffer_free.
+所有嵌套指针在调用期间必须有效；使用 luaskills_ffi_buffer_free 释放错误。
+*/
+int32_t luaskills_ffi_engine_new_v4(
+    const FfiLuaEngineOptionsV4 *options,
+    uint64_t *engine_id_out,
+    FfiOwnedBuffer *error_out
+);
+
+/*
+Create an engine with explicit callbacks, independent of global registrations; return zero or an owned error.
+使用独立于全局注册的显式回调创建引擎；返回零或拥有型错误。
+Pointers are borrowed during creation; callback context must outlive engine calls. Null callbacks disable transports.
+指针在创建期间借用；回调上下文必须存活至引擎调用结束。空回调表示传输不可用。
+*/
+int32_t luaskills_ffi_engine_new_with_database_providers_v1(
+    const FfiLuaEngineOptionsV4 *options,
+    const FfiDatabaseProviderCallbacksV1 *callbacks,
     uint64_t *engine_id_out,
     FfiOwnedBuffer *error_out
 );
@@ -1244,7 +1231,6 @@ int32_t luaskills_ffi_uninstall_skill(
     const FfiRuntimeSkillRoot *skill_roots,
     size_t skill_roots_len,
     const char *skill_id,
-    const FfiSkillUninstallOptions *options,
     FfiSkillUninstallResult **result_out,
     FfiOwnedBuffer *error_out
 );
@@ -1259,7 +1245,6 @@ int32_t luaskills_ffi_system_uninstall_skill(
     size_t skill_roots_len,
     int32_t authority,
     const char *skill_id,
-    const FfiSkillUninstallOptions *options,
     FfiSkillUninstallResult **result_out,
     FfiOwnedBuffer *error_out
 );

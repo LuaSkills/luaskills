@@ -58,9 +58,6 @@ pub(super) struct RunLuaRuntimeContext {
     /// Runtime skill roots used for dependency and context resolution.
     /// 用于依赖与上下文解析的运行时技能根列表。
     runtime_skill_roots: Vec<RuntimeSkillRoot>,
-    /// Optional LanceDB host bridge available to nested runlua calls.
-    /// 嵌套 runlua 调用可用的可选 LanceDB 宿主桥接。
-    lancedb_host: Option<Arc<LanceDbSkillHost>>,
     /// Optional SQLite host bridge available to nested runlua calls.
     /// 嵌套 runlua 调用可用的可选 SQLite 宿主桥接。
     sqlite_host: Option<Arc<SqliteSkillHost>>,
@@ -87,7 +84,6 @@ impl RunLuaRuntimeContext {
             host_options: engine.host_options.clone(),
             skill_config_service: engine.skill_config_service.clone(),
             runtime_skill_roots: engine.runtime_skill_roots.clone(),
-            lancedb_host: engine.lancedb_host.clone(),
             sqlite_host: engine.sqlite_host.clone(),
             managed_runtime_services: Arc::clone(&engine.managed_runtime_services),
             managed_runtime_workers: Arc::clone(&engine.managed_runtime_workers),
@@ -1070,7 +1066,12 @@ fn exec_error_result(error_text: String, request: &ExecRequest, timed_out: bool)
 
 /// Execute a process request and capture its structured result.
 /// 执行进程请求并捕获结构化结果。
-pub(super) fn execute_exec_request(request: ExecRequest) -> ExecResult {
+/// `request` owns command, IO and timeout settings; `host_mode` is the engine policy; returns output and terminal status.
+/// `request` 拥有命令、IO 及超时设置；`host_mode` 为引擎策略；返回输出及终态。
+pub(super) fn execute_exec_request(
+    request: ExecRequest,
+    host_mode: LuaRuntimeHostMode,
+) -> ExecResult {
     let stdin_bytes = match request.stdin.as_deref() {
         Some(input) => match encode_runtime_text(input, request.stdin_encoding) {
             Ok(bytes) => Some(bytes),
@@ -1116,7 +1117,12 @@ pub(super) fn execute_exec_request(request: ExecRequest) -> ExecResult {
     // Managed one-shot ownership tuple that covers the direct child, descendants, and bounded reaper capacity.
     // 覆盖直接子进程、后代进程与有界回收容量的受管单次执行所有权元组。
     let (mut child, process_tree, reaper_permit) =
-        match ManagedChildProcessTree::spawn_with_keepalive(&mut command, "process.exec", None) {
+        match ManagedChildProcessTree::spawn_with_keepalive(
+            &mut command,
+            "process.exec",
+            None,
+            host_mode,
+        ) {
             Ok(ownership) => ownership,
             Err(error) => {
                 let error_text = format!("failed to spawn process: {}", error);
@@ -1447,7 +1453,6 @@ impl LuaEngine {
                 host_options: runtime_context.host_options.clone(),
                 skill_config_service: runtime_context.skill_config_service.clone(),
                 runtime_skill_roots: runtime_context.runtime_skill_roots.clone(),
-                lancedb_host: runtime_context.lancedb_host.clone(),
                 sqlite_host: runtime_context.sqlite_host.clone(),
                 managed_runtime_services: runtime_context.managed_runtime_services.clone(),
                 managed_runtime_workers: runtime_context.managed_runtime_workers.clone(),

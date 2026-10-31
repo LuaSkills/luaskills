@@ -101,14 +101,53 @@ def require_absent(url, token):
     raise ValueError("Release or tag already exists; immutable candidates cannot overwrite it")
 
 
-def require_unused_release_tag(base, repository, tag, token):
-    """Reject an existing ref, published release or authenticated paginated draft release before any POST.
-    在任何 POST 前拒绝既有引用、已公开发布或认证分页列表中的草稿发布。
+def require_exact_release_tag(base, repository, tag, commit, token):
+    """Read an existing lightweight or annotated tag and require its final commit to equal commit.
+    读取已有轻量或附注标签，并要求其最终提交等于 commit。
+
+    base/repository/tag/token identify authenticated GitHub reads; return None or raise on mismatch.
+    base/repository/tag/token 标识经过认证的 GitHub 读取；返回 None，不匹配时报错。
+    """
+    # Ref identity is checked before following typed Git objects, never a returned arbitrary URL.
+    # 跟随带类型的 Git 对象之前先检查引用身份，绝不跟随返回的任意 URL。
+    reference = request(f"{base}/repos/{repository}/git/ref/tags/{urllib.parse.quote(tag, safe='')}", token)
+    if reference["ref"] != f"refs/tags/{tag}":
+        raise ValueError("Existing release tag ref identity differs")
+    # Annotated tags can point to other tags; detect cycles rather than accepting an unproven commit.
+    # 附注标签可以指向其他标签；检测循环，不能接受未经证明的提交。
+    git_object = reference["object"]
+    seen = set()
+    while git_object["type"] == "tag":
+        # Each API response must describe exactly the object addressed by the preceding ref.
+        # 每个 API 响应必须描述前一个引用所指向的精确对象。
+        identity = full_sha(git_object["sha"])
+        if identity in seen:
+            raise ValueError("Existing release tag contains a cycle")
+        seen.add(identity)
+        # Tag objects are immutable and bind their child object type and identity.
+        # 标签对象不可变，并绑定其子对象类型及身份。
+        annotated = request(f"{base}/repos/{repository}/git/tags/{identity}", token)
+        if annotated["sha"] != identity:
+            raise ValueError("Existing annotated tag object identity differs")
+        git_object = annotated["object"]
+    if git_object["type"] != "commit" or full_sha(git_object["sha"]) != full_sha(commit):
+        raise ValueError("Existing release tag does not match the accepted source commit")
+
+
+def require_unused_release_tag(base, repository, tag, token, existing_tag_commit=None):
+    """Reject existing releases/drafts; permit a pre-created tag only for explicit existing_tag_commit.
+    拒绝既有发布和草稿；仅为显式 existing_tag_commit 允许预先创建的标签。
+
+    base/repository/tag/token identify the destination; return None only after all read-only checks pass.
+    base/repository/tag/token 标识目标；仅全部只读检查通过后返回 None。
     """
     if not token:
         raise ValueError("Authenticated release-list evidence is required")
     require_absent(f"{base}/repos/{repository}/releases/tags/{urllib.parse.quote(tag, safe='')}", token)
-    require_absent(f"{base}/repos/{repository}/git/ref/tags/{urllib.parse.quote(tag, safe='')}", token)
+    if existing_tag_commit is None:
+        require_absent(f"{base}/repos/{repository}/git/ref/tags/{urllib.parse.quote(tag, safe='')}", token)
+    else:
+        require_exact_release_tag(base, repository, tag, existing_tag_commit, token)
     # Page size is the documented maximum; continue until the server returns a short final page.
     # 页大小是文档规定上限；持续读取直到服务器返回不足一页的最终结果。
     page = 1
@@ -283,6 +322,7 @@ def main():
     parser.add_argument("--source-evidence", required=True, type=Path)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--existing-tag", action="store_true", help="Require an already pushed tag pointing to the exact accepted source commit")
     # Arguments never infer a tag or source SHA from ambient branch names.
     # 参数绝不从环境分支名推断标签或源码 SHA。
     args = parser.parse_args()
@@ -312,7 +352,7 @@ def main():
         # Tag is frozen to the exact accepted Cargo version.
         # 标签冻结为精确已验收 Cargo 版本。
         tag = f"v{args.version}"
-        require_unused_release_tag(base, repository, tag, token)
+        require_unused_release_tag(base, repository, tag, token, args.source_commit if args.existing_tag else None)
         # Re-read actual default workflows immediately before mutation because the default branch may advance during builds.
         # 在写入前立即重读实际默认工作流，因为默认分支可能在构建期间前进。
         # CurrentEvidence records the actual default SHA/tree observed after platform acceptance, allowing SHA changes only with equal workflows.

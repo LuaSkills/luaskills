@@ -113,16 +113,7 @@ def main() -> None:
     host.github_base_url = None
     host.github_api_base_url = None
     host.github_token = None
-    host.sqlite_library_path = None
-    host.sqlite_provider_mode = 0
     host.sqlite_callback_mode = 0
-    host.lancedb_library_path = None
-    host.lancedb_provider_mode = 0
-    host.lancedb_callback_mode = 0
-    host.space_controller_endpoint = None
-    host.space_controller_auto_spawn = 0
-    host.space_controller_executable_path = None
-    host.space_controller_process_mode = 0
     host.cache_config = None
     host.runlua_pool_config = None
     host.reserved_entry_names = None

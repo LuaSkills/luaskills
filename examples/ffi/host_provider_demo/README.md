@@ -1,118 +1,17 @@
-# Host Callback Demo
+# Python SQLite 宿主示例
 
-这个目录演示如何把 `luaskills` 作为 FFI 库接入，同时由宿主自己接管 SQLite 数据库落点与执行。
+本示例使用 Python 标准库 `sqlite3` 管理数据库，通过 LuaSkills JSON SQLite 回调处理技能请求，不需要控制器或数据库动态库。
 
-当前 demo 重点验证三件事：
-
-1. 宿主通过 FFI 注册 SQLite JSON provider 回调
-2. `luaskills` 在 `host_callback` 模式下把数据库请求回调给宿主
-3. 宿主不复用 lib 默认数据库路径，而是基于稳定 `binding_tag` 自己决定数据库文件位置
-
-当前示例基于新的 callback ABI：
-
-- JSON 请求输入走 `FfiBorrowedBuffer`
-- JSON 响应输出走 `FfiOwnedBuffer`
-- callback 通过状态码返回成功或失败
-
-同时，示例中的 `_json` FFI 普通调用也已改为：
-
-- 请求输入走 `FfiBorrowedBuffer`
-- 返回值走 `FfiOwnedBuffer`
-
-## 当前示例结构
-
-- `run_python_host_provider_demo.py`
-  - Python 宿主示例
-  - 使用 `ctypes` 加载 `luaskills` 与 `vldb-sqlite`
-  - 注册 SQLite JSON provider 回调
-- `runtime_root/`
-  - 独立演示运行时目录
-  - 内置一个最小 skill
-- `backends/`
-  - 可选的本地后端动态库存放目录
-- `scripts/copy_local_backends.ps1`
-  - 从本机工作区复制 `vldb-sqlite` / `vldb-lancedb` 动态库到 `backends/`
-
-## 本地工作区默认后端仓库位置
-
-当前脚本默认会优先尝试这些本地工作区路径：
-
-- `D:\projects\VulcanLocalDataGateway\vldb-sqlite`
-- `D:\projects\VulcanLocalDataGateway\vldb-lancedb`
-
-如果您的本地仓库位置不同，可以直接：
-
-- 设置 `VLDB_SQLITE_LIB`
-- 设置 `VLDB_LANCEDB_LIB`
-
-或者自行修改脚本。
-
-## 快速准备
-
-### 1. 构建 `luaskills`
-
-在仓库根目录执行：
+先构建本仓库动态库，再设置 `LUASKILLS_LIB` 为该库的绝对路径并运行 `run_python_host_provider_demo.py`。Windows 示例：
 
 ```powershell
-cargo build
+cargo build --lib
+$env:LUASKILLS_LIB = (Resolve-Path target/debug/luaskills.dll).Path
+python examples/ffi/host_provider_demo/run_python_host_provider_demo.py
 ```
 
-### 2. 可选复制本地后端动态库
+示例技能写入测试备注，再读取并输出结果。数据库保存在专用演示根的 `host_managed/sqlite/ROOT-host-provider-sqlite-demo.db`，由 Python 宿主创建和关闭连接。
 
-如果您本机已经构建过 `vldb-sqlite` 或 `vldb-lancedb`，可以执行：
+示例仅实现 `execute_script` 与 `query_json`，后者返回 `{ "rows": [...] }`；其他动作明确失败。正式宿主应按自己的数据库协议实现所需动作、事务与容量限制。回调返回缓冲由 LuaSkills 分配器创建，并由对应释放接口回收。
 
-```powershell
-.\scripts\copy_local_backends.ps1
-```
-
-### 3. 运行 Python 宿主演示
-
-```powershell
-$env:LUASKILLS_LIB = "D:\projects\luaskills\target\debug\luaskills.dll"
-python .\run_python_host_provider_demo.py
-```
-
-如果 `vldb-sqlite` 不在默认位置，还可以显式传入：
-
-```powershell
-$env:VLDB_SQLITE_LIB = "D:\projects\VulcanLocalDataGateway\vldb-sqlite\target\debug\vldb_sqlite.dll"
-python .\run_python_host_provider_demo.py
-```
-
-## 运行结果
-
-成功时脚本会：
-
-1. 创建 FFI 引擎
-2. 以 `host_callback` 模式加载 demo skill
-3. 由宿主回调执行 SQLite 建表与查询
-4. 返回一个包含 `success` 的结果
-
-宿主实际数据库文件会落在：
-
-```text
-runtime_root/host_managed/sqlite/<binding_tag>.db
-```
-
-例如：
-
-```text
-runtime_root/host_managed/sqlite/ROOT-host-provider-sqlite-demo.db
-```
-
-这里的 `ROOT` 是演示夹具使用的系统控制级空间标签。正式宿主的 skill root 对外语义应固定为 `ROOT -> PROJECT -> USER`，启动或加载时必须传入 `ROOT` root；普通用户管理面只应操作实际存在的 `PROJECT` / `USER`。
-
-这说明：
-
-- lib 负责提供稳定 `binding_tag`
-- 宿主负责决定数据库真实落点
-- 数据库目录不再由 lib 强制决定
-
-## 当前示例为什么先选 SQLite
-
-因为：
-
-- `vldb-sqlite` 当前 JSON FFI 已经覆盖通用 SQL / FTS / BM25 核心路径
-- 更适合先验证宿主 provider 接管边界
-
-后续如果切到 `vldb-lancedb`，只需要换掉宿主壳层的回调实现，不需要重做 `luaskills` 的 provider 协议。
+0.7.3 删除了退役数据库字段与导出符号。示例结构声明必须与同版本头文件配套，不能混用旧动态库。

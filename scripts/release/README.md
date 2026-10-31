@@ -2,10 +2,12 @@
 
 此流程只交付候选，不执行 Cargo 或 SDK 发布。默认 `candidate` 模式只上传 GitHub Actions 产物。
 只有显式选择 `draft`，且相同完整 SHA 的既有五平台原生验收、锁定构建及汇总全部通过，独立阶段才创建新的 GitHub 草稿。
-既有 tag、release 或同名本地产物冲突均明确失败，不能覆盖。草稿上传中途失败时保留失败状态及已创建草稿，不能自动覆盖或重试写入。
+既有 release 或同名本地产物冲突均明确失败，不能覆盖。默认也拒绝既有标签；先打标再构建时显式选择 `existing_tag=true`，工作流会要求远端标签精确指向已验收源码提交，绝不移动标签。草稿上传中途失败时保留失败状态及已创建草稿，不能自动覆盖或重试写入。
 
 按 tag 查询仅返回已公开发布，不能证明不存在未公开草稿。草稿前置检查先检查 tag/ref，再以已认证令牌完整分页读取
 发布列表，按 `tag_name` 拒绝任何同名草稿或发布。列表返回未知结构、缺失字段或 API 失败均停止，不执行 POST。
+
+命令行对应 `create_draft.py --existing-tag`：逐层核对轻量或附注标签的 Git 对象身份，拒绝提交不符、对象类型不符及循环；不省略已公开发布查询或草稿分页检查。该选项只允许本次新发布使用预先推送的正确标签，不允许覆盖任何既有发布资产。
 
 GitHub 的 `GITHUB_TOKEN` 不能获得工作流写权限；来源提交相对实际默认分支修改 `.github/workflows/` 时，创建发布会失败。
 因此 `draft` 模式在冻结阶段通过已认证只读 API 读取实际仓库的 `default_branch`、该分支完整 SHA、根树及工作流子树，
@@ -55,7 +57,17 @@ GitHub 的 `GITHUB_TOKEN` 不能获得工作流写权限；来源提交相对实
 在固定提交的干净源码中执行；捕获命令使用 PowerShell 7 的 UTF-8 输出，所有输出保持在忽略的 `target/` 下：
 
 ```powershell
-rtk proxy cargo build --locked --release --lib --bins -j 4 --message-format=json > target/candidate-build.jsonl
+# Link the Windows debugger CRT statically, then restore the core's original build flags.
+# 静态链接 Windows 调试器 CRT，然后恢复核心的原始构建参数。
+$PreviousRustFlags = $env:RUSTFLAGS
+try {
+  if ($IsWindows) { $env:RUSTFLAGS = "$PreviousRustFlags -C target-feature=+crt-static".Trim() }
+  rtk cargo build --locked --release --features debug-sqlite --bin luaskills-debug -j 4
+  if ($LASTEXITCODE -ne 0) { throw "Debug build failed" }
+} finally {
+  $env:RUSTFLAGS = $PreviousRustFlags
+}
+rtk proxy cargo build --locked --release --lib -j 4 --message-format=json > target/candidate-build.jsonl
 rtk proxy cargo metadata --locked --format-version=1 > target/candidate-metadata.json
 rtk proxy cargo --version --verbose > target/candidate-cargo-version.txt
 rtk proxy powershell -NoProfile -File scripts/build/package_ffi_sdk.ps1 -Platform windows-x64 -OutputDir target/release-packages -SourceCommit <完整提交> -Version <实际包版本> -BuildLog target/candidate-build.jsonl -Metadata target/candidate-metadata.json -CargoVersion target/candidate-cargo-version.txt
@@ -86,6 +98,8 @@ FFI 归档保留既有 `include/`、`lib/` 和 `ffi-sdk-manifest.json` 布局，
 同平台 FFI demo 库字节必须与权威 FFI 归档一致；Rust demo 依赖使用冻结提交的 `rev`；demo/debug-tool
 现有清单的 `platform`、`release_tag` 及实际可执行文件均复核。源码另以 `git archive` 冻结为包含完整提交的
 `luaskills-source-<版本>-<完整提交>.tar.gz`。这是精确 Git 源码归档，不宣称等同于未来 Cargo 规范化的 `.crate` 包。
+
+调试包还必须通过 `verify_debug_package.py --archive <归档> --platform <平台>` 原生离线验收，实际解包并调用 SQLite；Windows 额外传入 `--bash "C:/Program Files/Git/bin/bash.exe"` 覆盖 Git Bash 包装器。该步骤在上传前执行，缺少 SQLite 宿主的旧二进制、损坏的 JSON 参数转发或未持久化的数据都会令候选构建失败。Windows 调试器使用静态 CRT 并检查实际 DLL 导入；UTF-8 清单只应用于调试 EXE，默认核心库保持原有构建参数。
 
 ## 调试工具签名
 

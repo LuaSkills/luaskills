@@ -78,6 +78,7 @@ impl OperationJournal {
     /// 持久化不可变调度候选，或确认其精确的已提交后继。
     /// `runtime_id`, `previous` and `snapshot` come from the original owner; this never replays business work.
     /// `runtime_id`、`previous` 及 `snapshot` 来自原所有者；此方法绝不重放业务工作。
+    #[cfg(test)]
     pub(in crate::runtime::embedded) fn checkpoint(
         &self,
         runtime_id: &str,

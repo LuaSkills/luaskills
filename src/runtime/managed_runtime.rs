@@ -11,6 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::Duration;
 
+use crate::LuaRuntimeHostMode;
 use crate::runtime::managed_package::{
     ManagedFilesystemObjectIdentity, ManagedRuntimePackageContext,
     capture_managed_directory_identity, validate_managed_directory_identity,
@@ -18,6 +19,7 @@ use crate::runtime::managed_package::{
 use crate::runtime::path::{
     host_process_path_argument, normalize_host_input_path_text, render_host_visible_path,
 };
+use crate::runtime::process_window::configure_command;
 use crate::skill::dependencies::{
     NodeRuntimeDependencySpec, NodeRuntimePackageManager, PythonRuntimeDependencySpec,
     PythonRuntimePackageManager,
@@ -59,6 +61,9 @@ impl ManagedRuntimeRootSource {
 /// 受管 Python 与 Node 解析使用的不可变已校验根集合。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedRuntimeRoots {
+    /// Engine-owned window policy shared by environment installers, workers, and sessions.
+    /// 环境安装器、工作进程与会话共享的引擎所有窗口策略。
+    host_mode: LuaRuntimeHostMode,
     /// Canonical LuaSkills data root retained for compatibility-owned resources.
     /// 为兼容资源保留的规范 LuaSkills 数据根。
     runtime_root: PathBuf,
@@ -267,7 +272,23 @@ impl ManagedRuntimeRoots {
             environment_root: canonical_environment_root,
             distribution_source,
             environment_source,
+            host_mode: LuaRuntimeHostMode::Console,
         })
+    }
+
+    /// Select the immutable child-process policy before sharing this root set with an engine.
+    /// 在向引擎共享本根集合之前选择不可变的子进程策略。
+    /// `host_mode` is the host's explicit selection; returns the updated owned root set.
+    /// `host_mode` 是宿主的显式选择；返回更新后的自有根集合。
+    pub fn with_host_mode(mut self, host_mode: LuaRuntimeHostMode) -> Self {
+        self.host_mode = host_mode;
+        self
+    }
+
+    /// Return the child-process policy bound to this immutable root set without modifying it.
+    /// 返回绑定到本不可变根集合的子进程策略，不修改根集合。
+    pub fn host_mode(&self) -> LuaRuntimeHostMode {
+        self.host_mode
     }
 
     /// Return the canonical LuaSkills data root.
@@ -2266,6 +2287,7 @@ fn create_python_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
         run_command(
             &mut create_command,
             "create managed Python virtual environment",
+            plan.managed_runtime_roots.host_mode(),
         )?;
         // Environment interpreter used by the reproducible lockfile synchronization step.
         // 可复现锁文件同步步骤使用的环境解释器。
@@ -2294,7 +2316,11 @@ fn create_python_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
             ],
         )?;
         sync_command.env("UV_NO_CONFIG", "1");
-        run_command(&mut sync_command, "synchronize managed Python environment")?;
+        run_command(
+            &mut sync_command,
+            "synchronize managed Python environment",
+            plan.managed_runtime_roots.host_mode(),
+        )?;
         finish_build_dir(plan, build_dir.clone())
     })();
     cleanup_unpublished_build_after_result(&build_dir, build_result)
@@ -2394,7 +2420,11 @@ fn create_node_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
                     &plan.package_manager_executable,
                 )?),
             );
-            run_command(&mut install_command, "install managed Node environment")
+            run_command(
+                &mut install_command,
+                "install managed Node environment",
+                plan.managed_runtime_roots.host_mode(),
+            )
         })
         .and_then(|()| finish_build_dir(plan, build_dir.clone()));
     cleanup_unpublished_build_after_result(&build_dir, install_result)
@@ -2655,7 +2685,16 @@ fn write_expected_marker(env_dir: &Path, marker: &ManagedRuntimeEnvMarker) -> Re
 
 /// Run one process command and convert failures into stable error text.
 /// 运行一个进程命令并将失败转换为稳定错误文本。
-fn run_command(command: &mut Command, operation: &str) -> Result<(), String> {
+/// `command` is the prepared installer, `operation` names diagnostics, and `host_mode` selects the window policy.
+/// `command` 为准备好的安装器，`operation` 标识诊断，`host_mode` 选择窗口策略。
+/// Returns unit after successful exit, otherwise the spawn failure or captured output and status.
+/// 成功退出后返回空值，否则返回启动失败或捕获的输出及状态。
+fn run_command(
+    command: &mut Command,
+    operation: &str,
+    host_mode: LuaRuntimeHostMode,
+) -> Result<(), String> {
+    configure_command(command, host_mode, 0);
     let output = command
         .output()
         .map_err(|error| format!("Failed to {}: {}", operation, error))?;
@@ -3639,6 +3678,9 @@ fn runtime_prefix(runtime: ManagedRuntimeKind) -> &'static str {
         ManagedRuntimeKind::Node => "node",
     }
 }
+
+#[cfg(all(test, windows))]
+mod host_mode_tests;
 
 #[cfg(test)]
 mod tests {

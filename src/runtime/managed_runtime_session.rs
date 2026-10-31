@@ -1133,7 +1133,7 @@ pub(crate) fn launch_managed_python_session(
     install_controlled_context_environment(&mut command, package)?;
     // Shared process-core launch options preserving the Lua-facing IO contract.
     // 保持 Lua IO 契约的共享进程核心启动选项。
-    let options = launch_options_from_request(&request);
+    let options = launch_options_from_request(&request, plan.managed_runtime_roots.host_mode());
     // Pure Rust process core reused by ordinary and managed runtime sessions.
     // 普通与受管运行时会话共同复用的纯 Rust 进程核心。
     let reaper_snapshot = Arc::clone(&snapshot);
@@ -1212,7 +1212,7 @@ pub(crate) fn launch_managed_node_session(
     install_controlled_context_environment(&mut command, package)?;
     // Shared process-core launch options preserving the Lua-facing IO contract.
     // 保持 Lua IO 契约的共享进程核心启动选项。
-    let options = launch_options_from_request(&request);
+    let options = launch_options_from_request(&request, plan.managed_runtime_roots.host_mode());
     // Launch result whose failure path must remove the unpublished snapshot immediately.
     // 启动失败路径必须立即删除未发布快照的启动结果。
     let reaper_snapshot = Arc::clone(&snapshot);
@@ -1936,10 +1936,14 @@ fn clear_windows_readonly_attribute(path: &Path) -> Result<(), String> {
 
 /// Convert one parsed session request into shared process-core launch options.
 /// 将解析后的会话请求转换为共享进程核心启动选项。
+/// `request` supplies IO limits and `host_mode` supplies engine policy; returns a complete owned launch configuration.
+/// `request` 提供 IO 限制，`host_mode` 提供引擎策略；返回完整自有启动配置。
 fn launch_options_from_request(
     request: &ManagedRuntimeSessionOpenRequest,
+    host_mode: crate::LuaRuntimeHostMode,
 ) -> ManagedProcessSessionLaunchOptions {
     ManagedProcessSessionLaunchOptions {
+        host_mode,
         stdout_encoding: request.stdout_encoding,
         stderr_encoding: request.stderr_encoding,
         stdin_encoding: request.stdin_encoding,

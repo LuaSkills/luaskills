@@ -1,4 +1,7 @@
 mod embedded;
+mod host_database;
+#[cfg(windows)]
+mod host_mode;
 
 #[cfg(windows)]
 use super::configured_package_search_directory_exists;
@@ -62,8 +65,8 @@ use crate::{
     RuntimeModelEmbedRequest, RuntimeModelEmbedResponse, RuntimeModelError, RuntimeModelErrorCode,
     RuntimeModelLlmRequest, RuntimeModelLlmResponse, RuntimeModelUsage, RuntimeRequestContext,
     RuntimeSkillRoot, SkillInstallRequest, SkillInstallSourceType, SkillManagementAuthority,
-    SkillUninstallOptions, set_host_tool_callback, set_model_embed_callback,
-    set_model_llm_availability_callback, set_model_llm_callback,
+    set_host_tool_callback, set_model_embed_callback, set_model_llm_availability_callback,
+    set_model_llm_callback,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -620,7 +623,6 @@ fn make_loaded_skill(
         dir: skill_dir,
         root_name: "ROOT".to_string(),
         managed_package,
-        lancedb_binding: None,
         sqlite_binding: None,
         resolved_entry_names: HashMap::new(),
         entry_sources: HashMap::new(),
@@ -714,7 +716,6 @@ fn make_test_engine(skills: HashMap<String, LoadedSkill>) -> LuaEngine {
         managed_runtime_workers: ManagedRuntimeWorkerService::new(),
         managed_runtime_roots: None,
         skill_config_service,
-        lancedb_host: None,
         sqlite_host: None,
         database_provider_callbacks: Arc::new(RuntimeDatabaseProviderCallbacks::default()),
         native_library_search_guard: NativeLibrarySearchGuard::default(),
@@ -3365,12 +3366,7 @@ fn ordinary_uninstall_in_root_cleans_user_residual_when_root_owns_same_skill_id(
     let mut engine = make_runtime_test_engine();
 
     let result = engine
-        .uninstall_skill_in_root(
-            &skill_roots,
-            &user_root,
-            "vulcan-codekit",
-            &SkillUninstallOptions::default(),
-        )
+        .uninstall_skill_in_root(&skill_roots, &user_root, "vulcan-codekit")
         .expect("ordinary uninstall should clean USER residual");
     assert_eq!(result.skill_id, "vulcan-codekit");
     assert!(!user_skill_dir.exists());
@@ -3612,7 +3608,6 @@ fn system_uninstall_skill_in_root_rejects_unlisted_target_root() {
             &rogue_root,
             SkillManagementAuthority::System,
             "vulcan-codekit",
-            &SkillUninstallOptions::default(),
         )
         .expect_err("unlisted explicit target root should be rejected");
     let rendered = error.to_string();
@@ -3624,72 +3619,6 @@ fn system_uninstall_skill_in_root_rejects_unlisted_target_root() {
         "unlisted target skill directory should not be removed"
     );
     let _ = fs::remove_dir_all(&runtime_root);
-}
-
-/// Verify skill database cleanup errors render paths through the host-visible formatter.
-/// 验证技能数据库清理错误会通过宿主可见路径渲染器输出路径。
-#[test]
-fn skill_database_cleanup_error_uses_host_visible_path() {
-    // Runtime engine used to call the real database cleanup helper.
-    // 用于调用真实数据库清理辅助函数的运行时引擎。
-    let engine = make_runtime_test_engine();
-    // Temporary database root that isolates the cleanup failure fixture.
-    // 隔离清理失败夹具的临时数据库根目录。
-    let database_root = make_temp_runtime_root("database-cleanup-path");
-    let _ = fs::remove_dir_all(&database_root);
-    fs::create_dir_all(database_root.join("sqlite")).expect("create sqlite database root");
-    // Database path pre-created as a file so remove_dir_all fails deterministically.
-    // 预先创建为文件的数据库路径，使 remove_dir_all 稳定失败。
-    let database_dir = database_root.join("sqlite").join("demo-skill");
-    fs::write(&database_dir, "not a directory").expect("write conflicting database file");
-    // Error returned by the real skill database cleanup helper.
-    // 真实技能数据库清理辅助函数返回的错误。
-    let error = engine
-        .remove_skill_database_dir(&database_root, "demo-skill", true, "sqlite")
-        .expect_err("database cleanup should fail when target is a file");
-    // Expected diagnostic prefix rendered with the shared host-visible path formatter.
-    // 使用共享宿主可见路径渲染器生成的期望诊断前缀。
-    let expected_prefix = format!(
-        "failed to remove sqlite directory {}:",
-        render_host_visible_path(&database_dir)
-    );
-
-    assert!(
-        error.to_string().starts_with(&expected_prefix),
-        "unexpected error: {}",
-        error
-    );
-    let _ = fs::remove_dir_all(&database_root);
-}
-
-/// Verify invalid skill database cleanup targets are reported instead of treated as absent.
-/// 验证非法技能数据库清理目标会被报告，而不是被当作不存在。
-#[test]
-fn skill_database_cleanup_invalid_target_path_is_reported() {
-    // Runtime engine used to call the real database cleanup helper.
-    // 用于调用真实数据库清理辅助函数的运行时引擎。
-    let engine = make_runtime_test_engine();
-    // Database root containing an embedded NUL that remove_dir_all cannot inspect.
-    // 包含内嵌 NUL 且 remove_dir_all 无法探测的数据库根目录。
-    let database_root = PathBuf::from("invalid\0database-root");
-
-    // Error returned before the invalid cleanup target can behave like a missing directory.
-    // 在非法清理目标表现得像缺失目录之前返回的错误。
-    let error = engine
-        .remove_skill_database_dir(&database_root, "demo-skill", true, "sqlite")
-        .expect_err("invalid database cleanup target should fail");
-    let rendered = error.to_string();
-
-    assert!(
-        rendered.contains("failed to remove sqlite directory"),
-        "unexpected error: {}",
-        rendered
-    );
-    assert!(
-        rendered.contains("invalid"),
-        "unexpected error: {}",
-        rendered
-    );
 }
 
 /// Verify the isolated runlua pool uses the documented default sizing when the host does not override it.
@@ -5426,8 +5355,12 @@ fn assert_vm_scope_is_clean(lua: &mlua::Lua) {
     ));
 
     let vulcan = get_vulcan_table(lua).expect("get vulcan");
-    let lancedb: Table = vulcan.get("lancedb").expect("get lancedb");
-    assert!(!lancedb.get::<bool>("enabled").expect("get lancedb enabled"));
+    assert!(matches!(
+        vulcan
+            .get::<LuaValue>("lancedb")
+            .expect("retired API lookup"),
+        LuaValue::Nil
+    ));
     let sqlite: Table = vulcan.get("sqlite").expect("get sqlite");
     assert!(!sqlite.get::<bool>("enabled").expect("get sqlite enabled"));
     assert!(matches!(
@@ -6138,7 +6071,7 @@ fn load_from_roots_skips_host_ignored_skill_before_resource_setup() {
     fs::create_dir_all(skill_dir.join("runtime")).expect("create runtime dir");
     fs::write(
             skill_dir.join("skill.yaml"),
-            "name: grpc-memory\nversion: 0.1.0\nenable: true\ndebug: false\nsqlite:\n  enable: true\nlancedb:\n  enable: true\nentries:\n  - name: remember\n    lua_entry: runtime/remember.lua\n    lua_module: grpc-memory.remember\n",
+            "name: grpc-memory\nversion: 0.1.0\nenable: true\ndebug: false\nsqlite:\n  enable: true\nentries:\n  - name: remember\n    lua_entry: runtime/remember.lua\n    lua_module: grpc-memory.remember\n",
         )
         .expect("write skill yaml");
     fs::write(

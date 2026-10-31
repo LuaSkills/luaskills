@@ -28,7 +28,7 @@ LuaSkills proporciona un contrato de runtime, no una colección de convenciones.
 - Strict help trees.
 - Inyección de contexto de runtime.
 - Inyección de rutas de dependencias.
-- Routing de SQLite / LanceDB providers.
+- Routing de SQLite providers.
 - Capas root de system, project y user.
 - Integración Rust, C ABI y public `_json` FFI.
 
@@ -39,7 +39,7 @@ LuaSkills proporciona un contrato de runtime, no una colección de convenciones.
 | Runtime Core | Cargar skills, recargar roots, listar entries y llamar skills. |
 | Skill Authoring | Escribir skills con APIs `vulcan.*` y help estructurado. |
 | Product Control | Mantener permisos, budget, UI y authority en el host. |
-| Data-aware Skills | Conectar SQLite / LanceDB mediante runtime, host provider o space controller. |
+| Data-aware Skills | Conectar SQLite mediante runtime, host provider o space controller. |
 | Multi-language Hosts | Usar el mismo modelo desde Rust, C ABI, TypeScript, Python y Go. |
 
 ## Ejemplos Importantes
