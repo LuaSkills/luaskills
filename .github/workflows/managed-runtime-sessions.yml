@@ -204,6 +204,16 @@ jobs:
         shell: pwsh
         run: cargo clippy --locked --all-targets -j 4 -- -D warnings
 
+      # Check pipe/event scheduling contracts early; the complete suite below remains mandatory.
+      # 提前验证管道与事件调度契约；后续完整测试仍然必须执行。
+      - name: Verify managed-session notification contracts
+        shell: pwsh
+        run: |
+          cargo test --locked --lib runtime::managed_session_events::tests -j 4 -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Managed-session event contract tests failed" }
+          cargo test --locked --lib persists_across_evals -j 4 -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Managed-session persistence tests failed" }
+
       # The standalone debugger explicitly owns SQLite while the default library stays host-only.
       # 独立调试工具显式拥有 SQLite，默认库仍然仅依赖宿主注册。
       - name: Verify SQLite debug host

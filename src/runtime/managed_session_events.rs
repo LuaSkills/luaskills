@@ -1282,6 +1282,65 @@ mod tests {
         assert!(!second.timed_out);
     }
 
+    /// Verify zero-timeout waits report the current queue state without waiting for a producer.
+    /// 验证零超时等待直接报告当前队列状态，不等待生产者。
+    /// This test uses synchronous publication so empty, ready, and drained states are deterministic.
+    /// 本测试使用同步发布，使空队列、就绪及取空后的状态具有确定性。
+    #[test]
+    fn zero_timeout_wait_preserves_ready_events_and_reports_empty_timeout() {
+        // Center has no asynchronous producer that could invalidate a queue-state assertion.
+        // 此中心没有可能使队列状态断言失效的异步生产者。
+        let center = ManagedSessionEventCenter::new(1).unwrap();
+        // Token identifies the single synchronously controlled session.
+        // 令牌标识唯一的同步受控会话。
+        let token = test_token(1);
+        center.register_session(token.clone()).unwrap();
+        // Started bounds both empty and ready zero-timeout calls using the existing one-second gate.
+        // 开始时间使用现有的一秒门禁，同时约束空队列和就绪队列的零超时调用。
+        let started = Instant::now();
+        // Empty must time out without fabricating an event.
+        // 空队列必须报告超时，且不得伪造事件。
+        let empty = center.wait(1, 0).unwrap();
+        assert!(empty.events.is_empty());
+        assert!(empty.timed_out);
+        assert_eq!(empty.remaining, 0);
+
+        center
+            .publish(&token, RuntimeManagedSessionEventKind::StdoutReadable)
+            .unwrap();
+        center
+            .publish(&token, RuntimeManagedSessionEventKind::StderrReadable)
+            .unwrap();
+        // First consumes only one slot and must not report timeout while an event is ready.
+        // 首批仅消费一个槽；存在就绪事件时不得报告超时。
+        let first = center.wait(1, 0).unwrap();
+        assert!(!first.timed_out);
+        assert_eq!(first.remaining, 1);
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(
+            first.events[0].kind,
+            RuntimeManagedSessionEventKind::StdoutReadable
+        );
+        // Second preserves order and leaves the queue empty.
+        // 第二批保持顺序，并将队列取空。
+        let second = center.wait(1, 0).unwrap();
+        assert!(!second.timed_out);
+        assert_eq!(second.remaining, 0);
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(
+            second.events[0].kind,
+            RuntimeManagedSessionEventKind::StderrReadable
+        );
+        assert!(first.events[0].sequence < second.events[0].sequence);
+        // Drained returns the same empty timeout contract after real events were consumed.
+        // 真实事件被消费后，取空状态返回相同的空队列超时契约。
+        let drained = center.wait(1, 0).unwrap();
+        assert!(drained.events.is_empty());
+        assert!(drained.timed_out);
+        assert_eq!(drained.remaining, 0);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
     /// Verify extreme wait timeouts are rejected deterministically before blocking.
     /// 验证极端等待超时会在阻塞前被确定性拒绝。
     #[test]

@@ -11099,6 +11099,14 @@ fn run_managed_session_persistence_integration(
     // EventCenter receives notifications from the real pipe readers and exit watcher.
     // EventCenter 接收真实管道读取器与退出监视器的通知。
     let event_center = engine.managed_runtime_services.event_center();
+    // No producer exists yet, so this checks an empty queue without racing a pipe notification.
+    // 此时还没有生产者，因此可以验证空队列而不与管道通知发生竞态。
+    let zero_event_wait = event_center
+        .wait(256, 0)
+        .expect("nonblocking managed event wait before session creation");
+    assert!(zero_event_wait.events.is_empty());
+    assert!(zero_event_wait.timed_out);
+    assert_eq!(zero_event_wait.remaining, 0);
     // WakeCount proves actual background output wakes the host edge callback.
     // WakeCount 证明真实后台输出会唤醒宿主边沿回调。
     let wake_count = Arc::new(AtomicUsize::new(0));
@@ -11263,13 +11271,10 @@ fn run_managed_session_persistence_integration(
     assert_eq!(zero_read["ok"], true);
     assert_eq!(zero_read["result"]["timed_out"], true);
     assert_eq!(zero_read["result"]["stdout"], "");
-    // ZeroEventWait proves host polling is also truly nonblocking when the queue is empty.
-    // ZeroEventWait 证明事件队列为空时宿主轮询也是真正非阻塞。
-    let zero_event_wait = event_center
-        .wait(256, 0)
-        .expect("nonblocking managed event wait");
-    assert!(zero_event_wait.events.is_empty());
-    assert!(zero_event_wait.timed_out);
+    // Pipe readers publish notifications after appending bytes; consuming all bytes does not
+    // quiesce those publishers. Empty event waits are therefore checked before session creation.
+    // 管道读取器在追加字节后发布通知；消费全部字节不会使这些发布者停止。
+    // 因此，空队列事件等待在创建会话之前验证。
 
     // SpamWrite requests enough flushed output to overflow the configured 1024-byte ring.
     // SpamWrite 请求足够多的刷新输出，以溢出配置的 1024 字节环形缓冲。
@@ -11305,12 +11310,17 @@ fn run_managed_session_persistence_integration(
             .expect("stdout total byte count")
             > 1024
     );
-    // SpamEvents contains one coalesced stdout slot despite many flushed sidecar writes.
-    // SpamEvents 尽管 sidecar 多次刷新写入，仍只包含一个合并后的 stdout 槽。
-    let spam_events = event_center.poll(256).expect("poll coalesced spam events");
+    // Wait for notification delivery independently of the preceding buffer read; a read can
+    // complete before its observer runs. Repeated stdout publications still occupy one slot.
+    // 独立于之前的缓冲读取等待通知交付；读取可以在观察器执行前完成。
+    // 重复的 stdout 发布仍然只占用一个槽。
+    let spam_events = wait_for_managed_session_event_kinds(
+        &event_center,
+        &[RuntimeManagedSessionEventKind::StdoutReadable],
+        Duration::from_secs(5),
+    );
     assert_eq!(
         spam_events
-            .events
             .iter()
             .filter(|event| {
                 event.managed_session_id == managed_session_id
