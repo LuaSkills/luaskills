@@ -82,9 +82,11 @@ save_release_asset_with_digest() {
     fi
     return 1
   fi
-  mapfile -t asset_info <<< "$asset_info_text"
-  asset_url="${asset_info[0]:-}"
-  asset_digest="${asset_info[1]:-}"
+  # Plain reads keep this working on the Bash 3.2 that ships with macOS, which has no mapfile.
+  # 使用普通 read，使脚本在 macOS 自带、没有 mapfile 的 Bash 3.2 上同样可用。
+  asset_url=""
+  asset_digest=""
+  { IFS= read -r asset_url || true; IFS= read -r asset_digest || true; } <<< "$asset_info_text"
   if [[ "$asset_digest" != sha256:* ]]; then
     echo "GitHub API digest for $asset_name is missing or unsupported: $asset_digest" >&2
     return 1
