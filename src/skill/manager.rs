@@ -359,6 +359,10 @@ pub struct SkillApplyResult {
     /// 当前结果涉及的可选稳定来源定位值。
     #[serde(default)]
     pub source_locator: Option<String>,
+    /// Platform key of the installed platform package; absent for standard and all-systems packages.
+    /// 已安装平台包的平台键；标准包与全系统包不带此字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_platform: Option<String>,
 }
 
 /// One staged install/update mutation that is not committed until runtime reload succeeds.
@@ -831,6 +835,7 @@ impl SkillManager {
                 version: None,
                 source_type: None,
                 source_locator: None,
+                package_platform: None,
             }));
         }
         self.emit_progress_detail(RuntimeSkillOperationProgressDetail {
@@ -874,6 +879,7 @@ impl SkillManager {
                 version: None,
                 source_type: None,
                 source_locator: None,
+                package_platform: None,
             }));
         }
         let replacement = if request.replace_source {
@@ -1209,6 +1215,7 @@ impl SkillManager {
                 version: Some(record.version),
                 source_type: Some(SkillInstallSourceType::Github),
                 source_locator: Some(target.locator.clone()),
+                package_platform: None,
             }));
         }
 
@@ -1400,6 +1407,7 @@ impl SkillManager {
                 version: Some(record.version),
                 source_type: Some(source_type),
                 source_locator: Some(target.locator.clone()),
+                package_platform: None,
             }));
         }
         self.emit_progress_detail(RuntimeSkillOperationProgressDetail {
@@ -1643,6 +1651,7 @@ impl SkillManager {
                 version: Some(version.to_string()),
                 source_type: Some(source_type),
                 source_locator: Some(source_locator),
+                package_platform: record.package_platform.clone(),
             },
             target_dir,
             install_record: record,
@@ -1780,6 +1789,7 @@ impl SkillManager {
                 version: Some(version.to_string()),
                 source_type: Some(source_type),
                 source_locator: Some(source_locator),
+                package_platform: updated_record.package_platform.clone(),
             },
             target_dir,
             backup_dir,

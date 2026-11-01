@@ -102,7 +102,7 @@ LuaSkills は [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) のスキ
 
 ```toml
 [dependencies]
-luaskills = "0.7.4"
+luaskills = "0.8.0"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md) に `call_skill` と `vulcan.host.*` ツールブリッジの例があります。
@@ -120,17 +120,16 @@ luaskills = "0.7.4"
 
 ### スキルを書く
 
-[demo-skill](https://github.com/LuaSkills/demo-skill) から始め、[Skill development manual](docs/development/skill-development.md) を読んでください。実際のランタイム構成で 1 つのスキルをデバッグするには：
+[demo-skill](https://github.com/LuaSkills/demo-skill) から始めるか、独立した開発ツール [luaskills-debug](https://github.com/LuaSkills/luaskills-debug) で新しいスキルを作成してください。ツールは [Releases](https://github.com/LuaSkills/luaskills-debug/releases) からダウンロードします。このリポジトリのリリースには含まれません。
 
 ```bash
-cargo run --features debug-sqlite --bin luaskills-debug -- call \
-  --runtime-root D:/runtime \
-  --skill-path D:/skills/demo-skill \
-  --tool ping \
-  --args-json "{\"note\":\"hello\"}"
+luaskills-debug new my-skill
+luaskills-debug call --runtime-root D:/runtime --skill-path my-skill --tool hello --args-json "{\"name\":\"LuaSkills\"}"
+luaskills-debug package --skill-path my-skill --out-dir dist
 ```
 
-`luaskills-debug` はスキルを `runtime_root/skills/<skill_id>` にコピーし、通常の `load_from_roots -> call_skill` 経路で実行するため、依存ルート、状態、データベース、コンテキストが実際のホスト実行と一致します。リポジトリ内の開発ツールであり、SDK や FFI の API は追加しません。
+`call` はスキルを `runtime_root/skills/<skill_id>` にコピーし、通常の `load_from_roots -> call_skill` 経路で実行するため、依存ルート、状態、データベース、コンテキストは実際のホスト実行と一致します。`package` は GitHub リリース用のアセットを作成します。ほとんどのスキルは標準レイアウト（全システム共通の zip 1 つ）を使います。大きなネイティブライブラリを同梱するスキルは `--layout platform` を使うと、システムごとのパッケージと `packages.json` インデックスが作成され、LuaSkills は現在のシステム用のパッケージをインストールします。リリース規則とデバッガーの全コマンドは [Skill development manual](docs/development/skill-development.md) を参照してください。
+
 
 ## ドキュメント
 
@@ -158,8 +157,8 @@ cargo run --features debug-sqlite --bin luaskills-debug -- call \
 
 | コンポーネント | バージョン |
 | --- | --- |
-| LuaSkills コアと FFI SDK | `0.7.4` |
-| TypeScript・Python・Go SDK | 独立したバージョン系列。[SDK overview](docs/sdk/index.md#versions) を参照 |
+| LuaSkills コアと FFI SDK | `0.8.0` |
+| TypeScript・Python・Go SDK | `0.8.0`。コアのリリース後に公開。[SDK overview](docs/sdk/index.md#versions) を参照 |
 | Lua ランタイムパッケージ | 互換 `0.1` 系列 |
 | 管理 Python / uv | `3.14.6` / `0.11.28` |
 | 管理 Node.js / pnpm | `24.18.0` / `11.11.0` |

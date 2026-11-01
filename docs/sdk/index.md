@@ -35,7 +35,7 @@ The Go SDK exposes typed model request, response, and error shapes, but process-
 
 ## Versions
 
-- **Each SDK has its own version line.** The SDK version is the package version (`package.json`, `pyproject.toml`, Go module tag), mirrored in each repository's `VERSION` file. SDK patch releases do not require a core release.
+- **SDKs follow the core version.** The SDK version is the package version (`package.json`, `pyproject.toml`, Go module tag), mirrored in each repository's `VERSION` file. Each core release ships SDKs with the same version; an SDK-only fix takes the next patch number of that SDK without a core release.
 - **Each SDK pins one core release.** The default LuaSkills core tag used by runtime asset installation (`DEFAULT_LUASKILLS_VERSION` / `DefaultLuaSkillsVersion`) and the embedded contract copied from core (`core_version`) must name the same core release. Hosts can override the asset tag explicitly.
 - **Contracts are copied, never edited.** `contracts/skill-config/v1/` and `contracts/embedded/v1/` are exact copies of the core repository's `contracts/`; generated SDK code is checked against them.
 - **Runtime packages are separate.** Lua runtime packages and native dependencies come from [`LuaSkills/luaskills-packages`](https://github.com/LuaSkills/luaskills-packages) in the compatible `0.1` series.
@@ -57,11 +57,12 @@ The current pins are listed in each SDK README under **Version Alignment**.
 SDKs consume published core artifacts, so they release after the core:
 
 1. The matching `LuaSkills/luaskills-packages` series already exists.
-2. The core GitHub release (five-platform FFI SDK, demos, debug tool) is built and verified.
+2. The core GitHub release (five-platform FFI SDK and demos) is built and verified.
 3. The `luaskills` crate is published to crates.io.
 4. The TypeScript and Python SDKs are released through their candidate and completion workflows, with cold registry consumer checks.
 5. The Go module tag is released after the TypeScript and Python chains pass the Go prerequisite checks.
 6. Each SDK runs its **Examples Release** workflow after its package or module tag is visible upstream.
+7. [luaskills-debug](https://github.com/LuaSkills/luaskills-debug) is released from its own repository against the published crate.
 
 The exact gates live in [`scripts/release/README.md`](../../scripts/release/README.md) and [`scripts/release/SDK_PREREQUISITES.md`](../../scripts/release/SDK_PREREQUISITES.md).
 

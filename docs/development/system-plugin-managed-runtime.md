@@ -390,6 +390,6 @@ An unrelated ordinary Skill-root reload does not replace the dedicated System le
 - [FFI and SDK overview](../integration/ffi-overview.md)
 - [Chinese FFI integration guide](../zh-CN/integration/ffi-integration-guide.md)
 - [Skill development manual](skill-development.md#59-managed-python-and-node-child-runtimes)
-- [Managed runtime invoke example](../../examples/managed_runtime/README.md)
+- [Managed runtime invoke example](https://github.com/LuaSkills/luaskills-debug/blob/main/docs/managed-runtime-smoke.md)
 - [Standard C ABI header](../../include/luaskills_ffi.h)
 - [Public JSON FFI header](../../include/luaskills_json_ffi.h)

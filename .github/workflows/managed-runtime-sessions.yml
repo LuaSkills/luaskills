@@ -113,7 +113,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: >-
-          python scripts/debug-tools/managed_runtime_layout_check.py
+          python scripts/deps/managed_runtime_layout_check.py
           $env:MANAGED_RUNTIME_ROOT
           --distribution-root $env:MANAGED_RUNTIME_DISTRIBUTION_ROOT
           --environment-root $env:MANAGED_RUNTIME_ENVIRONMENT_ROOT
@@ -122,32 +122,10 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: >-
-          python3 scripts/debug-tools/managed_runtime_layout_check.py
+          python3 scripts/deps/managed_runtime_layout_check.py
           "$MANAGED_RUNTIME_ROOT"
           --distribution-root "$MANAGED_RUNTIME_DISTRIBUTION_ROOT"
           --environment-root "$MANAGED_RUNTIME_ENVIRONMENT_ROOT"
-
-      - name: Run exact managed-runtime smoke on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: >-
-          ./scripts/debug-tools/managed_runtime_smoke.ps1
-          -RuntimeRoot $env:MANAGED_RUNTIME_ROOT
-          -DistributionRoot $env:MANAGED_RUNTIME_DISTRIBUTION_ROOT
-          -EnvironmentRoot $env:MANAGED_RUNTIME_ENVIRONMENT_ROOT
-          -SkipFetch
-          -KeepRuntimeRoot
-
-      - name: Run exact managed-runtime smoke on Unix
-        if: runner.os != 'Windows'
-        shell: bash
-        run: >-
-          bash ./scripts/debug-tools/managed_runtime_smoke.sh
-          --runtime-root "$MANAGED_RUNTIME_ROOT"
-          --distribution-root "$MANAGED_RUNTIME_DISTRIBUTION_ROOT"
-          --environment-root "$MANAGED_RUNTIME_ENVIRONMENT_ROOT"
-          --skip-fetch
-          --keep-runtime-root
 
       - name: Bind exact managed runtimes to PATH on Windows
         if: runner.os == 'Windows'
@@ -213,16 +191,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Managed-session event contract tests failed" }
           cargo test --locked --lib persists_across_evals -j 4 -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Managed-session persistence tests failed" }
-
-      # The standalone debugger explicitly owns SQLite while the default library stays host-only.
-      # 独立调试工具显式拥有 SQLite，默认库仍然仅依赖宿主注册。
-      - name: Verify SQLite debug host
-        shell: pwsh
-        run: |
-          cargo clippy --locked --features debug-sqlite --bin luaskills-debug -j 4 -- -D warnings
-          if ($LASTEXITCODE -ne 0) { throw "SQLite debug host lint failed" }
-          cargo test --locked --features debug-sqlite --bin luaskills-debug -j 4 -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw "SQLite debug host tests failed" }
 
       # Derive and validate the same offline contract on all five actual target platforms.
       # 在全部五个实际目标平台上派生并校验相同离线契约。

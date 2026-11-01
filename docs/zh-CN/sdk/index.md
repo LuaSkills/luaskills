@@ -35,7 +35,7 @@ Go SDK 提供类型化的模型请求、响应与错误结构，但进程级模�
 
 ## 版本规则
 
-- **每个 SDK 拥有独立版本线。** SDK 版本即包版本（`package.json`、`pyproject.toml`、Go 模块标签），并镜像到仓库的 `VERSION` 文件。SDK 补丁版本不要求核心同步发版。
+- **SDK 跟随核心版本。** SDK 版本即包版本（`package.json`、`pyproject.toml`、Go 模块标签），并镜像到仓库的 `VERSION` 文件。每次核心发布都随附同版本号的 SDK；仅修复 SDK 时递增该 SDK 的补丁号，不要求核心同步发版。
 - **每个 SDK 固定一个核心版本。** 运行时资产安装使用的默认核心标签（`DEFAULT_LUASKILLS_VERSION` / `DefaultLuaSkillsVersion`）与从核心复制的嵌入式契约（`core_version`）必须指向同一个核心版本；宿主可以显式覆盖资产标签。
 - **契约只复制、不修改。** `contracts/skill-config/v1/` 与 `contracts/embedded/v1/` 是核心仓库 `contracts/` 的精确副本，SDK 生成代码以其为准校验。
 - **运行时包独立发布。** Lua 运行时包与原生依赖来自 [`LuaSkills/luaskills-packages`](https://github.com/LuaSkills/luaskills-packages) 的兼容 `0.1` 系列。
@@ -57,11 +57,12 @@ Go SDK 提供类型化的模型请求、响应与错误结构，但进程级模�
 SDK 消费已发布的核心产物，因此在核心之后发布：
 
 1. 匹配的 `LuaSkills/luaskills-packages` 系列已经存在。
-2. 核心 GitHub Release（五平台 FFI SDK、示例与调试工具）完成构建与验收。
+2. 核心 GitHub Release（五平台 FFI SDK 与示例）完成构建与验收。
 3. `luaskills` crate 发布到 crates.io。
 4. TypeScript 与 Python SDK 通过各自的候选与完成工作流发布，并完成冷注册表消费验证。
 5. TypeScript 与 Python 链路通过 Go 前置检查后，发布 Go 模块标签。
 6. 各 SDK 的包或模块标签在上游可见后，再运行 **Examples Release** 工作流。
+7. [luaskills-debug](https://github.com/LuaSkills/luaskills-debug) 在自己的仓库中基于已发布的 crate 发布。
 
 具体门禁见 [`scripts/release/README.md`](../../../scripts/release/README.md) 与 [`scripts/release/SDK_PREREQUISITES.md`](../../../scripts/release/SDK_PREREQUISITES.md)。
 

@@ -102,7 +102,7 @@ LuaSkills는 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code)의 스킬 
 
 ```toml
 [dependencies]
-luaskills = "0.7.4"
+luaskills = "0.8.0"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md)에서 `call_skill`과 `vulcan.host.*` 도구 브리지를 볼 수 있습니다.
@@ -120,17 +120,16 @@ luaskills = "0.7.4"
 
 ### 스킬 작성
 
-[demo-skill](https://github.com/LuaSkills/demo-skill)에서 시작한 뒤 [Skill development manual](docs/development/skill-development.md)을 읽으세요. 실제 런타임 구성으로 스킬 하나를 디버그하려면:
+[demo-skill](https://github.com/LuaSkills/demo-skill)에서 시작하거나, 독립 개발 도구 [luaskills-debug](https://github.com/LuaSkills/luaskills-debug)로 새 스킬을 만드세요. 도구는 [Releases](https://github.com/LuaSkills/luaskills-debug/releases)에서 내려받으며, 이 저장소의 릴리스에는 포함되지 않습니다.
 
 ```bash
-cargo run --features debug-sqlite --bin luaskills-debug -- call \
-  --runtime-root D:/runtime \
-  --skill-path D:/skills/demo-skill \
-  --tool ping \
-  --args-json "{\"note\":\"hello\"}"
+luaskills-debug new my-skill
+luaskills-debug call --runtime-root D:/runtime --skill-path my-skill --tool hello --args-json "{\"name\":\"LuaSkills\"}"
+luaskills-debug package --skill-path my-skill --out-dir dist
 ```
 
-`luaskills-debug`는 스킬을 `runtime_root/skills/<skill_id>`로 복사하고 일반 `load_from_roots -> call_skill` 경로로 실행하므로, 의존성 루트·상태·데이터베이스·컨텍스트가 실제 호스트 실행과 같습니다. 저장소 내부 개발 도구이며 SDK나 FFI API를 추가하지 않습니다.
+`call`은 스킬을 `runtime_root/skills/<skill_id>`에 복사하고 일반적인 `load_from_roots -> call_skill` 경로로 실행하므로, 의존성 루트, 상태, 데이터베이스, 컨텍스트가 실제 호스트 실행과 같습니다. `package`는 GitHub 릴리스 자산을 만듭니다. 대부분의 스킬은 모든 시스템용 zip 하나를 쓰는 표준 레이아웃을 사용합니다. 큰 네이티브 라이브러리를 포함하는 스킬은 `--layout platform`으로 시스템별 패키지와 `packages.json` 인덱스를 만들 수 있으며, LuaSkills는 현재 시스템용 패키지를 설치합니다. 릴리스 규칙과 디버거의 모든 명령은 [Skill development manual](docs/development/skill-development.md)을 참고하세요.
+
 
 ## 문서
 
@@ -158,8 +157,8 @@ cargo run --features debug-sqlite --bin luaskills-debug -- call \
 
 | 구성 요소 | 버전 |
 | --- | --- |
-| LuaSkills 코어와 FFI SDK | `0.7.4` |
-| TypeScript, Python, Go SDK | 독립적인 버전 라인. [SDK overview](docs/sdk/index.md#versions) 참고 |
+| LuaSkills 코어와 FFI SDK | `0.8.0` |
+| TypeScript, Python, Go SDK | `0.8.0`, 코어 릴리스 이후 배포. [SDK overview](docs/sdk/index.md#versions) 참고 |
 | Lua 런타임 패키지 | 호환 `0.1` 시리즈 |
 | 관리형 Python / uv | `3.14.6` / `0.11.28` |
 | 관리형 Node.js / pnpm | `24.18.0` / `11.11.0` |

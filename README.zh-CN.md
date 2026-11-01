@@ -102,7 +102,7 @@ LuaSkills 是 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) 技能系
 
 ```toml
 [dependencies]
-luaskills = "0.7.4"
+luaskills = "0.8.0"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md) 演示 `call_skill` 与 `vulcan.host.*` 工具桥接。
@@ -122,17 +122,16 @@ luaskills = "0.7.4"
 
 ### 编写技能
 
-从 [demo-skill](https://github.com/LuaSkills/demo-skill) 开始，再阅读 [Lua Skill 开发手册](docs/zh-CN/development/skill-development.md)。用真实运行时布局调试单个技能：
+从 [demo-skill](https://github.com/LuaSkills/demo-skill) 开始，或用独立开发工具 [luaskills-debug](https://github.com/LuaSkills/luaskills-debug) 创建新技能。请从它的 [Releases](https://github.com/LuaSkills/luaskills-debug/releases) 下载，它不随本仓库发布。
 
 ```bash
-cargo run --features debug-sqlite --bin luaskills-debug -- call \
-  --runtime-root D:/runtime \
-  --skill-path D:/skills/demo-skill \
-  --tool ping \
-  --args-json "{\"note\":\"hello\"}"
+luaskills-debug new my-skill
+luaskills-debug call --runtime-root D:/runtime --skill-path my-skill --tool hello --args-json "{\"name\":\"LuaSkills\"}"
+luaskills-debug package --skill-path my-skill --out-dir dist
 ```
 
-`luaskills-debug` 会把技能复制到 `runtime_root/skills/<skill_id>`，再走正常的 `load_from_roots -> call_skill` 路径，使依赖根、状态、数据库与上下文和真实宿主执行一致。它只是仓库内的开发工具，不增加任何 SDK 或 FFI API。
+`call` 把技能复制到 `runtime_root/skills/<skill_id>`，并走正常的 `load_from_roots -> call_skill` 路径，因此依赖根、状态、数据库和上下文都与真实宿主执行一致。`package` 构建 GitHub release 资产。大多数技能使用标准布局：一个 zip 适用所有系统。内置较大原生库的技能可以使用 `--layout platform`，为每个系统各构建一个包并生成 `packages.json` 索引，LuaSkills 会安装当前系统对应的包。发布规则与调试工具的全部命令见 [Lua Skill 开发手册](docs/zh-CN/development/skill-development.md)。
+
 
 ## 文档
 
@@ -160,8 +159,8 @@ cargo run --features debug-sqlite --bin luaskills-debug -- call \
 
 | 组件 | 版本 |
 | --- | --- |
-| LuaSkills 核心与 FFI SDK | `0.7.4` |
-| TypeScript、Python、Go SDK | 各自独立的版本线，见 [SDK 总览](docs/zh-CN/sdk/index.md#版本规则) |
+| LuaSkills 核心与 FFI SDK | `0.8.0` |
+| TypeScript、Python、Go SDK | `0.8.0`，在核心发布之后发布，见 [SDK 总览](docs/zh-CN/sdk/index.md#版本规则) |
 | Lua 运行时包 | 兼容 `0.1` 系列 |
 | 受管 Python / uv | `3.14.6` / `0.11.28` |
 | 受管 Node.js / pnpm | `24.18.0` / `11.11.0` |

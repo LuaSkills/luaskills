@@ -390,6 +390,6 @@ callback 在每个 engine 的单个串行后台调度器上运行，可以发信
 - [FFI 对接文档](../integration/ffi-integration-guide.md)
 - [FFI 宿主接入检查清单](../integration/ffi-host-checklist.md)
 - [Lua Skill 开发手册](skill-development.md#59-受管-python-与-node-子运行时)
-- [受管运行时 invoke 示例](../../../examples/managed_runtime/README.md)
+- [受管运行时 invoke 示例](https://github.com/LuaSkills/luaskills-debug/blob/main/docs/managed-runtime-smoke.md)
 - [标准 C ABI 头文件](../../../include/luaskills_ffi.h)
 - [公共 JSON FFI 头文件](../../../include/luaskills_json_ffi.h)

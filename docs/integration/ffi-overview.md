@@ -202,6 +202,7 @@ SDK mapping:
 - `luaskills_ffi_check_skill_updates_json` (and the `system_` variant) reports installed and latest versions without downloading anything.
 - Setting `replace_source: true` on an update request switches a skill to a new source. The same version is accepted; an older one is rejected rather than downgraded.
 - A mirror failure never falls back to another mirror; only connection failures and 502/503/504 on the same URL are retried.
+- Installs and updates pick the package for the current platform: a GitHub release with a `{skill_id}-v{version}-packages.json` index supplies one package per platform, and Hub resolve requests carry `platform=<platform key>`. A platform package records its platform in the optional `package_platform` field of the install record; a package built for another platform fails with `skill_package_platform_mismatch`, and a release with no package for this platform fails with `skill_platform_unsupported`.
 
 ## Key Rules
 

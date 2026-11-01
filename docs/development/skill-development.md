@@ -64,10 +64,18 @@ Skill package layout rules:
 GitHub-managed skill installs and release assets must use the same `skill_id`:
 
 - If an install request does not pass an explicit `skill_id`, the runtime derives it from the GitHub repository name. It does not strip a `luaskills-` prefix automatically.
-- The release zip file name must be `{skill_id}-v{version}-skill.zip`.
-- The checksum file name must be `{skill_id}-v{version}-checksums.txt`.
-- The zip must contain only one top-level directory named exactly `{skill_id}`, and it must contain `{skill_id}/skill.yaml`.
+- Every release must publish `{skill_id}-v{version}-checksums.txt`, listing the SHA-256 of every other asset as `<sha256>  <asset name>` lines.
+- Every package zip must contain only one top-level directory named exactly `{skill_id}`, and it must contain `{skill_id}/skill.yaml`.
 - Repository name, release asset prefix, checksum asset prefix, zip top-level directory, and final install directory should all use the same `skill_id`.
+
+A release uses one of two layouts:
+
+| Layout | Assets | Use it when |
+| --- | --- | --- |
+| Standard (default) | `{skill_id}-v{version}-skill.zip` for every system, plus the checksums file | The skill ships no native libraries, or they are small. Most skills use this layout. |
+| Platform | One `{skill_id}-v{version}-{platform}-skill.zip` per system, `{skill_id}-v{version}-packages.json`, optionally the all-systems `{skill_id}-v{version}-skill.zip`, plus the checksums file | The skill bundles large native libraries for several systems, so each system downloads only its own. |
+
+The package index `packages.json` is what makes a release a platform release. When it is present, the runtime installs the package listed for the current platform, falls back to the all-systems package when the index lists one, and otherwise fails with `skill_platform_unsupported`. Without an index, the runtime installs the standard zip. Section 13.2 describes the index, the package marker, and how to build both layouts with `luaskills-debug package`.
 
 ## 2.2 Entry Input Schema
 
@@ -1076,15 +1084,7 @@ Lifecycle rules are deterministic:
 - `session:close(...)` and `session:kill()` terminate descendants as well as the direct child.
 - Background stdout, stderr, exit, and failure watchers never invoke Lua. System Plugin sessions publish bounded engine events for the host to poll or wait on; a host wake callback may only wake or schedule host work and must not synchronously enter Lua.
 
-For the complete System lease, persistent-session, host-event, and cleanup workflow, see the [System Plugin managed runtime guide](system-plugin-managed-runtime.md). The [Managed Runtime Example](../../examples/managed_runtime/README.md) is a working ordinary-Skill package for the pooled `status` / `invoke` path. During repository development, the layout checker and isolated smoke scripts provide a fast end-to-end verification path:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/debug-tools/managed_runtime_smoke.ps1
-```
-
-```bash
-bash scripts/debug-tools/managed_runtime_smoke.sh
-```
+For the complete System lease, persistent-session, host-event, and cleanup workflow, see the [System Plugin managed runtime guide](system-plugin-managed-runtime.md). The [managed runtime example](https://github.com/LuaSkills/luaskills-debug/blob/main/docs/managed-runtime-smoke.md) in the luaskills-debug repository is a working ordinary-Skill package for the pooled `status` / `invoke` path, with isolated smoke scripts for an end-to-end check.
 
 ### 5.10 `vulcan.config.*`
 
@@ -1818,7 +1818,7 @@ Notes:
 
 ### 13.1 Shipping Native Libraries Inside The Skill Package
 
-A dependency whose `source.type` is `bundled` takes its payload from the skill package itself, so installing it never needs GitHub or any network access. Each platform entry names the payload with `path` (relative to the skill directory; it may not leave the directory, including through links) and may pin it with `sha256`. Put every platform's library in the same package:
+A dependency whose `source.type` is `bundled` takes its payload from the skill package itself, so installing it never needs GitHub or any network access. Each platform entry names the payload with `path` (relative to the skill directory; it may not leave the directory, including through links) and may pin it with `sha256`. Put every platform's library in the skill source; the platform release layout (section 13.2) then gives each system a package with only its own library:
 
 ```yaml
 ffi_dependencies:
@@ -1852,6 +1852,47 @@ local lib = ffi.load(vulcan.path.join(base, "lib", "demo_native.dll"))
 `archive_type` may also be `zip` or `tar_gz` when the package ships an archive. `sha256` is accepted on every source type; for `github_release` it must agree with the digest GitHub reports for the asset.
 
 Every dependency is `required: true` by default, and any failure to make it ready stops the skill from loading. Declare `required: false` for a dependency the skill can work without: when its payload is missing, there is no package for the current platform, or its download or install fails, the runtime logs a warning and loads the skill anyway. Check for the exported file before using an optional dependency, so the skill can report that the feature is unavailable on this platform.
+
+### 13.2 Platform Packages
+
+A package that bundles every system's library grows with each system it supports. The platform layout splits it: each platform package keeps the shared files and only that platform's bundled payloads, so a Windows install never downloads Linux or macOS libraries.
+
+Build both layouts with [luaskills-debug](https://github.com/LuaSkills/luaskills-debug), which uses the packaging rules of the runtime itself:
+
+```bash
+luaskills-debug package --skill-path . --out-dir dist                    # standard
+luaskills-debug package --skill-path . --out-dir dist --layout platform  # platform
+```
+
+The platform layout writes one package per platform that has bundled payloads in `dependencies.yaml`, the all-systems package (omit it with `--no-universal`), the package index and the checksums file. A skill without bundled payloads cannot use the platform layout.
+
+The package index has this shape; unknown fields are rejected:
+
+```json
+{
+  "schema_version": 1,
+  "skill_id": "demo-skill",
+  "version": "1.2.3",
+  "layout": "platform",
+  "platforms": {
+    "linux-x64": { "asset": "demo-skill-v1.2.3-linux-x64-skill.zip", "sha256": "<64 hex>", "size": 12345 },
+    "windows-x64": { "asset": "demo-skill-v1.2.3-windows-x64-skill.zip", "sha256": "<64 hex>", "size": 12345 }
+  },
+  "universal": { "asset": "demo-skill-v1.2.3-skill.zip", "sha256": "<64 hex>", "size": 23456 }
+}
+```
+
+Platform keys are `windows-x64`, `windows-arm64`, `linux-x64`, `linux-arm64`, `macos-x64` and `macos-arm64`. The index itself is listed in the checksums file, and the runtime verifies the index, the selected package, and the GitHub asset digest against each other before installing.
+
+Each platform package also carries a marker, `{skill_id}/luaskills-package.json`:
+
+```json
+{"schema_version":1,"layout":"platform","platform":"windows-x64"}
+```
+
+The runtime refuses to install a package whose marker names another platform (`skill_package_platform_mismatch`), whichever source it came from, and records the installed platform as `package_platform` in the install record. Standard and all-systems packages carry no marker. Do not add the marker to a skill source; the packager writes it.
+
+Package limits on the LuaSkills Hub are 100 MiB per package, 600 MiB for all packages of one version, and 1 GiB expanded. `luaskills-debug package` warns when a build exceeds them.
 
 ## 14. `vulcan.sqlite.*`
 
@@ -1933,6 +1974,27 @@ Stable development constraints:
 - For exact input and output fields, combine the host SQLite provider contract with:
   - [Host database provider guide](../zh-CN/integration/host-database-provider-guide.md)
 - If you are a skill author rather than a host implementer, prefer existing memory-skill examples over guessing provider-specific result fields.
+
+## 15. Debug, Validate And Package With `luaskills-debug`
+
+[luaskills-debug](https://github.com/LuaSkills/luaskills-debug) is the standalone developer tool for skills. Download it from its [releases](https://github.com/LuaSkills/luaskills-debug/releases); it is not part of the LuaSkills core release. Its major and minor version follow the runtime it embeds.
+
+| Command | Purpose |
+| --- | --- |
+| `new <dir> [--layout standard\|platform]` | Create a skill from the built-in template, including a release workflow |
+| `validate --skill-path <dir>` | Check a skill source against the packaging rules |
+| `package --skill-path <dir> --out-dir <dir> [--layout standard\|platform]` | Build the release assets |
+| `sync`, `inspect`, `list-tools`, `call` | Copy a skill into a runtime root and run it through the normal `load_from_roots -> call_skill` path |
+
+```bash
+luaskills-debug new my-skill
+luaskills-debug call --runtime-root D:/runtime --skill-path my-skill --tool hello --args-json "{\"name\":\"LuaSkills\"}"
+luaskills-debug package --skill-path my-skill --out-dir dist
+```
+
+A package ships `skill.yaml`, `dependencies.yaml`, the README and license files, and the `runtime`, `node`, `python`, `native`, `help`, `overflow_templates`, `resources`, `licenses` and `schemas` directories. Pass `--include <name>` for any other top-level entry the skill needs. `node_modules`, `.pnpm-store`, `__pycache__`, `.DS_Store` and `*.pyc` are never packaged, and symbolic links are rejected.
+
+In GitHub Actions, the `LuaSkills/luaskills-debug` action runs `validate` and `package`; the workflow that `new` writes uses it. Set the repository variable `LUASKILLS_PACKAGE_LAYOUT` to `platform` to switch layouts.
 
 ## 16. Common Development Guidance
 

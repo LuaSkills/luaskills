@@ -59,7 +59,7 @@ Skill 作者最应该记住的边界是：依赖 `vulcan.context.*` 与 `vulcan.
 ## 本地示例
 
 - [LuaSkills Rust Demo](../../examples/demo-rust/README.md)：Rust crate 直连宿主示例，覆盖 `call_skill` 与 `vulcan.host.*`。
-- [受管 Python/Node 运行时示例](../../examples/managed_runtime/README.md)
+- [受管 Python/Node 运行时示例](https://github.com/LuaSkills/luaskills-debug/blob/main/docs/managed-runtime-smoke.md)（位于 luaskills-debug 仓库）
 - [技能包配置示例](../../examples/skill-package-config/README.md)
 - [C FFI Demo](../../examples/ffi/c/README.md)
 - [TypeScript 标准 FFI 示例](../../examples/ffi/typescript/README.md)
@@ -67,7 +67,7 @@ Skill 作者最应该记住的边界是：依赖 `vulcan.context.*` 与 `vulcan.
 - [FFI Demo Runtime](../../examples/ffi/demo_runtime/README.md)
 - [Host Callback Demo](../../examples/ffi/host_provider_demo/README.md)
 - [LuaSkills FFI Demo](../../examples/demo-ffi/README.md)
-- `cargo run --features debug-sqlite --bin luaskills-debug -- inspect --runtime-root <目录> --skill-path <目录>`：把单个 skill 同步进真实 `runtime_root` 后按宿主方式加载。
+- [luaskills-debug](https://github.com/LuaSkills/luaskills-debug)：独立开发工具。`inspect`、`list-tools` 与 `call` 把单个 skill 同步进真实 `runtime_root` 后按宿主方式加载；`new`、`validate` 与 `package` 创建、校验和打包技能。
 
 ## 维护者
 

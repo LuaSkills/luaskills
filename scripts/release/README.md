@@ -37,8 +37,8 @@ GitHub 的 `GITHUB_TOKEN` 不能获得工作流写权限；来源提交相对实
 或源码不符立即失败，不重新压缩代替。汇总仍要求五个平台的精确压缩 SHA 一致，不仅比较解压文件。
 这是为了避免相同 tar 在不同平台 gzip 实现中产生不同压缩结果；源码身份和压缩分发身份分别核验。
 
-冻结阶段在完整提交及包版本核验通过后，复用既有 Python 环境，依次运行 `test_candidate.py`、
-`test_sdk_prerequisites.py`、`test_sdk_recovery.py`、`test_certum_totp.py`、`test_release_gpg.py` 五个离线回归入口；任一失败均使冻结作业失败，
+冻结阶段在完整提交及包版本核验通过后，复用既有 Python 环境，依次运行 `test_candidate.py`、`test_release_tag.py`、
+`test_sdk_prerequisites.py`、`test_sdk_recovery.py`、`test_publish_crate.py` 五个离线回归入口；任一失败均使冻结作业失败，
 阻止依赖它的原生验收、候选构建、汇总与草稿创建。脚本与工作流来自同一个已核验完整 SHA。
 五平台原生验收在既有 `cargo test --locked --all-targets -j 4 -- --test-threads=1` 之后，独立执行
 `cargo test --locked --doc -j 4 -- --test-threads=1`，覆盖前者不运行的文档测试，并保留编译并发 4、共享测试串行的限制。
@@ -57,16 +57,6 @@ GitHub 的 `GITHUB_TOKEN` 不能获得工作流写权限；来源提交相对实
 在固定提交的干净源码中执行；捕获命令使用 PowerShell 7 的 UTF-8 输出，所有输出保持在忽略的 `target/` 下：
 
 ```powershell
-# Link the Windows debugger CRT statically, then restore the core's original build flags.
-# 静态链接 Windows 调试器 CRT，然后恢复核心的原始构建参数。
-$PreviousRustFlags = $env:RUSTFLAGS
-try {
-  if ($IsWindows) { $env:RUSTFLAGS = "$PreviousRustFlags -C target-feature=+crt-static".Trim() }
-  rtk cargo build --locked --release --features debug-sqlite --bin luaskills-debug -j 4
-  if ($LASTEXITCODE -ne 0) { throw "Debug build failed" }
-} finally {
-  $env:RUSTFLAGS = $PreviousRustFlags
-}
 rtk proxy cargo build --locked --release --lib -j 4 --message-format=json > target/candidate-build.jsonl
 rtk proxy cargo metadata --locked --format-version=1 > target/candidate-metadata.json
 rtk proxy cargo --version --verbose > target/candidate-cargo-version.txt
@@ -95,25 +85,12 @@ FFI 归档保留既有 `include/`、`lib/` 和 `ffi-sdk-manifest.json` 布局，
 - `licenses/LICENSE`、`licenses/THIRD_PARTY_NOTICES.md`、`licenses/Cargo.lock`：源码中现有材料。
 - `licenses/dependencies.json` 及 `licenses/dependencies/`：实际 Cargo 元数据许可表达式与实际依赖源码文件；未找到许可文件时记录空列表，不编造授权或宣称完整许可审计。
 
-同平台 FFI demo 库字节必须与权威 FFI 归档一致；Rust demo 依赖使用冻结提交的 `rev`；demo/debug-tool
-现有清单的 `platform`、`release_tag` 及实际可执行文件均复核。源码另以 `git archive` 冻结为包含完整提交的
+同平台 FFI demo 库字节必须与权威 FFI 归档一致；Rust demo 依赖使用冻结提交的 `rev`；demo
+现有清单的 `platform`、`release_tag` 均复核。调试工具 `luaskills-debug` 自 0.8.0 起在独立仓库
+[LuaSkills/luaskills-debug](https://github.com/LuaSkills/luaskills-debug) 构建、签名与发布，不再属于核心候选资产。源码另以 `git archive` 冻结为包含完整提交的
 `luaskills-source-<版本>-<完整提交>.tar.gz`。这是精确 Git 源码归档，不宣称等同于未来 Cargo 规范化的 `.crate` 包。
 
-调试包还必须通过 `verify_debug_package.py --archive <归档> --platform <平台>` 原生离线验收，实际解包并调用 SQLite；Windows 额外传入 `--bash "C:/Program Files/Git/bin/bash.exe"` 覆盖 Git Bash 包装器。该步骤在上传前执行，缺少 SQLite 宿主的旧二进制、损坏的 JSON 参数转发或未持久化的数据都会令候选构建失败。Windows 调试器使用静态 CRT 并检查实际 DLL 导入；UTF-8 清单只应用于调试 EXE，默认核心库保持原有构建参数。
-
-## 调试工具签名
-
-Windows 构建在 Cargo 构建之后、打包之前，以 Certum 云证书对 `target/release/luaskills-debug.exe` 原地签名，
-调试归档因此携带已签名字节。流程与 VMM 发行一致：`sign_windows.ps1 -Phase Install` 只安装哈希与签名均已固定的
-官方 SimplySign Desktop；`-Phase Sign` 用 `certum_totp.py` 由 `CERTUM_TOTP_SECRET` 生成一次性动态码，
-连同 `CERTUM_TOTP_EMAIL` 只交给一次登录进程，随后以 `signtool` 加 `http://time.certum.pl` 时间戳签名，
-并逐个验证证书链、`signing-policy.json` 固定的主体、颁发者、指纹与时间戳。已登记证书不代表登录完成，签名在限定次数内重试。
-任一密钥缺失、证书未就绪或身份不符都直接失败，不产出未签名的 Windows 调试工具。
-
-Linux 构建在同一位置以 `release_gpg.py sign` 为 `target/release/luaskills-debug` 生成分离式签名 `luaskills-debug.asc`，
-私钥 `GPG_PRIVATE_KEY` 只导入隔离的临时密钥环，签名身份固定为 `signing-policy.json` 的 `gpg_primary_fingerprint`，
-随后用只含 `release-gpg-public.asc` 的全新密钥环复验。打包时签名放在调试归档的 `bin/` 中，候选核验要求 Linux 调试归档携带它。
-核心动态库、demo 与 macOS 产物不签名。
+核心动态库与 demo 产物不签名；调试工具的 Windows Certum 与 Linux OpenPGP 签名随调试工具迁至其独立仓库。
 
 ## 唯一候选清单定义
 
@@ -173,8 +150,8 @@ python scripts/release/publish_crate.py 0.7.1 --publish
 rtk proxy python -X utf8 -m unittest discover -s scripts/release -p test_candidate.py -v
 rtk proxy python -X utf8 -m unittest discover -s scripts/release -p test_sdk_prerequisites.py -v
 rtk proxy python -X utf8 -m unittest discover -s scripts/release -p test_sdk_recovery.py -v
-rtk proxy python -X utf8 -m unittest discover -s scripts/release -p test_certum_totp.py -v
-rtk proxy python -X utf8 -m unittest discover -s scripts/release -p test_release_gpg.py -v
+rtk proxy python -X utf8 -m unittest discover -s scripts/release -p test_release_tag.py -v
+rtk proxy python -X utf8 -m unittest discover -s scripts/release -p test_publish_crate.py -v
 rtk proxy python -X utf8 -m py_compile scripts/release/candidate.py scripts/release/create_draft.py scripts/release/freeze_draft_source.py scripts/release/test_candidate.py
 ```
 

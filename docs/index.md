@@ -63,7 +63,7 @@ For products that embed the runtime.
 ## Local examples
 
 - [Rust demo](../examples/demo-rust/README.md): direct crate integration with `call_skill` and `vulcan.host.*`.
-- [Managed Python/Node runtime example](../examples/managed_runtime/README.md)
+- [Managed Python/Node runtime example](https://github.com/LuaSkills/luaskills-debug/blob/main/docs/managed-runtime-smoke.md) (in the luaskills-debug repository)
 - [Skill package configuration example](../examples/skill-package-config/README.md)
 - [C FFI demo](../examples/ffi/c/README.md)
 - [TypeScript FFI demo](../examples/ffi/typescript/README.md)
@@ -71,7 +71,7 @@ For products that embed the runtime.
 - [FFI demo runtime](../examples/ffi/demo_runtime/README.md)
 - [Host provider demo](../examples/ffi/host_provider_demo/README.md)
 - [FFI demo package](../examples/demo-ffi/README.md)
-- `cargo run --features debug-sqlite --bin luaskills-debug -- inspect --runtime-root <dir> --skill-path <dir>`: syncs one skill into a real `runtime_root` and loads it the way a host would.
+- [luaskills-debug](https://github.com/LuaSkills/luaskills-debug): the standalone developer tool. `inspect`, `list-tools` and `call` sync one skill into a real `runtime_root` and load it the way a host would; `new`, `validate` and `package` create, check and package skills.
 
 ## Maintainers
 

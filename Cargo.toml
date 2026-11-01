@@ -1,6 +1,6 @@
 [package]
 name = "luaskills"
-version = "0.7.4"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -37,17 +37,9 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 # Opt into the host-selected SQLite operation-journal adapter; the default runtime links no SQLite.
 # 显式启用宿主选择的 SQLite 操作日志适配器；默认运行时不链接 SQLite。
 sqlite-journal = ["dep:rusqlite"]
-# Link SQLite only when building the standalone debugger as a database-providing host.
-# 仅在将独立调试工具构建为数据库宿主时链接 SQLite。
-debug-sqlite = ["dep:rusqlite", "rusqlite/hooks"]
 # Generate offline embedded contracts from the exact Rust serialization types only when requested.
 # 仅在显式请求时，从精确 Rust 序列化类型生成离线嵌入式契约。
 contract-generation = ["dep:schemars"]
-
-[[bin]]
-name = "luaskills-debug"
-path = "src/bin/luaskills-debug.rs"
-required-features = ["debug-sqlite"]
 
 [[bin]]
 name = "generate_embedded_contract"

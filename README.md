@@ -100,7 +100,7 @@ LuaSkills powers the skill system of [Vulcan Code](https://github.com/OpenVulcan
 
 ```toml
 [dependencies]
-luaskills = "0.7.4"
+luaskills = "0.8.0"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md) shows `call_skill` and the `vulcan.host.*` tool bridge.
@@ -120,22 +120,15 @@ See the [SDK overview](docs/sdk/index.md) and the [FFI overview](docs/integratio
 
 ### Writing a skill
 
-Start from [demo-skill](https://github.com/LuaSkills/demo-skill), then read the [skill development manual](docs/development/skill-development.md). To debug one skill against a real runtime layout:
+Start from [demo-skill](https://github.com/LuaSkills/demo-skill), or create a new skill with [luaskills-debug](https://github.com/LuaSkills/luaskills-debug), the standalone developer tool. Download it from its [releases](https://github.com/LuaSkills/luaskills-debug/releases); it is not part of this repository's release.
 
 ```bash
-cargo run --features debug-sqlite --bin luaskills-debug -- call \
-  --runtime-root D:/runtime \
-  --skill-path D:/skills/demo-skill \
-  --tool ping \
-  --args-json "{\"note\":\"hello\"}"
+luaskills-debug new my-skill
+luaskills-debug call --runtime-root D:/runtime --skill-path my-skill --tool hello --args-json "{\"name\":\"LuaSkills\"}"
+luaskills-debug package --skill-path my-skill --out-dir dist
 ```
 
-`luaskills-debug` copies the skill into `runtime_root/skills/<skill_id>` and runs the normal `load_from_roots -> call_skill` path, so dependency roots, state, databases, and context match real host execution. It is a repository developer tool and adds no SDK or FFI API.
-
-Two details matter when a skill reads host-injected context:
-
-- Every `call` injects the context shape a host provides for one developer invocation: `request_id`, `client_name`, and `matched_client_pattern` are `luaskills-debug`, and `client_budget` carries `tool_result` and `file_read` scopes of 200000 bytes with unlimited lines. Pass `--context-file <path>`, or `--client-budget <json>` and `--tool-config <json>`, to reproduce one specific host profile instead.
-- Sync skips build, checkout, and debug-wrapper directories at every depth (`target`, `.git`, `.svn`, `node_modules`, `__pycache__`, `.luaskills-debug`) so a Rust workspace does not get copied into the runtime root. Packaging output and names the runtime root owns (`dist`, `out`, `temp`, `state`, `databases`, `dependencies`, `lua_packages`, `libs`) are skipped only directly under the package root; deeper directories with those names, such as `runtime/libs/`, are copied as ordinary skill content.
+`call` copies the skill into `runtime_root/skills/<skill_id>` and runs the normal `load_from_roots -> call_skill` path, so dependency roots, state, databases, and context match real host execution. `package` builds the GitHub release assets. Most skills use the standard layout: one zip for every system. A skill that bundles large native libraries can use `--layout platform`, which builds one package per system plus a `packages.json` index, and LuaSkills installs the package for the current system. The [skill development manual](docs/development/skill-development.md) covers the release rules and every debugger command.
 
 
 ## Documentation
@@ -164,8 +157,8 @@ Two details matter when a skill reads host-injected context:
 
 | Component | Version |
 | --- | --- |
-| LuaSkills core and FFI SDK | `0.7.4` |
-| TypeScript, Python, and Go SDKs | Independent version lines; see the [SDK overview](docs/sdk/index.md#versions) |
+| LuaSkills core and FFI SDK | `0.8.0` |
+| TypeScript, Python, and Go SDKs | `0.8.0`, released after the core; see the [SDK overview](docs/sdk/index.md#versions) |
 | Lua runtime packages | compatible `0.1` series |
 | Managed Python / uv | `3.14.6` / `0.11.28` |
 | Managed Node.js / pnpm | `24.18.0` / `11.11.0` |

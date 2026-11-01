@@ -4,7 +4,7 @@
 
 LuaSkills 的公开用户安装面只建议开放两类来源：
 
-1. `github`：通过 GitHub Release 解析 `{skill_id}-v{version}-skill.zip` 与 checksums。
+1. `github`：通过 GitHub Release 的 checksums 文件解析技能包。存在包索引 `{skill_id}-v{version}-packages.json` 时按当前平台选择平台包，否则使用标准包 `{skill_id}-v{version}-skill.zip`；规则见[技能开发手册](../development/skill-development.md)的 2.1 与 13.2 节。
 2. `official_hub`：通过官方 Skills Hub resolve 接口获取标准 manifest 后安装。
 
 `url` 不再作为用户可见安装来源。历史 `url` source type 保留用于兼容解析，但运行时会拒绝公开 URL 安装。
@@ -47,7 +47,7 @@ GET /api/v1/health
 GET /api/v1/skills/search?q={keyword}&platform={platform}&runtime_version={version}
 GET /api/v1/skills/{skill_id}
 GET /api/v1/skills/{skill_id}/versions
-GET /api/v1/skills/{skill_id}/resolve?version=latest
+GET /api/v1/skills/{skill_id}/resolve?version=latest&platform={platform}
 GET /api/v1/sources
 ```
 
@@ -71,6 +71,8 @@ GET /api/v1/sources
 }
 ```
 
+运行时调用 resolve 时总是带上当前平台键（如 `windows-x64`），Hub 据此为平台分包的版本返回对应平台包；不分包的版本忽略该参数。
+
 resolve 响应同时也是运行时可消费的标准 manifest：
 
 ```json
@@ -90,6 +92,16 @@ resolve 响应同时也是运行时可消费的标准 manifest：
   }
 }
 ```
+
+manifest 可以额外声明它解析出的包布局：
+
+| 字段 | 取值 | 运行时行为 |
+| --- | --- | --- |
+| `layout` 省略 | — | 不做布局预期校验；包内若带平台标记，仍须与当前平台一致 |
+| `layout: "universal"` | 不得声明 `platform` | 包必须不带平台标记 |
+| `layout: "platform"` | `platform` 必填 | `platform` 必须等于当前平台，且包内平台标记一致；否则以 `skill_package_platform_mismatch` 拒绝 |
+
+平台分包版本在 Hub 没有当前平台的包、也没有全系统包时，resolve 应返回明确错误（运行时对应错误码 `skill_platform_unsupported`），不要回退到其他平台的包。安装成功后，安装记录的 `package_platform` 字段记录已安装平台包的平台键；标准包与全系统包不写该字段。
 
 ## 4. 私有 URL Manifest
 

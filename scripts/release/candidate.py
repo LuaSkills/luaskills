@@ -28,9 +28,9 @@ PLATFORMS = {
     "macos-arm64": ("aarch64-apple-darwin", "macos", "aarch64", ("libluaskills.dylib", "libluaskills.a")),
     "windows-x64": ("x86_64-pc-windows-msvc", "windows", "x86_64", ("luaskills.dll", "luaskills.dll.lib", "luaskills.lib")),
 }
-# The existing four archive families remain the exact mandatory set for each platform.
+# These three archive families are the exact mandatory set for each platform; the debugger ships from LuaSkills/luaskills-debug.
 # 既有四种归档仍是各平台精确的必需集合。
-ARCHIVE_FAMILIES = ("ffi-sdk", "demo-ffi", "demo-rust", "debug-tool")
+ARCHIVE_FAMILIES = ("ffi-sdk", "demo-ffi", "demo-rust")
 # Actual Cargo verbose bytes belong to release evidence, independently of the Rust runtime build ABI.
 # 实际 Cargo 详细版本字节属于发布证据，独立于 Rust 运行时构建 ABI。
 CARGO_VERSION_EVIDENCE_FILE = "cargo-version.txt"
@@ -518,8 +518,8 @@ def verify_payload(files, manifest, source_path, commit, version, platform):
 
 
 def verify_auxiliary(directory, platform, commit, version, core_files):
-    """Verify actual demo/debug manifests, pinned Rust dependency and copied FFI libraries for this candidate.
-    验证此候选实际 demo 及调试清单、冻结 Rust 依赖及复制的 FFI 库。
+    """Verify actual demo manifests, pinned Rust dependency and copied FFI libraries for this candidate.
+    验证此候选实际 demo 清单、冻结 Rust 依赖及复制的 FFI 库。
     """
     for mode in ("ffi", "rust"):
         # Files are the established demo archive layout emitted by the existing packagers.
@@ -540,26 +540,11 @@ def verify_auxiliary(directory, platform, commit, version, core_files):
             dependency = tomllib.loads(files["Cargo.toml"].decode("utf-8-sig"))["dependencies"]["luaskills"]
             if dependency != {"git": "https://github.com/LuaSkills/luaskills.git", "rev": commit}:
                 raise ValueError("Rust demo dependency must pin the same frozen source commit")
-    # Debug package uses its existing platform binary path declaration.
-    # 调试包使用既有平台二进制路径声明。
-    debug = archive_files(directory / f"luaskills-debug-tool-{platform}.tar.gz")
-    # Debug manifest is authoritative for the packaged executable location.
-    # 调试清单是包内可执行文件位置的权威。
-    manifest = decode_json(debug["debug-tool-manifest.json"])
-    # ExpectedBinary is derived from the supported OS identity, not an arbitrary manifest path.
-    # ExpectedBinary 派生自受支持 OS 身份，不采用任意清单路径。
-    expected_binary = "bin/luaskills-debug.exe" if PLATFORMS[platform][1] == "windows" else "bin/luaskills-debug"
-    if manifest["platform"] != platform or manifest["release_tag"] != f"v{version}" or manifest["binary"] != expected_binary or not debug[expected_binary]:
-        raise ValueError("Debug candidate manifest or executable mismatch")
-    # Linux debug tools ship a detached OpenPGP signature; release_gpg.py verified it before packaging.
-    # Linux 调试工具附带分离式 OpenPGP 签名；release_gpg.py 已在打包前验证。
-    if PLATFORMS[platform][1] == "linux" and not debug.get(f"{expected_binary}.asc", b"").startswith(b"-----BEGIN PGP SIGNATURE-----"):
-        raise ValueError("Linux debug candidate is missing its OpenPGP signature")
 
 
 def collect(args):
-    """Verify all four archives for one platform and emit immutable checksums and candidate evidence.
-    验证一个平台全部四种归档，并输出不可变校验和及候选证据。
+    """Verify all three archives for one platform and emit immutable checksums and candidate evidence.
+    验证一个平台全部三种归档，并输出不可变校验和及候选证据。
     """
     # Archives are exact expected filenames; additional archives are a packaging error.
     # 归档使用精确预期文件名；额外归档属于打包错误。
@@ -568,7 +553,7 @@ def collect(args):
     # 源码名称由全部平台候选原样共享。
     source_name = f"luaskills-source-{args.version}-{args.source_commit}.tar.gz"
     if {path.name for path in args.output.glob("*.tar.gz")} != {*archives, source_name}:
-        raise ValueError("Platform candidate must contain exactly four archives and the frozen source archive")
+        raise ValueError("Platform candidate must contain exactly three archives and the frozen source archive")
     # FFI package supplies the verified native build identity.
     # FFI 包提供已验证的原生构建身份。
     files = archive_files(args.output / archives[0])

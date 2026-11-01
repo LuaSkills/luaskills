@@ -219,7 +219,7 @@ scripts/deps/fetch_managed_runtimes.ps1 -RuntimeRoot D:\build-cache -Distributio
 RUNTIME_ROOT=/tmp/luaskills-build MANAGED_RUNTIME_DISTRIBUTION_ROOT=/opt/vulcancode/dependencies/runtimes scripts/deps/fetch_managed_runtimes.sh all
 ```
 
-使用 `managed_runtime_layout_check.py --distribution-root ... --environment-root ...` 校验拆分根。`luaskills-debug` 命令接受 `--managed-runtime-distribution-root`、`--managed-runtime-environment-root` 与 `--help` 列出的五个 `--managed-runtime-*` 资源参数；受管运行时冒烟脚本默认验证拆分根。
+使用 `scripts/deps/managed_runtime_layout_check.py --distribution-root ... --environment-root ...` 校验拆分根。[luaskills-debug](https://github.com/LuaSkills/luaskills-debug) 命令接受 `--managed-runtime-distribution-root`、`--managed-runtime-environment-root` 与 `--help` 列出的五个 `--managed-runtime-*` 资源参数；它的受管运行时冒烟脚本默认验证拆分根。
 
 ## Lua 与状态语义
 

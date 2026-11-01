@@ -63,10 +63,18 @@ Skill 包结构必须遵守：
 GitHub 托管 skill 的安装与发布资产必须保持同一个 `skill_id`：
 
 - 安装请求若未显式传入 `skill_id`，运行时会从 GitHub 仓库名派生 `skill_id`，不会自动剥离 `luaskills-` 前缀。
-- release zip 文件名必须是 `{skill_id}-v{version}-skill.zip`。
-- checksum 文件名必须是 `{skill_id}-v{version}-checksums.txt`。
-- zip 内部只能包含与 `skill_id` 同名的顶层目录，并且必须包含 `{skill_id}/skill.yaml`。
+- 每个 release 都必须发布 `{skill_id}-v{version}-checksums.txt`，以 `<sha256>  <资产名>` 逐行列出其余全部资产的 SHA-256。
+- 每个包 zip 内部只能包含与 `skill_id` 同名的顶层目录，并且必须包含 `{skill_id}/skill.yaml`。
 - 仓库名、release 资产名前缀、checksum 文件名前缀、zip 顶层目录和最终安装目录应全部使用同一个 `skill_id`。
+
+release 采用以下两种布局之一：
+
+| 布局 | 资产 | 适用场景 |
+| --- | --- | --- |
+| 标准（默认） | 适用所有系统的 `{skill_id}-v{version}-skill.zip`，加 checksum 文件 | 技能不带原生库，或原生库很小。大多数技能使用此布局。 |
+| 平台分包 | 每个系统一个 `{skill_id}-v{version}-{platform}-skill.zip`、`{skill_id}-v{version}-packages.json`、可选的全系统包 `{skill_id}-v{version}-skill.zip`，加 checksum 文件 | 技能为多个系统内置较大的原生库，每个系统只下载自己的那一份。 |
+
+包索引 `packages.json` 是平台分包 release 的标志。存在索引时，运行时安装索引中当前平台对应的包；索引未列出当前平台但列出全系统包时安装全系统包；否则以 `skill_platform_unsupported` 失败。没有索引时安装标准 zip。索引、包标记以及如何用 `luaskills-debug package` 构建两种布局，见 13.2 节。
 
 ## 2.2 入口输入 Schema
 
@@ -1081,15 +1089,7 @@ return {
 - `session:close(...)` 与 `session:kill()` 会同时终止直接子进程及其后代。
 - 后台 stdout、stderr、退出与失败观察器绝不会调用 Lua。System Plugin 会话只向宿主发布有界引擎事件；宿主 wake callback 只能唤醒或调度宿主工作，不能同步进入 Lua。
 
-完整 System 租约、持久会话、宿主事件与清理流程见 [System Plugin 受管运行时使用指南](system-plugin-managed-runtime.md)。[Managed Runtime Example](../../../examples/managed_runtime/README.md) 是覆盖池化 `status` / `invoke` 路径的可运行普通 Skill 包。仓库开发阶段可以用布局检查器与隔离冒烟脚本做端到端验证：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/debug-tools/managed_runtime_smoke.ps1
-```
-
-```bash
-bash scripts/debug-tools/managed_runtime_smoke.sh
-```
+完整 System 租约、持久会话、宿主事件与清理流程见 [System Plugin 受管运行时使用指南](system-plugin-managed-runtime.md)。luaskills-debug 仓库中的[受管运行时示例](https://github.com/LuaSkills/luaskills-debug/blob/main/docs/managed-runtime-smoke.md)是覆盖池化 `status` / `invoke` 路径的可运行普通 Skill 包，并附带用于端到端检查的隔离冒烟脚本。
 
 ### 5.10 `vulcan.config.*`
 
@@ -1823,7 +1823,7 @@ local ffi_root = vulcan.deps.ffi_path
 
 ### 13.1 在技能包内分发原生库
 
-`source.type` 为 `bundled` 的依赖直接从技能包自身取载荷，安装时不需要访问 GitHub 或任何网络。每个平台条目用 `path` 指定载荷（相对技能目录，不能越出该目录，包括经由链接越出），并可用 `sha256` 固定其摘要。所有平台的库放在同一个包里：
+`source.type` 为 `bundled` 的依赖直接从技能包自身取载荷，安装时不需要访问 GitHub 或任何网络。每个平台条目用 `path` 指定载荷（相对技能目录，不能越出该目录，包括经由链接越出），并可用 `sha256` 固定其摘要。所有平台的库都放在技能源码中；采用平台分包发布布局（13.2 节）时，每个系统的包只带自己的库：
 
 ```yaml
 ffi_dependencies:
@@ -1857,6 +1857,47 @@ local lib = ffi.load(vulcan.path.join(base, "lib", "demo_native.dll"))
 包内分发压缩包时，`archive_type` 也可以是 `zip` 或 `tar_gz`。所有来源类型都接受 `sha256`；对 `github_release` 来源，它必须与 GitHub 为该资产报告的摘要一致。
 
 依赖默认是 `required: true`，任何无法就绪的情况都会阻止技能加载。技能没有它也能工作的依赖应声明 `required: false`：载荷缺失、当前平台没有对应包、下载或安装失败时，运行时只记录警告并照常加载技能。使用可选依赖前先检查导出文件是否存在，以便技能报告该功能在当前平台不可用。
+
+### 13.2 平台分包
+
+内置全部系统原生库的包会随支持的系统数量增长。平台分包布局把它拆开：每个平台包保留共享文件，只带本平台的内置载荷，Windows 安装不会下载 Linux 或 macOS 的库。
+
+用 [luaskills-debug](https://github.com/LuaSkills/luaskills-debug) 构建两种布局，它直接使用运行时自身的打包规则：
+
+```bash
+luaskills-debug package --skill-path . --out-dir dist                    # 标准
+luaskills-debug package --skill-path . --out-dir dist --layout platform  # 平台分包
+```
+
+平台分包为 `dependencies.yaml` 中带内置载荷的每个平台各写一个包，另写全系统包（可用 `--no-universal` 省略）、包索引和 checksum 文件。没有内置载荷的技能不能使用平台分包。
+
+包索引形状如下，未知字段会被拒绝：
+
+```json
+{
+  "schema_version": 1,
+  "skill_id": "demo-skill",
+  "version": "1.2.3",
+  "layout": "platform",
+  "platforms": {
+    "linux-x64": { "asset": "demo-skill-v1.2.3-linux-x64-skill.zip", "sha256": "<64 位十六进制>", "size": 12345 },
+    "windows-x64": { "asset": "demo-skill-v1.2.3-windows-x64-skill.zip", "sha256": "<64 位十六进制>", "size": 12345 }
+  },
+  "universal": { "asset": "demo-skill-v1.2.3-skill.zip", "sha256": "<64 位十六进制>", "size": 23456 }
+}
+```
+
+平台键为 `windows-x64`、`windows-arm64`、`linux-x64`、`linux-arm64`、`macos-x64` 与 `macos-arm64`。索引本身也列在 checksum 文件中；安装前运行时会互相核对索引、所选包与 GitHub 资产摘要。
+
+每个平台包还带有标记文件 `{skill_id}/luaskills-package.json`：
+
+```json
+{"schema_version":1,"layout":"platform","platform":"windows-x64"}
+```
+
+无论包来自哪个来源，标记指向其他平台时运行时都拒绝安装（`skill_package_platform_mismatch`），并把已安装平台记录为安装记录中的 `package_platform`。标准包与全系统包不带标记。不要在技能源码中放置标记，它由打包器写入。
+
+LuaSkills Hub 的包上限为单包 100 MiB、单版本全部包合计 600 MiB、解压后 1 GiB。构建超出时 `luaskills-debug package` 会给出警告。
 
 ## 14. `vulcan.sqlite.*`
 
@@ -1938,6 +1979,27 @@ local lib = ffi.load(vulcan.path.join(base, "lib", "demo_native.dll"))
 - 具体输入输出字段请结合宿主的 SQLite provider 契约与：
   - [宿主数据库 Provider 对接说明](../integration/host-database-provider-guide.md)
 - 如果你是 skill 作者而不是宿主实现者，建议优先参考对应记忆类 skill 的现有调用示例，而不是猜测 SQL provider 的自定义返回字段。
+
+## 15. 用 `luaskills-debug` 调试、校验与打包
+
+[luaskills-debug](https://github.com/LuaSkills/luaskills-debug) 是独立的技能开发工具，从其 [Releases](https://github.com/LuaSkills/luaskills-debug/releases) 下载，不随 LuaSkills 核心发布。它的主次版本号跟随所内嵌的运行时。
+
+| 命令 | 用途 |
+| --- | --- |
+| `new <目录> [--layout standard\|platform]` | 从内置模板创建技能，包含发布工作流 |
+| `validate --skill-path <目录>` | 按打包规则检查技能源码 |
+| `package --skill-path <目录> --out-dir <目录> [--layout standard\|platform]` | 构建发布资产 |
+| `sync`、`inspect`、`list-tools`、`call` | 把技能复制到运行时根目录，经正常 `load_from_roots -> call_skill` 路径执行 |
+
+```bash
+luaskills-debug new my-skill
+luaskills-debug call --runtime-root D:/runtime --skill-path my-skill --tool hello --args-json "{\"name\":\"LuaSkills\"}"
+luaskills-debug package --skill-path my-skill --out-dir dist
+```
+
+包内包含 `skill.yaml`、`dependencies.yaml`、README 与许可证文件，以及 `runtime`、`node`、`python`、`native`、`help`、`overflow_templates`、`resources`、`licenses`、`schemas` 目录。技能需要的其他顶层条目用 `--include <名称>` 加入。`node_modules`、`.pnpm-store`、`__pycache__`、`.DS_Store` 与 `*.pyc` 永不打包，符号链接会被拒绝。
+
+在 GitHub Actions 中，`LuaSkills/luaskills-debug` action 执行 `validate` 与 `package`；`new` 生成的工作流就使用它。把仓库变量 `LUASKILLS_PACKAGE_LAYOUT` 设为 `platform` 即可切换布局。
 
 ## 16. 常见开发建议
 

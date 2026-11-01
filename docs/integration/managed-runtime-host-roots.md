@@ -219,7 +219,7 @@ scripts/deps/fetch_managed_runtimes.ps1 -RuntimeRoot D:\build-cache -Distributio
 RUNTIME_ROOT=/tmp/luaskills-build MANAGED_RUNTIME_DISTRIBUTION_ROOT=/opt/vulcancode/dependencies/runtimes scripts/deps/fetch_managed_runtimes.sh all
 ```
 
-Validate split roots with `managed_runtime_layout_check.py --distribution-root ... --environment-root ...`. The `luaskills-debug` commands accept `--managed-runtime-distribution-root`, `--managed-runtime-environment-root`, and the five `--managed-runtime-*` resource flags shown by `--help`; the managed runtime smoke scripts exercise split roots by default.
+Validate split roots with `scripts/deps/managed_runtime_layout_check.py --distribution-root ... --environment-root ...`. The [luaskills-debug](https://github.com/LuaSkills/luaskills-debug) commands accept `--managed-runtime-distribution-root`, `--managed-runtime-environment-root`, and the five `--managed-runtime-*` resource flags shown by `--help`; its managed runtime smoke scripts exercise split roots by default.
 
 ## Lua and status behavior
 

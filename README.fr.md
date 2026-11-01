@@ -102,7 +102,7 @@ LuaSkills fait tourner le système de skills de [Vulcan Code](https://github.com
 
 ```toml
 [dependencies]
-luaskills = "0.7.4"
+luaskills = "0.8.0"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md) montre `call_skill` et le pont d’outils `vulcan.host.*`.
@@ -120,17 +120,16 @@ Voir le [SDK overview](docs/sdk/index.md) et le [FFI overview](docs/integration/
 
 ### Écrire un skill
 
-Partez de [demo-skill](https://github.com/LuaSkills/demo-skill), puis lisez le [Skill development manual](docs/development/skill-development.md). Pour déboguer un skill avec une arborescence de runtime réelle :
+Partez de [demo-skill](https://github.com/LuaSkills/demo-skill) ou créez un nouveau skill avec [luaskills-debug](https://github.com/LuaSkills/luaskills-debug), l'outil de développement autonome. Téléchargez-le depuis ses [Releases](https://github.com/LuaSkills/luaskills-debug/releases) ; il ne fait pas partie des releases de ce dépôt.
 
 ```bash
-cargo run --features debug-sqlite --bin luaskills-debug -- call \
-  --runtime-root D:/runtime \
-  --skill-path D:/skills/demo-skill \
-  --tool ping \
-  --args-json "{\"note\":\"hello\"}"
+luaskills-debug new my-skill
+luaskills-debug call --runtime-root D:/runtime --skill-path my-skill --tool hello --args-json "{\"name\":\"LuaSkills\"}"
+luaskills-debug package --skill-path my-skill --out-dir dist
 ```
 
-`luaskills-debug` copie le skill dans `runtime_root/skills/<skill_id>` et suit le chemin normal `load_from_roots -> call_skill`, afin que racines de dépendances, état, bases de données et contexte correspondent à une exécution hôte réelle. C’est un outil de développement du dépôt ; il n’ajoute aucune API SDK ou FFI.
+`call` copie le skill dans `runtime_root/skills/<skill_id>` et l'exécute par le chemin normal `load_from_roots -> call_skill` : racines de dépendances, état, bases de données et contexte correspondent donc à une exécution réelle par l'hôte. `package` produit les ressources de la release GitHub. La plupart des skills utilisent la disposition standard : un seul zip pour tous les systèmes. Un skill qui embarque de grosses bibliothèques natives peut utiliser `--layout platform`, qui produit un paquet par système et un index `packages.json` ; LuaSkills installe le paquet du système courant. Le [Skill development manual](docs/development/skill-development.md) décrit les règles de publication et toutes les commandes du débogueur.
+
 
 ## Documentation
 
@@ -158,8 +157,8 @@ cargo run --features debug-sqlite --bin luaskills-debug -- call \
 
 | Composant | Version |
 | --- | --- |
-| Cœur LuaSkills et FFI SDK | `0.7.4` |
-| SDK TypeScript, Python et Go | Lignes de version indépendantes ; voir le [SDK overview](docs/sdk/index.md#versions) |
+| Cœur LuaSkills et FFI SDK | `0.8.0` |
+| SDK TypeScript, Python et Go | `0.8.0`, publiés après le cœur ; voir le [SDK overview](docs/sdk/index.md#versions) |
 | Paquets du runtime Lua | série compatible `0.1` |
 | Python / uv gérés | `3.14.6` / `0.11.28` |
 | Node.js / pnpm gérés | `24.18.0` / `11.11.0` |

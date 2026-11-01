@@ -46,7 +46,7 @@ SQLite 默认建议路径为技能根父目录下的 `{database_dir_name}/sqlite
 
 ## 调试工具
 
-独立调试工具 `luaskills-debug` 自己提供 SQLite 宿主，启用 SQLite 的技能可以直接执行 SQL。构建使用 `--features debug-sqlite`，不改变默认核心库的依赖。输入、事务、数据目录与支持边界见[调试工具 SQLite 宿主](debug-sqlite-host.md)。
+独立调试工具 [luaskills-debug](https://github.com/LuaSkills/luaskills-debug) 在自己的仓库中发布，通过公开宿主接口注册自带的 SQLite 宿主，启用 SQLite 的技能可以直接执行 SQL。输入、事务、数据目录与支持边界见[调试工具 SQLite 宿主](https://github.com/LuaSkills/luaskills-debug/blob/main/docs/zh-CN/sqlite-host.md)。
 
 ## 内部操作日志
 

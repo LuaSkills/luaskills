@@ -110,16 +110,15 @@ fn source_demo_launchers_reference_existing_dependency_fetchers() {
     );
 }
 
-/// Verify the three tar-based PowerShell packagers share the checked helper; FFI candidates use offline behavioral tests.
-/// 验证三个基于 tar 的 PowerShell 打包器共享受检辅助脚本；FFI 候选由离线行为测试覆盖。
+/// Verify the tar-based PowerShell packagers share the checked helper; FFI candidates use offline behavioral tests.
+/// 验证基于 tar 的 PowerShell 打包器共享受检辅助脚本；FFI 候选由离线行为测试覆盖。
 #[test]
 fn powershell_packagers_share_checked_archive_helper() {
     // Exact tar-based packager set; scripts/release/test_candidate.py covers the cross-platform FFI archiver.
     // 精确基于 tar 的打包器集合；scripts/release/test_candidate.py 覆盖跨平台 FFI 归档器。
-    const PACKAGERS: [&str; 3] = [
+    const PACKAGERS: [&str; 2] = [
         "scripts/build/package_demo.ps1",
         "scripts/build/package_lua_runtime.ps1",
-        "scripts/build/package_debug_tool.ps1",
     ];
     // Shared helper source containing the one authoritative tar invocation.
     // 包含唯一权威 tar 调用的共享辅助脚本源码。

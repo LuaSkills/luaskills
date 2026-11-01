@@ -80,6 +80,7 @@ fn test_apply_result(status: &str) -> SkillApplyResult {
         version: Some("0.1.0".to_string()),
         source_type: Some(SkillInstallSourceType::Github),
         source_locator: Some("vulcan-ai/vulcan-codekit".to_string()),
+        package_platform: None,
     }
 }
 
