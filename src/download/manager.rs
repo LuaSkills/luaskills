@@ -3401,8 +3401,8 @@ mod network_policy_tests {
     use super::{DownloadManager, DownloadManagerConfig, send_with_transient_retry};
     use crate::host::options::LuaRuntimeSecretString;
     use crate::package::PackageLayout;
-    use sha2::{Digest, Sha256};
     use crate::skill::dependencies::GithubReleaseSourceSpec;
+    use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::PathBuf;
@@ -3631,7 +3631,10 @@ mod network_policy_tests {
             index["universal"] = serde_json::json!({ "asset": "demo-v1.0.0-skill.zip", "sha256": universal_sha, "size": 9 });
             assets.push(serde_json::json!({ "name": "demo-v1.0.0-skill.zip", "browser_download_url": format!("{base}/download/universal.zip") }));
         }
-        let index_text = format!("{}\n", serde_json::to_string_pretty(&index).expect("index json"));
+        let index_text = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&index).expect("index json")
+        );
         let index_sha = format!("{:x}", Sha256::digest(index_text.as_bytes()));
         let checksums = format!(
             "{package_sha}  demo-v1.0.0-linux-x64-skill.zip\n{index_sha}  demo-v1.0.0-packages.json\n{universal_sha}  demo-v1.0.0-skill.zip\n"
@@ -3661,7 +3664,10 @@ mod network_policy_tests {
         assert_eq!(resolved.asset.asset_name, "demo-v1.0.0-linux-x64-skill.zip");
         assert_eq!(resolved.layout, PackageLayout::Platform);
         assert_eq!(resolved.package_platform.as_deref(), Some("linux-x64"));
-        assert_eq!(resolved.asset.sha256.as_deref(), Some("c".repeat(64).as_str()));
+        assert_eq!(
+            resolved.asset.sha256.as_deref(),
+            Some("c".repeat(64).as_str())
+        );
         server.finish();
         let _ = std::fs::remove_dir_all(cache_root);
 
@@ -3675,7 +3681,10 @@ mod network_policy_tests {
                 "macos-arm64",
             )
             .expect_err("no package for platform");
-        assert!(error.starts_with(crate::package::SKILL_PLATFORM_UNSUPPORTED), "{error}");
+        assert!(
+            error.starts_with(crate::package::SKILL_PLATFORM_UNSUPPORTED),
+            "{error}"
+        );
         server.finish();
         let _ = std::fs::remove_dir_all(cache_root);
 

@@ -240,7 +240,11 @@ impl PackageIndex {
             self.skill_id,
             self.version,
             platform,
-            self.platforms.keys().cloned().collect::<Vec<_>>().join(", ")
+            self.platforms
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         ))
     }
 
@@ -262,8 +266,12 @@ fn validate_index_entry(entry: &PackageIndexEntry, expected_asset: &str) -> Resu
             entry.asset, expected_asset
         ));
     }
-    let normalized = normalize_sha256(&entry.sha256)
-        .map_err(|_| format!("package index asset '{}' has an invalid sha256", entry.asset))?;
+    let normalized = normalize_sha256(&entry.sha256).map_err(|_| {
+        format!(
+            "package index asset '{}' has an invalid sha256",
+            entry.asset
+        )
+    })?;
     if normalized != entry.sha256 {
         return Err(format!(
             "package index asset '{}' sha256 must be lowercase hexadecimal",
@@ -476,7 +484,9 @@ struct InspectedSource {
 
 /// Validate one skill source directory without writing anything.
 /// 校验单个技能源目录，不写入任何内容。
-pub fn validate_skill_source(options: &SkillSourceOptions) -> Result<SkillValidationReport, String> {
+pub fn validate_skill_source(
+    options: &SkillSourceOptions,
+) -> Result<SkillValidationReport, String> {
     Ok(inspect_skill_source(options)?.report)
 }
 
@@ -501,7 +511,11 @@ fn inspect_skill_source(options: &SkillSourceOptions) -> Result<InspectedSource,
         Some(skill_id) => skill_id.trim().to_string(),
         None => fs::canonicalize(skill_dir)
             .ok()
-            .and_then(|path| path.file_name().and_then(|name| name.to_str()).map(str::to_string))
+            .and_then(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+            })
             .ok_or_else(|| {
                 format!(
                     "Failed to resolve skill id from directory {}",
@@ -521,14 +535,18 @@ fn inspect_skill_source(options: &SkillSourceOptions) -> Result<InspectedSource,
         Err(error) => issues.push(issue("manifest_invalid", error, Some("skill.yaml"))),
     }
 
-    let mut root_names: BTreeSet<String> =
-        DEFAULT_PACKAGE_ROOT_NAMES.iter().map(|name| name.to_string()).collect();
+    let mut root_names: BTreeSet<String> = DEFAULT_PACKAGE_ROOT_NAMES
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
     for name in &options.extra_root_names {
         let name = name.trim();
         if name.is_empty() || name.contains(['/', '\\']) || name == "." || name == ".." {
             issues.push(issue(
                 "root_name_invalid",
-                format!("extra package entry '{name}' must be one top-level file or directory name"),
+                format!(
+                    "extra package entry '{name}' must be one top-level file or directory name"
+                ),
                 None,
             ));
             continue;
@@ -595,9 +613,13 @@ fn inspect_skill_source(options: &SkillSourceOptions) -> Result<InspectedSource,
                             "bundled_payload_missing"
                         };
                         let message = if code == "bundled_payload_missing" {
-                            format!("bundled payload '{normalized}' for platform '{platform}' does not exist; build or stage it before packaging")
+                            format!(
+                                "bundled payload '{normalized}' for platform '{platform}' does not exist; build or stage it before packaging"
+                            )
                         } else {
-                            format!("bundled payload '{normalized}' for platform '{platform}' is outside the package entries; move it under 'native/' or add its top-level entry")
+                            format!(
+                                "bundled payload '{normalized}' for platform '{platform}' is outside the package entries; move it under 'native/' or add its top-level entry"
+                            )
                         };
                         issues.push(issue(code, message, Some(&normalized)));
                         continue;
@@ -605,7 +627,11 @@ fn inspect_skill_source(options: &SkillSourceOptions) -> Result<InspectedSource,
                     bundled.entry(platform).or_default().insert(normalized);
                 }
             }
-            Err(error) => issues.push(issue("dependencies_invalid", error, Some("dependencies.yaml"))),
+            Err(error) => issues.push(issue(
+                "dependencies_invalid",
+                error,
+                Some("dependencies.yaml"),
+            )),
         }
     }
 
@@ -722,9 +748,21 @@ fn walk_package_entry(
             return Ok(());
         }
         let mut entries = fs::read_dir(path)
-            .map_err(|error| format!("Failed to read {}: {}", render_host_visible_path(path), error))?
+            .map_err(|error| {
+                format!(
+                    "Failed to read {}: {}",
+                    render_host_visible_path(path),
+                    error
+                )
+            })?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Failed to read {}: {}", render_host_visible_path(path), error))?;
+            .map_err(|error| {
+                format!(
+                    "Failed to read {}: {}",
+                    render_host_visible_path(path),
+                    error
+                )
+            })?;
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
             let child_name = entry.file_name();
@@ -885,7 +923,14 @@ pub fn build_skill_release(request: &PackageBuildRequest) -> Result<PackageBuild
     if build_universal {
         let name = standard_package_asset_name(&skill_id, &version);
         let files: Vec<&PackageFile> = inspected.files.iter().collect();
-        assets.push(write_package(&request.out_dir, &name, &skill_id, &files, None, PackageAssetKind::Universal)?);
+        assets.push(write_package(
+            &request.out_dir,
+            &name,
+            &skill_id,
+            &files,
+            None,
+            PackageAssetKind::Universal,
+        )?);
     }
     if request.layout == PackageLayout::Platform {
         let all_payloads: BTreeSet<&str> = inspected
@@ -906,7 +951,14 @@ pub fn build_skill_release(request: &PackageBuildRequest) -> Result<PackageBuild
                 .collect();
             let name = platform_package_asset_name(&skill_id, &version, platform);
             let marker = PackageMarker::for_platform(platform).to_canonical_json()?;
-            let mut asset = write_package(&request.out_dir, &name, &skill_id, &files, Some(&marker), PackageAssetKind::Platform)?;
+            let mut asset = write_package(
+                &request.out_dir,
+                &name,
+                &skill_id,
+                &files,
+                Some(&marker),
+                PackageAssetKind::Platform,
+            )?;
             asset.platform = Some(platform.clone());
             assets.push(asset);
         }
@@ -918,7 +970,10 @@ pub fn build_skill_release(request: &PackageBuildRequest) -> Result<PackageBuild
             platforms: assets
                 .iter()
                 .filter_map(|asset| {
-                    asset.platform.clone().map(|platform| (platform, index_entry(asset)))
+                    asset
+                        .platform
+                        .clone()
+                        .map(|platform| (platform, index_entry(asset)))
                 })
                 .collect(),
             universal: assets
@@ -928,7 +983,12 @@ pub fn build_skill_release(request: &PackageBuildRequest) -> Result<PackageBuild
         };
         index.validate(&skill_id, &version)?;
         let name = package_index_asset_name(&skill_id, &version);
-        assets.push(write_text_asset(&request.out_dir, &name, &index.to_canonical_json()?, PackageAssetKind::Index)?);
+        assets.push(write_text_asset(
+            &request.out_dir,
+            &name,
+            &index.to_canonical_json()?,
+            PackageAssetKind::Index,
+        )?);
     }
     let mut checksum_lines: Vec<String> = assets
         .iter()
@@ -937,7 +997,12 @@ pub fn build_skill_release(request: &PackageBuildRequest) -> Result<PackageBuild
     checksum_lines.sort_by(|left, right| left[66..].cmp(&right[66..]));
     let checksums = format!("{}\n", checksum_lines.join("\n"));
     let name = checksums_asset_name(&skill_id, &version);
-    assets.push(write_text_asset(&request.out_dir, &name, &checksums, PackageAssetKind::Checksums)?);
+    assets.push(write_text_asset(
+        &request.out_dir,
+        &name,
+        &checksums,
+        PackageAssetKind::Checksums,
+    )?);
 
     Ok(PackageBuildReport {
         skill_id,
@@ -969,8 +1034,13 @@ fn write_package(
 ) -> Result<PackageAsset, String> {
     let path = out_dir.join(name);
     let temp_path = out_dir.join(format!(".{name}.partial"));
-    let file = fs::File::create(&temp_path)
-        .map_err(|error| format!("Failed to create {}: {}", render_host_visible_path(&temp_path), error))?;
+    let file = fs::File::create(&temp_path).map_err(|error| {
+        format!(
+            "Failed to create {}: {}",
+            render_host_visible_path(&temp_path),
+            error
+        )
+    })?;
     let mut writer = ZipWriter::new(file);
     let mut expected = BTreeSet::new();
     let mut entries: Vec<(String, Option<&PackageFile>)> = files
@@ -993,7 +1063,11 @@ fn write_package(
         match file {
             Some(file) => {
                 let mut source = fs::File::open(&file.source).map_err(|error| {
-                    format!("Failed to open {}: {}", render_host_visible_path(&file.source), error)
+                    format!(
+                        "Failed to open {}: {}",
+                        render_host_visible_path(&file.source),
+                        error
+                    )
                 })?;
                 std::io::copy(&mut source, &mut writer)
                     .map_err(|error| format!("Failed to add '{member}' to {name}: {error}"))?;
@@ -1008,8 +1082,13 @@ fn write_package(
         .finish()
         .map_err(|error| format!("Failed to finish {name}: {error}"))?;
     verify_package_members(&temp_path, name, &expected)?;
-    fs::rename(&temp_path, &path)
-        .map_err(|error| format!("Failed to publish {}: {}", render_host_visible_path(&path), error))?;
+    fs::rename(&temp_path, &path).map_err(|error| {
+        format!(
+            "Failed to publish {}: {}",
+            render_host_visible_path(&path),
+            error
+        )
+    })?;
     let (sha256, size) = file_digest(&path)?;
     Ok(PackageAsset {
         name: name.to_string(),
@@ -1040,9 +1119,18 @@ fn file_mode(_path: &Path) -> u32 {
 
 /// Reopen one written zip and require exactly the expected unique members.
 /// 重新打开单个已写入 zip，要求成员恰好是期望的唯一集合。
-fn verify_package_members(path: &Path, name: &str, expected: &BTreeSet<String>) -> Result<(), String> {
-    let file = fs::File::open(path)
-        .map_err(|error| format!("Failed to open {}: {}", render_host_visible_path(path), error))?;
+fn verify_package_members(
+    path: &Path,
+    name: &str,
+    expected: &BTreeSet<String>,
+) -> Result<(), String> {
+    let file = fs::File::open(path).map_err(|error| {
+        format!(
+            "Failed to open {}: {}",
+            render_host_visible_path(path),
+            error
+        )
+    })?;
     let mut archive =
         ZipArchive::new(file).map_err(|error| format!("Failed to reopen {name}: {error}"))?;
     let mut actual = BTreeSet::new();
@@ -1059,20 +1147,37 @@ fn verify_package_members(path: &Path, name: &str, expected: &BTreeSet<String>) 
         }
     }
     if &actual != expected {
-        return Err(format!("{name} member list does not match the package files"));
+        return Err(format!(
+            "{name} member list does not match the package files"
+        ));
     }
     Ok(())
 }
 
 /// Write one text asset atomically.
 /// 原子写入单个文本资产。
-fn write_text_asset(out_dir: &Path, name: &str, text: &str, kind: PackageAssetKind) -> Result<PackageAsset, String> {
+fn write_text_asset(
+    out_dir: &Path,
+    name: &str,
+    text: &str,
+    kind: PackageAssetKind,
+) -> Result<PackageAsset, String> {
     let path = out_dir.join(name);
     let temp_path = out_dir.join(format!(".{name}.partial"));
-    fs::write(&temp_path, text.as_bytes())
-        .map_err(|error| format!("Failed to write {}: {}", render_host_visible_path(&temp_path), error))?;
-    fs::rename(&temp_path, &path)
-        .map_err(|error| format!("Failed to publish {}: {}", render_host_visible_path(&path), error))?;
+    fs::write(&temp_path, text.as_bytes()).map_err(|error| {
+        format!(
+            "Failed to write {}: {}",
+            render_host_visible_path(&temp_path),
+            error
+        )
+    })?;
+    fs::rename(&temp_path, &path).map_err(|error| {
+        format!(
+            "Failed to publish {}: {}",
+            render_host_visible_path(&path),
+            error
+        )
+    })?;
     let (sha256, size) = file_digest(&path)?;
     Ok(PackageAsset {
         name: name.to_string(),
@@ -1087,15 +1192,24 @@ fn write_text_asset(out_dir: &Path, name: &str, text: &str, kind: PackageAssetKi
 /// Return the lowercase SHA-256 and size of one file.
 /// 返回单个文件的小写 SHA-256 与大小。
 pub fn file_digest(path: &Path) -> Result<(String, u64), String> {
-    let mut file = fs::File::open(path)
-        .map_err(|error| format!("Failed to open {}: {}", render_host_visible_path(path), error))?;
+    let mut file = fs::File::open(path).map_err(|error| {
+        format!(
+            "Failed to open {}: {}",
+            render_host_visible_path(path),
+            error
+        )
+    })?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut size = 0_u64;
     loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| format!("Failed to read {}: {}", render_host_visible_path(path), error))?;
+        let read = file.read(&mut buffer).map_err(|error| {
+            format!(
+                "Failed to read {}: {}",
+                render_host_visible_path(path),
+                error
+            )
+        })?;
         if read == 0 {
             break;
         }

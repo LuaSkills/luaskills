@@ -108,15 +108,16 @@ impl SkillSourceManifest {
             }
             Some("universal") => {
                 if self.platform.is_some() {
-                    return Err("source manifest universal layout must not declare platform".to_string());
+                    return Err(
+                        "source manifest universal layout must not declare platform".to_string()
+                    );
                 }
                 Ok(Some(None))
             }
             Some("platform") => {
-                let platform = self
-                    .platform
-                    .as_deref()
-                    .ok_or_else(|| "source manifest platform layout requires platform".to_string())?;
+                let platform = self.platform.as_deref().ok_or_else(|| {
+                    "source manifest platform layout requires platform".to_string()
+                })?;
                 if platform != runtime_platform {
                     return Err(format!(
                         "{}: source manifest resolved the '{}' package but this runtime is '{}'",

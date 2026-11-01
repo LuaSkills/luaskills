@@ -52,7 +52,10 @@ fn bundled_skill(root: &Path) -> PathBuf {
 "#,
     );
     write(&skill.join("runtime/main.lua"), "return {}\n");
-    write(&skill.join("native/windows-x64/demo.dll"), "windows payload");
+    write(
+        &skill.join("native/windows-x64/demo.dll"),
+        "windows payload",
+    );
     write(&skill.join("native/linux-x64/libdemo.so"), "linux payload");
     write(&skill.join("notes/private.txt"), "not shipped");
     write(&skill.join("runtime/node_modules/x.js"), "generated");
@@ -64,7 +67,14 @@ fn bundled_skill(root: &Path) -> PathBuf {
 fn members(path: &Path) -> BTreeSet<String> {
     let mut archive = ZipArchive::new(fs::File::open(path).expect("open zip")).expect("read zip");
     (0..archive.len())
-        .map(|index| archive.by_index(index).expect("entry").name().expect("name").into_owned())
+        .map(|index| {
+            archive
+                .by_index(index)
+                .expect("entry")
+                .name()
+                .expect("name")
+                .into_owned()
+        })
         .collect()
 }
 
@@ -102,7 +112,14 @@ fn index_selects_platform_then_universal_then_reports_unsupported() {
         universal: None,
     };
     index.validate("demo", "1.2.3").expect("valid index");
-    assert_eq!(index.select("linux-x64").expect("platform").platform.as_deref(), Some("linux-x64"));
+    assert_eq!(
+        index
+            .select("linux-x64")
+            .expect("platform")
+            .platform
+            .as_deref(),
+        Some("linux-x64")
+    );
     let error = index.select("macos-arm64").expect_err("no package");
     assert!(error.starts_with(SKILL_PLATFORM_UNSUPPORTED), "{error}");
 
@@ -129,18 +146,27 @@ fn index_rejects_foreign_names_versions_and_platforms() {
     assert!(base.validate("other", "1.2.3").is_err());
 
     let mut renamed = base.clone();
-    renamed.platforms.insert("linux-x64".to_string(), entry("demo-linux.zip"));
+    renamed
+        .platforms
+        .insert("linux-x64".to_string(), entry("demo-linux.zip"));
     assert!(renamed.validate("demo", "1.2.3").is_err());
 
     let mut unknown = base.clone();
-    unknown.platforms.insert("solaris-sparc".to_string(), entry("demo-v1.2.3-solaris-sparc-skill.zip"));
+    unknown.platforms.insert(
+        "solaris-sparc".to_string(),
+        entry("demo-v1.2.3-solaris-sparc-skill.zip"),
+    );
     assert!(unknown.validate("demo", "1.2.3").is_err());
 
     let mut future = base;
     future.schema_version = PACKAGE_INDEX_SCHEMA_VERSION + 1;
     assert!(future.validate("demo", "1.2.3").is_err());
 
-    let parsed = PackageIndex::parse(r#"{"schema_version":1,"skill_id":"demo","version":"1.2.3","layout":"platform","platforms":{},"extra":1}"#, "demo", "1.2.3");
+    let parsed = PackageIndex::parse(
+        r#"{"schema_version":1,"skill_id":"demo","version":"1.2.3","layout":"platform","platforms":{},"extra":1}"#,
+        "demo",
+        "1.2.3",
+    );
     assert!(parsed.is_err());
 }
 
@@ -156,13 +182,24 @@ fn standard_build_ships_every_payload_without_marker() {
     })
     .expect("standard build");
 
-    let names: Vec<&str> = report.assets.iter().map(|asset| asset.name.as_str()).collect();
-    assert_eq!(names, ["demo-v1.2.3-skill.zip", "demo-v1.2.3-checksums.txt"]);
+    let names: Vec<&str> = report
+        .assets
+        .iter()
+        .map(|asset| asset.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["demo-v1.2.3-skill.zip", "demo-v1.2.3-checksums.txt"]
+    );
     let package = members(&report.assets[0].path);
     assert!(package.contains("demo/native/windows-x64/demo.dll"));
     assert!(package.contains("demo/native/linux-x64/libdemo.so"));
     assert!(!package.contains(&format!("demo/{PACKAGE_MARKER_FILE_NAME}")));
-    assert!(!package.iter().any(|name| name.contains("notes/") || name.contains("node_modules")));
+    assert!(
+        !package
+            .iter()
+            .any(|name| name.contains("notes/") || name.contains("node_modules"))
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -193,9 +230,16 @@ fn platform_build_splits_payloads_and_lists_every_asset() {
         .iter()
         .find(|asset| asset.kind == PackageAssetKind::Index)
         .expect("index");
-    let index = PackageIndex::parse(&fs::read_to_string(&index_asset.path).expect("read index"), "demo", "1.2.3")
-        .expect("parse index");
-    assert_eq!(index.platforms.keys().cloned().collect::<Vec<_>>(), ["linux-x64", "windows-x64"]);
+    let index = PackageIndex::parse(
+        &fs::read_to_string(&index_asset.path).expect("read index"),
+        "demo",
+        "1.2.3",
+    )
+    .expect("parse index");
+    assert_eq!(
+        index.platforms.keys().cloned().collect::<Vec<_>>(),
+        ["linux-x64", "windows-x64"]
+    );
     assert_eq!(index.platforms["linux-x64"].sha256, linux.sha256);
     assert!(index.universal.is_some());
 
@@ -203,18 +247,27 @@ fn platform_build_splits_payloads_and_lists_every_asset() {
     assert_eq!(checksums_asset.kind, PackageAssetKind::Checksums);
     let checksums = fs::read_to_string(&checksums_asset.path).expect("read checksums");
     for asset in &report.assets[..report.assets.len() - 1] {
-        assert!(checksums.contains(&format!("{}  {}", asset.sha256, asset.name)), "{}", asset.name);
+        assert!(
+            checksums.contains(&format!("{}  {}", asset.sha256, asset.name)),
+            "{}",
+            asset.name
+        );
     }
 
     let extracted = root.join("extracted");
-    let skill_dir = crate::download::archive::extract_skill_package_zip(&linux.path, &extracted, "demo")
-        .expect("extract");
+    let skill_dir =
+        crate::download::archive::extract_skill_package_zip(&linux.path, &extracted, "demo")
+            .expect("extract");
     assert_eq!(
-        verify_package_platform(&skill_dir, "linux-x64", Some(Some("linux-x64"))).expect("matching platform"),
+        verify_package_platform(&skill_dir, "linux-x64", Some(Some("linux-x64")))
+            .expect("matching platform"),
         Some("linux-x64".to_string())
     );
     let mismatch = verify_package_platform(&skill_dir, "windows-x64", None).expect_err("mismatch");
-    assert!(mismatch.starts_with(SKILL_PACKAGE_PLATFORM_MISMATCH), "{mismatch}");
+    assert!(
+        mismatch.starts_with(SKILL_PACKAGE_PLATFORM_MISMATCH),
+        "{mismatch}"
+    );
     assert!(verify_package_platform(&skill_dir, "linux-x64", Some(None)).is_err());
     let _ = fs::remove_dir_all(root);
 }
@@ -242,7 +295,11 @@ fn validation_reports_missing_payloads_and_extra_entries() {
     let skill = bundled_skill(&root);
     fs::remove_file(skill.join("native/linux-x64/libdemo.so")).expect("remove payload");
     let report = validate_skill_source(&source(&skill)).expect("validate");
-    let codes: Vec<&str> = report.issues.iter().map(|issue| issue.code.as_str()).collect();
+    let codes: Vec<&str> = report
+        .issues
+        .iter()
+        .map(|issue| issue.code.as_str())
+        .collect();
     assert_eq!(codes, ["bundled_payload_missing"]);
     assert_eq!(report.bundled_platforms, ["windows-x64"]);
 
