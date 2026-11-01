@@ -102,7 +102,7 @@ LuaSkills は [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) のスキ
 
 ```toml
 [dependencies]
-luaskills = "0.8.0"
+luaskills = "0.8.1"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md) に `call_skill` と `vulcan.host.*` ツールブリッジの例があります。
@@ -157,8 +157,8 @@ luaskills-debug package --skill-path my-skill --out-dir dist
 
 | コンポーネント | バージョン |
 | --- | --- |
-| LuaSkills コアと FFI SDK | `0.8.0` |
-| TypeScript・Python・Go SDK | `0.8.0`。コアのリリース後に公開。[SDK overview](docs/sdk/index.md#versions) を参照 |
+| LuaSkills コアと FFI SDK | `0.8.1` |
+| TypeScript・Python・Go SDK | `0.8.1`。コアのリリース後に公開。[SDK overview](docs/sdk/index.md#versions) を参照 |
 | Lua ランタイムパッケージ | 互換 `0.1` 系列 |
 | 管理 Python / uv | `3.14.6` / `0.11.28` |
 | 管理 Node.js / pnpm | `24.18.0` / `11.11.0` |

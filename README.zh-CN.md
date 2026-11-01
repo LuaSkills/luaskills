@@ -102,7 +102,7 @@ LuaSkills 是 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) 技能系
 
 ```toml
 [dependencies]
-luaskills = "0.8.0"
+luaskills = "0.8.1"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md) 演示 `call_skill` 与 `vulcan.host.*` 工具桥接。
@@ -159,8 +159,8 @@ luaskills-debug package --skill-path my-skill --out-dir dist
 
 | 组件 | 版本 |
 | --- | --- |
-| LuaSkills 核心与 FFI SDK | `0.8.0` |
-| TypeScript、Python、Go SDK | `0.8.0`，在核心发布之后发布，见 [SDK 总览](docs/zh-CN/sdk/index.md#版本规则) |
+| LuaSkills 核心与 FFI SDK | `0.8.1` |
+| TypeScript、Python、Go SDK | `0.8.1`，在核心发布之后发布，见 [SDK 总览](docs/zh-CN/sdk/index.md#版本规则) |
 | Lua 运行时包 | 兼容 `0.1` 系列 |
 | 受管 Python / uv | `3.14.6` / `0.11.28` |
 | 受管 Node.js / pnpm | `24.18.0` / `11.11.0` |

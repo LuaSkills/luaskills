@@ -102,7 +102,7 @@ LuaSkills는 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code)의 스킬 
 
 ```toml
 [dependencies]
-luaskills = "0.8.0"
+luaskills = "0.8.1"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md)에서 `call_skill`과 `vulcan.host.*` 도구 브리지를 볼 수 있습니다.
@@ -157,8 +157,8 @@ luaskills-debug package --skill-path my-skill --out-dir dist
 
 | 구성 요소 | 버전 |
 | --- | --- |
-| LuaSkills 코어와 FFI SDK | `0.8.0` |
-| TypeScript, Python, Go SDK | `0.8.0`, 코어 릴리스 이후 배포. [SDK overview](docs/sdk/index.md#versions) 참고 |
+| LuaSkills 코어와 FFI SDK | `0.8.1` |
+| TypeScript, Python, Go SDK | `0.8.1`, 코어 릴리스 이후 배포. [SDK overview](docs/sdk/index.md#versions) 참고 |
 | Lua 런타임 패키지 | 호환 `0.1` 시리즈 |
 | 관리형 Python / uv | `3.14.6` / `0.11.28` |
 | 관리형 Node.js / pnpm | `24.18.0` / `11.11.0` |
