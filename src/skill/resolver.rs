@@ -20,6 +20,14 @@ pub struct SkillSourceManifest {
     /// Downloadable archive metadata for the resolved skill package.
     /// 已解析技能包的可下载归档元数据。
     pub archive: SkillSourceArchive,
+    /// Layout of the resolved package (`platform` or `universal`), present from schema version 2.
+    /// 已解析包的布局（`platform` 或 `universal`），自结构版本 2 起提供。
+    #[serde(default)]
+    pub layout: Option<String>,
+    /// Platform of a resolved platform package.
+    /// 已解析平台包的平台。
+    #[serde(default)]
+    pub platform: Option<String>,
     /// Optional update source recorded after installation.
     /// 安装后记录的可选更新来源。
     #[serde(default)]
@@ -81,6 +89,49 @@ impl SkillSourceManifest {
             return Err("source manifest archive.url must not be empty".to_string());
         }
         normalize_sha256(self.archive.sha256.as_str())
+    }
+}
+
+impl SkillSourceManifest {
+    /// Return the package platform the archive must carry (`Some(None)` for universal), or `None` without a layout.
+    /// 返回归档必须携带的包平台（通用包为 `Some(None)`）；未声明布局时返回 `None`。
+    pub fn expected_package_platform(
+        &self,
+        runtime_platform: &str,
+    ) -> Result<Option<Option<String>>, String> {
+        match self.layout.as_deref() {
+            None => {
+                if self.platform.is_some() {
+                    return Err("source manifest declares platform without layout".to_string());
+                }
+                Ok(None)
+            }
+            Some("universal") => {
+                if self.platform.is_some() {
+                    return Err("source manifest universal layout must not declare platform".to_string());
+                }
+                Ok(Some(None))
+            }
+            Some("platform") => {
+                let platform = self
+                    .platform
+                    .as_deref()
+                    .ok_or_else(|| "source manifest platform layout requires platform".to_string())?;
+                if platform != runtime_platform {
+                    return Err(format!(
+                        "{}: source manifest resolved the '{}' package but this runtime is '{}'",
+                        crate::package::SKILL_PACKAGE_PLATFORM_MISMATCH,
+                        platform,
+                        runtime_platform
+                    ));
+                }
+                Ok(Some(Some(platform.to_string())))
+            }
+            Some(other) => Err(format!(
+                "source manifest layout '{}' is not supported; expected platform or universal",
+                other
+            )),
+        }
     }
 }
 

@@ -4,6 +4,7 @@ pub mod ffi;
 pub mod ffi_embedded;
 pub mod ffi_standard;
 pub mod host;
+pub mod package;
 mod providers;
 pub mod runtime;
 pub mod skill;

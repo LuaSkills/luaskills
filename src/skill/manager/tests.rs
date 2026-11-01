@@ -60,6 +60,7 @@ fn test_installed_record(version: &str) -> InstalledSkillRecord {
         managed: true,
         source: test_install_source_record(),
         installed_at_unix_ms: 1,
+        package_platform: None,
     }
 }
 
@@ -1287,6 +1288,7 @@ fn stage_skill_install_rejects_temp_root_probe_errors() {
             "vulcan-codekit",
             &temp_root.join("unused.zip"),
             "0.1.0",
+            None,
             test_install_source_record(),
             "install message".to_string(),
         )
@@ -1337,6 +1339,7 @@ fn stage_skill_update_rejects_temp_root_probe_errors() {
             "vulcan-codekit",
             &temp_root.join("unused.zip"),
             "0.2.0",
+            None,
             test_installed_record("0.1.0"),
             test_install_source_record(),
         )
@@ -1851,6 +1854,7 @@ fn hub_manager_with_records(
                 tag: None,
             },
             installed_at_unix_ms: 1,
+            package_platform: None,
         };
         std::fs::write(
             installs.join(format!("{skill_id}.yaml")),

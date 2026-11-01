@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
+use crate::dependency::platform::current_platform_key;
 use crate::download::archive::extract_skill_package_zip;
 use crate::download::manager::{DownloadManager, DownloadManagerConfig};
 use crate::host::callbacks::{
@@ -14,6 +15,7 @@ use crate::host::callbacks::{
 };
 use crate::host::options::RuntimeSkillRoot;
 use crate::lua_skill::{SkillMeta, validate_luaskills_identifier, validate_luaskills_version};
+use crate::package::verify_package_platform;
 use crate::runtime::path::render_host_visible_path;
 use crate::skill::resolver::{SkillSourceManifest, parse_skill_source_manifest};
 use crate::skill::source::{
@@ -974,14 +976,16 @@ impl SkillManager {
         match record.source.source_type {
             SkillInstallSourceType::Github => Ok(self
                 .downloader()
-                .resolve_github_release_asset(
+                .resolve_github_managed_skill_release_asset(
                     &crate::skill::dependencies::GithubReleaseSourceSpec {
                         repo: locator.to_string(),
                         tag_api: None,
                     },
-                    &format!("{}-v{{version}}-skill.zip", skill_id),
+                    skill_id,
                     None,
+                    current_platform_key(),
                 )?
+                .asset
                 .version),
             SkillInstallSourceType::OfficialHub => {
                 let manifest = self.fetch_official_hub_manifest(locator)?;
@@ -1121,14 +1125,16 @@ impl SkillManager {
         }
 
         let downloader = self.downloader();
-        let asset = downloader.resolve_github_managed_skill_release_asset(
+        let resolved = downloader.resolve_github_managed_skill_release_asset(
             &crate::skill::dependencies::GithubReleaseSourceSpec {
                 repo: repo.clone(),
                 tag_api: None,
             },
             skill_id,
             None,
+            current_platform_key(),
         )?;
+        let asset = &resolved.asset;
         let archive_downloader =
             self.downloader_for_skill_progress(skill_id, SkillInstallSourceType::Github);
         let archive_path = archive_downloader.download_with_sha256(
@@ -1148,6 +1154,7 @@ impl SkillManager {
             skill_id,
             &archive_path,
             asset.version.as_str(),
+            Some(resolved.package_platform.as_deref()),
             InstalledSkillSourceRecord {
                 source_type: SkillInstallSourceType::Github,
                 locator: repo.clone(),
@@ -1175,14 +1182,16 @@ impl SkillManager {
             )
         })?;
         let downloader = self.downloader();
-        let asset = downloader.resolve_github_managed_skill_release_asset(
+        let resolved = downloader.resolve_github_managed_skill_release_asset(
             &crate::skill::dependencies::GithubReleaseSourceSpec {
                 repo: target.locator.clone(),
                 tag_api: None,
             },
             skill_id,
             None,
+            current_platform_key(),
         )?;
+        let asset = &resolved.asset;
         let latest_version = Version::parse(asset.version.as_str()).map_err(|error| {
             format!(
                 "latest GitHub release version '{}' of skill '{}' is invalid: {}",
@@ -1222,6 +1231,7 @@ impl SkillManager {
             skill_id,
             &archive_path,
             asset.version.as_str(),
+            Some(resolved.package_platform.as_deref()),
             record,
             InstalledSkillSourceRecord {
                 source_type: SkillInstallSourceType::Github,
@@ -1322,6 +1332,7 @@ impl SkillManager {
         source_locator: &str,
     ) -> Result<PreparedSkillApply, String> {
         let expected_sha256 = manifest.validate_for_skill(skill_id)?;
+        let expected_platform = manifest.expected_package_platform(current_platform_key())?;
         self.emit_progress_detail(RuntimeSkillOperationProgressDetail {
             phase: "source_resolved",
             status: "completed",
@@ -1345,6 +1356,7 @@ impl SkillManager {
             skill_id,
             &archive_path,
             manifest.version.as_str(),
+            expected_platform.as_ref().map(Option::as_deref),
             source_record_from_manifest(&manifest, source_type, source_locator),
             format!(
                 "skill '{}' version {} was installed from {:?} '{}'",
@@ -1364,6 +1376,7 @@ impl SkillManager {
     ) -> Result<PreparedSkillApply, String> {
         let source_type = target.source_type;
         let expected_sha256 = manifest.validate_for_skill(skill_id)?;
+        let expected_platform = manifest.expected_package_platform(current_platform_key())?;
         let current_version = Version::parse(record.version.as_str()).map_err(|error| {
             format!(
                 "installed version '{}' of skill '{}' is invalid: {}",
@@ -1412,6 +1425,7 @@ impl SkillManager {
             skill_id,
             &archive_path,
             manifest.version.as_str(),
+            expected_platform.as_ref().map(Option::as_deref),
             record,
             source_record_from_manifest(&manifest, source_type, target.locator.as_str()),
         )
@@ -1431,9 +1445,10 @@ impl SkillManager {
                 "official_hub install requires host option official_skill_hub_base_url".to_string()
             })?;
         let resolve_url = format!(
-            "{}/api/v1/skills/{}/resolve?version=latest",
+            "{}/api/v1/skills/{}/resolve?version=latest&platform={}",
             base_url.trim_end_matches('/'),
-            skill_id
+            skill_id,
+            current_platform_key()
         );
         self.emit_progress_detail(RuntimeSkillOperationProgressDetail {
             phase: "fetching_manifest",
@@ -1517,11 +1532,16 @@ impl SkillManager {
 
     /// Stage one validated archive as a new skill installation.
     /// 将单个已校验归档暂存为新的技能安装。
+    ///
+    /// `expected_platform` is the package the source selected (`Some(None)` for a universal package), or `None` when
+    /// the source did not declare a layout; the archive marker must agree with it and with the running platform.
+    /// `expected_platform` 是来源选中的包（通用包为 `Some(None)`），来源未声明布局时为 `None`；归档标记必须与其及当前平台一致。
     fn stage_skill_install_from_archive(
         &self,
         skill_id: &str,
         archive_path: &Path,
         version: &str,
+        expected_platform: Option<Option<&str>>,
         source: InstalledSkillSourceRecord,
         message: String,
     ) -> Result<PreparedSkillApply, String> {
@@ -1576,6 +1596,11 @@ impl SkillManager {
                 version
             ));
         }
+        let package_platform = verify_package_platform(
+            &extracted_skill_dir,
+            current_platform_key(),
+            expected_platform,
+        )?;
 
         self.emit_progress(
             "staging_install",
@@ -1608,6 +1633,7 @@ impl SkillManager {
             managed: true,
             source,
             installed_at_unix_ms: current_unix_millis("installed skill record timestamp")?,
+            package_platform,
         };
         Ok(PreparedSkillApply::Install(PreparedSkillInstall {
             result: SkillApplyResult {
@@ -1630,6 +1656,7 @@ impl SkillManager {
         skill_id: &str,
         archive_path: &Path,
         version: &str,
+        expected_platform: Option<Option<&str>>,
         previous_record: InstalledSkillRecord,
         source: InstalledSkillSourceRecord,
     ) -> Result<PreparedSkillApply, String> {
@@ -1682,6 +1709,11 @@ impl SkillManager {
                 version
             ));
         }
+        let package_platform = verify_package_platform(
+            &extracted_skill_dir,
+            current_platform_key(),
+            expected_platform,
+        )?;
 
         self.emit_progress(
             "backing_up_current",
@@ -1735,6 +1767,7 @@ impl SkillManager {
             managed: true,
             source,
             installed_at_unix_ms: current_unix_millis("updated skill record timestamp")?,
+            package_platform,
         };
         Ok(PreparedSkillApply::Update(PreparedSkillUpdate {
             result: SkillApplyResult {
@@ -2490,6 +2523,15 @@ fn read_skill_manifest_from_directory(skill_dir: &Path) -> Result<SkillMeta, Str
         })?
         .trim()
         .to_string();
+    read_skill_manifest_with_skill_id(skill_dir, skill_id)
+}
+
+/// Read one skill manifest from disk and bind an explicit skill id, used when the source directory is a repository checkout.
+/// 从磁盘读取单个技能清单并绑定显式技能标识符，用于源目录是仓库检出目录的情况。
+pub(crate) fn read_skill_manifest_with_skill_id(
+    skill_dir: &Path,
+    skill_id: String,
+) -> Result<SkillMeta, String> {
     validate_luaskills_identifier(&skill_id, "skill_id")?;
     let skill_yaml_path = skill_dir.join("skill.yaml");
     let yaml_text = fs::read_to_string(&skill_yaml_path).map_err(|error| {

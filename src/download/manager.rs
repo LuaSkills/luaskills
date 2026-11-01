@@ -18,10 +18,14 @@ use sha2::{Digest, Sha256};
 
 use crate::dependency::types::DependencySourceType;
 use crate::download::github::{
-    GithubReleaseApiResponse, github_api_token_for, is_official_github_api_url,
-    rewrite_github_download_url,
+    GithubReleaseApiResponse, GithubReleaseAssetRecord, github_api_token_for,
+    is_official_github_api_url, rewrite_github_download_url,
 };
 use crate::host::options::LuaRuntimeSecretString;
+use crate::package::{
+    PackageIndex, PackageLayout, checksums_asset_name, package_index_asset_name,
+    standard_package_asset_name,
+};
 use crate::runtime::file_system::replace_file_atomically;
 use crate::runtime::path::render_host_visible_path;
 use crate::runtime_logging::info as log_info;
@@ -285,6 +289,21 @@ pub struct ResolvedGithubReleaseAsset {
     pub sha256: Option<String>,
 }
 
+/// Package selected from one managed skill release for the requesting platform.
+/// 为请求平台从单个受管技能 release 中选出的包。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedSkillReleasePackage {
+    /// Selected release asset with its verified checksum.
+    /// 选中的 release 资产及其已校验的校验值。
+    pub asset: ResolvedGithubReleaseAsset,
+    /// Layout the release was published with.
+    /// release 发布时使用的布局。
+    pub layout: PackageLayout,
+    /// Platform of the selected platform package, or `None` for the universal package.
+    /// 选中平台包的平台；通用包为 `None`。
+    pub package_platform: Option<String>,
+}
+
 /// Download-manager configuration that describes cache roots and upstream policy.
 /// 描述缓存根目录与上游策略的下载管理配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -520,60 +539,125 @@ impl DownloadManager {
         })
     }
 
-    /// Resolve one managed GitHub skill release asset together with its checksum metadata.
-    /// 解析单个受管 GitHub 技能 release 资产及其校验和元数据。
+    /// Resolve the package of one managed GitHub skill release for `platform`, together with its checksum.
+    /// 为 `platform` 解析单个受管 GitHub 技能 release 的包及其校验值。
+    ///
+    /// A release that carries a package index is resolved only through that index; a release without one uses the
+    /// standard `{skill_id}-v{version}-skill.zip`.
+    /// 带包索引的 release 只按索引解析；没有索引的 release 使用标准 `{skill_id}-v{version}-skill.zip`。
     pub fn resolve_github_managed_skill_release_asset(
         &self,
         source: &GithubReleaseSourceSpec,
         skill_id: &str,
         expected_version: Option<&str>,
-    ) -> Result<ResolvedGithubReleaseAsset, String> {
-        let mut resolved = self.resolve_github_release_asset(
-            source,
-            &format!("{}-v{{version}}-skill.zip", skill_id),
-            expected_version,
-        )?;
-        let release = self.fetch_github_release(source, Some(resolved.version.as_str()))?;
-        let checksum_asset_name = format!("{}-v{}-checksums.txt", skill_id, resolved.version);
-        let checksum_asset = release
-            .assets
-            .iter()
-            .find(|asset| asset.name == checksum_asset_name)
-            .ok_or_else(|| {
-                format!(
-                    "GitHub release {} does not contain checksum asset '{}'",
-                    release.tag_name, checksum_asset_name
-                )
-            })?;
-        let checksum_url = rewrite_github_download_url(
-            checksum_asset.browser_download_url.as_str(),
-            self.config.github_base_url.as_deref(),
+        platform: &str,
+    ) -> Result<ResolvedSkillReleasePackage, String> {
+        self.ensure_network_allowed()?;
+        let release = self.fetch_github_release(source, expected_version)?;
+        let version = normalize_release_version(
+            expected_version.unwrap_or(release.tag_name.as_str()),
+            release.tag_name.as_str(),
         );
+        let find_asset = |name: &str| release.assets.iter().find(|asset| asset.name == name);
+        let cache_fragment = format!(
+            "{}-{}",
+            sanitize_cache_key_fragment(source.repo.as_str()),
+            sanitize_cache_key_fragment(release.tag_name.as_str())
+        );
+        let checksum_asset_name = checksums_asset_name(skill_id, &version);
+        let checksum_asset = find_asset(&checksum_asset_name).ok_or_else(|| {
+            format!(
+                "GitHub release {} does not contain checksum asset '{}'",
+                release.tag_name, checksum_asset_name
+            )
+        })?;
         let checksum_text = self.fetch_text(
-            checksum_url.as_str(),
-            &format!(
-                "github-checksums-{}-{}",
-                sanitize_cache_key_fragment(source.repo.as_str()),
-                sanitize_cache_key_fragment(release.tag_name.as_str())
+            &rewrite_github_download_url(
+                checksum_asset.browser_download_url.as_str(),
+                self.config.github_base_url.as_deref(),
             ),
+            &format!("github-checksums-{cache_fragment}"),
         )?;
-        let manifest_sha256 = parse_checksum_manifest_for_asset(
-            checksum_text.as_str(),
-            resolved.asset_name.as_str(),
-        )?;
-        // A digest reported by the release metadata must agree with the checksum asset, so a
-        // download mirror cannot replace both the archive and its checksum file.
-        // Release 元数据给出的摘要必须与校验文件一致，使下载镜像无法同时替换压缩包与校验文件。
-        if let Some(digest) = resolved.sha256.as_deref()
-            && !digest.eq_ignore_ascii_case(manifest_sha256.as_str())
+        // ListedSha256 returns the checksum-file digest of one asset after it agrees with any release digest, so a
+        // download mirror cannot replace both an asset and its checksum file.
+        // ListedSha256 返回校验文件中单个资产的摘要，并要求其与 Release 摘要一致，使下载镜像无法同时替换资产与校验文件。
+        let listed_sha256 = |asset: &GithubReleaseAssetRecord| -> Result<String, String> {
+            let listed = parse_checksum_manifest_for_asset(checksum_text.as_str(), &asset.name)?;
+            if let Some(digest) = asset.sha256_digest()
+                && digest != listed
+            {
+                return Err(format!(
+                    "GitHub release {} reports digest sha256:{} for '{}' but '{}' lists {}",
+                    release.tag_name, digest, asset.name, checksum_asset_name, listed
+                ));
+            }
+            Ok(listed)
+        };
+
+        let index_asset_name = package_index_asset_name(skill_id, &version);
+        let (asset_name, layout, package_platform, indexed_sha256) =
+            match find_asset(&index_asset_name) {
+                Some(index_asset) => {
+                    let index_sha256 = listed_sha256(index_asset)?;
+                    let index_text = self.fetch_text(
+                        &rewrite_github_download_url(
+                            index_asset.browser_download_url.as_str(),
+                            self.config.github_base_url.as_deref(),
+                        ),
+                        &format!("github-package-index-{cache_fragment}"),
+                    )?;
+                    let actual = format!("{:x}", Sha256::digest(index_text.as_bytes()));
+                    if actual != index_sha256 {
+                        return Err(format!(
+                            "package index '{}' has SHA-256 {} but '{}' lists {}",
+                            index_asset_name, actual, checksum_asset_name, index_sha256
+                        ));
+                    }
+                    let index = PackageIndex::parse(&index_text, skill_id, &version)?;
+                    let selected = index.select(platform)?;
+                    (
+                        selected.entry.asset,
+                        PackageLayout::Platform,
+                        selected.platform,
+                        Some(selected.entry.sha256),
+                    )
+                }
+                None => (
+                    standard_package_asset_name(skill_id, &version),
+                    PackageLayout::Standard,
+                    None,
+                    None,
+                ),
+            };
+        let asset = find_asset(&asset_name).ok_or_else(|| {
+            format!(
+                "GitHub release {} does not contain asset '{}'",
+                release.tag_name, asset_name
+            )
+        })?;
+        let sha256 = listed_sha256(asset)?;
+        if let Some(indexed) = indexed_sha256
+            && indexed != sha256
         {
             return Err(format!(
-                "GitHub release {} reports digest sha256:{} for '{}' but '{}' lists {}",
-                release.tag_name, digest, resolved.asset_name, checksum_asset_name, manifest_sha256
+                "package index lists SHA-256 {} for '{}' but '{}' lists {}",
+                indexed, asset_name, checksum_asset_name, sha256
             ));
         }
-        resolved.sha256 = Some(manifest_sha256);
-        Ok(resolved)
+        Ok(ResolvedSkillReleasePackage {
+            asset: ResolvedGithubReleaseAsset {
+                tag_name: release.tag_name.clone(),
+                version,
+                asset_name: asset.name.clone(),
+                download_url: rewrite_github_download_url(
+                    asset.browser_download_url.as_str(),
+                    self.config.github_base_url.as_deref(),
+                ),
+                sha256: Some(sha256),
+            },
+            layout,
+            package_platform,
+        })
     }
 
     /// Resolve cache state, stream any required network payload, and atomically publish it.
@@ -3316,6 +3400,8 @@ mod tests {
 mod network_policy_tests {
     use super::{DownloadManager, DownloadManagerConfig, send_with_transient_retry};
     use crate::host::options::LuaRuntimeSecretString;
+    use crate::package::PackageLayout;
+    use sha2::{Digest, Sha256};
     use crate::skill::dependencies::GithubReleaseSourceSpec;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -3501,7 +3587,6 @@ mod network_policy_tests {
             .into_bytes();
             vec![
                 http_response("200 OK", &[], &release),
-                http_response("200 OK", &[], &release),
                 http_response(
                     "200 OK",
                     &[],
@@ -3511,10 +3596,102 @@ mod network_policy_tests {
         });
         let (manager, cache_root) = token_manager("digest");
         let error = manager
-            .resolve_github_managed_skill_release_asset(&loopback_source(&server.url), "demo", None)
+            .resolve_github_managed_skill_release_asset(
+                &loopback_source(&server.url),
+                "demo",
+                None,
+                "linux-x64",
+            )
             .expect_err("disagreeing digest must be rejected");
         assert!(error.contains("reports digest"), "{error}");
-        assert_eq!(server.finish().len(), 3);
+        assert_eq!(server.finish().len(), 2);
+        let _ = std::fs::remove_dir_all(cache_root);
+    }
+
+    /// Build a release that publishes one linux-x64 package, a package index and checksums, and the planned responses.
+    /// 构造发布一个 linux-x64 包、包索引与校验文件的 Release 及其计划响应。
+    fn platform_release_responses(base: &str, with_universal: bool) -> Vec<Vec<u8>> {
+        let package_sha = "c".repeat(64);
+        let universal_sha = "d".repeat(64);
+        let mut index = serde_json::json!({
+            "schema_version": 1,
+            "skill_id": "demo",
+            "version": "1.0.0",
+            "layout": "platform",
+            "platforms": {
+                "linux-x64": { "asset": "demo-v1.0.0-linux-x64-skill.zip", "sha256": package_sha, "size": 5 }
+            }
+        });
+        let mut assets = vec![
+            serde_json::json!({ "name": "demo-v1.0.0-linux-x64-skill.zip", "browser_download_url": format!("{base}/download/linux.zip") }),
+            serde_json::json!({ "name": "demo-v1.0.0-packages.json", "browser_download_url": format!("{base}/download/packages.json") }),
+            serde_json::json!({ "name": "demo-v1.0.0-checksums.txt", "browser_download_url": format!("{base}/download/checksums.txt") }),
+        ];
+        if with_universal {
+            index["universal"] = serde_json::json!({ "asset": "demo-v1.0.0-skill.zip", "sha256": universal_sha, "size": 9 });
+            assets.push(serde_json::json!({ "name": "demo-v1.0.0-skill.zip", "browser_download_url": format!("{base}/download/universal.zip") }));
+        }
+        let index_text = format!("{}\n", serde_json::to_string_pretty(&index).expect("index json"));
+        let index_sha = format!("{:x}", Sha256::digest(index_text.as_bytes()));
+        let checksums = format!(
+            "{package_sha}  demo-v1.0.0-linux-x64-skill.zip\n{index_sha}  demo-v1.0.0-packages.json\n{universal_sha}  demo-v1.0.0-skill.zip\n"
+        );
+        let release = serde_json::json!({ "tag_name": "v1.0.0", "assets": assets }).to_string();
+        vec![
+            http_response("200 OK", &[], release.as_bytes()),
+            http_response("200 OK", &[], checksums.as_bytes()),
+            http_response("200 OK", &[], index_text.as_bytes()),
+        ]
+    }
+
+    /// A release with a package index resolves the current platform's package, then the universal package.
+    /// 带包索引的 Release 先解析当前平台的包，再回落到通用包。
+    #[test]
+    fn managed_skill_release_selects_package_through_index() {
+        let server = CaptureServer::start(|base| platform_release_responses(base, false));
+        let (manager, cache_root) = token_manager("index-platform");
+        let resolved = manager
+            .resolve_github_managed_skill_release_asset(
+                &loopback_source(&server.url),
+                "demo",
+                None,
+                "linux-x64",
+            )
+            .expect("platform package");
+        assert_eq!(resolved.asset.asset_name, "demo-v1.0.0-linux-x64-skill.zip");
+        assert_eq!(resolved.layout, PackageLayout::Platform);
+        assert_eq!(resolved.package_platform.as_deref(), Some("linux-x64"));
+        assert_eq!(resolved.asset.sha256.as_deref(), Some("c".repeat(64).as_str()));
+        server.finish();
+        let _ = std::fs::remove_dir_all(cache_root);
+
+        let server = CaptureServer::start(|base| platform_release_responses(base, false));
+        let (manager, cache_root) = token_manager("index-unsupported");
+        let error = manager
+            .resolve_github_managed_skill_release_asset(
+                &loopback_source(&server.url),
+                "demo",
+                None,
+                "macos-arm64",
+            )
+            .expect_err("no package for platform");
+        assert!(error.starts_with(crate::package::SKILL_PLATFORM_UNSUPPORTED), "{error}");
+        server.finish();
+        let _ = std::fs::remove_dir_all(cache_root);
+
+        let server = CaptureServer::start(|base| platform_release_responses(base, true));
+        let (manager, cache_root) = token_manager("index-universal");
+        let resolved = manager
+            .resolve_github_managed_skill_release_asset(
+                &loopback_source(&server.url),
+                "demo",
+                None,
+                "macos-arm64",
+            )
+            .expect("universal package");
+        assert_eq!(resolved.asset.asset_name, "demo-v1.0.0-skill.zip");
+        assert_eq!(resolved.package_platform, None);
+        server.finish();
         let _ = std::fs::remove_dir_all(cache_root);
     }
 }

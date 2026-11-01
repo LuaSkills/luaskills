@@ -55,4 +55,8 @@ pub struct InstalledSkillRecord {
     /// Unix timestamp in milliseconds when the install record was written.
     /// 当前安装记录写入时的 Unix 毫秒时间戳。
     pub installed_at_unix_ms: u128,
+    /// Platform of the installed platform package, or `None` for a universal package.
+    /// 已安装平台包的平台；通用包为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_platform: Option<String>,
 }
