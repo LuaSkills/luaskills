@@ -4,6 +4,10 @@ use crate::runtime::path::normalize_host_input_path_text;
 use crate::runtime::process_session::finalize_one_shot_process_tree;
 use std::sync::OnceLock;
 
+/// Chunk name reported in error locations for inline runlua source.
+/// 内联 runlua 源码在报错位置中显示的代码块名称。
+const RUNLUA_CHUNK_NAME: &str = "=runlua";
+
 /// RunLua execution request accepted by `vulcan.runtime.lua.exec`.
 /// `vulcan.runtime.lua.exec` 接收的 RunLua 执行请求结构。
 #[derive(Debug, Deserialize, Serialize)]
@@ -1512,14 +1516,23 @@ impl LuaEngine {
             .set("__runlua_args", args_table)
             .map_err(|error| format!("Failed to set runlua args: {}", error))?;
 
+        // The prefix shares the first source line so reported line numbers match the caller's code.
+        // 前缀与源码首行同处一行，使报错行号与调用者代码一致。
         let wrapper = format!(
-            "return (function()\n  local args = __runlua_args\n  return table.pack((function()\n{}\nend)())\nend)()",
+            "return (function() local args = __runlua_args return table.pack((function() {}\nend)()) end)()",
             resolved_code
         );
+        // Chunk name shown in error locations instead of the Rust caller location.
+        // 报错位置中显示的代码块名称，取代 Rust 调用位置。
+        let chunk_name = match entry_file.as_deref() {
+            Some(file) => format!("@{}", render_log_friendly_path(file)),
+            None => RUNLUA_CHUNK_NAME.to_string(),
+        };
 
         Self::install_runlua_timeout_guard(lua, request.timeout_ms)
             .map_err(|error| error.to_string())?;
-        let execution_result = Self::execute_runlua_wrapper(lua, &wrapper, entry_file.as_deref());
+        let execution_result =
+            Self::execute_runlua_wrapper(lua, &wrapper, &chunk_name, entry_file.as_deref());
         Self::remove_runlua_timeout_guard(lua);
         // Printed output transfers out of the request-local capture buffer to avoid cloning every line.
         // 打印输出从请求局部捕获缓冲区直接转移，避免逐行克隆完整结果。
@@ -1624,6 +1637,7 @@ impl LuaEngine {
     fn execute_runlua_wrapper(
         lua: &Lua,
         wrapper: &str,
+        chunk_name: &str,
         entry_file: Option<&Path>,
     ) -> Result<Table, mlua::Error> {
         match entry_file.and_then(Path::parent) {
@@ -1633,7 +1647,7 @@ impl LuaEngine {
                     .map_err(|error| mlua::Error::runtime(format!("luaexec cwd: {}", error)))?;
                 std::env::set_current_dir(entry_dir)
                     .map_err(|error| mlua::Error::runtime(format!("luaexec set cwd: {}", error)))?;
-                let execution = lua.load(wrapper).eval::<Table>();
+                let execution = lua.load(wrapper).set_name(chunk_name).eval::<Table>();
                 let restore_result = std::env::set_current_dir(&original_dir).map_err(|error| {
                     mlua::Error::runtime(format!("luaexec restore cwd: {}", error))
                 });
@@ -1643,7 +1657,7 @@ impl LuaEngine {
                     (_, Err(error)) => Err(error),
                 }
             }
-            None => lua.load(wrapper).eval::<Table>(),
+            None => lua.load(wrapper).set_name(chunk_name).eval::<Table>(),
         }
     }
 
@@ -1679,19 +1693,6 @@ impl LuaEngine {
         lua.globals()
             .set("print", print_fn)
             .map_err(|error| format!("Failed to override global print for runlua: {}", error))?;
-
-        lua.load(
-            r#"
-if jit and type(jit.off) == "function" then
-    jit.off(true, true)
-end
-if jit and type(jit.flush) == "function" then
-    jit.flush()
-end
-"#,
-        )
-        .exec()
-        .map_err(|error| format!("Failed to disable JIT for runlua: {}", error))?;
 
         runtime
             .set("log", LuaValue::Nil)
@@ -1731,6 +1732,11 @@ end
             lua.set_app_data(logical_cwd::EvaluationDeadline(deadline));
         }
         let timeout_text = format!("luaexec execution timed out after {} ms", timeout_ms);
+        // LuaJIT traces bypass instruction hooks, so the whole engine stays off for every evaluation.
+        // LuaJIT 跟踪代码会绕过指令钩子，因此每次执行都整体关闭编译引擎。
+        lua.load("jit.off(); jit.flush()")
+            .set_name("=luaexec_timeout_guard")
+            .exec()?;
 
         lua.set_hook(
             HookTriggers::new().every_nth_instruction(LUA_BUDGET_HOOK_INTERVAL),

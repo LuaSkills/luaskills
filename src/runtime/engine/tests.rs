@@ -6681,6 +6681,145 @@ fn execute_runlua_request_inline_marks_invalid_utf8_return_string() {
     assert!(result.contains("invalid UTF-8 Lua string"));
 }
 
+/// Run one engine operation on a detached thread and fail instead of hanging when it never returns.
+/// 在分离线程上执行一次引擎操作；若永不返回则判定失败而不是挂起测试。
+fn run_engine_operation_with_watchdog(
+    operation: impl FnOnce(&LuaEngine) -> String + Send + 'static,
+) -> String {
+    // Channel carrying the operation result from the detached worker thread.
+    // 从分离工作线程传回操作结果的通道。
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let engine = make_runtime_test_engine();
+        let _ = result_tx.send(operation(&engine));
+    });
+    result_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("Lua execution timeout should stop a runaway loop instead of hanging")
+}
+
+/// Verify the runlua timeout stops a runaway loop even when LuaJIT would compile it.
+/// 验证 runlua 超时能停止死循环，即使 LuaJIT 原本会编译该循环。
+#[test]
+fn execute_runlua_request_inline_timeout_stops_runaway_loop() {
+    let result = run_engine_operation_with_watchdog(|engine| {
+        engine
+            .execute_runlua_request_json_inline(
+                r#"{"code":"local i = 0\nwhile true do i = i + 1 end","timeout_ms":200}"#,
+            )
+            .expect("timed-out runlua should still render a result")
+    });
+
+    assert!(result.contains("FAILED"), "unexpected result: {result}");
+    assert!(result.contains("timed out"), "unexpected result: {result}");
+}
+
+/// Verify the runtime session timeout stops a runaway loop even when LuaJIT would compile it.
+/// 验证运行时会话超时能停止死循环，即使 LuaJIT 原本会编译该循环。
+#[test]
+fn runtime_session_eval_timeout_stops_runaway_loop() {
+    let result = run_engine_operation_with_watchdog(|engine| {
+        let created: Value = serde_json::from_str(
+            &engine
+                .create_runtime_lease_json(r#"{"sid":"runaway-loop","ttl_sec":60}"#)
+                .expect("create runtime session"),
+        )
+        .expect("create response json");
+        let request = json!({
+            "lease_id": created["lease_id"],
+            "code": "local i = 0\nwhile true do i = i + 1 end",
+            "timeout_ms": 200
+        });
+        match engine.eval_runtime_lease_json(&request.to_string()) {
+            Ok(text) | Err(text) => text,
+        }
+    });
+
+    assert!(result.contains("timed out"), "unexpected result: {result}");
+}
+
+/// Verify inline runlua errors name the runlua chunk and report the caller's own line numbers.
+/// 验证内联 runlua 报错使用 runlua 代码块名称，并报告调用者自身的行号。
+#[test]
+fn execute_runlua_request_inline_error_location_matches_caller_source() {
+    let engine = make_runtime_test_engine();
+
+    let runtime_error = engine
+        .execute_runlua_request_json_inline(
+            r#"{"code":"local first = 1\nlocal t = nil\nreturn t.value"}"#,
+        )
+        .expect("failed runlua should still render a result");
+    assert!(
+        runtime_error.contains("runlua:3:"),
+        "unexpected result: {runtime_error}"
+    );
+    assert!(
+        !runtime_error.contains(".rs:"),
+        "unexpected result: {runtime_error}"
+    );
+
+    let syntax_error = engine
+        .execute_runlua_request_json_inline(r#"{"code":"local first = 1\nlocal second = = 2"}"#)
+        .expect("failed runlua should still render a result");
+    assert!(
+        syntax_error.contains("runlua:2:"),
+        "unexpected result: {syntax_error}"
+    );
+}
+
+/// Verify file-backed runlua errors name the source file with its own line numbers.
+/// 验证文件型 runlua 报错使用源文件名称及其自身行号。
+#[test]
+fn execute_runlua_request_inline_file_error_location_matches_source_file() {
+    let engine = make_runtime_test_engine();
+    // Temporary runlua script root used by the file-backed request.
+    // 文件型请求使用的临时 runlua 脚本根目录。
+    let temp_root = make_temp_runtime_root("runlua-file-error-location");
+    let _ = fs::remove_dir_all(&temp_root);
+    fs::create_dir_all(&temp_root).expect("create runlua error location dir");
+    let script_path = temp_root.join("failing.lua");
+    fs::write(&script_path, "local first = 1\nerror('file failure')\n")
+        .expect("write failing runlua script");
+    let request = json!({
+        "file": render_host_visible_path(&script_path)
+    });
+
+    let result = engine
+        .execute_runlua_request_json_inline(&request.to_string())
+        .expect("failed file runlua should still render a result");
+    assert!(
+        result.contains("failing.lua:2:"),
+        "unexpected result: {result}"
+    );
+
+    let _ = fs::remove_dir_all(&temp_root);
+}
+
+/// Verify runtime session errors name the session chunk and report the caller's own line numbers.
+/// 验证运行时会话报错使用会话代码块名称，并报告调用者自身的行号。
+#[test]
+fn runtime_session_eval_error_location_matches_caller_source() {
+    let engine = make_runtime_test_engine();
+    let created: Value = serde_json::from_str(
+        &engine
+            .create_runtime_lease_json(r#"{"sid":"error-location","ttl_sec":60}"#)
+            .expect("create runtime session"),
+    )
+    .expect("create response json");
+    let request = json!({
+        "lease_id": created["lease_id"],
+        "code": "local t = nil\nreturn t.value"
+    });
+    let result = match engine.eval_runtime_lease_json(&request.to_string()) {
+        Ok(text) | Err(text) => text,
+    };
+
+    assert!(
+        result.contains("runtime_session:2:"),
+        "unexpected result: {result}"
+    );
+}
+
 /// Verify file-based luaexec keeps working after the process-wide cwd guard is poisoned.
 /// 验证进程级 cwd guard 锁 poison 后，基于文件的 luaexec 仍可继续执行。
 #[test]

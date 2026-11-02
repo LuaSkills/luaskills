@@ -12,6 +12,10 @@ use crate::runtime::managed_package::{
 use crate::runtime::path::{host_process_path_argument, normalize_host_input_path_text};
 use mlua::{MetaMethod, UserData, UserDataMethods};
 
+/// Chunk name reported in error locations for runtime session source.
+/// 运行时会话源码在报错位置中显示的代码块名称。
+const RUNTIME_SESSION_CHUNK_NAME: &str = "=runtime_session";
+
 /// Typed module execution sharing the existing trusted System package boundary.
 /// 与既有可信 System 包边界共享的类型化模块执行。
 pub(super) mod embedded;
@@ -2192,7 +2196,10 @@ impl LuaEngine {
                         error
                     ))
                 })?;
-                let execution = lua.load(wrapper).eval::<LuaValue>();
+                let execution = lua
+                    .load(wrapper)
+                    .set_name(RUNTIME_SESSION_CHUNK_NAME)
+                    .eval::<LuaValue>();
                 let restore_result = std::env::set_current_dir(&original_dir).map_err(|error| {
                     mlua::Error::runtime(format!("runtime lease restore cwd: {}", error))
                 });
@@ -2202,7 +2209,10 @@ impl LuaEngine {
                     (_, Err(error)) => Err(error),
                 }
             }
-            None => lua.load(wrapper).eval::<LuaValue>(),
+            None => lua
+                .load(wrapper)
+                .set_name(RUNTIME_SESSION_CHUNK_NAME)
+                .eval::<LuaValue>(),
         }
     }
     /// Create one persistent runtime lease and return a stable JSON response.
@@ -2615,8 +2625,10 @@ impl LuaEngine {
             .globals()
             .set("__runlua_args", args_table)
             .map_err(|error| format!("Failed to set runtime session args: {}", error))?;
+        // The prefix shares the first source line so reported line numbers match the caller's code.
+        // 前缀与源码首行同处一行，使报错行号与调用者代码一致。
         let wrapper = format!(
-            "return (function()\n  local args = __runlua_args\n  {}\nend)()",
+            "return (function() local args = __runlua_args {}\nend)()",
             request.code
         );
         Self::install_runlua_timeout_guard(&session.vm.lua, request.timeout_ms)
@@ -2624,7 +2636,12 @@ impl LuaEngine {
         // System paths are VM-local and absolute; ordinary file sessions retain serialized chdir.
         // 系统路径属于虚拟机且已绝对化；普通文件会话保留串行目录切换。
         let eval_result = if session.profile == RuntimeLeaseProfile::SystemLuaLib {
-            session.vm.lua.load(&wrapper).eval::<LuaValue>()
+            session
+                .vm
+                .lua
+                .load(&wrapper)
+                .set_name(RUNTIME_SESSION_CHUNK_NAME)
+                .eval::<LuaValue>()
         } else {
             Self::eval_lua_value_with_optional_cwd(
                 &session.vm.lua,
