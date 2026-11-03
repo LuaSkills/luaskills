@@ -102,7 +102,7 @@ LuaSkills fait tourner le système de skills de [Vulcan Code](https://github.com
 
 ```toml
 [dependencies]
-luaskills = "0.8.2"
+luaskills = "0.9.0"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md) montre `call_skill` et le pont d’outils `vulcan.host.*`.
@@ -157,8 +157,8 @@ luaskills-debug package --skill-path my-skill --out-dir dist
 
 | Composant | Version |
 | --- | --- |
-| Cœur LuaSkills et FFI SDK | `0.8.2` |
-| SDK TypeScript, Python et Go | `0.8.2`, publiés après le cœur ; voir le [SDK overview](docs/sdk/index.md#versions) |
+| Cœur LuaSkills et FFI SDK | `0.9.0` |
+| SDK TypeScript, Python et Go | `0.9.0`, publiés après le cœur ; voir le [SDK overview](docs/sdk/index.md#versions) |
 | Paquets du runtime Lua | série compatible `0.1` |
 | Python / uv gérés | `3.14.6` / `0.11.28` |
 | Node.js / pnpm gérés | `24.18.0` / `11.11.0` |

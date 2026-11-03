@@ -514,6 +514,9 @@ fn parse_host_options_with_managed_roots(
         managed_runtime_distribution_root,
         managed_runtime_environment_root,
         managed_runtime_config,
+        // The plain C ABI structs carry no preservation flag; their hosts keep the derived layout.
+        // 原生 C ABI 结构不携带保留标记；其宿主保持推导布局。
+        preserve_host_writable_dirs: false,
         temp_dir: parse_optional_string(value.temp_dir, "temp_dir")?.map(PathBuf::from),
         resources_dir: parse_optional_string(value.resources_dir, "resources_dir")?
             .map(PathBuf::from),

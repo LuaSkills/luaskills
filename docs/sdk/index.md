@@ -35,12 +35,13 @@ The Go SDK exposes typed model request, response, and error shapes, but process-
 
 ## Versions
 
-- **SDKs follow the core version.** The SDK version is the package version (`package.json`, `pyproject.toml`, Go module tag), mirrored in each repository's `VERSION` file. Each core release ships SDKs with the same version; an SDK-only fix takes the next patch number of that SDK without a core release.
-- **Each SDK pins one core release.** The default LuaSkills core tag used by runtime asset installation (`DEFAULT_LUASKILLS_VERSION` / `DefaultLuaSkillsVersion`) and the embedded contract copied from core (`core_version`) must name the same core release. Hosts can override the asset tag explicitly.
+- **Core patches keep the contract; contract changes open a minor series.** The embedded contract names its release series (`core_series`, `major.minor`) instead of the exact core version, so its bytes and `contract_sha256` stay the same for every patch of a series. The core release workflow rejects a patch whose contract differs from the previous published release of its series (`scripts/release/contract_series.py`).
+- **SDKs follow the core series.** The SDK version is the package version (`package.json`, `pyproject.toml`, Go module tag), mirrored in each repository's `VERSION` file. A new core series ships SDKs with the same `major.minor`; core patches need no SDK release, and an SDK-only fix takes the next patch number of that SDK.
+- **Each SDK resolves the newest core patch of its series.** Runtime asset installation (`DEFAULT_LUASKILLS_SERIES` / `DefaultLuaSkillsSeries`) installs the newest published core release of the SDK's series and refuses it unless its packaged contract digest equals the SDK's; there is no fallback to an older patch. The embedded compatibility check accepts any core version of that series with the same contract digest, protocol, ABI and description versions. Hosts can still pin an exact core tag, which is checked the same way.
 - **Contracts are copied, never edited.** `contracts/skill-config/v1/` and `contracts/embedded/v1/` are exact copies of the core repository's `contracts/`; generated SDK code is checked against them.
 - **Runtime packages are separate.** Lua runtime packages and native dependencies come from [`LuaSkills/luaskills-packages`](https://github.com/LuaSkills/luaskills-packages) in the compatible `0.1` series.
 
-The current pins are listed in each SDK README under **Version Alignment**.
+The current series are listed in each SDK README under **Version Alignment**.
 
 ## Choosing an integration path
 

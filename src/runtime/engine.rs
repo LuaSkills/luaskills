@@ -7210,6 +7210,9 @@ impl LuaEngine {
         } = options;
         let host_options = host_options.normalized();
         host_options
+            .validate_writable_dirs()
+            .map_err(std::io::Error::other)?;
+        host_options
             .managed_runtime_config
             .validate()
             .map_err(std::io::Error::other)?;

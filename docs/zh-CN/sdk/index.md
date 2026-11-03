@@ -35,12 +35,13 @@ Go SDK 提供类型化的模型请求、响应与错误结构，但进程级模�
 
 ## 版本规则
 
-- **SDK 跟随核心版本。** SDK 版本即包版本（`package.json`、`pyproject.toml`、Go 模块标签），并镜像到仓库的 `VERSION` 文件。每次核心发布都随附同版本号的 SDK；仅修复 SDK 时递增该 SDK 的补丁号，不要求核心同步发版。
-- **每个 SDK 固定一个核心版本。** 运行时资产安装使用的默认核心标签（`DEFAULT_LUASKILLS_VERSION` / `DefaultLuaSkillsVersion`）与从核心复制的嵌入式契约（`core_version`）必须指向同一个核心版本；宿主可以显式覆盖资产标签。
+- **核心补丁保持契约，契约变化开启次版本系列。** 嵌入式契约只写明发布系列（`core_series`，即 `major.minor`），不写精确核心版本，因此同一系列每个补丁的契约字节及 `contract_sha256` 都相同。核心发布工作流拒绝契约与本系列上一已发布版本不同的补丁（`scripts/release/contract_series.py`）。
+- **SDK 跟随核心系列。** SDK 版本即包版本（`package.json`、`pyproject.toml`、Go 模块标签），并镜像到仓库的 `VERSION` 文件。新的核心系列随附同 `major.minor` 的 SDK；核心补丁不需要发布 SDK，仅修复 SDK 时递增该 SDK 的补丁号。
+- **每个 SDK 解析本系列最新的核心补丁。** 运行时资产安装（`DEFAULT_LUASKILLS_SERIES` / `DefaultLuaSkillsSeries`）安装 SDK 所在系列最新的已发布核心版本，只有其包内契约摘要等于 SDK 的摘要时才接受，不回退到旧补丁。嵌入式兼容检查接受该系列中契约摘要、协议、ABI 与描述版本均一致的任意核心版本。宿主仍可固定精确核心标签，并按同样规则校验。
 - **契约只复制、不修改。** `contracts/skill-config/v1/` 与 `contracts/embedded/v1/` 是核心仓库 `contracts/` 的精确副本，SDK 生成代码以其为准校验。
 - **运行时包独立发布。** Lua 运行时包与原生依赖来自 [`LuaSkills/luaskills-packages`](https://github.com/LuaSkills/luaskills-packages) 的兼容 `0.1` 系列。
 
-当前固定版本见各 SDK README 的 **Version Alignment** 一节。
+当前系列见各 SDK README 的 **Version Alignment** 一节。
 
 ## 接入方式选择
 

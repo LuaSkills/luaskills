@@ -38,6 +38,21 @@ environment_root  = <runtime_root>/dependencies/envs
 
 优先级始终是“显式 Host Option > `runtime_root` 派生默认值”。环境变量和 `PATH` 永远不是候选来源。
 
+## 只读运行时根
+
+`runtime_root` 默认也拥有两个可写目录：`temp_dir = <runtime_root>/temp`（以 `vulcan.runtime.temp_dir` 暴露给技能）与 `download_cache_root = <runtime_root>/temp/downloads`。宿主把 `runtime_root` 安装为只读（例如位于带版本号的应用目录中）时，设置 `preserve_host_writable_dirs: true` 并显式给出两个路径：
+
+```json
+{
+  "runtime_root": "C:/Program Files/Host/lua_runtime",
+  "preserve_host_writable_dirs": true,
+  "temp_dir": "C:/Users/me/.host/cache/luaskills-temp",
+  "download_cache_root": "C:/Users/me/.host/cache/luaskills-downloads"
+}
+```
+
+此时两个路径均为必填；缺少任一项时引擎创建失败，不以推导值代替。宿主负责创建 `temp_dir`；引擎在首次需要时创建下载缓存。技能状态、数据库与依赖本就跟随各技能根的父目录，因此在使用用户级技能根和显式受管根时，`runtime_root` 下不会写入任何内容。该选项可经 Rust、JSON FFI 与嵌入式协议使用；原生 C ABI 结构不携带它，保持推导布局。
+
 ## 引擎级资源策略
 
 `LuaRuntimeHostOptions.managed_runtime_config` 在创建引擎时固定 Worker 与 Session 策略。Lua 代码不能修改该策略；任何非法零值都会在分配运行时根、环境、Worker 或 Session 前被拒绝。

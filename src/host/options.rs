@@ -367,6 +367,14 @@ pub struct LuaRuntimeHostOptions {
     /// Host-managed cache directory used for downloaded archives and remote manifests.
     /// 宿主管理的下载缓存目录，用于归档文件和远程清单缓存。
     pub download_cache_root: Option<PathBuf>,
+    /// Keep the host-set `temp_dir` and `download_cache_root` instead of deriving them from
+    /// `runtime_root`, so a read-only runtime root never receives transient files or downloads.
+    /// Both paths are then required; the host creates `temp_dir`, the engine creates the cache.
+    /// 保留宿主设置的 `temp_dir` 与 `download_cache_root`，不再从 `runtime_root` 推导，
+    /// 使只读运行时根绝不接收临时文件或下载内容。此时两个路径均为必填；宿主创建 `temp_dir`，
+    /// 引擎创建下载缓存。
+    #[serde(default)]
+    pub preserve_host_writable_dirs: bool,
     /// Fixed sibling directory name used under one skill-root parent to store dependencies.
     /// 在单个技能根父目录下存放依赖时使用的固定兄弟目录名称。
     #[serde(default)]
@@ -461,19 +469,24 @@ impl LuaRuntimeHostOptions {
 
     /// Apply the fixed runtime-root layout to all legacy directory fields.
     /// 将固定 runtime-root 布局应用到所有兼容目录字段。
+    ///
+    /// With `preserve_host_writable_dirs`, the host-set writable directories are kept as given.
+    /// 设置 `preserve_host_writable_dirs` 时，宿主设置的可写目录按原值保留。
     pub fn apply_runtime_root_layout(&mut self) {
         let Some(layout) = self.runtime_layout() else {
             return;
         };
 
-        self.temp_dir = Some(layout.temp_dir());
+        if !self.preserve_host_writable_dirs {
+            self.temp_dir = Some(layout.temp_dir());
+            self.download_cache_root = Some(layout.downloads_dir());
+        }
         self.resources_dir = Some(layout.resources_dir());
         self.lua_packages_dir = Some(layout.lua_packages_dir());
         self.host_provided_tool_root = Some(layout.bin_dir());
         self.host_provided_lua_root = Some(layout.lua_packages_dir());
         self.host_provided_ffi_root = Some(layout.libs_dir());
         self.system_lua_lib_dir = Some(layout.system_lua_lib_dir());
-        self.download_cache_root = Some(layout.downloads_dir());
         self.dependency_dir_name = "dependencies".to_string();
         self.state_dir_name = "state".to_string();
         self.database_dir_name = "databases".to_string();
@@ -506,6 +519,28 @@ impl LuaRuntimeHostOptions {
     pub fn normalized(mut self) -> Self {
         self.apply_runtime_root_layout();
         self
+    }
+
+    /// Reject `preserve_host_writable_dirs` without both writable directories; nothing is derived instead.
+    /// 拒绝缺少任一可写目录的 `preserve_host_writable_dirs`；不以推导值代替。
+    pub fn validate_writable_dirs(&self) -> Result<(), String> {
+        if !self.preserve_host_writable_dirs {
+            return Ok(());
+        }
+        for (field, value) in [
+            ("temp_dir", &self.temp_dir),
+            ("download_cache_root", &self.download_cache_root),
+        ] {
+            if value
+                .as_ref()
+                .is_none_or(|path| path.as_os_str().is_empty())
+            {
+                return Err(format!(
+                    "preserve_host_writable_dirs requires a non-empty {field}"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -714,6 +749,47 @@ mod tests {
             normalized.managed_runtime_environment_root,
             Some(environment_root)
         );
+    }
+
+    /// Verify preserved writable directories survive normalization while read-only paths still follow the root.
+    /// 验证保留的可写目录在规范化后不变，只读路径仍跟随运行时根。
+    #[test]
+    fn runtime_root_normalization_preserves_host_writable_dirs() {
+        let runtime_root = PathBuf::from("D:/application/lua_runtime");
+        let temp_dir = PathBuf::from("D:/user-data/cache/temp");
+        let downloads = PathBuf::from("D:/user-data/cache/downloads");
+        let mut options = LuaRuntimeHostOptions::with_runtime_root(runtime_root.clone());
+        options.preserve_host_writable_dirs = true;
+        options.temp_dir = Some(temp_dir.clone());
+        options.download_cache_root = Some(downloads.clone());
+
+        let normalized = options.normalized();
+
+        assert_eq!(normalized.temp_dir, Some(temp_dir));
+        assert_eq!(normalized.download_cache_root, Some(downloads));
+        assert_eq!(
+            normalized.resources_dir,
+            Some(runtime_root.join("resources"))
+        );
+        assert!(normalized.validate_writable_dirs().is_ok());
+    }
+
+    /// Verify the default layout still owns both writable directories, and preservation requires both paths.
+    /// 验证默认布局仍拥有两个可写目录，且保留模式要求两个路径都存在。
+    #[test]
+    fn writable_dirs_follow_root_unless_preserved_with_both_paths() {
+        let runtime_root = PathBuf::from("D:/application/lua_runtime");
+        let mut options = LuaRuntimeHostOptions::with_runtime_root(runtime_root.clone());
+        options.temp_dir = Some(PathBuf::from("D:/elsewhere"));
+        let normalized = options.normalized();
+        assert_eq!(normalized.temp_dir, Some(runtime_root.join("temp")));
+
+        let missing = LuaRuntimeHostOptions {
+            preserve_host_writable_dirs: true,
+            temp_dir: Some(PathBuf::from("D:/user-data/cache/temp")),
+            ..LuaRuntimeHostOptions::default()
+        };
+        assert!(missing.validate_writable_dirs().is_err());
     }
 
     /// Verify omitted host policy preserves every documented B3-B7 default.

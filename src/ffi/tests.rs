@@ -2767,6 +2767,7 @@ fn ffi_engine_new_and_free_roundtrip() {
                 host_provided_ffi_root: Some(temp_root.join("libs")),
                 system_lua_lib_dir: None,
                 download_cache_root: Some(temp_root.join("temp").join("downloads")),
+                preserve_host_writable_dirs: false,
                 dependency_dir_name: "dependencies".to_string(),
                 state_dir_name: "state".to_string(),
                 database_dir_name: "databases".to_string(),

@@ -283,7 +283,7 @@ def verify_build(root, platform, version, report_path, description):
         raise ValueError("Contract or lockfile identity mismatch")
     if (root / "contracts/embedded/v1/contract.sha256").read_text().split()[0] != build["contract_sha256"]:
         raise ValueError("Offline contract sidecar mismatch")
-    if description["core_version"] != version or contract["core_version"] != version or description["description_version"] != contract["compatibility"]["description_version"] or description["protocol_version"] != contract["protocol_version"] or description["abi_structure_version"] != contract["protocol_version"]:
+    if description["core_version"] != version or contract["core_series"] != ".".join(version.split(".")[:2]) or description["description_version"] != contract["compatibility"]["description_version"] or description["protocol_version"] != contract["protocol_version"] or description["abi_structure_version"] != contract["protocol_version"]:
         raise ValueError("Native core version or description version mismatch")
     if description["commands"] != contract["commands"] or description["runtime_commands"] != contract["runtime_commands"]:
         raise ValueError("Native command set differs from the offline contract")

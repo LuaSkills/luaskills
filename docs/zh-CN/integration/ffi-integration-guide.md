@@ -518,7 +518,7 @@ System Plugin 租约不把整个 `system_lua_lib` 当成一个共享包。每次
 
 每个存活 Worker 或持久会话快照都会持有对应受管环境的跨进程共享生命周期租约。环境最终发布或替换只尝试一次非阻塞独占租约；存在活动 Worker 或会话时立即返回稳定的 busy 错误，不会等待、强退使用方或原地替换环境。
 
-旧字段 `temp_dir`、`resources_dir`、`lua_packages_dir`、`host_provided_tool_root`、`host_provided_lua_root`、`host_provided_ffi_root`、`download_cache_root`、`dependency_dir_name`、`state_dir_name` 与 `database_dir_name` 仍属于既有运行时布局接口。技能配置不沿用这套推导：宿主必须单独提供绝对用户级 `skill_config_root`，没有旧单文件配置字段或路径猜测。JSON FFI 直接在 host options 里传 `runtime_root`；标准 C ABI 使用对应版本结构传入运行时与受管根。
+旧字段 `temp_dir`、`resources_dir`、`lua_packages_dir`、`host_provided_tool_root`、`host_provided_lua_root`、`host_provided_ffi_root`、`download_cache_root`、`dependency_dir_name`、`state_dir_name` 与 `database_dir_name` 仍属于既有运行时布局接口。技能配置不沿用这套推导：宿主必须单独提供绝对用户级 `skill_config_root`，没有旧单文件配置字段或路径猜测。JSON FFI 直接在 host options 里传 `runtime_root`；标准 C ABI 使用对应版本结构传入运行时与受管根。`runtime_root` 只读时，JSON FFI 宿主设置 `preserve_host_writable_dirs: true` 并显式提供 `temp_dir` 与 `download_cache_root`，详见[受管运行时宿主根](managed-runtime-host-roots.md#只读运行时根)。
 
 ### 7.1.2 callback 注册前置要求
 

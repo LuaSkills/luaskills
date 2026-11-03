@@ -37,6 +37,8 @@ GitHub 的 `GITHUB_TOKEN` 不能获得工作流写权限；来源提交相对实
 或源码不符立即失败，不重新压缩代替。汇总仍要求五个平台的精确压缩 SHA 一致，不仅比较解压文件。
 这是为了避免相同 tar 在不同平台 gzip 实现中产生不同压缩结果；源码身份和压缩分发身份分别核验。
 
+冻结阶段随后执行 `contract_series.py --version <版本>`：补丁版本（`x.y.z` 且 `z > 0`）的 `contracts/embedded/v1/contract.json` 必须与同一 `x.y` 系列中此前最新已公开发布版本逐字节相同，契约变化必须开启新的次版本；该脚本经 GitHub API 读取公开发布列表及该标签的契约，草稿与预发布不计入。其离线回归为 `test_contract_series.py`。
+
 冻结阶段在完整提交及包版本核验通过后，复用既有 Python 环境，依次运行 `test_candidate.py`、`test_release_tag.py`、
 `test_sdk_prerequisites.py`、`test_sdk_recovery.py`、`test_publish_crate.py` 五个离线回归入口；任一失败均使冻结作业失败，
 阻止依赖它的原生验收、候选构建、汇总与草稿创建。脚本与工作流来自同一个已核验完整 SHA。

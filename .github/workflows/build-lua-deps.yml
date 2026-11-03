@@ -83,6 +83,14 @@ jobs:
           python -X utf8 -m unittest discover -s scripts/release -p test_sdk_prerequisites.py -v
           python -X utf8 -m unittest discover -s scripts/release -p test_sdk_recovery.py -v
           python -X utf8 -m unittest discover -s scripts/release -p test_publish_crate.py -v
+          python -X utf8 -m unittest discover -s scripts/release -p test_contract_series.py -v
+      # A patch must ship the series contract byte for byte; a contract change needs a new minor release.
+      # 补丁版本必须逐字节携带系列契约；契约变化必须开启新的次版本。
+      - name: Require patch releases to keep the series contract
+        env:
+          CORE_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: python -X utf8 scripts/release/contract_series.py --version "$CORE_VERSION"
       # Exercise the real public source endpoint before native builds, packaging or draft creation.
       # 在原生构建、打包或草稿创建前验证真实公共源码端点。
       - name: Verify exact public commit archive before native builds

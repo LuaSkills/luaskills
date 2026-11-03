@@ -9,7 +9,7 @@ rtk proxy cargo +1.94.0 run --locked --features contract-generation --bin genera
 rtk proxy cargo +1.94.0 run --locked --features contract-generation --bin generate_embedded_contract -j 4 -- --check
 ```
 
-生成器的 `contract-generation` 功能默认关闭，普通 DLL、静态库及宿主构建不需要加载 Schema 生成器。Schemars 版本由 `Cargo.toml` 精确固定并纳入 `Cargo.lock`；依赖锁、生成入口源码摘要及核心包版本保存在产物中。生成源码摘要归一化 CRLF；产物经 `.gitattributes` 固定 LF，不能按平台重新转换后复用旧摘要。
+生成器的 `contract-generation` 功能默认关闭，普通 DLL、静态库及宿主构建不需要加载 Schema 生成器。Schemars 版本由 `Cargo.toml` 精确固定并纳入 `Cargo.lock`；产物保存生成入口源码摘要及发布系列 `core_series`（`major.minor`），不保存精确核心包版本或依赖锁摘要，因此同一系列的补丁版本保持契约字节与摘要不变。补丁版本改变契约时，核心发布工作流中的 `scripts/release/contract_series.py` 拒绝发布；契约变化必须开启新的次版本系列。生成源码摘要归一化 CRLF；产物经 `.gitattributes` 固定 LF，不能按平台重新转换后复用旧摘要。
 
 `request` 使用实际 Rust 反序列化类型；`error_response`、`root_responses`、`runtime_responses` 使用实际序列化类型。每项均是独立 Draft 2020-12 根 Schema，局部 `$ref` 只能在该项自身的 `$defs` 内解析，不能拿整个契约容器替代根 Schema。运行时响应类型来自 `src/ffi_embedded/responses.rs`，原生分发通过同一类型别名约束真实返回值；宿主请求批次直接使用代理实际序列化的 `HostRequest` 类型。`runtime` 根命令按其 `operation.type` 选择 `runtime_responses`，其余根命令按 `command.type` 选择 `root_responses`。
 
@@ -49,7 +49,7 @@ SDK 同步时复制完整契约及摘要到自己的发布包，再从这份离�
 
 C 调用方先调用 `luaskills_ffi_embedded_describe_v1(FfiBorrowedBuffer*)`，再决定是否创建传输。入口将有效输出位置清零，然后返回只读普通 JSON；它没有响应信封，也没有分配身份。字节由动态库拥有，直到动态库卸载前有效；调用方必须在保留已加载动态库期间按契约上限复制，绝不能调用旧版缓冲释放或嵌入式结果释放入口。缺少符号、非零状态、空指针、零长度和超过上限均显式失败。指针仍来自已加载的本机代码，长度校验不构成对恶意动态库的隔离。
 
-SDK 接入策略为：创建任何原生拥有对象前，精确匹配描述版本、核心包版本、JSON 协议、ABI 结构版本及包内契约 SHA-256，并检查必需命令、语义能力、已实现后端及进程平台约束。额外能力不授予权限，预留的 `worker_process` 不能被视为已实现。当前核心只声明 `in_process`；三个 SDK 的接入状态应以各仓库当前实现和测试为准，生成类型本身不代表构造时已强制检查。
+SDK 接入策略为：创建任何原生拥有对象前，精确匹配描述版本、核心发布系列（核心包版本的 `major.minor`）、JSON 协议、ABI 结构版本及包内契约 SHA-256，并检查必需命令、语义能力、已实现后端及进程平台约束。额外能力不授予权限，预留的 `worker_process` 不能被视为已实现。当前核心只声明 `in_process`；三个 SDK 的接入状态应以各仓库当前实现和测试为准，生成类型本身不代表构造时已强制检查。
 
 `build.rs` 对 `build_support/identity.rs` 中唯一声明的源码根按包相对路径排序，读取精确字节；源码摘要不归一化 CRLF。另外记录实际 Cargo 目标、优化和调试设置、功能环境名称、编码编译参数摘要以及实际 rustc 详细版本。生成的 `OUT_DIR/embedded-build-inputs.json` 保存逐文件摘要，其完整字节摘要作为 `inputs_sha256`。构建不依赖 Git、网络、时间或开发者绝对源码路径，输出只写入 `OUT_DIR`。必需输入缺失、链接逃逸或非普通文件直接拒绝，不静默遗漏。
 

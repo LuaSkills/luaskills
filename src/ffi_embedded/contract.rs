@@ -18,6 +18,14 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 pub(crate) mod tests;
 
+/// Release series (`major.minor`) shared by every patch release that keeps this contract.
+/// 保持本契约的全部补丁版本共享的发布系列（`major.minor`）。
+pub const CORE_SERIES: &str = concat!(
+    env!("CARGO_PKG_VERSION_MAJOR"),
+    ".",
+    env!("CARGO_PKG_VERSION_MINOR")
+);
+
 /// Hash source `text` after normalizing Git's platform-dependent line endings.
 /// 对源码 `text` 归一化 Git 平台相关换行后计算摘要。
 /// Return a lowercase SHA-256 identity independent of CRLF checkout conversion.
@@ -61,15 +69,17 @@ pub fn document() -> Value {
     // The registry maps commands to real Rust result types; tests verify coverage against derived command discriminators.
     // 注册表将命令映射到实际 Rust 结果类型；测试对照派生命令判别验证覆盖范围。
     let runtime_responses = super::responses::schemas();
+    // The contract names its release series, never the exact package version or dependency lock:
+    // a patch release keeps these bytes and their digest, so SDKs accept it without regeneration.
+    // 契约只写明发布系列，不写精确包版本或依赖锁：补丁版本保持这些字节及其摘要不变，
+    // 因此 SDK 无需重新生成即可接受它。
     json!({
         "contract_version": EMBEDDED_FFI_PROTOCOL_VERSION,
-        "core_version": env!("CARGO_PKG_VERSION"),
+        "core_series": CORE_SERIES,
         "protocol_version": EMBEDDED_FFI_PROTOCOL_VERSION,
         "generator": {
             "name": "luaskills/generate_embedded_contract",
-            "source_version": env!("CARGO_PKG_VERSION"),
             "source_sha256": source_digest(include_str!("contract.rs")),
-            "cargo_lock_sha256": source_digest(include_str!("../../Cargo.lock")),
             "schema_draft": "2020-12",
         },
         "commands": ROOT_COMMAND_NAMES,

@@ -38,6 +38,21 @@ environment_root  = <runtime_root>/dependencies/envs
 
 The precedence is always `explicit host option > runtime_root-derived default`. Environment variables and `PATH` are never candidates.
 
+## Read-only runtime root
+
+`runtime_root` normally also owns the two writable directories: `temp_dir = <runtime_root>/temp` (exposed to skills as `vulcan.runtime.temp_dir`) and `download_cache_root = <runtime_root>/temp/downloads`. A host that installs `runtime_root` read-only, for example inside a versioned application directory, sets `preserve_host_writable_dirs: true` and gives both paths explicitly:
+
+```json
+{
+  "runtime_root": "C:/Program Files/Host/lua_runtime",
+  "preserve_host_writable_dirs": true,
+  "temp_dir": "C:/Users/me/.host/cache/luaskills-temp",
+  "download_cache_root": "C:/Users/me/.host/cache/luaskills-downloads"
+}
+```
+
+Both paths are then required; engine creation fails when either is missing, and nothing is derived in their place. The host creates `temp_dir`; the engine creates the download cache when it first needs it. Skill state, databases and dependencies already follow each skill root's parent directory, so with user-owned skill roots and explicit managed roots nothing below `runtime_root` is written. The option is available through Rust, JSON FFI and the embedded protocol; the plain C ABI structs do not carry it and keep the derived layout.
+
 ## Engine-wide resource policy
 
 `LuaRuntimeHostOptions.managed_runtime_config` fixes the Worker/session policy when the engine is created. Lua code cannot change it, and invalid zero values are rejected before runtime roots, environments, Workers, or sessions are allocated.

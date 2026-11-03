@@ -198,7 +198,7 @@
     "title": "EmbeddedCoreDescription",
     "type": "object"
   },
-  "core_version": "0.8.2",
+  "core_series": "0.9",
   "error_response": {
     "$defs": {
       "EmbeddedError": {
@@ -333,11 +333,9 @@
     "type": "object"
   },
   "generator": {
-    "cargo_lock_sha256": "d410d10600df3fa79d435c58d894be03009fdbaa8c4f3f34d5e12f7a1e1aa890",
     "name": "luaskills/generate_embedded_contract",
     "schema_draft": "2020-12",
-    "source_sha256": "f31dc521eeff41b774bddf11408f2a8dd2c1d6bb77c8650bfc3bfb7fa5e621d1",
-    "source_version": "0.8.2"
+    "source_sha256": "c4cd8952eb1ff3607d6e58d1224652bde3de27f5f6bf501e756d76da2d8e6961"
   },
   "json_vectors": {
     "invalid": [
@@ -1760,6 +1758,11 @@
               "string",
               "null"
             ]
+          },
+          "preserve_host_writable_dirs": {
+            "default": false,
+            "description": "Keep the host-set `temp_dir` and `download_cache_root` instead of deriving them from\n`runtime_root`, so a read-only runtime root never receives transient files or downloads.\nBoth paths are then required; the host creates `temp_dir`, the engine creates the cache.\n保留宿主设置的 `temp_dir` 与 `download_cache_root`，不再从 `runtime_root` 推导，\n使只读运行时根绝不接收临时文件或下载内容。此时两个路径均为必填；宿主创建 `temp_dir`，\n引擎创建下载缓存。",
+            "type": "boolean"
           },
           "private_skill_source_allowlist": {
             "default": [],
