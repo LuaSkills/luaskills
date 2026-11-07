@@ -5,7 +5,7 @@ use crate::skill::dependencies::{
     GithubReleaseSourceSpec, PackageDependencyManifest, ToolDependencySpec, UrlSourceSpec,
 };
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Build one minimal dependency manager rooted under one unique temporary test directory.
@@ -95,14 +95,10 @@ fn dependency_install_root_cannot_escape_through_special_components() {
     );
 }
 
-/// Return one shared guard for tests that temporarily replace the global runtime log callback.
-/// 返回一把共享保护锁，用于临时替换全局运行时日志回调的测试。
+/// Return the crate-wide guard shared with every other test that replaces the global runtime log callback.
+/// 返回与所有其他替换全局运行时日志回调的测试共享的全 crate 保护锁。
 fn runtime_log_callback_test_guard() -> MutexGuard<'static, ()> {
-    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-    match TEST_MUTEX.get_or_init(|| Mutex::new(())).lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+    crate::runtime::test_support::runtime_log_callback_test_guard()
 }
 
 /// Reset the global runtime log callback when one logging test exits.

@@ -14,6 +14,21 @@ pub(crate) fn process_env_test_guard() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Acquire the process-wide guard shared by every test that replaces the global runtime log callback.
+/// 获取由所有替换全局运行时日志回调的测试共享的进程级保护锁。
+/// Without it, parallel tests overwrite each other's callback and lose or misattribute observations.
+/// 若无此锁，并行测试会互相覆盖回调，导致观测丢失或归属错误。
+pub(crate) fn runtime_log_callback_test_guard() -> MutexGuard<'static, ()> {
+    /// Process-wide lock that serializes tests owning the global log callback.
+    /// 用于串行化拥有全局日志回调的测试的进程级锁。
+    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+
+    GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Restore one process environment variable after a test mutates it.
 /// 在测试修改环境变量后恢复单个进程环境变量。
 fn restore_test_env_var(name: &str, previous: Option<OsString>) {

@@ -1,23 +1,38 @@
 //! Real diagnostic behavior uses the existing logger, actual reusable VMs and physical retirement.
 //! 真实诊断行为使用既有日志器、实际复用 VM 及物理退役。
-//! These process-global logger tests require the existing serial shared-resource harness.
-//! 这些进程全局日志测试要求使用既有串行共享资源测试配置。
+//! These process-global logger tests serialize through the shared log-callback test guard held by RestoreLogger.
+//! 这些进程全局日志测试通过 RestoreLogger 持有的共享日志回调测试保护锁串行化。
+//! Other embedded tests still run in parallel and emit into the installed callback, so observers filter by runtime id.
+//! 其他嵌入式测试仍并行运行并向已安装回调发送，因此观察者按运行时 id 过滤。
 
 use super::*;
 use crate::runtime::logging::{
     RuntimeLogCallback, diagnostic_subscriber, send_diagnostic, set_log_callback,
 };
+use crate::runtime::test_support::runtime_log_callback_test_guard;
+use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// Restore the original process logger after actual runtime shutdown, including assertion unwinds.
-/// 在实际运行时关闭后恢复原进程日志器，包括断言展开时。
-pub(super) struct RestoreLogger(Option<RuntimeLogCallback>);
+/// Own the global logger for one test and restore the original after actual runtime shutdown, including assertion unwinds.
+/// 为单个测试独占全局日志器，并在实际运行时关闭后恢复原日志器，包括断言展开时。
+pub(super) struct RestoreLogger {
+    /// Original callback restored before the guard below is released.
+    /// 在下方保护锁释放前恢复的原回调。
+    previous: Option<RuntimeLogCallback>,
+    /// Shared serialization guard; fields drop after Drop::drop, so restoration happens while still held.
+    /// 共享串行化保护锁；字段在 Drop::drop 之后释放，因此恢复发生在仍持锁期间。
+    _guard: MutexGuard<'static, ()>,
+}
 
 impl RestoreLogger {
-    /// Capture the exact original callback before registering a test observer; return restoration ownership.
-    /// 在注册测试观察者前捕获精确原回调；返回恢复所有权。
+    /// Acquire the shared logger guard, then capture the exact original callback; return restoration ownership.
+    /// 获取共享日志器保护锁，再捕获精确原回调；返回恢复所有权。
     pub(super) fn capture() -> Self {
-        Self(diagnostic_subscriber().and_then(|subscriber| subscriber.upgrade()))
+        let guard = runtime_log_callback_test_guard();
+        Self {
+            previous: diagnostic_subscriber().and_then(|subscriber| subscriber.upgrade()),
+            _guard: guard,
+        }
     }
 }
 
@@ -25,7 +40,7 @@ impl Drop for RestoreLogger {
     /// Restore the original callback without affecting operation or instance ownership.
     /// 恢复原回调，不影响操作或实例所有权。
     fn drop(&mut self) {
-        set_log_callback(self.0.take());
+        set_log_callback(self.previous.take());
     }
 }
 
@@ -81,9 +96,13 @@ fn embedded_diagnostics_observe_real_reuse_host_wait_heap_and_retirement() {
     // Wait for actual retirement emission separately from earlier physical completion notification.
     // 与更早物理完成通知分开等待实际退役发送。
     let (retired_sender, retired_receiver) = std::sync::mpsc::channel();
+    // Parallel embedded tests also emit into the installed callback; keep only this runtime's events.
+    // 并行嵌入式测试也会向已安装回调发送；仅保留此运行时的事件。
+    let runtime_id = json!(runtime.id());
     set_log_callback(Some(Arc::new(move |event| {
         if let Ok(observation) = serde_json::from_str::<Value>(&event.message)
             && observation["luaskills_embedded_diagnostic"] == json!(1)
+            && observation["runtime_id"] == runtime_id
         {
             // Publish the captured event before waking the test waiting for its complete observation.
             // 在唤醒等待完整观测的测试前发布捕获事件。
@@ -299,11 +318,16 @@ fn embedded_diagnostics_panic_and_removed_external_callback_preserve_execution()
     // Observe the actual original post-destruction callback boundary before changing global registration.
     // 在改变全局注册前观测实际原销毁后回调边界。
     let (retired_sender, retired_receiver) = std::sync::mpsc::channel();
+    // Parallel embedded tests also emit into the installed callback; react only to this runtime's events.
+    // 并行嵌入式测试也会向已安装回调发送；仅响应此运行时的事件。
+    let runtime_id = json!(runtime.id());
+    let callback_runtime_id = runtime_id.clone();
     // Keep external callback ownership alive after removing its global registration.
     // 在移除全局注册后保持外部回调所有权存活。
     let callback: RuntimeLogCallback = Arc::new(move |event| {
         if let Ok(observation) = serde_json::from_str::<Value>(&event.message)
             && observation["luaskills_embedded_diagnostic"] == json!(1)
+            && observation["runtime_id"] == callback_runtime_id
         {
             callback_deliveries.fetch_add(1, Ordering::Relaxed);
             if observation["phase"] == "retired" {
@@ -371,6 +395,7 @@ fn embedded_diagnostics_panic_and_removed_external_callback_preserve_execution()
     set_log_callback(Some(Arc::new(move |event| {
         if let Ok(observation) = serde_json::from_str::<Value>(&event.message)
             && observation["luaskills_embedded_diagnostic"] == json!(1)
+            && observation["runtime_id"] == runtime_id
         {
             replacement_observed.fetch_add(1, Ordering::Relaxed);
         }
