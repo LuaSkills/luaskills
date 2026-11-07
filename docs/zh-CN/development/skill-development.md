@@ -392,6 +392,17 @@ return vulcan.json.encode({
 - `debug.sethook` 不可用。其他 `debug` 函数照常可用，例如 `debug.getupvalue`、`debug.getmetatable` 和
   `debug.traceback`。
 
+阻塞的宿主调用在等待期间不运行 Lua，超时检查停不下它们，因此改由剩余时间约束：
+
+- `vulcan.process.exec`、`vulcan.io.popen`、`vulcan.runtime.python.invoke` 和 `vulcan.runtime.node.invoke`
+  最多等待自身 `timeout_ms` 与剩余时间中较小者。这样被截断的 invoke 返回 `timed_out = true`。时间用完后
+  再发起的调用会以 `Evaluation deadline exceeded.` 失败。
+- `session:read` 最多等待剩余时间。`session:close` 把优雅等待缩短到剩余时间；截止时间已过时不再等待，
+  直接终止进程树。
+- 这些调用触发的受管环境构建（uv 或 pnpm，包括生命周期脚本与构建钩子）会在截止时间连同整棵进程树一起
+  终止，等待其他调用方的构建也到此为止。每次构建另有 30 分钟上限。构建耗时超过执行超时的环境，应提前在
+  超时足够长的调用中构建好。
+
 ## 4. `vulcan.call`
 
 ### 4.1 用途
@@ -1018,7 +1029,7 @@ export async function main(args, ctx) {
 | `file` | `string` | 是 | 当前 skill 目录内的安全相对路径 |
 | `handler` | `string` | 否 | Python 默认 `main`；Node 默认 `default`，并 fallback 到 `main` |
 | `args` | JSON 兼容 Lua 值 | 否 | 传给子 handler |
-| `timeout_ms` | 正整数 | 否 | 单次调用超时；优先于引擎 `managed_runtime_config.invoke_default_timeout_ms`；两处都省略时无限制；超时 Worker 会被丢弃 |
+| `timeout_ms` | 正整数 | 否 | 单次调用超时；优先于引擎 `managed_runtime_config.invoke_default_timeout_ms`；两处都省略时无限制，但在 runLua、租约或嵌入式调用中仍受剩余时间约束（见 3.4）；超时 Worker 会被丢弃 |
 
 调用返回：
 

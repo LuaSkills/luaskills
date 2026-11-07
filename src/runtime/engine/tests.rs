@@ -1,3 +1,4 @@
+mod blocking_calls;
 mod embedded;
 mod execution_budget;
 mod host_database;

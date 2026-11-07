@@ -1672,7 +1672,14 @@ impl ManagedProcessSession {
     fn read(&self, lua: &Lua, args: MultiValue) -> mlua::Result<Table> {
         // Request is the fully validated Lua read request.
         // Request 是完成全部校验的 Lua 读取请求。
-        let request = parse_session_read_request(args)?;
+        let mut request = parse_session_read_request(args)?;
+        // The read blocks without running Lua, so the evaluation deadline caps its wait.
+        // 读取阻塞期间不运行 Lua，因此由执行截止时间约束其等待。
+        if let Some(remaining) = crate::runtime::engine::logical_cwd::remaining_timeout_ms(lua)
+            .map_err(|error| mlua::Error::runtime(format!("process.session.read: {error}")))?
+        {
+            request.timeout_ms = request.timeout_ms.min(remaining);
+        }
         // Read is the package-agnostic result converted below without lifecycle logic.
         // Read 是下方不含生命周期逻辑地转换的包无关结果。
         let read = self
@@ -1703,7 +1710,19 @@ impl ManagedProcessSession {
     fn close(&self, lua: &Lua, args: MultiValue) -> mlua::Result<Table> {
         // Request contains the validated non-negative graceful timeout.
         // Request 包含经过校验的非负优雅退出超时。
-        let request = parse_session_close_request(args)?;
+        let mut request = parse_session_close_request(args)?;
+        // The graceful wait is capped by the evaluation deadline; once it has passed the close still
+        // runs, with no grace, so the process tree is always torn down.
+        // 优雅等待受执行截止时间约束；截止时间已过时仍会执行关闭，只是不再等待，从而保证进程树
+        // 总能被清理。
+        if let Some(deadline) = crate::runtime::engine::logical_cwd::deadline(lua) {
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis();
+            request.timeout_ms = request
+                .timeout_ms
+                .min(u64::try_from(remaining).unwrap_or(u64::MAX));
+        }
         // FinalStatus is converted only after the core completes full teardown.
         // FinalStatus 只会在核心完成完整清理后进行转换。
         let final_status = self

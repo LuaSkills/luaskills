@@ -4,12 +4,13 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::LuaRuntimeHostMode;
 use crate::runtime::managed_package::{
@@ -19,7 +20,7 @@ use crate::runtime::managed_package::{
 use crate::runtime::path::{
     host_process_path_argument, normalize_host_input_path_text, render_host_visible_path,
 };
-use crate::runtime::process_window::configure_command;
+use crate::runtime::process_session::{ManagedChildProcessTree, finalize_one_shot_process_tree};
 use crate::skill::dependencies::{
     NodeRuntimeDependencySpec, NodeRuntimePackageManager, PythonRuntimeDependencySpec,
     PythonRuntimePackageManager,
@@ -969,6 +970,20 @@ fn recover_failed_managed_runtime_publication(
 fn acquire_managed_runtime_env_file_lock(
     plan: &ManagedRuntimeEnvPlan,
 ) -> Result<ManagedRuntimeEnvFileLock, String> {
+    acquire_managed_runtime_env_file_lock_until(plan, None)
+}
+
+/// Acquire the cross-process construction lock of one environment, waiting at most until `deadline`.
+/// 获取单个环境的跨进程构建锁，最多等待到 `deadline`。
+///
+/// Without a deadline this blocks like [`acquire_managed_runtime_env_file_lock`]; with one it polls,
+/// so a caller whose evaluation budget runs out stops waiting behind another process's build.
+/// 没有截止时间时与 [`acquire_managed_runtime_env_file_lock`] 一样阻塞；有截止时间时改为轮询，
+/// 使执行预算耗尽的调用方不再等在另一个进程的构建之后。
+fn acquire_managed_runtime_env_file_lock_until(
+    plan: &ManagedRuntimeEnvPlan,
+    deadline: Option<Instant>,
+) -> Result<ManagedRuntimeEnvFileLock, String> {
     let parent = plan.env_dir.parent().ok_or_else(|| {
         format!(
             "managed env directory has no parent: {}",
@@ -996,12 +1011,28 @@ fn acquire_managed_runtime_env_file_lock(
                 render_managed_runtime_path(&path)
             )
         })?;
-    lock_managed_runtime_env_file(&file).map_err(|error| {
+    let lock_error = |error: std::io::Error| {
         format!(
             "Failed to lock managed environment {}: {error}",
             render_managed_runtime_path(&path)
         )
-    })?;
+    };
+    match deadline {
+        None => lock_managed_runtime_env_file(&file).map_err(lock_error)?,
+        // The nonblocking exclusive attempt takes the same whole-file lock as the blocking call.
+        // 非阻塞独占尝试与阻塞调用获取的是同一个整文件锁。
+        Some(deadline) => {
+            while !try_lock_managed_runtime_env_lease_exclusive(&file).map_err(lock_error)? {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "evaluation deadline exceeded while another process builds managed environment {}",
+                        render_managed_runtime_path(&plan.env_dir)
+                    ));
+                }
+                thread::sleep(MANAGED_ENV_LOCK_POLL_INTERVAL);
+            }
+        }
+    }
     Ok(ManagedRuntimeEnvFileLock { file, path })
 }
 
@@ -2067,9 +2098,45 @@ pub fn managed_env_marker_matches(
     actual == expected
 }
 
+/// Longest time one managed environment build may run before its installer tree is killed.
+/// 单次受管环境构建在其安装器进程树被终止前允许运行的最长时间。
+///
+/// Installers run package-authored code (pnpm lifecycle scripts, PEP 517 build hooks), so a hung
+/// hook must not hold the construction locks forever.
+/// 安装器会运行包作者编写的代码（pnpm 生命周期脚本、PEP 517 构建钩子），因此卡住的钩子不能
+/// 永久持有构建锁。
+const MANAGED_ENV_BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Interval between attempts to take a construction lock that another builder holds.
+/// 尝试获取被其他构建方持有的构建锁时的轮询间隔。
+const MANAGED_ENV_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Interval between exit checks of one running installer command.
+/// 检查运行中安装命令是否退出的间隔。
+const MANAGED_ENV_INSTALLER_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Bytes kept from the end of each installer output stream for failure diagnostics.
+/// 每个安装器输出流为失败诊断保留的末尾字节数。
+const MANAGED_ENV_INSTALLER_OUTPUT_TAIL_BYTES: usize = 64 * 1024;
+
 /// Ensure one managed runtime environment exists and matches its expected marker.
 /// 确保一个受管运行时环境存在并且匹配其期望标记。
 pub fn ensure_managed_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
+    ensure_managed_env_until(plan, None)
+}
+
+/// Ensure one managed runtime environment exists, stopping at `deadline` when one is given.
+/// 确保一个受管运行时环境存在；给定 `deadline` 时到期即停止。
+///
+/// `deadline` is the caller's evaluation deadline: waiting for another builder's locks stops there,
+/// and a build started here is killed there. Every build is also capped by
+/// [`MANAGED_ENV_BUILD_TIMEOUT`].
+/// `deadline` 是调用方的执行截止时间：等待其他构建方的锁到此为止，在此开始的构建也会在此被
+/// 终止。每次构建还受 [`MANAGED_ENV_BUILD_TIMEOUT`] 约束。
+pub(crate) fn ensure_managed_env_until(
+    plan: &ManagedRuntimeEnvPlan,
+    deadline: Option<Instant>,
+) -> Result<(), String> {
     validate_managed_runtime_plan_assets(plan)?;
     if managed_env_is_ready(plan)? {
         return Ok(());
@@ -2077,22 +2144,59 @@ pub fn ensure_managed_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
     // Per-environment construction lock shared by every engine in this process.
     // 当前进程中所有引擎共享的每环境构建锁。
     let build_lock = managed_runtime_env_lock(&plan.env_dir);
-    // Build guard recovered after poisoning so a failed installer does not permanently wedge retries.
-    // 在锁中毒后恢复构建保护，避免失败安装永久阻塞重试。
-    let _build_guard = build_lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _build_guard = lock_managed_runtime_env_build_until(&build_lock, plan, deadline)?;
     // Cross-process lock prevents another host process from staging or replacing the same env.
     // 跨进程锁防止另一个宿主进程同时暂存或替换同一个环境。
-    let _file_lock = acquire_managed_runtime_env_file_lock(plan)?;
+    let _file_lock = acquire_managed_runtime_env_file_lock_until(plan, deadline)?;
     // Double-check under the construction lock because another caller may have published the environment.
     // 在构建锁内二次检查，因为其他调用方可能已经发布环境。
     if managed_env_is_ready(plan)? {
         return Ok(());
     }
+    // The build budget starts once the locks are held, so waiting does not count against it.
+    // 构建预算从持有锁开始计算，等待时间不计入。
+    let now = Instant::now();
+    let build_cap = now.checked_add(MANAGED_ENV_BUILD_TIMEOUT).unwrap_or(now);
+    let build_deadline = deadline.map_or(build_cap, |deadline| deadline.min(build_cap));
+    if now >= build_deadline {
+        return Err(format!(
+            "evaluation deadline exceeded before building managed environment {}",
+            render_managed_runtime_path(&plan.env_dir)
+        ));
+    }
     match plan.runtime {
-        ManagedRuntimeKind::Python => create_python_env(plan),
-        ManagedRuntimeKind::Node => create_node_env(plan),
+        ManagedRuntimeKind::Python => create_python_env(plan, build_deadline),
+        ManagedRuntimeKind::Node => create_node_env(plan, build_deadline),
+    }
+}
+
+/// Take the in-process construction lock of one environment, waiting at most until `deadline`.
+/// 获取单个环境的进程内构建锁，最多等待到 `deadline`。
+///
+/// The guard is recovered after poisoning so a failed installer does not permanently wedge retries.
+/// 锁中毒后会恢复保护对象，避免失败安装永久阻塞重试。
+fn lock_managed_runtime_env_build_until<'a>(
+    build_lock: &'a Mutex<()>,
+    plan: &ManagedRuntimeEnvPlan,
+    deadline: Option<Instant>,
+) -> Result<MutexGuard<'a, ()>, String> {
+    let Some(deadline) = deadline else {
+        return Ok(build_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner));
+    };
+    loop {
+        match build_lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) if Instant::now() >= deadline => {
+                return Err(format!(
+                    "evaluation deadline exceeded while another caller builds managed environment {}",
+                    render_managed_runtime_path(&plan.env_dir)
+                ));
+            }
+            Err(TryLockError::WouldBlock) => thread::sleep(MANAGED_ENV_LOCK_POLL_INTERVAL),
+        }
     }
 }
 
@@ -2237,7 +2341,7 @@ fn validate_managed_runtime_install_identity_matches(
 ///
 /// Returns unit after atomic publication, or a cleanup-complete build/command error.
 /// 原子发布后返回空值；失败时返回已完成清理的构建或命令错误。
-fn create_python_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
+fn create_python_env(plan: &ManagedRuntimeEnvPlan, deadline: Instant) -> Result<(), String> {
     validate_managed_runtime_plan_assets(plan)?;
     // Unique unpublished same-parent directory used for the complete isolated uv build.
     // 完整隔离 uv 构建使用的唯一同父级未发布目录。
@@ -2288,6 +2392,7 @@ fn create_python_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
             &mut create_command,
             "create managed Python virtual environment",
             plan.managed_runtime_roots.host_mode(),
+            deadline,
         )?;
         // Environment interpreter used by the reproducible lockfile synchronization step.
         // 可复现锁文件同步步骤使用的环境解释器。
@@ -2320,6 +2425,7 @@ fn create_python_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
             &mut sync_command,
             "synchronize managed Python environment",
             plan.managed_runtime_roots.host_mode(),
+            deadline,
         )?;
         finish_build_dir(plan, build_dir.clone())
     })();
@@ -2335,7 +2441,7 @@ fn create_python_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
 ///
 /// Returns unit after atomic publication, or a cleanup-complete copy/install error.
 /// 原子发布后返回空值；失败时返回已完成清理的复制或安装错误。
-fn create_node_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
+fn create_node_env(plan: &ManagedRuntimeEnvPlan, deadline: Instant) -> Result<(), String> {
     validate_managed_runtime_plan_assets(plan)?;
     // Unpublished same-parent build directory used for the entire pnpm installation.
     // 整个 pnpm 安装期间使用的同父级未发布构建目录。
@@ -2424,6 +2530,7 @@ fn create_node_env(plan: &ManagedRuntimeEnvPlan) -> Result<(), String> {
                 &mut install_command,
                 "install managed Node environment",
                 plan.managed_runtime_roots.host_mode(),
+                deadline,
             )
         })
         .and_then(|()| finish_build_dir(plan, build_dir.clone()));
@@ -2683,30 +2790,184 @@ fn write_expected_marker(env_dir: &Path, marker: &ManagedRuntimeEnvMarker) -> Re
     })
 }
 
-/// Run one process command and convert failures into stable error text.
-/// 运行一个进程命令并将失败转换为稳定错误文本。
-/// `command` is the prepared installer, `operation` names diagnostics, and `host_mode` selects the window policy.
-/// `command` 为准备好的安装器，`operation` 标识诊断，`host_mode` 选择窗口策略。
-/// Returns unit after successful exit, otherwise the spawn failure or captured output and status.
-/// 成功退出后返回空值，否则返回启动失败或捕获的输出及状态。
+/// Run one installer command until it exits or `deadline` passes, and convert failures into stable
+/// error text.
+/// 运行一个安装命令直到其退出或超过 `deadline`，并将失败转换为稳定错误文本。
+///
+/// `command` is the prepared installer, `operation` names diagnostics, and `host_mode` selects the
+/// window policy. The installer runs as an owned process tree, so on timeout every descendant
+/// (lifecycle scripts, build backends) is killed with it. Only the tail of each output stream is kept.
+/// `command` 为准备好的安装器，`operation` 标识诊断，`host_mode` 选择窗口策略。安装器作为
+/// 受管进程树运行，超时时其所有后代（生命周期脚本、构建后端）都会一并终止。每个输出流只保留末尾。
+///
+/// Returns unit after successful exit, otherwise the spawn failure, timeout, or output tail and status.
+/// 成功退出后返回空值，否则返回启动失败、超时，或输出末尾及状态。
 fn run_command(
     command: &mut Command,
     operation: &str,
     host_mode: LuaRuntimeHostMode,
+    deadline: Instant,
 ) -> Result<(), String> {
-    configure_command(command, host_mode, 0);
-    let output = command
-        .output()
-        .map_err(|error| format!("Failed to {}: {}", operation, error))?;
-    if output.status.success() {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let started_at = Instant::now();
+    let (mut child, process_tree, reaper_permit) =
+        ManagedChildProcessTree::spawn_with_keepalive(command, operation, None, host_mode)
+            .map_err(|error| format!("Failed to {operation}: {error}"))?;
+    let stdout_reader = child.stdout.take().map(spawn_installer_output_tail_reader);
+    let stderr_reader = child.stderr.take().map(spawn_installer_output_tail_reader);
+    let mut timed_out = false;
+    let mut wait_error = None;
+    let observed_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() >= deadline => {
+                timed_out = true;
+                break None;
+            }
+            Ok(None) => thread::sleep(MANAGED_ENV_INSTALLER_POLL_INTERVAL),
+            Err(error) => {
+                wait_error = Some(format!("failed to wait for installer: {error}"));
+                break None;
+            }
+        }
+    };
+    // The whole tree is closed before the pipes are joined, so a descendant that inherited them
+    // cannot keep the readers open.
+    // 在等待管道读取线程前关闭整棵进程树，使继承管道的后代无法让读取线程一直不结束。
+    let final_status = finalize_one_shot_process_tree(
+        child,
+        process_tree,
+        reaper_permit,
+        observed_status,
+        operation,
+    );
+    let stdout = join_installer_output_tail_reader(stdout_reader);
+    let stderr = join_installer_output_tail_reader(stderr_reader);
+    let status = match (final_status, wait_error) {
+        (Err(cleanup_error), Some(wait_error)) => {
+            return Err(format!(
+                "Failed to {operation}: {wait_error}; cleanup failed: {cleanup_error}"
+            ));
+        }
+        (Err(cleanup_error), None) => {
+            return Err(format!("Failed to {operation}: {cleanup_error}"));
+        }
+        (Ok(_), Some(wait_error)) => return Err(format!("Failed to {operation}: {wait_error}")),
+        (Ok(status), None) => status,
+    };
+    if timed_out {
+        return Err(format!(
+            "Failed to {operation}: installer did not finish within {} ms and was terminated; stdout={stdout} stderr={stderr}",
+            started_at.elapsed().as_millis()
+        ));
+    }
+    if status.success() {
         return Ok(());
     }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Err(format!(
-        "Failed to {}: status={} stdout={} stderr={}",
-        operation, output.status, stdout, stderr
+    Err(format_installer_failure(
+        operation, status, &stdout, &stderr,
     ))
+}
+
+/// Render one failed installer exit with its retained output tails.
+/// 渲染一次失败的安装器退出及其保留的输出末尾。
+fn format_installer_failure(
+    operation: &str,
+    status: ExitStatus,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    format!("Failed to {operation}: status={status} stdout={stdout} stderr={stderr}")
+}
+
+/// Bytes kept from the end of one installer output stream.
+/// 单个安装器输出流保留的末尾字节。
+struct InstallerOutputTail {
+    /// Last bytes read from the stream, at most [`MANAGED_ENV_INSTALLER_OUTPUT_TAIL_BYTES`].
+    /// 从该流读取的最后若干字节，最多 [`MANAGED_ENV_INSTALLER_OUTPUT_TAIL_BYTES`]。
+    bytes: Vec<u8>,
+    /// Earlier bytes discarded to keep the tail bounded.
+    /// 为保持末尾有界而丢弃的更早字节数。
+    dropped_bytes: u64,
+    /// Read failure that ended the capture early, if any.
+    /// 提前结束捕获的读取失败（如有）。
+    error: Option<String>,
+}
+
+impl InstallerOutputTail {
+    /// Drop the oldest bytes beyond `limit`, counting them as dropped.
+    /// 丢弃超出 `limit` 的最旧字节，并计入丢弃数。
+    fn trim_to(&mut self, limit: usize) {
+        if self.bytes.len() > limit {
+            let excess = self.bytes.len() - limit;
+            self.bytes.drain(..excess);
+            self.dropped_bytes = self.dropped_bytes.saturating_add(excess as u64);
+        }
+    }
+}
+
+/// Read one installer output stream to its end on a background thread, keeping only its tail.
+/// 在后台线程中把一个安装器输出流读到结束，只保留其末尾。
+fn spawn_installer_output_tail_reader<R>(mut reader: R) -> thread::JoinHandle<InstallerOutputTail>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut tail = InstallerOutputTail {
+            bytes: Vec::new(),
+            dropped_bytes: 0,
+            error: None,
+        };
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    tail.bytes.extend_from_slice(&buffer[..read]);
+                    // Trimming only once the buffer doubles keeps the copy cost amortized.
+                    // 仅在缓冲区翻倍后才裁剪，使复制开销保持均摊。
+                    if tail.bytes.len() > 2 * MANAGED_ENV_INSTALLER_OUTPUT_TAIL_BYTES {
+                        tail.trim_to(MANAGED_ENV_INSTALLER_OUTPUT_TAIL_BYTES);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    tail.error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        tail.trim_to(MANAGED_ENV_INSTALLER_OUTPUT_TAIL_BYTES);
+        tail
+    })
+}
+
+/// Join one installer output reader and render its tail as trimmed diagnostic text.
+/// 等待一个安装器输出读取线程，并将其末尾渲染为去除首尾空白的诊断文本。
+fn join_installer_output_tail_reader(
+    handle: Option<thread::JoinHandle<InstallerOutputTail>>,
+) -> String {
+    let Some(handle) = handle else {
+        return String::new();
+    };
+    let Ok(tail) = handle.join() else {
+        return "[installer output reader panicked]".to_string();
+    };
+    let mut text = String::new();
+    if tail.dropped_bytes > 0 {
+        text.push_str(&format!(
+            "[installer output truncated; dropped_bytes={}] ",
+            tail.dropped_bytes
+        ));
+    }
+    text.push_str(String::from_utf8_lossy(&tail.bytes).trim());
+    if let Some(error) = tail.error {
+        text.push_str(&format!(" [installer output read failed: {error}]"));
+    }
+    text
 }
 
 /// Return the Python executable inside one venv directory.
@@ -3681,6 +3942,9 @@ fn runtime_prefix(runtime: ManagedRuntimeKind) -> &'static str {
 
 #[cfg(all(test, windows))]
 mod host_mode_tests;
+
+#[cfg(test)]
+mod installer_tests;
 
 #[cfg(test)]
 mod tests {

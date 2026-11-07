@@ -63,7 +63,7 @@ environment_root  = <runtime_root>/dependencies/envs
 | `worker_idle_ttl_secs` | `60` | 空闲 Worker 回收秒数 |
 | `persistent_session_limit_per_engine` | `256` | 单个引擎拥有的启动中与活动 Python/Node 持久会话总数 |
 | `persistent_session_default_buffer_limit_bytes_per_stream` | `1048576`（1 MiB） | 每个 Session stdout 或 stderr 流默认保留字节数 |
-| `invoke_default_timeout_ms` | `None` / `null` | `python.invoke`/`node.invoke` 默认超时；缺失表示无限制 |
+| `invoke_default_timeout_ms` | `None` / `null` | `python.invoke`/`node.invoke` 默认超时；缺失表示无限制，但 runLua、租约或嵌入式调用的截止时间仍会约束每次调用 |
 
 所有已配置数值都必须大于零。单次 `session.open({ buffer_limit_bytes = ... })` 的正数值优先于该 Session 的引擎缓冲默认值；单次 `invoke({ timeout_ms = ... })` 的正数值优先于该调用的引擎超时默认值；其他调用继续使用不可变引擎策略。
 

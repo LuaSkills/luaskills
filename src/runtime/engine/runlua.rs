@@ -1728,9 +1728,11 @@ impl LuaEngine {
     /// 为隔离 luaexec 虚拟机安装硬超时保护。
     pub(super) fn install_runlua_timeout_guard(lua: &Lua, timeout_ms: u64) -> mlua::Result<()> {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        if logical_cwd::directory(lua).is_some() {
-            lua.set_app_data(logical_cwd::EvaluationDeadline(deadline));
-        }
+        // Blocking host calls (process, popen, managed runtimes, sessions) read this deadline, since
+        // the instruction hook cannot interrupt them while they wait.
+        // 阻塞宿主调用（进程、popen、受管运行时、会话）读取该截止时间，因为它们等待期间指令钩子
+        // 无法打断它们。
+        lua.set_app_data(logical_cwd::EvaluationDeadline(deadline));
         let timeout_text = format!("luaexec execution timed out after {} ms", timeout_ms);
         // The VM was hardened at creation, so the JIT is already off and the deadline, once
         // passed, cannot be caught by pcall-style retry loops.

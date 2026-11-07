@@ -32,6 +32,7 @@ fn desktop_host_mode_environment_installer() {
         &mut command,
         "probe desktop installer",
         LuaRuntimeHostMode::Desktop,
+        Instant::now() + Duration::from_secs(120),
     )
     .unwrap();
 }

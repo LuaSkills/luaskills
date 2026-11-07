@@ -56,7 +56,7 @@ use crate::runtime::managed_package::{
 };
 use crate::runtime::managed_runtime::{
     ManagedRuntimeEnvPlan, ManagedRuntimeRoots,
-    current_managed_runtime_persistent_session_capability, ensure_managed_env,
+    current_managed_runtime_persistent_session_capability, ensure_managed_env_until,
     managed_env_is_ready, resolve_node_env_plan, resolve_python_env_plan,
 };
 use crate::runtime::managed_runtime_services::{
@@ -3291,6 +3291,7 @@ fn parse_managed_runtime_session_open_request(
         stderr_encoding,
         stdin_encoding,
         buffer_limit_bytes,
+        env_build_deadline: None,
     })
 }
 
@@ -3485,12 +3486,13 @@ fn open_managed_python_session(
     let observer = reservation.observer();
     // Strict session launch request parsed from Lua.
     // 从 Lua 解析得到的严格会话启动请求。
-    let request = parse_managed_runtime_session_open_request(
+    let mut request = parse_managed_runtime_session_open_request(
         spec,
         api_name,
         default_encoding,
         services.persistent_session_default_buffer_limit_bytes_per_stream(),
     )?;
+    request.env_build_deadline = logical_cwd::deadline(lua);
     // Pure Rust launch result owning the process tree and optional package snapshot cleanup.
     // 拥有进程树与可选包快照清理的纯 Rust 启动结果。
     let launch = launch_managed_python_session(package.as_ref(), request, observer)
@@ -3545,12 +3547,13 @@ fn open_managed_node_session(
     let observer = reservation.observer();
     // Strict session launch request parsed from Lua.
     // 从 Lua 解析得到的严格会话启动请求。
-    let request = parse_managed_runtime_session_open_request(
+    let mut request = parse_managed_runtime_session_open_request(
         spec,
         api_name,
         default_encoding,
         services.persistent_session_default_buffer_limit_bytes_per_stream(),
     )?;
+    request.env_build_deadline = logical_cwd::deadline(lua);
     // Pure Rust launch result owning the process tree and unique Node snapshot cleanup.
     // 拥有进程树与唯一 Node 快照清理的纯 Rust 启动结果。
     let launch = launch_managed_node_session(package.as_ref(), request, observer)
@@ -3569,9 +3572,30 @@ const MANAGED_RUNTIME_WORKER_TEARDOWN_TIMEOUT_SECS: u64 = 2;
 /// Maximum UTF-8 bytes accepted for one line-delimited Worker protocol record.
 /// 单条逐行 Worker 协议记录允许的最大 UTF-8 字节数。
 const MANAGED_RUNTIME_WORKER_PROTOCOL_LINE_LIMIT_BYTES: usize = 2 * 1024 * 1024;
-/// Maximum queued protocol lines per Worker stream before reader backpressure is applied.
-/// 应用读取器背压前每个 Worker 流最多排队的协议行数。
+/// Maximum queued stdout protocol lines before reader backpressure is applied.
+/// 应用读取器背压前最多排队的 stdout 协议行数。
 const MANAGED_RUNTIME_WORKER_CHANNEL_CAPACITY: usize = 4;
+
+/// Raw stderr collected continuously from one Worker, bounded like one protocol record.
+/// 从单个 Worker 持续收集的原始 stderr，上限与一条协议记录相同。
+///
+/// stderr is drained as it arrives, never only between invocations, so a handler or its children
+/// can write any amount of stderr without blocking on a full pipe.
+/// stderr 随到随读，而不是只在两次调用之间读取，因此处理函数或其子进程写出任意数量的 stderr
+/// 都不会因管道写满而阻塞。
+#[derive(Default)]
+struct ManagedRuntimeWorkerStderr {
+    /// Retained lines joined by newlines, at most the protocol line limit.
+    /// 以换行连接的保留行，最多为协议行上限。
+    text: String,
+    /// Bytes discarded once the retained text reached its bound.
+    /// 保留文本达到上限后丢弃的字节数。
+    dropped_bytes: usize,
+}
+
+/// Stderr buffer shared between one Worker and its collector thread.
+/// 由单个 Worker 与其收集线程共享的 stderr 缓冲区。
+type SharedManagedRuntimeWorkerStderr = Arc<Mutex<ManagedRuntimeWorkerStderr>>;
 
 /// Resolved invocation request for one managed child runtime.
 /// 单个受管子运行时的已解析调用请求。
@@ -3715,9 +3739,9 @@ struct ManagedRuntimeWorker {
     /// Receiver for line-delimited stdout envelopes.
     /// 接收按行分隔 stdout 信封的通道。
     stdout_rx: mpsc::Receiver<Result<String, String>>,
-    /// Receiver for line-delimited stderr messages.
-    /// 接收按行分隔 stderr 消息的通道。
-    stderr_rx: mpsc::Receiver<Result<String, String>>,
+    /// Raw stderr collected continuously by the stderr reader.
+    /// 由 stderr 读取线程持续收集的原始 stderr。
+    stderr: SharedManagedRuntimeWorkerStderr,
     /// Background stdout reader handle.
     /// stdout 后台读取线程句柄。
     stdout_reader: Option<thread::JoinHandle<()>>,
@@ -4397,6 +4421,60 @@ where
         .map_err(|error| format!("spawn managed runtime worker {stream_name} reader: {error}"))
 }
 
+/// Spawn one background thread that keeps draining Worker stderr into a bounded shared buffer.
+/// 启动一个后台线程，持续把 Worker stderr 读入有界共享缓冲区。
+///
+/// `reader` is the stderr pipe and `buffer` receives its lines. The thread never blocks on the
+/// buffer, so the child can never stall on a full stderr pipe; it ends at EOF or a read failure.
+/// `reader` 是 stderr 管道，`buffer` 接收其各行。该线程从不因缓冲区而阻塞，因此子进程永远不会
+/// 卡在写满的 stderr 管道上；线程在 EOF 或读取失败时结束。
+///
+/// Returns a join handle or a thread-creation error without panicking.
+/// 返回线程 join 句柄，或返回线程创建错误且不触发 panic。
+fn spawn_managed_runtime_stderr_collector<R>(
+    reader: R,
+    buffer: SharedManagedRuntimeWorkerStderr,
+) -> Result<thread::JoinHandle<()>, String>
+where
+    R: std::io::Read + Send + 'static,
+{
+    thread::Builder::new()
+        .name("managed-runtime-worker-stderr".to_string())
+        .spawn(move || {
+            let mut reader = BufReader::new(reader);
+            loop {
+                let (line, terminal) = match read_managed_runtime_worker_line(&mut reader) {
+                    Ok(Some(Ok(line))) => (line, false),
+                    // An oversized or non-UTF-8 line was fully consumed, so reading can go on.
+                    // 超长或非 UTF-8 的行已被完整消费，因此可以继续读取。
+                    Ok(Some(Err(error))) => (format!("[worker stderr reader error: {error}]"), false),
+                    Ok(None) => break,
+                    Err(error) => (
+                        format!("[worker stderr reader error: managed runtime worker stderr read failed: {error}]"),
+                        true,
+                    ),
+                };
+                {
+                    let mut stderr = buffer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let ManagedRuntimeWorkerStderr {
+                        text,
+                        dropped_bytes,
+                    } = &mut *stderr;
+                    if !text.is_empty() {
+                        append_bounded_worker_diagnostic(text, "\n", dropped_bytes);
+                    }
+                    append_bounded_worker_diagnostic(text, &line, dropped_bytes);
+                }
+                if terminal {
+                    break;
+                }
+            }
+        })
+        .map_err(|error| format!("spawn managed runtime worker stderr reader: {error}"))
+}
+
 /// Read one newline-delimited Worker record while discarding bytes beyond the hard limit.
 /// 读取一条换行分隔 Worker 记录，同时丢弃超过硬上限的字节。
 ///
@@ -4527,7 +4605,7 @@ fn spawn_managed_runtime_worker_with_snapshot(
             }
         };
     let (stdout_tx, stdout_rx) = mpsc::sync_channel(MANAGED_RUNTIME_WORKER_CHANNEL_CAPACITY);
-    let (stderr_tx, stderr_rx) = mpsc::sync_channel(MANAGED_RUNTIME_WORKER_CHANNEL_CAPACITY);
+    let stderr_buffer = SharedManagedRuntimeWorkerStderr::default();
     // Reader creation is fallible so an OS thread limit cannot strand the already spawned tree.
     // 读取器创建是可失败的，因此操作系统线程限制不会遗留已经启动的进程树。
     let stdout_reader = match spawn_managed_runtime_line_reader(stdout, stdout_tx, "stdout") {
@@ -4552,34 +4630,35 @@ fn spawn_managed_runtime_worker_with_snapshot(
             });
         }
     };
-    let stderr_reader = match spawn_managed_runtime_line_reader(stderr, stderr_tx, "stderr") {
-        Ok(handle) => handle,
-        Err(error) => {
-            let cleanup_errors = teardown_unpublished_managed_runtime_worker(
-                child,
-                &process_tree,
-                reaper_permit,
-                package_snapshot.as_ref().map(|snapshot| {
-                    let snapshot = Arc::clone(snapshot);
-                    Box::new(move || drop(snapshot)) as Box<dyn FnOnce() + Send>
-                }),
-            );
-            let reader_deadline = Instant::now()
-                .checked_add(Duration::from_secs(
-                    MANAGED_RUNTIME_WORKER_TEARDOWN_TIMEOUT_SECS,
-                ))
-                .unwrap_or_else(Instant::now);
-            join_managed_runtime_reader_bounded(stdout_reader, "stdout", reader_deadline);
-            return Err(if cleanup_errors.is_empty() {
-                error
-            } else {
-                format!(
-                    "{error}; cleanup also failed: {}",
-                    cleanup_errors.join("; ")
-                )
-            });
-        }
-    };
+    let stderr_reader =
+        match spawn_managed_runtime_stderr_collector(stderr, Arc::clone(&stderr_buffer)) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let cleanup_errors = teardown_unpublished_managed_runtime_worker(
+                    child,
+                    &process_tree,
+                    reaper_permit,
+                    package_snapshot.as_ref().map(|snapshot| {
+                        let snapshot = Arc::clone(snapshot);
+                        Box::new(move || drop(snapshot)) as Box<dyn FnOnce() + Send>
+                    }),
+                );
+                let reader_deadline = Instant::now()
+                    .checked_add(Duration::from_secs(
+                        MANAGED_RUNTIME_WORKER_TEARDOWN_TIMEOUT_SECS,
+                    ))
+                    .unwrap_or_else(Instant::now);
+                join_managed_runtime_reader_bounded(stdout_reader, "stdout", reader_deadline);
+                return Err(if cleanup_errors.is_empty() {
+                    error
+                } else {
+                    format!(
+                        "{error}; cleanup also failed: {}",
+                        cleanup_errors.join("; ")
+                    )
+                });
+            }
+        };
     Ok(ManagedRuntimeWorker {
         child_ownership: Some(ManagedRuntimeWorkerChildOwnership {
             child,
@@ -4589,7 +4668,7 @@ fn spawn_managed_runtime_worker_with_snapshot(
         package_snapshot,
         stdin,
         stdout_rx,
-        stderr_rx,
+        stderr: stderr_buffer,
         stdout_reader: Some(stdout_reader),
         stderr_reader: Some(stderr_reader),
         last_used_at: Instant::now(),
@@ -4597,21 +4676,18 @@ fn spawn_managed_runtime_worker_with_snapshot(
     })
 }
 
-/// Drain any currently buffered stderr lines from one managed runtime worker.
-/// 排空一个受管运行时 worker 当前已缓冲的 stderr 行。
+/// Take the stderr collected so far from one managed runtime worker, leaving its buffer empty.
+/// 取出一个受管运行时 worker 目前已收集的 stderr，并清空其缓冲区。
 fn drain_managed_runtime_worker_stderr(worker: &ManagedRuntimeWorker) -> String {
-    let mut output = String::new();
-    let mut dropped_bytes = 0usize;
-    while let Ok(record) = worker.stderr_rx.try_recv() {
-        let line = match record {
-            Ok(line) => line,
-            Err(error) => format!("[worker stderr reader error: {error}]"),
-        };
-        if !output.is_empty() {
-            append_bounded_worker_diagnostic(&mut output, "\n", &mut dropped_bytes);
-        }
-        append_bounded_worker_diagnostic(&mut output, &line, &mut dropped_bytes);
-    }
+    let ManagedRuntimeWorkerStderr {
+        text: mut output,
+        dropped_bytes,
+    } = std::mem::take(
+        &mut *worker
+            .stderr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
     if dropped_bytes > 0 {
         let marker = format!("\n[worker stderr truncated; dropped_bytes={dropped_bytes}]");
         // Marker replaces the tail if necessary so diagnostics remain within the same hard bound.
@@ -5641,7 +5717,7 @@ fn invoke_managed_python(lua: &Lua, spec: LuaValue) -> Result<LuaValue, mlua::Er
     let worker_service = current_lua_managed_runtime_worker_service(lua, api_name)?;
     // Strict invocation request applying the host default only when Lua omitted timeout_ms.
     // 严格调用请求；仅当 Lua 省略 timeout_ms 时应用宿主默认值。
-    let request = parse_managed_runtime_invoke_request(
+    let mut request = parse_managed_runtime_invoke_request(
         spec,
         api_name,
         "main",
@@ -5661,7 +5737,9 @@ fn invoke_managed_python(lua: &Lua, spec: LuaValue) -> Result<LuaValue, mlua::Er
     // 仅从可信包上下文解析得到的环境计划。
     let plan = resolve_python_env_plan(package.as_ref(), runtime_spec)
         .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
-    ensure_managed_env(&plan)
+    // A deadline-bound evaluation also bounds the environment build it triggers.
+    // 带截止时间的执行同样约束它触发的环境构建。
+    ensure_managed_env_until(&plan, logical_cwd::deadline(lua))
         .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
     // Canonical source file proven to remain inside the package root.
     // 已证明仍位于包根目录内的规范源码文件。
@@ -5695,6 +5773,12 @@ fn invoke_managed_python(lua: &Lua, spec: LuaValue) -> Result<LuaValue, mlua::Er
     // 按包隔离的 Worker 池键。
     // JSON result returned by the managed Python worker.
     // 受管 Python Worker 返回的 JSON 结果。
+    // The worker wait is a blocking host call, so the evaluation deadline caps it like
+    // `process.exec`; it is read after the environment build, which spends the same budget.
+    // Worker 等待是阻塞宿主调用，因此与 `process.exec` 一样受执行截止时间约束；在环境构建之后
+    // 读取，因为构建消耗的是同一份预算。
+    request.timeout_ms = logical_cwd::cap_timeout_ms(lua, request.timeout_ms)
+        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
     let result = invoke_pooled_managed_runtime(
         worker_service.as_ref(),
         key,
@@ -5733,7 +5817,7 @@ fn invoke_managed_node(lua: &Lua, spec: LuaValue) -> Result<LuaValue, mlua::Erro
     let worker_service = current_lua_managed_runtime_worker_service(lua, api_name)?;
     // Strict invocation request applying the host default only when Lua omitted timeout_ms.
     // 严格调用请求；仅当 Lua 省略 timeout_ms 时应用宿主默认值。
-    let request = parse_managed_runtime_invoke_request(
+    let mut request = parse_managed_runtime_invoke_request(
         spec,
         api_name,
         "default",
@@ -5754,7 +5838,9 @@ fn invoke_managed_node(lua: &Lua, spec: LuaValue) -> Result<LuaValue, mlua::Erro
     // 仅从可信包上下文解析得到的环境计划。
     let plan = resolve_node_env_plan(package.as_ref(), runtime_spec)
         .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
-    ensure_managed_env(&plan)
+    // A deadline-bound evaluation also bounds the environment build it triggers.
+    // 带截止时间的执行同样约束它触发的环境构建。
+    ensure_managed_env_until(&plan, logical_cwd::deadline(lua))
         .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
     // Canonical source file validation performed before creating the import snapshot.
     // 创建导入快照前执行的规范源码文件校验。
@@ -5789,6 +5875,12 @@ fn invoke_managed_node(lua: &Lua, spec: LuaValue) -> Result<LuaValue, mlua::Erro
     });
     // JSON result returned by the managed Node worker.
     // 受管 Node Worker 返回的 JSON 结果。
+    // The worker wait is a blocking host call, so the evaluation deadline caps it like
+    // `process.exec`; it is read after the environment build, which spends the same budget.
+    // Worker 等待是阻塞宿主调用，因此与 `process.exec` 一样受执行截止时间约束；在环境构建之后
+    // 读取，因为构建消耗的是同一份预算。
+    request.timeout_ms = logical_cwd::cap_timeout_ms(lua, request.timeout_ms)
+        .map_err(|error| mlua::Error::runtime(format!("{api_name}: {error}")))?;
     let result = invoke_pooled_managed_runtime(
         worker_service.as_ref(),
         key,

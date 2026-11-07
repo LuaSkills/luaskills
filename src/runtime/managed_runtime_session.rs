@@ -23,7 +23,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::GENERIC_READ;
 #[cfg(windows)]
@@ -44,7 +44,7 @@ use crate::runtime::managed_package::{
 use crate::runtime::managed_runtime::{
     ManagedRuntimeEnvLease, ManagedRuntimeEnvPlan, acquire_ready_managed_env_lease,
     configure_managed_command_base_environment,
-    current_managed_runtime_persistent_session_capability, ensure_managed_env,
+    current_managed_runtime_persistent_session_capability, ensure_managed_env_until,
     resolve_node_env_plan, resolve_python_env_plan,
 };
 #[cfg(windows)]
@@ -101,6 +101,9 @@ pub(crate) struct ManagedRuntimeSessionOpenRequest {
     /// Maximum retained bytes for each output stream.
     /// 每个输出流最多保留的字节数。
     pub(crate) buffer_limit_bytes: usize,
+    /// Deadline of the opening evaluation, which also bounds the environment build it triggers.
+    /// 发起打开的执行的截止时间，同时约束其触发的环境构建。
+    pub(crate) env_build_deadline: Option<Instant>,
 }
 
 /// Pure Rust launch result converted into the shared Lua userdata by the engine layer.
@@ -1095,7 +1098,7 @@ pub(crate) fn launch_managed_python_session(
     // Reproducible environment plan resolved only from the trusted package context.
     // 仅从可信包上下文解析得到的可复现环境计划。
     let plan = resolve_python_env_plan(package, runtime_spec)?;
-    ensure_managed_env(&plan)?;
+    ensure_managed_env_until(&plan, request.env_build_deadline)?;
     // Original source validation rejects unsafe lexical input before fixed-object snapshot copying.
     // 原始源码校验会在固定对象快照复制前拒绝不安全词法输入。
     let _source_file = package.resolve_existing_file(&request.file, "file")?;
@@ -1179,7 +1182,7 @@ pub(crate) fn launch_managed_node_session(
     // Reproducible environment plan resolved only from the trusted package context.
     // 仅从可信包上下文解析得到的可复现环境计划。
     let plan = resolve_node_env_plan(package, runtime_spec)?;
-    ensure_managed_env(&plan)?;
+    ensure_managed_env_until(&plan, request.env_build_deadline)?;
     ensure_regular_file(&plan.runtime_executable, "managed Node executable")?;
     // Canonical original file validated before copying any package content.
     // 在复制任何包内容前校验的规范原始文件。

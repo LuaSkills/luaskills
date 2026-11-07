@@ -63,7 +63,7 @@ Both paths are then required; engine creation fails when either is missing, and 
 | `worker_idle_ttl_secs` | `60` | Idle Worker retirement time in seconds |
 | `persistent_session_limit_per_engine` | `256` | Launching plus live persistent Python/Node sessions owned by one engine |
 | `persistent_session_default_buffer_limit_bytes_per_stream` | `1048576` (1 MiB) | Default retained bytes for each session stdout or stderr stream |
-| `invoke_default_timeout_ms` | `None` / `null` | Default `python.invoke`/`node.invoke` timeout; absence means unlimited |
+| `invoke_default_timeout_ms` | `None` / `null` | Default `python.invoke`/`node.invoke` timeout; absence means unlimited, though a runLua, lease or embedded-call deadline still caps each call |
 
 Every configured numeric value must be greater than zero. A positive per-call `session.open({ buffer_limit_bytes = ... })` overrides the engine buffer default for that session. A positive per-call `invoke({ timeout_ms = ... })` overrides the engine invoke default for that call. Other calls continue to use the immutable engine policy.
 

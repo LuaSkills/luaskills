@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::StatusCode;
 use reqwest::header::ACCEPT;
@@ -777,6 +777,7 @@ impl DownloadManager {
             let attempt_result = self.run_http_task(move |client| {
                 Ok(stream_download_to_temp_file(
                     client,
+                    Duration::from_secs(DOWNLOAD_HTTP_REQUEST_TIMEOUT_SECS),
                     source_locator,
                     attempt_target,
                     attempt_expected,
@@ -1389,6 +1390,14 @@ impl Drop for PendingDownloadFile {
 /// The client parameter reuses the process-wide reqwest connection pool.
 /// client 参数复用进程级 reqwest 连接池。
 ///
+/// The total_timeout parameter bounds the whole attempt. reqwest's blocking timeout restarts on
+/// every body read, so a server that trickles bytes would otherwise keep the attempt, and one of the
+/// few shared HTTP workers, busy forever. The deadline is checked after each read, so an attempt
+/// ends at most one read timeout after it.
+/// total_timeout 参数约束整次尝试。reqwest 阻塞模式的超时在每次读取正文时重新计时，否则一个
+/// 缓慢逐字节发送的服务器会让这次尝试以及为数不多的共享 HTTP 工作线程之一永远被占用。截止时间
+/// 在每次读取后检查，因此一次尝试最多在截止时间之后再多一个读取超时结束。
+///
 /// The source_locator parameter is the exact request URL and progress identity.
 /// source_locator 参数是精确请求 URL 与进度标识。
 ///
@@ -1405,11 +1414,22 @@ impl Drop for PendingDownloadFile {
 /// 返回尚未发布的已完成文件，或返回分类后的尝试错误。
 fn stream_download_to_temp_file(
     client: reqwest::blocking::Client,
+    total_timeout: Duration,
     source_locator: String,
     target_path: PathBuf,
     expected_sha256: Option<String>,
     progress_callback: Option<DownloadProgressCallback>,
 ) -> Result<PendingDownloadFile, DownloadAttemptError> {
+    // Deadline covers the request, its transient retries, and the whole body.
+    // Deadline 覆盖请求、其瞬时重试以及完整正文。
+    let deadline = Instant::now().checked_add(total_timeout);
+    let past_deadline = || {
+        DownloadAttemptError::Failed(format!(
+            "Failed to download {}: exceeded the total download timeout of {} s",
+            source_locator,
+            total_timeout.as_secs_f64()
+        ))
+    };
     // Response is validated before any temp file is created or old cache is touched.
     // Response 在创建任何临时文件或触碰旧缓存前完成验证。
     let mut response = send_with_transient_retry(|| client.get(&source_locator).send())
@@ -1459,6 +1479,12 @@ fn stream_download_to_temp_file(
         })?;
         if read_count == 0 {
             break;
+        }
+        // A body that is still arriving at the deadline fails the attempt; one that just ended
+        // is kept.
+        // 截止时间到达时仍在传输的正文使本次尝试失败；恰好已传完的正文予以保留。
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(past_deadline());
         }
         pending_file
             .write_all(&buffer[..read_count])
@@ -1919,7 +1945,8 @@ mod tests {
         DownloadManager, DownloadManagerConfig, DownloadRequest, PendingDownloadFile,
         cached_download_file_metadata, format_github_release_tag_not_found_error,
         lock_download_target_registry, parse_checksum_manifest_for_asset,
-        shared_download_target_lock, validate_file_utf8, verify_file_sha256,
+        shared_download_target_lock, stream_download_to_temp_file, validate_file_utf8,
+        verify_file_sha256,
     };
     use crate::dependency::types::DependencySourceType;
     use crate::runtime::path::render_host_visible_path;
@@ -2247,6 +2274,75 @@ mod tests {
             github_api_base_url: None,
             github_token: None,
         })
+    }
+
+    /// Serve one response whose body arrives one byte per `interval`, for `total_bytes` bytes.
+    /// 提供一个正文按每 `interval` 一个字节到达、共 `total_bytes` 字节的响应。
+    ///
+    /// Returns the request URL; the server thread stops once the client hangs up.
+    /// 返回请求 URL；客户端断开后服务线程随即结束。
+    fn start_trickling_server(total_bytes: usize, interval: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind trickling HTTP listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set trickling HTTP listener nonblocking");
+        let address = listener.local_addr().expect("read trickling HTTP address");
+        thread::spawn(move || {
+            let mut stream = accept_test_http_connection(&listener);
+            read_test_http_request(&mut stream);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {total_bytes}\r\n\r\n"
+            );
+            if stream.write_all(headers.as_bytes()).is_err() {
+                return;
+            }
+            for _ in 0..total_bytes {
+                thread::sleep(interval);
+                if stream
+                    .write_all(b"x")
+                    .and_then(|()| stream.flush())
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        format!("http://{address}/trickle.bin")
+    }
+
+    /// A body that keeps trickling in, each read within the client timeout, still ends the
+    /// attempt at its total timeout.
+    /// 每次读取都在客户端超时之内、但持续缓慢到达的正文，仍会在总超时处结束本次尝试。
+    #[test]
+    fn streamed_download_stops_at_total_timeout_despite_trickling_body() {
+        let url = start_trickling_server(40, Duration::from_millis(250));
+        let client = DownloadManager::build_http_client_with_timeouts(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .expect("build bounded test HTTP client");
+        let cache_root = make_download_test_root("trickle");
+        let started_at = Instant::now();
+        let result = stream_download_to_temp_file(
+            client,
+            Duration::from_secs(1),
+            url,
+            cache_root.join("trickle.bin"),
+            None,
+            None,
+        );
+        let elapsed = started_at.elapsed();
+        let error = match result {
+            Ok(_) => panic!("a 10 s trickle must not finish within a 1 s total timeout"),
+            Err(super::DownloadAttemptError::Failed(error)) => error,
+            Err(super::DownloadAttemptError::ChecksumMismatch(error)) => {
+                panic!("unexpected checksum failure: {error}")
+            }
+        };
+        assert!(error.contains("total download timeout"), "{error}");
+        assert!(elapsed < Duration::from_secs(5), "elapsed {elapsed:?}");
+        assert_no_download_temp_files(&cache_root);
+        let _ = std::fs::remove_dir_all(&cache_root);
     }
 
     /// Verify the production client builder bounds a response that never starts.

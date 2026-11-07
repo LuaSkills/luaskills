@@ -8,26 +8,48 @@ use super::*;
 #[derive(Clone)]
 pub(crate) struct LogicalCwd(pub(crate) PathBuf);
 
-/// Monotonic deadline attached to a System evaluation, unavailable to writable Lua globals.
-/// 附加到系统执行的单调截止时间，不存放在可写 Lua 全局变量中。
+/// Monotonic deadline of one deadline-bound evaluation (runLua, runtime or System lease, embedded
+/// call), unavailable to writable Lua globals.
+/// 单次带截止时间执行（runLua、运行时或系统租约、嵌入式调用）的单调截止时间，不存放在可写
+/// Lua 全局变量中。
 pub(crate) struct EvaluationDeadline(pub(crate) Instant);
 
-/// Returns the remaining System budget or rejects an expired invocation before host work begins.
-/// 返回剩余系统预算，或在宿主任务开始前拒绝已到期调用。
-/// Ordinary VMs without an evaluation deadline return none.
-/// 没有执行截止时间的普通虚拟机返回空值。
+/// Error raised when blocking host work starts after the evaluation deadline has passed.
+/// 在执行截止时间之后才开始阻塞宿主任务时抛出的错误。
+pub(crate) const EVALUATION_DEADLINE_EXCEEDED: &str = "Evaluation deadline exceeded.";
+
+/// Returns the deadline of the current evaluation, or none for VMs that run without one.
+/// 返回当前执行的截止时间；没有截止时间的虚拟机返回空值。
+pub(crate) fn deadline(lua: &Lua) -> Option<Instant> {
+    lua.app_data_ref::<EvaluationDeadline>()
+        .map(|deadline| deadline.0)
+}
+
+/// Returns the remaining evaluation budget or rejects an expired invocation before host work begins.
+/// 返回剩余执行预算，或在宿主任务开始前拒绝已到期调用。
+/// VMs without an evaluation deadline return none.
+/// 没有执行截止时间的虚拟机返回空值。
 pub(crate) fn remaining_timeout_ms(lua: &Lua) -> mlua::Result<Option<u64>> {
-    let Some(deadline) = lua.app_data_ref::<EvaluationDeadline>() else {
+    let Some(deadline) = deadline(lua) else {
         return Ok(None);
     };
     let remaining = deadline
-        .0
         .saturating_duration_since(Instant::now())
         .as_millis();
     if remaining == 0 {
-        return Err(mlua::Error::runtime("System evaluation deadline exceeded."));
+        return Err(mlua::Error::runtime(EVALUATION_DEADLINE_EXCEEDED));
     }
     Ok(Some(remaining.min(u64::MAX as u128) as u64))
+}
+
+/// Returns `timeout_ms` tightened to the remaining evaluation budget; an absent timeout becomes
+/// that budget, and an expired deadline is an error.
+/// 返回按剩余执行预算收紧后的 `timeout_ms`；未指定超时则取该预算，截止时间已过则报错。
+pub(crate) fn cap_timeout_ms(lua: &Lua, timeout_ms: Option<u64>) -> mlua::Result<Option<u64>> {
+    Ok(match remaining_timeout_ms(lua)? {
+        Some(remaining) => Some(timeout_ms.map_or(remaining, |timeout| timeout.min(remaining))),
+        None => timeout_ms,
+    })
 }
 
 /// Returns the System directory, or none for ordinary VMs that retain their existing contract.

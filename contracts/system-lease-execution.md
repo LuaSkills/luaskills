@@ -45,14 +45,26 @@ to the native loader; Unicode script loading is covered independently.
 ## Deadline / 截止预算
 
 `vulcan.runtime.remaining_timeout_ms()` returns the current System eval budget;
-expired work is rejected before the next managed host entry. `process.exec` and
-`io.popen` use the smaller of their own timeout and that budget. Persistent process
-sessions remain explicitly owned, long-lived resources. Native calls are not
-forcibly interruptible: lease ownership must remain held until they actually return.
+expired work is rejected before the next managed host entry with
+`Evaluation deadline exceeded.`. Blocking host calls use the smaller of their own
+timeout and that budget: `process.exec`, `io.popen`, `python.invoke`, `node.invoke`
+and `process.session` reads. `process.session` close shortens its graceful wait to the
+budget and, once it has passed, kills the process tree without waiting. A managed
+environment build started during the eval (uv or pnpm, including lifecycle scripts
+and build hooks) is killed with its process tree at the deadline, and waiting for
+another builder's locks stops there. Persistent process sessions otherwise remain
+explicitly owned, long-lived resources. Native calls are not forcibly interruptible:
+lease ownership must remain held until they actually return. The same deadline
+applies to plain runLua, runtime leases and embedded calls.
 
-上述接口返回当前系统执行的剩余预算；到期时拒绝后续受管入口。同步子进程及 popen
-使用自身上限与剩余预算中较小者。持久进程会话仍是显式管理的长期资源。不可中断的
-原生调用必须在实际返回前继续占有租约。
+上述接口返回当前系统执行的剩余预算；到期时以 `Evaluation deadline exceeded.` 拒绝
+后续受管入口。阻塞宿主调用使用自身上限与剩余预算中较小者：`process.exec`、
+`io.popen`、`python.invoke`、`node.invoke` 以及 `process.session` 读取。
+`process.session` 关闭会把优雅等待缩短到剩余预算，预算耗尽后不再等待、直接终止
+进程树。执行期间触发的受管环境构建（uv 或 pnpm，包括生命周期脚本与构建钩子）在
+截止时间连同进程树一起终止，等待其他构建方持有的锁也到此为止。除此之外，持久进程
+会话仍是显式管理的长期资源。不可中断的原生调用必须在实际返回前继续占有租约。
+普通 runLua、运行时租约和嵌入式调用适用同一截止时间。
 
 ## Evidence / 验证
 

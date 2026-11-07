@@ -9470,3 +9470,47 @@
   - 通过 C API 关闭 JIT；
   - 文档写明主技能 VM 池不受限制；
   - 并发测试遇到回归时判定失败，不再卡住。
+
+## 2026-11-08：第 4 组审核修复，阻塞的宿主调用受截止时间约束
+
+### 概述
+
+- 审核编号：A1-03、A6-01、A1-02、B1-01（含 B1-02）、B5-01、B5-02。详见 `docs/audit/20261106/FIX_STATUS.md`。
+- 每个 runLua、运行时租约和 System 租约的 eval 都设置截止时间，原来只有 System 租约设置。
+- 修复后，下面这些调用都按剩余截止时间收紧：
+  - `process.exec`、popen、python/node invoke、`session:read`：等待不超过剩余时间；
+  - `session:close`：优雅等待缩短到剩余时间，到期后直接终止进程树；
+  - 环境构建：截止时间到达时，连同 postinstall 脚本、构建后端整棵终止；等待其他构建方的锁也到此为止。每次构建另有 30 分钟上限，安装输出只保留尾部。
+- worker 的 stderr 改为随到随读，写入有上限的缓冲区，handler 写大量 stderr 不再卡住。
+- 下载：每次尝试有总截止时间。
+- 镜像测速：遵守单镜像截止时间。
+
+### 文件变更清单
+
+- `src/runtime/engine/logical_cwd.rs`：新增 `deadline`、`cap_timeout_ms` 和 `EVALUATION_DEADLINE_EXCEEDED`。
+- `src/runtime/engine/runlua.rs`：每次 eval 都设置 `EvaluationDeadline`。
+- `src/runtime/engine.rs`：
+  - invoke 收紧超时，并把截止时间传给环境构建；
+  - 托管会话打开时传入截止时间；
+  - worker stderr 改为后台收集到共享缓冲区。
+- `src/runtime/process_session.rs`：`read`、`close` 按截止时间收紧。
+- `src/runtime/managed_runtime.rs`：
+  - 新增 `ensure_managed_env_until`，锁等待有截止时间；
+  - `run_command` 改为受管进程树、轮询退出、到期整棵终止、只保留输出尾部。
+- `src/runtime/managed_runtime_session.rs`：会话打开请求新增 `env_build_deadline`。
+- `src/download/manager.rs`：`stream_download_to_temp_file` 新增 `total_timeout`。
+- `src/download/mirrors.rs`：测速读取循环检查截止时间。
+- 测试：
+  - 新增 `engine/tests/blocking_calls.rs`、`managed_runtime/installer_tests.rs`；
+  - 下载和镜像测试中新增慢速正文用例。
+- 文档：
+  - `contracts/system-lease-execution.md`；
+  - `docs/development/skill-development.md` 及中文版；
+  - `docs/integration/managed-runtime-host-roots.md` 及中文版。
+
+### 验证记录
+
+- `cargo fmt --check`、`cargo clippy --all-targets` 无警告。
+- `cargo test --lib`：1106 通过、0 失败、3 忽略。
+- 4 个集成测试目标共 13 项通过。
+- 去掉“每次 eval 都设置截止时间”这一处修复后，`runlua_deadline_caps_process_exec`（29.6 秒）和 `runlua_deadline_caps_process_session_read`（20.2 秒）都失败；恢复后通过。

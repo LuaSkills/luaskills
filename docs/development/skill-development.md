@@ -383,6 +383,12 @@ The JIT compiler is off for the whole life of these VMs, because compiled code s
 - `jit.status()` returns `false`, and `jit.off()` and `jit.flush()` do nothing. `jit.on`, `jit.opt`, `jit.util` and `jit.profile` are not available.
 - `debug.sethook` is not available. The other `debug` functions, such as `debug.getupvalue`, `debug.getmetatable` and `debug.traceback`, keep working.
 
+Blocking host calls run no Lua while they wait, so the timeout check cannot stop them. They are capped by the time left instead:
+
+- `vulcan.process.exec`, `vulcan.io.popen`, `vulcan.runtime.python.invoke` and `vulcan.runtime.node.invoke` wait at most the smaller of their own `timeout_ms` and the time left. An invoke cut short this way reports `timed_out = true`. A call made after the time is up fails with `Evaluation deadline exceeded.`.
+- `session:read` waits at most the time left. `session:close` shortens its graceful wait to the time left; once the deadline has passed it kills the process tree without waiting.
+- A managed environment build that such a call starts (uv or pnpm, including lifecycle scripts and build hooks) is killed with its whole process tree at the deadline, and waiting for another caller's build stops there too. Every build is also capped at 30 minutes. Prepare an environment whose build takes longer than an evaluation timeout ahead of time, from a call whose timeout is long enough.
+
 ## 4. `vulcan.call`
 
 ### 4.1 Purpose
@@ -1009,7 +1015,7 @@ Invoke input:
 | `file` | `string` | yes | safe relative path inside the current skill directory |
 | `handler` | `string` | no | Python defaults to `main`; Node defaults to `default` with `main` fallback |
 | `args` | JSON-compatible Lua value | no | passed to the child handler |
-| `timeout_ms` | positive integer | no | per-call timeout; overrides the engine `managed_runtime_config.invoke_default_timeout_ms`; both omitted means unlimited; timed-out workers are discarded |
+| `timeout_ms` | positive integer | no | per-call timeout; overrides the engine `managed_runtime_config.invoke_default_timeout_ms`; both omitted means unlimited, except that inside runLua, a lease or an embedded call the time left caps it (see 3.4); timed-out workers are discarded |
 
 Invoke result:
 

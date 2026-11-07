@@ -276,7 +276,9 @@ pub fn probe_github_mirrors(
             let target = target.clone();
             let client = client.clone();
             let release_path = release_path.clone();
-            thread::spawn(move || probe_one_mirror(&client, &target, &release_path, max_bytes))
+            thread::spawn(move || {
+                probe_one_mirror(&client, &target, &release_path, max_bytes, timeout)
+            })
         })
         .collect();
     Ok(handles
@@ -308,6 +310,7 @@ fn probe_one_mirror(
     target: &LuaRuntimeGithubMirrorProbeTarget,
     release_path: &str,
     max_bytes: u64,
+    timeout: Duration,
 ) -> LuaRuntimeGithubMirrorProbeResult {
     let base = match target.github_base_url.as_deref() {
         Some(base) => match normalize_github_mirror_base_url(base) {
@@ -364,6 +367,13 @@ fn probe_one_mirror(
                 read_error = Some(error.to_string());
                 break;
             }
+        }
+        // The client timeout restarts on every read, so a trickling mirror is cut off here.
+        // 客户端超时在每次读取时重新计时，因此缓慢逐字节发送的镜像在这里被截断。
+        if started.elapsed() >= timeout {
+            complete = false;
+            read_error = Some("Mirror probe deadline exceeded".to_string());
+            break;
         }
     }
     let body_ms = body_started.elapsed().as_millis().max(1) as u64;
@@ -568,6 +578,57 @@ mod tests {
         );
         assert!(!results[2].ok);
         assert_eq!(results[2].http_status, Some(404));
+    }
+
+    /// A mirror that trickles its body is cut off at the probe deadline and marked incomplete.
+    /// 缓慢逐字节发送正文的镜像会在探测截止时间处被截断，并标记为不完整。
+    #[test]
+    fn probe_stops_trickling_mirror_at_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+        let base = format!("http://{}", listener.local_addr().expect("probe address"));
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept probe request");
+            let mut head = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).expect("read probe request") == 0 {
+                    return;
+                }
+                head.push(byte[0]);
+            }
+            let headers = "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: 64\r\nconnection: close\r\n\r\n";
+            if stream.write_all(headers.as_bytes()).is_err() {
+                return;
+            }
+            for _ in 0..64 {
+                thread::sleep(std::time::Duration::from_millis(200));
+                if stream
+                    .write_all(b"x")
+                    .and_then(|()| stream.flush())
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        let started_at = std::time::Instant::now();
+        let results = probe_github_mirrors(&LuaRuntimeGithubMirrorProbeRequest {
+            targets: vec![LuaRuntimeGithubMirrorProbeTarget {
+                id: "slow".to_string(),
+                github_base_url: Some(format!("{base}/mirror")),
+            }],
+            release_path: Some("demo/demo/releases/download/v1/a.bin".to_string()),
+            max_bytes: Some(64),
+            timeout_ms: Some(1_000),
+        })
+        .expect("probe request");
+        let elapsed = started_at.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "elapsed {elapsed:?}"
+        );
+        assert!(!results[0].complete, "{:?}", results[0]);
+        assert!(results[0].bytes_read < 64, "{:?}", results[0]);
     }
 
     /// Requests over the target limit are rejected before any network work.
