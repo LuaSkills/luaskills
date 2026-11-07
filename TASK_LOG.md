@@ -9554,3 +9554,37 @@
 - 4 个集成测试目标共 13 项通过。
 - 去掉 `drop_skills_failing_vm_registration` 后，`load_from_roots_drops_only_skills_whose_entries_fail_in_a_vm` 失败；只在技能 VM 中试编译时同样失败；恢复后通过。
 - 还原 `skill/manager.rs` 后，`load_from_roots_skips_only_skills_with_malformed_user_manifests` 失败；恢复后通过。
+
+## 2026-11-08：第 6 组审核修复，依赖安装与缓存的正确性
+
+### 概述
+
+- 审核编号：B5-07、B5-05、B5-03、G01-002（含 B5-06）。详见 `docs/audit/20261106/FIX_STATUS.md`。
+- 依赖先解压到暂存目录，全部成功后才移动到最终路径，失败不会留下被当作已安装的文件。
+- 技能私有依赖记录实际使用的版本目录，更新后的清理按记录保留和删除，去掉版本锁定或 `v` 前缀版本都不再删错、漏删。
+- Release 校验文件、包索引和 skilllist 索引每次重新获取，坏响应不再被永久缓存。
+- 下载缓存路径包含来源地址和期望 SHA-256，同名依赖不再串用载荷。
+
+### 文件变更清单
+
+- `src/download/archive.rs`：`install_downloaded_payload` 改为暂存后发布，新增 `publish_staged_exports`。
+- `src/dependency/manager.rs`：
+  - `install_dependency` 拆出 `make_dependency_ready`，返回就绪的安装根目录，并为技能私有依赖写入记录；
+  - 新增记录读写函数和 `collect_dependency_platform_roots`；
+  - `cleanup_updated_skill_dependencies` 按依赖、按记录计算要删除的目录；
+  - skilllist 索引改用 `fetch_text_fresh`。
+- `src/download/manager.rs`：
+  - `cached_path_for_request` 增加期望摘要参数，对缓存键、来源地址、期望摘要取摘要；
+  - Release 校验文件和包索引改用 `fetch_text_fresh`。
+- 测试：
+  - `archive.rs` 新增 `failed_extraction_leaves_no_partial_export`；
+  - `dependency/manager/tests.rs` 新增 3 个清理测试；
+  - `download/manager.rs` 新增 `bad_checksum_response_is_not_cached`、`cache_path_separates_sources_and_expected_digests`，已有测试按新签名传入期望摘要。
+- 文档：现有文档没有描述依赖安装和清理的内部行为，不需要修改。
+
+### 验证记录
+
+- `cargo fmt --check`、`cargo clippy --all-targets` 无警告。
+- `cargo test --lib`：1117 通过、0 失败、3 忽略。
+- 4 个集成测试目标共 13 项通过。
+- 同时撤掉 4 处修复（直接解压到最终路径、不写记录且只用原始版本号、校验文件改回缓存、缓存键去掉来源和摘要）后，6 个新测试全部失败；恢复后通过。

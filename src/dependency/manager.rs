@@ -1,7 +1,7 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
@@ -260,6 +260,10 @@ impl DependencyManager {
 
     /// Reuse, install or download one dependency, failing whenever it cannot be made ready.
     /// 复用、安装或下载单个依赖，无法就绪时一律失败。
+    ///
+    /// A skill-private dependency also records which version directory it now uses, so update
+    /// cleanup keeps exactly that directory.
+    /// 技能私有依赖还会记录它当前使用的版本目录，使更新后的清理恰好保留该目录。
     #[allow(clippy::too_many_arguments)]
     fn install_dependency(
         &self,
@@ -275,24 +279,57 @@ impl DependencyManager {
         platform_key: &str,
         install_root: &Path,
     ) -> Result<(), String> {
-        if self
-            .find_existing_local_dependency_request(
-                skill_id,
-                kind,
-                dependency_name,
-                version.as_deref(),
-                scope,
-                package,
-                platform_key,
-                install_root,
-            )?
-            .is_some()
-        {
+        let ready_root = self.make_dependency_ready(
+            skill_id,
+            skill_dir,
+            kind,
+            dependency_name,
+            version,
+            scope,
+            source_type,
+            source,
+            package,
+            platform_key,
+            install_root,
+        )?;
+        if scope == DependencyScope::Skill {
+            record_active_dependency_root(&ready_root);
+        }
+        Ok(())
+    }
+
+    /// Reuse, install or download one dependency and return the install root that is now ready.
+    /// 复用、安装或下载单个依赖，并返回已经就绪的安装根目录。
+    #[allow(clippy::too_many_arguments)]
+    fn make_dependency_ready(
+        &self,
+        skill_id: &str,
+        skill_dir: &Path,
+        kind: SkillDependencyKind,
+        dependency_name: &str,
+        version: Option<String>,
+        scope: DependencyScope,
+        source_type: DependencySourceType,
+        source: &crate::skill::dependencies::DependencySourceSpec,
+        package: Option<&crate::skill::dependencies::DependencyPackageSpec>,
+        platform_key: &str,
+        install_root: &Path,
+    ) -> Result<PathBuf, String> {
+        if let Some(existing) = self.find_existing_local_dependency_request(
+            skill_id,
+            kind,
+            dependency_name,
+            version.as_deref(),
+            scope,
+            package,
+            platform_key,
+            install_root,
+        )? {
             log_info(format!(
                 "[LuaSkills:dependency] Skill '{}' reuses existing dependency '{}' on {}",
                 skill_id, dependency_name, platform_key
             ));
-            return Ok(());
+            return Ok(existing.install_root);
         }
 
         if scope == DependencyScope::Host {
@@ -327,7 +364,7 @@ impl DependencyManager {
                     "[LuaSkills:dependency] Skill '{}' reuses existing dependency '{}' on {}",
                     skill_id, dependency_name, platform_key
                 ));
-                Ok(())
+                Ok(resolved_request.install_root)
             }
             DependencyDetectionStatus::Missing if source_type == DependencySourceType::Bundled => {
                 self.install_bundled_dependency(&resolved_request)?;
@@ -335,7 +372,7 @@ impl DependencyManager {
                     "[LuaSkills:dependency] Installed bundled dependency '{}' for skill '{}' on {}",
                     dependency_name, skill_id, platform_key
                 ));
-                Ok(())
+                Ok(resolved_request.install_root)
             }
             DependencyDetectionStatus::Missing => {
                 let cache_key = format!(
@@ -399,7 +436,7 @@ impl DependencyManager {
                     "[LuaSkills:dependency] Installed dependency '{}' for skill '{}' on {}",
                     dependency_name, skill_id, platform_key
                 ));
-                Ok(())
+                Ok(resolved_request.install_root)
             }
         }
     }
@@ -797,6 +834,13 @@ impl DependencyManager {
 
     /// Remove stale skill-private dependency roots after one successful skill update.
     /// 在单个技能更新成功后移除已经过期的技能私有依赖根目录。
+    ///
+    /// Call it after the updated skill reloaded, so each still-declared dependency has recorded
+    /// the version directory it now uses. That directory is always kept, and every other version
+    /// directory of the dependency for this platform is removed. Without a record, the roots
+    /// derived from the previous manifest are removed unless the current manifest derives them too.
+    /// 应在更新后的技能重载之后调用，此时每个仍声明的依赖都已记录它当前使用的版本目录。该目录总会保留，
+    /// 该依赖在当前平台的其他版本目录都会删除。没有记录时，删除由旧清单派生、且当前清单不再派生的根目录。
     pub fn cleanup_updated_skill_dependencies(
         &self,
         skill_id: &str,
@@ -808,14 +852,36 @@ impl DependencyManager {
         if platform_key == "unknown" {
             return Ok(());
         }
+        let normalized_platform = normalize_dependency_path_component(platform_key);
 
         let previous_roots =
             self.collect_skill_local_dependency_roots(skill_id, previous_manifest, platform_key)?;
         let current_roots =
             self.collect_skill_local_dependency_roots(skill_id, current_manifest, platform_key)?;
 
-        for stale_root in previous_roots.difference(&current_roots) {
-            remove_stale_dependency_root(stale_root)?;
+        for (dependency_dir, previous_candidates) in &previous_roots {
+            let current_candidates = current_roots.get(dependency_dir);
+            let mut stale = previous_candidates.clone();
+            let mut keep = current_candidates.cloned().unwrap_or_default();
+            if let Some(active_root) =
+                read_active_dependency_root(dependency_dir, &normalized_platform)
+            {
+                if current_candidates.is_some() {
+                    // The record names the root the reload just used; every other version is unused.
+                    // 记录指向刚才重载使用的根目录；其他版本都已不再使用。
+                    keep.insert(active_root);
+                    stale.extend(collect_dependency_platform_roots(
+                        dependency_dir,
+                        &normalized_platform,
+                    )?);
+                } else {
+                    stale.insert(active_root);
+                    remove_active_dependency_record(dependency_dir, &normalized_platform);
+                }
+            }
+            for stale_root in stale.difference(&keep) {
+                remove_stale_dependency_root(stale_root)?;
+            }
         }
         Ok(())
     }
@@ -833,15 +899,19 @@ impl DependencyManager {
         Ok(())
     }
 
-    /// Collect all skill-local dependency install roots that are relevant for the current platform.
-    /// 收集当前平台下与单个技能相关的全部技能私有依赖安装根目录。
+    /// Collect the candidate install roots of every skill-local dependency for the current platform.
+    /// 收集当前平台下每个技能私有依赖的候选安装根目录。
+    ///
+    /// Keys are the per-dependency directories that hold one directory per version; values are
+    /// the roots a declared version can be installed under (with and without a leading `v`).
+    /// 键是每个依赖下按版本分目录的目录；值是声明版本可能安装到的根目录（带与不带前导 `v`）。
     fn collect_skill_local_dependency_roots(
         &self,
         skill_id: &str,
         manifest: Option<&PackageDependencyManifest>,
         platform_key: &str,
-    ) -> Result<BTreeSet<PathBuf>, String> {
-        let mut roots = BTreeSet::new();
+    ) -> Result<BTreeMap<PathBuf, BTreeSet<PathBuf>>, String> {
+        let mut roots = BTreeMap::new();
         let Some(manifest) = manifest else {
             return Ok(roots);
         };
@@ -886,12 +956,12 @@ impl DependencyManager {
         Ok(roots)
     }
 
-    /// Insert one dependency install root when the dependency is skill-local and applicable to the current platform.
-    /// 当依赖属于技能私有且适用于当前平台时，把其安装根目录加入集合。
+    /// Insert the candidate install roots of one dependency that is skill-local and applies to the current platform.
+    /// 当依赖属于技能私有且适用于当前平台时，把其候选安装根目录加入集合。
     #[allow(clippy::too_many_arguments)]
     fn push_dependency_root_if_applicable(
         &self,
-        roots: &mut BTreeSet<PathBuf>,
+        roots: &mut BTreeMap<PathBuf, BTreeSet<PathBuf>>,
         skill_id: &str,
         kind: SkillDependencyKind,
         dependency_name: &str,
@@ -904,15 +974,23 @@ impl DependencyManager {
             return;
         }
 
-        let root = build_dependency_install_root(
-            self.install_root_for_kind(kind, scope),
-            scope,
-            skill_id,
-            dependency_name,
-            version,
-            platform_key,
-        );
-        roots.insert(root);
+        let kind_root = self.install_root_for_kind(kind, scope);
+        let dependency_dir = kind_root
+            .join(skill_id)
+            .join(normalize_dependency_path_component(dependency_name));
+        let candidates = roots.entry(dependency_dir).or_default();
+        // The installer strips a leading `v` from resolved release versions, so both spellings can exist.
+        // 安装器会去掉解析出的 Release 版本的前导 `v`，因此两种写法都可能存在。
+        for version_candidate in local_dependency_version_candidates(version) {
+            candidates.insert(build_dependency_install_root(
+                kind_root,
+                scope,
+                skill_id,
+                dependency_name,
+                version_candidate.as_deref(),
+                platform_key,
+            ));
+        }
     }
 
     /// Detect whether one dependency is already installed by checking all declared exports.
@@ -952,7 +1030,9 @@ impl DependencyManager {
             "skilllist-{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(url)
         );
-        let cached_text = self.downloader.fetch_text(url, &cache_key)?;
+        // The index is fetched fresh, so one bad response is never served again from the cache.
+        // 索引每次都重新获取，一次坏响应不会再从缓存中返回。
+        let cached_text = self.downloader.fetch_text_fresh(url, &cache_key)?;
         serde_norway::from_str::<SkillListIndexFile>(&cached_text)
             .map_err(|error| format!("failed to parse skilllist index {}: {}", url, error))
     }
@@ -1126,6 +1206,123 @@ fn dependency_export_target_is_ready(
             error
         )),
     }
+}
+
+/// File name prefix of the record naming the version directory a skill-private dependency uses.
+/// 记录技能私有依赖当前使用的版本目录的文件名前缀。
+const ACTIVE_DEPENDENCY_RECORD_PREFIX: &str = ".luaskills-active-";
+
+/// Return the record path for one install root `<dependency>/<version>/<platform>`.
+/// 返回安装根目录 `<dependency>/<version>/<platform>` 对应的记录路径。
+fn active_dependency_record_path(dependency_dir: &Path, normalized_platform: &str) -> PathBuf {
+    dependency_dir.join(format!(
+        "{ACTIVE_DEPENDENCY_RECORD_PREFIX}{normalized_platform}"
+    ))
+}
+
+/// Record that a skill-private dependency now uses `install_root`; failures only log a warning.
+/// 记录技能私有依赖当前使用 `install_root`；失败时只记录警告。
+fn record_active_dependency_root(install_root: &Path) {
+    let (Some(platform), Some(version_dir)) = (install_root.file_name(), install_root.parent())
+    else {
+        return;
+    };
+    let (Some(platform), Some(version), Some(dependency_dir)) = (
+        platform.to_str(),
+        version_dir.file_name().and_then(|value| value.to_str()),
+        version_dir.parent(),
+    ) else {
+        return;
+    };
+    let record_path = active_dependency_record_path(dependency_dir, platform);
+    if fs::read_to_string(&record_path).ok().as_deref() == Some(version) {
+        return;
+    }
+    // Sequence keeps concurrent writers of one process from sharing a temporary file.
+    // Sequence 让同一进程内并发的写入方不会共用同一个临时文件。
+    static RECORD_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let temp_path = dependency_dir.join(format!(
+        "{ACTIVE_DEPENDENCY_RECORD_PREFIX}{platform}.tmp-{}-{}",
+        std::process::id(),
+        RECORD_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let result = fs::write(&temp_path, version).and_then(|()| {
+        crate::runtime::file_system::replace_file_atomically(&temp_path, &record_path)
+    });
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp_path);
+        log_warn(format!(
+            "[LuaSkills:dependency] Failed to record active dependency root {}: {}",
+            render_dependency_manager_path(install_root),
+            error
+        ));
+    }
+}
+
+/// Read the install root a skill-private dependency recorded for one platform, if any.
+/// 读取技能私有依赖为某个平台记录的安装根目录（如有）。
+fn read_active_dependency_root(
+    dependency_dir: &Path,
+    normalized_platform: &str,
+) -> Option<PathBuf> {
+    let version = fs::read_to_string(active_dependency_record_path(
+        dependency_dir,
+        normalized_platform,
+    ))
+    .ok()?;
+    // A record that is not one portable path component is ignored rather than trusted.
+    // 不是单个可移植路径片段的记录会被忽略，而不是被信任。
+    if !dependency_path_component_is_portable(&version) {
+        return None;
+    }
+    Some(dependency_dir.join(version).join(normalized_platform))
+}
+
+/// Remove the active-root record of one dependency that is no longer declared; best effort.
+/// 删除不再声明的依赖的活动根记录；按最佳努力进行。
+fn remove_active_dependency_record(dependency_dir: &Path, normalized_platform: &str) {
+    let _ = fs::remove_file(active_dependency_record_path(
+        dependency_dir,
+        normalized_platform,
+    ));
+}
+
+/// Collect `<dependency>/<version>/<platform>` for every version directory of one dependency.
+/// 收集单个依赖每个版本目录下的 `<dependency>/<version>/<platform>`。
+fn collect_dependency_platform_roots(
+    dependency_dir: &Path,
+    normalized_platform: &str,
+) -> Result<BTreeSet<PathBuf>, String> {
+    let entries = match fs::read_dir(dependency_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => {
+            return Err(format!(
+                "Failed to scan dependency versions under {} before update cleanup: {}",
+                render_dependency_manager_path(dependency_dir),
+                error
+            ));
+        }
+    };
+    let mut roots = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "Failed to scan dependency versions under {} before update cleanup: {}",
+                render_dependency_manager_path(dependency_dir),
+                error
+            )
+        })?;
+        let is_dir = entry
+            .file_type()
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false);
+        let platform_root = entry.path().join(normalized_platform);
+        if is_dir && platform_root.is_dir() {
+            roots.insert(platform_root);
+        }
+    }
+    Ok(roots)
 }
 
 /// Remove one stale dependency root while treating an already-missing root as cleaned.

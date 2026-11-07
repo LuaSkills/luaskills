@@ -571,7 +571,9 @@ impl DownloadManager {
                 release.tag_name, checksum_asset_name
             )
         })?;
-        let checksum_text = self.fetch_text(
+        // Release metadata is fetched fresh, so one bad response is never served again from the cache.
+        // Release 元数据每次都重新获取，一次坏响应不会再从缓存中返回。
+        let checksum_text = self.fetch_text_fresh(
             &rewrite_github_download_url(
                 checksum_asset.browser_download_url.as_str(),
                 self.config.github_base_url.as_deref(),
@@ -599,7 +601,7 @@ impl DownloadManager {
             match find_asset(&index_asset_name) {
                 Some(index_asset) => {
                     let index_sha256 = listed_sha256(index_asset)?;
-                    let index_text = self.fetch_text(
+                    let index_text = self.fetch_text_fresh(
                         &rewrite_github_download_url(
                             index_asset.browser_download_url.as_str(),
                             self.config.github_base_url.as_deref(),
@@ -689,9 +691,18 @@ impl DownloadManager {
             )
         })?;
 
+        // ExpectedSha256 is normalized before cache lookup or network work begins.
+        // ExpectedSha256 在缓存查找或网络工作开始前完成归一化。
+        let expected_sha256 = match validation {
+            DownloadValidation::Sha256(value) => Some(normalize_expected_sha256(
+                &self.cached_path_for_request(request, None),
+                value,
+            )?),
+            DownloadValidation::None | DownloadValidation::Utf8 => None,
+        };
         // TargetPath is the only stable cache path exposed to callers.
         // TargetPath 是唯一向调用方暴露的稳定缓存路径。
-        let target_path = self.cached_path_for_request(request);
+        let target_path = self.cached_path_for_request(request, expected_sha256.as_deref());
         if let Some(active_target) = active_download_progress_target() {
             return Err(format!(
                 "Download progress callback for active cache target {} cannot start nested download for {}",
@@ -699,14 +710,6 @@ impl DownloadManager {
                 render_download_path(&target_path)
             ));
         }
-        // ExpectedSha256 is normalized before cache lookup or network work begins.
-        // ExpectedSha256 在缓存查找或网络工作开始前完成归一化。
-        let expected_sha256 = match validation {
-            DownloadValidation::Sha256(value) => {
-                Some(normalize_expected_sha256(&target_path, value)?)
-            }
-            DownloadValidation::None | DownloadValidation::Utf8 => None,
-        };
         // RequiresUtf8 records the text-specific pre-publication validation contract.
         // RequiresUtf8 记录文本专属的发布前验证契约。
         let requires_utf8 = matches!(validation, DownloadValidation::Utf8);
@@ -983,13 +986,32 @@ impl DownloadManager {
 
     /// Return the deterministic cache path for one download request.
     /// 返回单个下载请求对应的确定性缓存路径。
-    fn cached_path_for_request(&self, request: &DownloadRequest) -> PathBuf {
+    ///
+    /// The path digests the cache key, the source locator and the expected SHA-256, so two
+    /// requests share a cache file only when all three agree.
+    /// 路径对缓存键、来源地址和期望 SHA-256 取摘要，只有三者都相同的请求才共用一个缓存文件。
+    fn cached_path_for_request(
+        &self,
+        request: &DownloadRequest,
+        expected_sha256: Option<&str>,
+    ) -> PathBuf {
         // FileExtension preserves the bounded allow-listed suffix inferred from the source URL.
         // FileExtension 保留从来源 URL 推导出的有界白名单后缀。
         let file_extension = infer_download_extension(&request.source_locator);
+        // Each field is length-prefixed, so no two different field tuples digest the same bytes.
+        // 每个字段都带长度前缀，因此不同的字段组合不会得到相同的摘要输入。
+        let mut hasher = Sha256::new();
+        for field in [
+            request.cache_key.as_str(),
+            request.source_locator.as_str(),
+            expected_sha256.unwrap_or(""),
+        ] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
         // CacheKeyDigest prevents caller-controlled separators or absolute prefixes from escaping the cache root.
         // CacheKeyDigest 防止调用方控制的分隔符或绝对路径前缀逃逸缓存根目录。
-        let cache_key_digest = format!("{:x}", Sha256::digest(request.cache_key.as_bytes()));
+        let cache_key_digest = format!("{:x}", hasher.finalize());
         self.config
             .cache_root
             .join(format!("{cache_key_digest}{file_extension}"))
@@ -2483,7 +2505,7 @@ mod tests {
         };
         // CachedPath must contain only the SHA-256 key digest and allow-listed URL suffix.
         // CachedPath 必须只包含缓存键 SHA-256 摘要与 URL 白名单后缀。
-        let cached_path = manager.cached_path_for_request(&request);
+        let cached_path = manager.cached_path_for_request(&request, None);
         // FileName captures the untrusted-key projection for exact character validation.
         // FileName 捕获不可信缓存键投影，以便精确验证字符范围。
         let file_name = cached_path
@@ -2538,7 +2560,7 @@ mod tests {
         };
         // Corrupted cache path that must not be returned as a valid payload file.
         // 不应作为有效载荷文件返回的损坏缓存路径。
-        let cached_path = manager.cached_path_for_request(&request);
+        let cached_path = manager.cached_path_for_request(&request, None);
         std::fs::create_dir_all(&cached_path).expect("cached directory should be created");
 
         let error = manager
@@ -3021,7 +3043,7 @@ mod tests {
         };
         // TargetPath is populated with the old cache before refresh begins.
         // TargetPath 在刷新开始前写入旧缓存。
-        let target_path = manager.cached_path_for_request(&request);
+        let target_path = manager.cached_path_for_request(&request, Some(&expected_sha256));
         std::fs::write(&target_path, b"old-cache").expect("write old cache");
 
         // Error proves both the old cache and redownload were rejected.
@@ -3036,6 +3058,46 @@ mod tests {
         );
         assert_eq!(server.finish(), 1);
         assert_no_download_temp_files(&cache_root);
+        let _ = std::fs::remove_dir_all(&cache_root);
+    }
+
+    /// Requests sharing a cache key but not a source or digest never share a cache file.
+    /// 缓存键相同但来源或摘要不同的请求绝不共用缓存文件。
+    #[test]
+    fn cache_path_separates_sources_and_expected_digests() {
+        let first = b"first-payload";
+        let second = b"second-payload";
+        let server = TestHttpServer::start(vec![
+            test_http_response(first, Some(first.len())),
+            test_http_response(second, Some(second.len())),
+        ]);
+        let cache_root = make_download_test_root("cache_key_identity");
+        let manager = make_test_download_manager(cache_root.clone());
+        let request = |locator: String| DownloadRequest {
+            source_type: DependencySourceType::Url,
+            source_locator: locator,
+            cache_key: "tool-rg-linux-x64".to_string(),
+        };
+        let first_sha = format!("{:x}", Sha256::digest(first));
+        let second_sha = format!("{:x}", Sha256::digest(second));
+
+        let first_path = manager
+            .download_with_sha256(&request(format!("{}?a", server.url)), &first_sha)
+            .expect("download first payload");
+        let second_path = manager
+            .download_with_sha256(&request(format!("{}?b", server.url)), &second_sha)
+            .expect("download second payload from another source");
+        let base_url = server.url.clone();
+        assert_eq!(server.finish(), 2, "the second source must be fetched");
+        assert_ne!(first_path, second_path);
+        assert_eq!(std::fs::read(&first_path).expect("read first"), first);
+
+        let same_source = request(format!("{base_url}?a"));
+        assert_ne!(
+            manager.cached_path_for_request(&same_source, Some(&first_sha)),
+            manager.cached_path_for_request(&same_source, Some(&second_sha)),
+            "a different expected digest selects a different cache file"
+        );
         let _ = std::fs::remove_dir_all(&cache_root);
     }
 
@@ -3070,7 +3132,7 @@ mod tests {
         };
         // TargetPath starts with content rejected by the expected checksum.
         // TargetPath 初始包含会被期望 checksum 拒绝的内容。
-        let target_path = manager.cached_path_for_request(&request);
+        let target_path = manager.cached_path_for_request(&request, Some(&expected_sha256));
         std::fs::write(&target_path, b"invalid-old-cache").expect("write invalid old cache");
 
         // DownloadedPath is the same stable target after validated replacement.
@@ -3116,7 +3178,7 @@ mod tests {
         };
         // TargetPath contains valid text that must remain visible after rejection.
         // TargetPath 包含拒绝后必须继续可见的有效文本。
-        let target_path = manager.cached_path_for_request(&request);
+        let target_path = manager.cached_path_for_request(&request, None);
         std::fs::write(&target_path, b"old-valid-text").expect("write valid old text cache");
 
         // Error is raised before the pending file reaches atomic publication.
@@ -3165,7 +3227,7 @@ mod tests {
         };
         // TargetPath contains the valid old text that must survive failure.
         // TargetPath 包含失败后必须保留的有效旧文本。
-        let target_path = manager.cached_path_for_request(&request);
+        let target_path = manager.cached_path_for_request(&request, None);
         std::fs::write(&target_path, b"old-valid-text").expect("write old text cache");
 
         // Error originates before any atomic publication can consume the old target.
@@ -3357,7 +3419,7 @@ mod tests {
         };
         // TargetPath must remain absent because neither temp file passed validation.
         // TargetPath 必须保持缺失，因为两个临时文件都未通过校验。
-        let target_path = manager.cached_path_for_request(&request);
+        let target_path = manager.cached_path_for_request(&request, Some(&expected_sha256));
 
         // Error retains both the first failure and automatic retry context.
         // Error 保留首次失败与自动重试上下文。
@@ -3701,6 +3763,51 @@ mod network_policy_tests {
             .expect_err("disagreeing digest must be rejected");
         assert!(error.contains("reports digest"), "{error}");
         assert_eq!(server.finish().len(), 2);
+        let _ = std::fs::remove_dir_all(cache_root);
+    }
+
+    /// A bad checksum response is fetched again on the next resolution instead of being cached.
+    /// 一次坏的校验文件响应会在下次解析时重新获取，而不是被缓存。
+    #[test]
+    fn bad_checksum_response_is_not_cached() {
+        let listed = "e".repeat(64);
+        let server = CaptureServer::start(|base| {
+            let release = serde_json::json!({
+                "tag_name": "v1.0.0",
+                "assets": [
+                    {
+                        "name": "demo-v1.0.0-skill.zip",
+                        "browser_download_url": format!("{base}/download/demo-v1.0.0-skill.zip"),
+                    },
+                    {
+                        "name": "demo-v1.0.0-checksums.txt",
+                        "browser_download_url": format!("{base}/download/demo-v1.0.0-checksums.txt"),
+                    }
+                ]
+            })
+            .to_string()
+            .into_bytes();
+            vec![
+                http_response("200 OK", &[], &release),
+                http_response("200 OK", &[], b"<html>proxy busy</html>"),
+                http_response("200 OK", &[], &release),
+                http_response(
+                    "200 OK",
+                    &[],
+                    format!("{listed}  demo-v1.0.0-skill.zip\n").as_bytes(),
+                ),
+            ]
+        });
+        let (manager, cache_root) = token_manager("checksum-refresh");
+        let source = loopback_source(&server.url);
+        manager
+            .resolve_github_managed_skill_release_asset(&source, "demo", None, "linux-x64")
+            .expect_err("a checksum page without the asset must fail");
+        let resolved = manager
+            .resolve_github_managed_skill_release_asset(&source, "demo", None, "linux-x64")
+            .expect("the checksum file is fetched again");
+        assert_eq!(resolved.asset.sha256.as_deref(), Some(listed.as_str()));
+        assert_eq!(server.finish().len(), 4);
         let _ = std::fs::remove_dir_all(cache_root);
     }
 

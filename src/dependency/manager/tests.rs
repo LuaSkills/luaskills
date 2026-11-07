@@ -1467,3 +1467,142 @@ fn optional_dependency_failures_warn_and_required_ones_fail() {
         }
     }
 }
+
+/// Tool manifest with one dependency `demo-tool` at `version` (None means unversioned).
+/// 只含一个版本为 `version` 的 `demo-tool` 依赖的工具清单（None 表示未声明版本）。
+fn demo_tool_manifest(version: Option<&str>, platform_key: &str) -> PackageDependencyManifest {
+    let mut tool = tool_dependency("demo-tool", "0.0.0", platform_key);
+    tool.version = version.map(str::to_string);
+    PackageDependencyManifest {
+        tool_dependencies: vec![tool],
+        ..PackageDependencyManifest::default()
+    }
+}
+
+/// Create one installed `demo-tool` root under version directory `version_dir`.
+/// 在版本目录 `version_dir` 下创建一个已安装的 `demo-tool` 根目录。
+fn install_demo_tool(
+    manager: &DependencyManager,
+    version_dir: &str,
+    platform_key: &str,
+) -> PathBuf {
+    let root = build_dependency_install_root(
+        &manager.config.tool_root,
+        DependencyScope::Skill,
+        "demo-skill",
+        "demo-tool",
+        Some(version_dir),
+        platform_key,
+    );
+    fs::create_dir_all(root.join("bin")).expect("create installed dependency root");
+    fs::write(root.join("bin").join("demo.bin"), version_dir).expect("write installed export");
+    root
+}
+
+/// Removing a version pin keeps the root the reloaded skill still uses.
+/// 去掉版本锁定后，仍保留重载后的技能正在使用的根目录。
+#[test]
+fn cleanup_keeps_the_root_an_unpinned_dependency_reuses() {
+    let platform_key = current_platform_key();
+    if platform_key == "unknown" {
+        return;
+    }
+    let (manager, root) = test_manager();
+    let skill_dir = root.join("skills").join("demo-skill");
+    fs::create_dir_all(&skill_dir).expect("create skill dir");
+    let live_root = install_demo_tool(&manager, "1.0.0", platform_key);
+    let previous = demo_tool_manifest(Some("1.0.0"), platform_key);
+    let current = demo_tool_manifest(None, platform_key);
+
+    // The reload of the updated skill reuses 1.0.0 before cleanup runs.
+    // 更新后技能的重载在清理之前复用了 1.0.0。
+    manager
+        .ensure_skill_dependencies("demo-skill", &skill_dir, &current)
+        .expect("unversioned dependency reuses the installed version");
+    manager
+        .cleanup_updated_skill_dependencies("demo-skill", Some(&previous), Some(&current))
+        .expect("cleanup");
+
+    assert!(live_root.exists(), "the root in use must survive cleanup");
+    manager
+        .ensure_skill_dependencies("demo-skill", &skill_dir, &current)
+        .expect("dependency is still ready after cleanup");
+    let _ = fs::remove_dir_all(root);
+}
+
+/// A `v`-prefixed version installed without the prefix is removed once the update moves on.
+/// 以去掉 `v` 前缀的目录安装的版本，在更新换版后会被删除。
+#[test]
+fn cleanup_removes_roots_installed_without_the_v_prefix() {
+    let platform_key = current_platform_key();
+    if platform_key == "unknown" {
+        return;
+    }
+    let (manager, root) = test_manager();
+    let skill_dir = root.join("skills").join("demo-skill");
+    fs::create_dir_all(&skill_dir).expect("create skill dir");
+    let old_root = install_demo_tool(&manager, "1.0.0", platform_key);
+    let new_root = install_demo_tool(&manager, "2.0.0", platform_key);
+    let previous = demo_tool_manifest(Some("v1.0.0"), platform_key);
+    let current = demo_tool_manifest(Some("v2.0.0"), platform_key);
+
+    manager
+        .ensure_skill_dependencies("demo-skill", &skill_dir, &current)
+        .expect("v2.0.0 reuses the 2.0.0 directory");
+    manager
+        .cleanup_updated_skill_dependencies("demo-skill", Some(&previous), Some(&current))
+        .expect("cleanup");
+
+    assert!(!old_root.exists(), "the 1.0.0 root is no longer used");
+    assert!(new_root.exists(), "the 2.0.0 root is in use");
+
+    // Without a record, the v-stripped spelling of the previous version is still removed.
+    // 没有记录时，旧版本去掉 `v` 的写法同样会被删除。
+    let dependency_dir = old_root
+        .parent()
+        .and_then(Path::parent)
+        .expect("dependency dir");
+    fs::remove_file(dependency_dir.join(format!(
+        "{ACTIVE_DEPENDENCY_RECORD_PREFIX}{}",
+        normalize_dependency_path_component(platform_key)
+    )))
+    .expect("remove active record");
+    let old_root = install_demo_tool(&manager, "1.0.0", platform_key);
+    manager
+        .cleanup_updated_skill_dependencies("demo-skill", Some(&previous), Some(&current))
+        .expect("cleanup without record");
+    assert!(!old_root.exists());
+    assert!(new_root.exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Dropping an unversioned dependency removes the version directory it had resolved to.
+/// 删除一个未声明版本的依赖时，会删除它此前解析到的版本目录。
+#[test]
+fn cleanup_removes_the_recorded_root_of_a_dropped_dependency() {
+    let platform_key = current_platform_key();
+    if platform_key == "unknown" {
+        return;
+    }
+    let (manager, root) = test_manager();
+    let skill_dir = root.join("skills").join("demo-skill");
+    fs::create_dir_all(&skill_dir).expect("create skill dir");
+    let resolved_root = install_demo_tool(&manager, "1.3.0", platform_key);
+    let previous = demo_tool_manifest(None, platform_key);
+    manager
+        .ensure_skill_dependencies("demo-skill", &skill_dir, &previous)
+        .expect("unversioned dependency reuses 1.3.0");
+
+    manager
+        .cleanup_updated_skill_dependencies(
+            "demo-skill",
+            Some(&previous),
+            Some(&PackageDependencyManifest::default()),
+        )
+        .expect("cleanup");
+    assert!(
+        !resolved_root.exists(),
+        "the dropped dependency's root is removed"
+    );
+    let _ = fs::remove_dir_all(root);
+}

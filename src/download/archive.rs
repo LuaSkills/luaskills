@@ -1,6 +1,8 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use flate2::read::GzDecoder;
 use tar::Archive;
@@ -51,8 +53,18 @@ fn extracted_skill_manifest_is_file(skill_yaml: &Path) -> Result<bool, String> {
     }
 }
 
+/// Sequence number that keeps concurrent staging directories of one process apart.
+/// 让同一进程内并发的暂存目录互不冲突的序号。
+static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 /// Install one downloaded payload into the dependency root according to export rules.
 /// 按导出规则把单个已下载载荷安装到依赖根目录。
+///
+/// Exports are first extracted into a hidden staging directory inside `install_root`, and are
+/// moved to their final paths only after every export was extracted. A failed extraction leaves
+/// no partial file at any final path; other files under `install_root` are never touched.
+/// 导出文件先解压到 `install_root` 内的隐藏暂存目录，全部解压成功后才移动到最终路径。解压失败时
+/// 任何最终路径上都不会留下不完整的文件；`install_root` 下的其他文件不受影响。
 pub fn install_downloaded_payload(
     archive_path: &Path,
     archive_type: DependencyArchiveType,
@@ -72,13 +84,74 @@ pub fn install_downloaded_payload(
             error
         )
     })?;
-    match archive_type {
-        DependencyArchiveType::Raw => install_from_raw_file(archive_path, &resolved_exports),
-        DependencyArchiveType::Zip => install_from_zip_archive(archive_path, &resolved_exports),
-        DependencyArchiveType::TarGz => {
-            install_from_tar_gz_archive(archive_path, &resolved_exports)
+    // StagingRoot receives every extracted export before any final path is written.
+    // StagingRoot 在写入任何最终路径之前接收全部解压出的导出文件。
+    let staging_root = install_root.join(format!(
+        ".luaskills-staging-{}-{}",
+        std::process::id(),
+        STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&staging_root).map_err(|error| {
+        format!(
+            "Failed to create {}: {}",
+            render_archive_path(&staging_root),
+            error
+        )
+    })?;
+    let result =
+        resolve_dependency_export_targets(&staging_root, exports).and_then(|staged_exports| {
+            match archive_type {
+                DependencyArchiveType::Raw => install_from_raw_file(archive_path, &staged_exports),
+                DependencyArchiveType::Zip => {
+                    install_from_zip_archive(archive_path, &staged_exports)
+                }
+                DependencyArchiveType::TarGz => {
+                    install_from_tar_gz_archive(archive_path, &staged_exports)
+                }
+            }?;
+            publish_staged_exports(&staged_exports, &resolved_exports)
+        });
+    // Cleanup is best effort: a leftover staging directory is never mistaken for an export.
+    // 清理按最佳努力进行：残留的暂存目录绝不会被当作导出文件。
+    let _ = fs::remove_dir_all(&staging_root);
+    result
+}
+
+/// Move every fully extracted staged export to its final path.
+/// 把每个已完整解压的暂存导出文件移动到最终路径。
+///
+/// The staged and final slices are resolved from the same declarations, so they pair by index.
+/// staged 与 final 两个切片由同一组声明解析而来，因此按下标一一对应。
+fn publish_staged_exports(
+    staged_exports: &[ResolvedDependencyExport<'_>],
+    final_exports: &[ResolvedDependencyExport<'_>],
+) -> Result<(), String> {
+    // Published records final paths already moved, so a repeated declaration is moved only once.
+    // Published 记录已经移动的最终路径，重复的声明只移动一次。
+    let mut published = BTreeSet::new();
+    for (staged, target) in staged_exports.iter().zip(final_exports) {
+        if !published.insert(target.target_path.clone()) {
+            continue;
         }
+        if let Some(parent) = target.target_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "Failed to create {}: {}",
+                    render_archive_path(parent),
+                    error
+                )
+            })?;
+        }
+        fs::rename(&staged.target_path, &target.target_path).map_err(|error| {
+            format!(
+                "Failed to move extracted {} to {}: {}",
+                render_archive_path(&staged.target_path),
+                render_archive_path(&target.target_path),
+                error
+            )
+        })?;
     }
+    Ok(())
 }
 
 /// Extract one skill package zip into a temporary root and return the extracted skill directory.
@@ -1313,6 +1386,71 @@ mod tests {
         );
         // Cleanup result is intentionally ignored for best-effort temporary test artifacts.
         // 对临时测试产物的清理结果按最佳努力原则有意忽略。
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    /// Build a stored zip whose single `demo.bin` entry fails its CRC check when read.
+    /// 构造一个只含 `demo.bin` 条目、读取时 CRC 校验失败的未压缩 zip。
+    fn bad_crc_zip(path: &Path) {
+        use std::io::Write as _;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            writer
+                .start_file(
+                    "demo.bin",
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Stored),
+                )
+                .expect("start zip entry");
+            writer
+                .write_all(b"CORRUPTED-TOOL-PAYLOAD")
+                .expect("write zip entry");
+            writer.finish().expect("finish zip");
+        }
+        let mut bytes = cursor.into_inner();
+        let position = bytes
+            .windows(b"CORRUPTED".len())
+            .position(|window| window == b"CORRUPTED")
+            .expect("find stored payload");
+        bytes[position] = b'X';
+        std::fs::write(path, bytes).expect("write bad zip");
+    }
+
+    /// A failed extraction writes nothing at the final export path and leaves no staging directory.
+    /// 解压失败时不会在最终导出路径写入任何内容，也不会留下暂存目录。
+    #[test]
+    fn failed_extraction_leaves_no_partial_export() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "luaskills_archive_failed_extraction_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).expect("temp root should be created");
+        let archive_path = temp_root.join("payload.zip");
+        bad_crc_zip(&archive_path);
+        let install_root = temp_root.join("install");
+        let exports = vec![DependencyExportSpec {
+            archive_path: "demo.bin".to_string(),
+            target_path: "bin/demo.bin".to_string(),
+            executable: false,
+        }];
+
+        for _ in 0..2 {
+            let error = install_downloaded_payload(
+                &archive_path,
+                DependencyArchiveType::Zip,
+                &install_root,
+                &exports,
+            )
+            .expect_err("a corrupted entry must fail extraction");
+            assert!(error.contains("Failed to extract"), "{error}");
+            assert!(!install_root.join("bin").join("demo.bin").exists());
+            let leftovers: Vec<_> = std::fs::read_dir(&install_root)
+                .expect("read install root")
+                .collect();
+            assert!(leftovers.is_empty(), "unexpected leftovers: {leftovers:?}");
+        }
         let _ = std::fs::remove_dir_all(&temp_root);
     }
 }
