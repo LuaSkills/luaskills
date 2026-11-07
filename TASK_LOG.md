@@ -9360,3 +9360,42 @@
 - `dependency::` 27、`skill::` 73、`ffi` 112、`download::` 46 项通过；`cargo clippy --all-targets` 无警告。
 - demo-skill 删除 Windows 原生库后：0.7.1 调试工具报 `loaded without any callable entries`；
   本地 0.7.2 调试工具正常调用 `hello`，`native-demo` 返回 `exists: false`。
+
+## 2026-11-07：第 1 组审核修复，堵住崩溃和数据损坏
+
+### 概述
+
+- 来自 `docs/audit/20261106` 的审核结论：panic 穿过 C ABI 会中止宿主；`vulcan.call` 自递归、带环的表转 JSON、自引用的 `vulcan.io` encoding 选项会耗尽原生栈；嵌套超过 serde 读取上限的 embedded 结果会写进操作日志，之后整份历史都读不出来。
+- 这几种情况现在都变成普通错误，宿主进程和持久历史不受影响。
+
+### 文件变更清单
+
+- `src/ffi.rs`、`src/ffi_standard.rs`：121 个导出函数的函数体包上 panic 边界（`ffi_json_boundary`、`ffi_status_boundary`、`ffi_pointer_boundary`、`ffi_unit_boundary`），函数体逻辑不变。
+- `src/runtime/engine.rs`：
+  - `vulcan.call` 的嵌套深度在 Rust app-data 里计数，上限 32 层；
+  - `lua_value_to_json` 增加环检测，深度上限 100 层。
+- `src/runtime/json_limits.rs`（新增）：统一定义值嵌套上限 100 和 serde 可读回上限 127，并提供对 Lua 表的迭代深度检查。
+- `src/runtime/engine/lease/embedded.rs`、`embedded/values.rs`、`src/runtime/embedded/scheduler/sessions.rs`：
+  - embedded 导出结果在 `from_value` 之前先检查深度；
+  - 宿主参数在 schema 校验之前先检查深度。
+- `src/runtime/embedded/value_size.rs`：`json_size` 用格式化器做 127 层兜底。
+- `src/runtime/managed_io.rs`：encoding 选项只接受一层表。
+- 根据 diff 审查补的三处：
+  - `LuaVmLease` 和请求作用域守卫在 panic 展开期间直接淘汰虚拟机，不再放回池里复用；
+  - `json_value_to_lua` 和工具参数入口同样限制 100 层，`vulcan.json.decode` 能解出的值都能再编码；
+  - `ffi_status_boundary` 在函数体运行前清空 `error_out`，panic 时先释放函数体已写入的错误缓冲。
+  - popen 与 `vulcan.io` 共用 `parse_encoding_field`，同样拒绝嵌套 encoding 表；
+  - embedded 调用先报告未声明的导出，再做参数值检查；
+  - `check_lua_json_depth` 不再把表类型的键算作嵌套；`json_size` 文档写明 RawValue 前提；
+  - 新增协程场景测试，确认嵌套调用计数不会因被放弃的协程而残留。
+- 测试：`src/ffi/tests.rs`、`src/ffi_standard/tests.rs`、`src/runtime/managed_io/tests.rs`，新增 `src/runtime/engine/tests/value_boundaries.rs` 和 `src/runtime/engine/tests/embedded/scheduler/persistence/nesting.rs`。
+- `docs/development/skill-development.md` 与中文版：说明 32 层调用上限和 JSON 的环、深度限制。
+
+### 验证记录
+
+- 新增和扩充的 14 个回归测试通过（含 `lua_vm_pool_discards_vm_leased_during_panic`、`json_values_entering_lua_share_the_encode_depth_limit`、`nested_vulcan_call_depth_survives_abandoned_coroutines`）；`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings` 通过。
+- `tests/` 下的 4 个集成测试目标共 13 项通过。
+- `cargo test --lib`：1085 通过，3 失败。
+  - 2 个是并发运行时 PATH 互相干扰（报 `cmd.exe` 找不到），单独运行通过。
+  - 1 个 `embedded_diagnostics_*` 在基线上同样失败（另一个这次碰巧通过），与本次改动无关。
+- 用审核里 G02-004 的触发条件做端到端检查：原来宿主以 `0xC0000409` 中止，现在返回失败信封。

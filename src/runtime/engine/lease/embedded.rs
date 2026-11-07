@@ -468,6 +468,14 @@ impl EmbeddedModule {
                 // Direct function calls do not compile a new wrapper for every request.
                 // 直接函数调用不为每次请求编译新包装。
                 let result = export.function.call::<LuaValue>(argument)?;
+                // The serializer below recurses per table; bound the depth first so a deep or
+                // cyclic result becomes an error instead of a native stack overflow.
+                // 下面的序列化器按表递归；先限制深度，让过深或带环的结果变成错误，而不是原生栈溢出。
+                crate::runtime::json_limits::check_lua_json_depth(
+                    &result,
+                    crate::runtime::json_limits::MAX_JSON_NESTING_DEPTH,
+                )
+                .map_err(mlua::Error::runtime)?;
                 // Output contract validation happens before request-owned resources commit.
                 // 输出契约在请求所属资源提交前校验。
                 let mut value = lua.from_value(result)?;

@@ -3193,3 +3193,32 @@ fn github_mirror_json_entrypoints_round_trip() {
     };
     assert_eq!(rejected["ok"], false);
 }
+
+/// Verify a panic inside a JSON ABI export body becomes a failed envelope instead of aborting the host.
+/// 验证 JSON ABI 导出函数体内的 panic 会变成失败包络，而不是中止宿主进程。
+#[test]
+fn ffi_json_boundary_turns_panic_into_error_envelope() {
+    let response = unsafe {
+        decode_response_json(super::ffi_json_boundary("luaskills_ffi_probe_json", || {
+            panic!("probe failure")
+        }))
+    };
+    assert_eq!(response["ok"], false);
+    assert_eq!(
+        response["error"],
+        "luaskills_ffi_probe_json panicked: probe failure"
+    );
+
+    // A body that returns normally passes its buffer through unchanged.
+    // 正常返回的函数体原样传出其缓冲。
+    let passed = unsafe {
+        decode_response_json(super::ffi_json_boundary("luaskills_ffi_probe_json", || {
+            super::ffi_error("ordinary failure")
+        }))
+    };
+    assert_eq!(passed["error"], "ordinary failure");
+
+    // Exports without a result channel contain the panic as well.
+    // 没有结果通道的导出函数同样会拦截 panic。
+    super::ffi_unit_boundary("luaskills_ffi_probe_free", || panic!("free failure"));
+}

@@ -1,6 +1,8 @@
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CString, c_char};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
@@ -9,6 +11,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::ffi_standard::{FfiBorrowedBuffer, FfiOwnedBuffer, alloc_owned_buffer_from_vec};
+use crate::runtime::logging;
 use crate::runtime::managed_runtime::resolve_managed_runtime_install;
 use crate::runtime::managed_session_events::ManagedSessionEventCenter;
 use crate::runtime::path::{normalize_host_input_path_text, render_host_visible_path};
@@ -242,6 +245,36 @@ fn ffi_ok<T: Serialize>(result: T) -> FfiOwnedBuffer {
         result: Some(result),
         error: None::<String>,
     })
+}
+
+/// Render the panic `payload` raised inside exported function `function_name` as plain error text.
+/// 将导出函数 `function_name` 内抛出的 panic `payload` 渲染为普通错误文本。
+pub(crate) fn ffi_panic_message(function_name: &str, payload: &(dyn Any + Send)) -> String {
+    // Panic payloads are `&str` or `String` for every `panic!` form; anything else has no text.
+    // 所有 `panic!` 形式的载荷都是 `&str` 或 `String`；其他类型没有可用文本。
+    let detail = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-text panic payload");
+    format!("{function_name} panicked: {detail}")
+}
+
+/// Run one JSON ABI export `body`; a panic becomes a failed envelope instead of aborting the host.
+/// 运行一个 JSON ABI 导出函数体 `body`；panic 转为失败包络，而不是中止宿主进程。
+fn ffi_json_boundary(function_name: &str, body: impl FnOnce() -> FfiOwnedBuffer) -> FfiOwnedBuffer {
+    match catch_unwind(AssertUnwindSafe(body)) {
+        Ok(buffer) => buffer,
+        Err(payload) => ffi_error(ffi_panic_message(function_name, payload.as_ref())),
+    }
+}
+
+/// Run one export `body` without a result channel; a panic is contained so it cannot unwind into C.
+/// 运行一个没有结果通道的导出函数体 `body`；panic 被拦截，不会展开进 C 栈帧。
+pub(crate) fn ffi_unit_boundary(function_name: &str, body: impl FnOnce()) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(body)) {
+        logging::error(ffi_panic_message(function_name, payload.as_ref()));
+    }
 }
 
 /// Build one failed FFI JSON envelope.
@@ -503,28 +536,34 @@ pub(crate) fn exported_ffi_function_names() -> Vec<String> {
 /// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_string_free(value: *mut c_char) {
-    if !value.is_null() {
-        let _ = unsafe { CString::from_raw(value) };
-    }
+    ffi_unit_boundary("luaskills_ffi_string_free", move || {
+        if !value.is_null() {
+            let _ = unsafe { CString::from_raw(value) };
+        }
+    })
 }
 
 /// Return the stable FFI version descriptor as one JSON envelope.
 /// 以 JSON 响应包络形式返回稳定的 FFI 版本描述。
 #[unsafe(no_mangle)]
 pub extern "C" fn luaskills_ffi_version_json() -> FfiOwnedBuffer {
-    ffi_ok(json!({
-        "ffi_version": FFI_VERSION,
-        "protocol": "json-cabi"
-    }))
+    ffi_json_boundary("luaskills_ffi_version_json", move || {
+        ffi_ok(json!({
+            "ffi_version": FFI_VERSION,
+            "protocol": "json-cabi"
+        }))
+    })
 }
 
 /// Return the exported JSON FFI entrypoint list as one JSON envelope.
 /// 以 JSON 响应包络形式返回已导出的 JSON FFI 入口列表。
 #[unsafe(no_mangle)]
 pub extern "C" fn luaskills_ffi_describe_json() -> FfiOwnedBuffer {
-    ffi_ok(FfiDescribeJsonResult {
-        ffi_version: FFI_VERSION.to_string(),
-        exported_functions: exported_ffi_function_names(),
+    ffi_json_boundary("luaskills_ffi_describe_json", move || {
+        ffi_ok(FfiDescribeJsonResult {
+            ffi_version: FFI_VERSION.to_string(),
+            exported_functions: exported_ffi_function_names(),
+        })
     })
 }
 
@@ -540,22 +579,24 @@ pub extern "C" fn luaskills_ffi_describe_json() -> FfiOwnedBuffer {
 pub unsafe extern "C" fn luaskills_ffi_engine_new_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<EngineNewJsonRequest>(
-        input_json,
-        "luaskills_ffi_engine_new_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match LuaEngine::new(request.options) {
-        Ok(engine) => {
-            let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let mut registry = lock_ffi_engine_registry();
-            registry.insert(engine_id, FfiEngineSlot::new(engine));
-            ffi_ok(EngineHandleJsonResult { engine_id })
+    ffi_json_boundary("luaskills_ffi_engine_new_json", move || {
+        let request = match decode_json_request::<EngineNewJsonRequest>(
+            input_json,
+            "luaskills_ffi_engine_new_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match LuaEngine::new(request.options) {
+            Ok(engine) => {
+                let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let mut registry = lock_ffi_engine_registry();
+                registry.insert(engine_id, FfiEngineSlot::new(engine));
+                ffi_ok(EngineHandleJsonResult { engine_id })
+            }
+            Err(error) => ffi_error(error.to_string()),
         }
-        Err(error) => ffi_error(error.to_string()),
-    }
+    })
 }
 
 /// Resolve one managed Python or Node installation through the read-only JSON FFI surface.
@@ -572,36 +613,38 @@ pub unsafe extern "C" fn luaskills_ffi_engine_new_json(
 pub unsafe extern "C" fn luaskills_ffi_managed_runtime_resolve_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<ManagedRuntimeResolveJsonRequest>(
-        input_json,
-        "luaskills_ffi_managed_runtime_resolve_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    // Host-visible distribution path normalized before the FFI request enters native resolution.
-    // FFI 请求进入原生解析前归一化宿主可见的发行根路径。
-    let distribution_root = match normalize_host_input_path_text(
-        &request.distribution_root.as_os_str().to_string_lossy(),
-    ) {
-        Ok(path) => path,
-        Err(error) => return ffi_error(format!("distribution_root: {error}")),
-    };
-    match resolve_managed_runtime_install(
-        std::path::Path::new(&distribution_root),
-        request.runtime,
-        &request.version,
-        &request.platform,
-    ) {
-        Ok(mut descriptor) => {
-            // Host-visible copies retain the descriptor's derived serialization contract as fields evolve.
-            // 宿主可见副本继续复用描述符派生的序列化契约，避免字段演进时出现遗漏。
-            descriptor.install_root = render_host_visible_path(&descriptor.install_root).into();
-            descriptor.executable = render_host_visible_path(&descriptor.executable).into();
-            ffi_ok(descriptor)
+    ffi_json_boundary("luaskills_ffi_managed_runtime_resolve_json", move || {
+        let request = match decode_json_request::<ManagedRuntimeResolveJsonRequest>(
+            input_json,
+            "luaskills_ffi_managed_runtime_resolve_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        // Host-visible distribution path normalized before the FFI request enters native resolution.
+        // FFI 请求进入原生解析前归一化宿主可见的发行根路径。
+        let distribution_root = match normalize_host_input_path_text(
+            &request.distribution_root.as_os_str().to_string_lossy(),
+        ) {
+            Ok(path) => path,
+            Err(error) => return ffi_error(format!("distribution_root: {error}")),
+        };
+        match resolve_managed_runtime_install(
+            std::path::Path::new(&distribution_root),
+            request.runtime,
+            &request.version,
+            &request.platform,
+        ) {
+            Ok(mut descriptor) => {
+                // Host-visible copies retain the descriptor's derived serialization contract as fields evolve.
+                // 宿主可见副本继续复用描述符派生的序列化契约，避免字段演进时出现遗漏。
+                descriptor.install_root = render_host_visible_path(&descriptor.install_root).into();
+                descriptor.executable = render_host_visible_path(&descriptor.executable).into();
+                ffi_ok(descriptor)
+            }
+            Err(error) => ffi_error(error),
         }
-        Err(error) => ffi_error(error),
-    }
+    })
 }
 
 /// Free one existing LuaSkills engine handle.
@@ -616,21 +659,23 @@ pub unsafe extern "C" fn luaskills_ffi_managed_runtime_resolve_json(
 pub unsafe extern "C" fn luaskills_ffi_engine_free_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<EngineIdJsonRequest>(
-        input_json,
-        "luaskills_ffi_engine_free_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    // Removed slot whose potentially blocking engine teardown runs after the registry lock drops.
-    // 已移除的槽；其潜在阻塞引擎清理会在注册表锁释放后运行。
-    let removed_slot = match remove_ffi_engine_slot(request.engine_id) {
-        Some(removed_slot) => removed_slot,
-        None => return ffi_error(format!("FFI engine {} not found", request.engine_id)),
-    };
-    destroy_removed_ffi_engine_slot(removed_slot);
-    ffi_ok(json!({ "freed": true }))
+    ffi_json_boundary("luaskills_ffi_engine_free_json", move || {
+        let request = match decode_json_request::<EngineIdJsonRequest>(
+            input_json,
+            "luaskills_ffi_engine_free_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        // Removed slot whose potentially blocking engine teardown runs after the registry lock drops.
+        // 已移除的槽；其潜在阻塞引擎清理会在注册表锁释放后运行。
+        let removed_slot = match remove_ffi_engine_slot(request.engine_id) {
+            Some(removed_slot) => removed_slot,
+            None => return ffi_error(format!("FFI engine {} not found", request.engine_id)),
+        };
+        destroy_removed_ffi_engine_slot(removed_slot);
+        ffi_ok(json!({ "freed": true }))
+    })
 }
 
 /// Load skills from one ordered root chain through the JSON FFI surface.
@@ -645,21 +690,23 @@ pub unsafe extern "C" fn luaskills_ffi_engine_free_json(
 pub unsafe extern "C" fn luaskills_ffi_load_from_roots_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<EngineRootsJsonRequest>(
-        input_json,
-        "luaskills_ffi_load_from_roots_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine_mut(request.engine_id, |engine| {
-        engine
-            .load_from_roots(&request.skill_roots)
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(()) => ffi_ok(json!({ "loaded": true })),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_load_from_roots_json", move || {
+        let request = match decode_json_request::<EngineRootsJsonRequest>(
+            input_json,
+            "luaskills_ffi_load_from_roots_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine_mut(request.engine_id, |engine| {
+            engine
+                .load_from_roots(&request.skill_roots)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(()) => ffi_ok(json!({ "loaded": true })),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Reload skills from one ordered root chain through the JSON FFI surface.
@@ -674,21 +721,23 @@ pub unsafe extern "C" fn luaskills_ffi_load_from_roots_json(
 pub unsafe extern "C" fn luaskills_ffi_reload_from_roots_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<EngineRootsJsonRequest>(
-        input_json,
-        "luaskills_ffi_reload_from_roots_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine_mut(request.engine_id, |engine| {
-        engine
-            .reload_from_roots(&request.skill_roots)
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(()) => ffi_ok(json!({ "reloaded": true })),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_reload_from_roots_json", move || {
+        let request = match decode_json_request::<EngineRootsJsonRequest>(
+            input_json,
+            "luaskills_ffi_reload_from_roots_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine_mut(request.engine_id, |engine| {
+            engine
+                .reload_from_roots(&request.skill_roots)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(()) => ffi_ok(json!({ "reloaded": true })),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// List runtime entry descriptors visible to one host-injected authority through the JSON FFI surface.
@@ -703,24 +752,26 @@ pub unsafe extern "C" fn luaskills_ffi_reload_from_roots_json(
 pub unsafe extern "C" fn luaskills_ffi_list_entries_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<EngineAuthorityJsonRequest>(
-        input_json,
-        "luaskills_ffi_list_entries_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let authority =
-        match require_json_authority(request.authority, "luaskills_ffi_list_entries_json") {
-            Ok(authority) => authority,
+    ffi_json_boundary("luaskills_ffi_list_entries_json", move || {
+        let request = match decode_json_request::<EngineAuthorityJsonRequest>(
+            input_json,
+            "luaskills_ffi_list_entries_json",
+        ) {
+            Ok(request) => request,
             Err(error) => return ffi_error(error),
         };
-    match with_engine(request.engine_id, |engine| {
-        engine.list_entries_for_authority(authority)
-    }) {
-        Ok(result) => ffi_ok::<Vec<RuntimeEntryDescriptor>>(result),
-        Err(error) => ffi_error(error),
-    }
+        let authority =
+            match require_json_authority(request.authority, "luaskills_ffi_list_entries_json") {
+                Ok(authority) => authority,
+                Err(error) => return ffi_error(error),
+            };
+        match with_engine(request.engine_id, |engine| {
+            engine.list_entries_for_authority(authority)
+        }) {
+            Ok(result) => ffi_ok::<Vec<RuntimeEntryDescriptor>>(result),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// List structured help trees visible to one host-injected authority through the JSON FFI surface.
@@ -735,24 +786,26 @@ pub unsafe extern "C" fn luaskills_ffi_list_entries_json(
 pub unsafe extern "C" fn luaskills_ffi_list_skill_help_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<EngineAuthorityJsonRequest>(
-        input_json,
-        "luaskills_ffi_list_skill_help_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let authority =
-        match require_json_authority(request.authority, "luaskills_ffi_list_skill_help_json") {
-            Ok(authority) => authority,
+    ffi_json_boundary("luaskills_ffi_list_skill_help_json", move || {
+        let request = match decode_json_request::<EngineAuthorityJsonRequest>(
+            input_json,
+            "luaskills_ffi_list_skill_help_json",
+        ) {
+            Ok(request) => request,
             Err(error) => return ffi_error(error),
         };
-    match with_engine(request.engine_id, |engine| {
-        engine.list_skill_help_for_authority(authority)
-    }) {
-        Ok(result) => ffi_ok::<Vec<RuntimeSkillHelpDescriptor>>(result),
-        Err(error) => ffi_error(error),
-    }
+        let authority =
+            match require_json_authority(request.authority, "luaskills_ffi_list_skill_help_json") {
+                Ok(authority) => authority,
+                Err(error) => return ffi_error(error),
+            };
+        match with_engine(request.engine_id, |engine| {
+            engine.list_skill_help_for_authority(authority)
+        }) {
+            Ok(result) => ffi_ok::<Vec<RuntimeSkillHelpDescriptor>>(result),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Render one structured help detail payload visible to one host-injected authority through the JSON FFI surface.
@@ -767,31 +820,33 @@ pub unsafe extern "C" fn luaskills_ffi_list_skill_help_json(
 pub unsafe extern "C" fn luaskills_ffi_render_skill_help_detail_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<RenderHelpJsonRequest>(
-        input_json,
-        "luaskills_ffi_render_skill_help_detail_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let authority = match require_json_authority(
-        request.authority,
-        "luaskills_ffi_render_skill_help_detail_json",
-    ) {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        engine.render_skill_help_detail_for_authority(
-            authority,
-            &request.skill_id,
-            &request.flow_name,
-            request.request_context.as_ref(),
-        )
-    }) {
-        Ok(result) => ffi_ok::<Option<RuntimeHelpDetail>>(result),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_render_skill_help_detail_json", move || {
+        let request = match decode_json_request::<RenderHelpJsonRequest>(
+            input_json,
+            "luaskills_ffi_render_skill_help_detail_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        let authority = match require_json_authority(
+            request.authority,
+            "luaskills_ffi_render_skill_help_detail_json",
+        ) {
+            Ok(authority) => authority,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine(request.engine_id, |engine| {
+            engine.render_skill_help_detail_for_authority(
+                authority,
+                &request.skill_id,
+                &request.flow_name,
+                request.request_context.as_ref(),
+            )
+        }) {
+            Ok(result) => ffi_ok::<Option<RuntimeHelpDetail>>(result),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Resolve prompt argument completion candidates through the JSON FFI surface.
@@ -806,30 +861,35 @@ pub unsafe extern "C" fn luaskills_ffi_render_skill_help_detail_json(
 pub unsafe extern "C" fn luaskills_ffi_prompt_argument_completions_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<PromptCompletionJsonRequest>(
-        input_json,
+    ffi_json_boundary(
         "luaskills_ffi_prompt_argument_completions_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let authority = match require_json_authority(
-        request.authority,
-        "luaskills_ffi_prompt_argument_completions_json",
-    ) {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        Ok(engine.prompt_argument_completions_for_authority(
-            authority,
-            &request.prompt_name,
-            &request.argument_name,
-        ))
-    }) {
-        Ok(result) => ffi_ok::<Option<Vec<String>>>(result),
-        Err(error) => ffi_error(error),
-    }
+        move || {
+            let request = match decode_json_request::<PromptCompletionJsonRequest>(
+                input_json,
+                "luaskills_ffi_prompt_argument_completions_json",
+            ) {
+                Ok(request) => request,
+                Err(error) => return ffi_error(error),
+            };
+            let authority = match require_json_authority(
+                request.authority,
+                "luaskills_ffi_prompt_argument_completions_json",
+            ) {
+                Ok(authority) => authority,
+                Err(error) => return ffi_error(error),
+            };
+            match with_engine(request.engine_id, |engine| {
+                Ok(engine.prompt_argument_completions_for_authority(
+                    authority,
+                    &request.prompt_name,
+                    &request.argument_name,
+                ))
+            }) {
+                Ok(result) => ffi_ok::<Option<Vec<String>>>(result),
+                Err(error) => ffi_error(error),
+            }
+        },
+    )
 }
 
 /// Check whether one canonical tool name belongs to one visible Lua skill entry.
@@ -844,23 +904,26 @@ pub unsafe extern "C" fn luaskills_ffi_prompt_argument_completions_json(
 pub unsafe extern "C" fn luaskills_ffi_is_skill_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<IsSkillJsonRequest>(
-        input_json,
-        "luaskills_ffi_is_skill_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let authority = match require_json_authority(request.authority, "luaskills_ffi_is_skill_json") {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        engine.is_skill_for_authority(authority, &request.tool_name)
-    }) {
-        Ok(value) => ffi_ok(BoolJsonResult { value }),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_is_skill_json", move || {
+        let request = match decode_json_request::<IsSkillJsonRequest>(
+            input_json,
+            "luaskills_ffi_is_skill_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        let authority =
+            match require_json_authority(request.authority, "luaskills_ffi_is_skill_json") {
+                Ok(authority) => authority,
+                Err(error) => return ffi_error(error),
+            };
+        match with_engine(request.engine_id, |engine| {
+            engine.is_skill_for_authority(authority, &request.tool_name)
+        }) {
+            Ok(value) => ffi_ok(BoolJsonResult { value }),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Resolve the visible owning skill id of one canonical tool name through the JSON FFI surface.
@@ -875,24 +938,28 @@ pub unsafe extern "C" fn luaskills_ffi_is_skill_json(
 pub unsafe extern "C" fn luaskills_ffi_skill_name_for_tool_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<SkillNameForToolJsonRequest>(
-        input_json,
-        "luaskills_ffi_skill_name_for_tool_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let authority =
-        match require_json_authority(request.authority, "luaskills_ffi_skill_name_for_tool_json") {
+    ffi_json_boundary("luaskills_ffi_skill_name_for_tool_json", move || {
+        let request = match decode_json_request::<SkillNameForToolJsonRequest>(
+            input_json,
+            "luaskills_ffi_skill_name_for_tool_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        let authority = match require_json_authority(
+            request.authority,
+            "luaskills_ffi_skill_name_for_tool_json",
+        ) {
             Ok(authority) => authority,
             Err(error) => return ffi_error(error),
         };
-    match with_engine(request.engine_id, |engine| {
-        engine.skill_name_for_tool_for_authority(authority, &request.tool_name)
-    }) {
-        Ok(skill_id) => ffi_ok(OptionalSkillNameJsonResult { skill_id }),
-        Err(error) => ffi_error(error),
-    }
+        match with_engine(request.engine_id, |engine| {
+            engine.skill_name_for_tool_for_authority(authority, &request.tool_name)
+        }) {
+            Ok(skill_id) => ffi_ok(OptionalSkillNameJsonResult { skill_id }),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// List flattened skill config records through the JSON FFI surface.
@@ -909,19 +976,21 @@ pub unsafe extern "C" fn luaskills_ffi_skill_name_for_tool_json(
 pub unsafe extern "C" fn luaskills_ffi_skill_config_list_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<SkillConfigListJsonRequest>(
-        input_json,
-        "luaskills_ffi_skill_config_list_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        engine.list_skill_config_entries(request.skill_id.as_deref())
-    }) {
-        Ok(entries) => ffi_ok(entries),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_skill_config_list_json", move || {
+        let request = match decode_json_request::<SkillConfigListJsonRequest>(
+            input_json,
+            "luaskills_ffi_skill_config_list_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine(request.engine_id, |engine| {
+            engine.list_skill_config_entries(request.skill_id.as_deref())
+        }) {
+            Ok(entries) => ffi_ok(entries),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Describe effective package configuration declarations through the JSON FFI surface.
@@ -940,47 +1009,49 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_list_json(
 pub unsafe extern "C" fn luaskills_ffi_skill_config_describe_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<SkillPackageConfigDescribeJsonRequest>(
-        input_json,
-        "luaskills_ffi_skill_config_describe_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match request.mode {
-        crate::SkillPackageConfigDescribeMode::Effective => {
-            if request.root_name.is_some() {
-                return ffi_error(
-                    "CONFIG_BATCH_ARGUMENT_CONFLICT: root_name is accepted only in installed describe mode",
-                );
+    ffi_json_boundary("luaskills_ffi_skill_config_describe_json", move || {
+        let request = match decode_json_request::<SkillPackageConfigDescribeJsonRequest>(
+            input_json,
+            "luaskills_ffi_skill_config_describe_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match request.mode {
+            crate::SkillPackageConfigDescribeMode::Effective => {
+                if request.root_name.is_some() {
+                    return ffi_error(
+                        "CONFIG_BATCH_ARGUMENT_CONFLICT: root_name is accepted only in installed describe mode",
+                    );
+                }
+                match with_engine(request.engine_id, |engine| {
+                    engine.describe_skill_package_config(
+                        request.skill_id.as_deref(),
+                        request.include_values,
+                    )
+                }) {
+                    Ok(descriptors) => ffi_ok(descriptors),
+                    Err(error) => ffi_error(error),
+                }
             }
-            match with_engine(request.engine_id, |engine| {
-                engine.describe_skill_package_config(
-                    request.skill_id.as_deref(),
-                    request.include_values,
-                )
-            }) {
-                Ok(descriptors) => ffi_ok(descriptors),
-                Err(error) => ffi_error(error),
+            crate::SkillPackageConfigDescribeMode::Installed => {
+                if request.include_values {
+                    return ffi_error(
+                        "CONFIG_BATCH_ARGUMENT_CONFLICT: installed describe mode never returns persisted values",
+                    );
+                }
+                match with_engine(request.engine_id, |engine| {
+                    Ok(engine.describe_installed_skill_package_config(
+                        request.skill_id.as_deref(),
+                        request.root_name.as_deref(),
+                    ))
+                }) {
+                    Ok(descriptors) => ffi_ok(descriptors),
+                    Err(error) => ffi_error(error),
+                }
             }
         }
-        crate::SkillPackageConfigDescribeMode::Installed => {
-            if request.include_values {
-                return ffi_error(
-                    "CONFIG_BATCH_ARGUMENT_CONFLICT: installed describe mode never returns persisted values",
-                );
-            }
-            match with_engine(request.engine_id, |engine| {
-                Ok(engine.describe_installed_skill_package_config(
-                    request.skill_id.as_deref(),
-                    request.root_name.as_deref(),
-                ))
-            }) {
-                Ok(descriptors) => ffi_ok(descriptors),
-                Err(error) => ffi_error(error),
-            }
-        }
-    }
+    })
 }
 
 /// Validate one effective package configuration through the JSON FFI surface.
@@ -998,19 +1069,21 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_describe_json(
 pub unsafe extern "C" fn luaskills_ffi_skill_config_validate_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<SkillPackageConfigValidateJsonRequest>(
-        input_json,
-        "luaskills_ffi_skill_config_validate_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        engine.validate_skill_package_config(&request.skill_id)
-    }) {
-        Ok(status) => ffi_ok(status),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_skill_config_validate_json", move || {
+        let request = match decode_json_request::<SkillPackageConfigValidateJsonRequest>(
+            input_json,
+            "luaskills_ffi_skill_config_validate_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine(request.engine_id, |engine| {
+            engine.validate_skill_package_config(&request.skill_id)
+        }) {
+            Ok(status) => ffi_ok(status),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Read one optional skill config value through the JSON FFI surface.
@@ -1027,24 +1100,26 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_validate_json(
 pub unsafe extern "C" fn luaskills_ffi_skill_config_get_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<SkillConfigGetJsonRequest>(
-        input_json,
-        "luaskills_ffi_skill_config_get_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        engine.get_skill_config_value(&request.skill_id, &request.key)
-    }) {
-        Ok(value) => ffi_ok(SkillConfigGetJsonResult {
-            found: value.is_some(),
-            skill_id: request.skill_id,
-            key: request.key,
-            value,
-        }),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_skill_config_get_json", move || {
+        let request = match decode_json_request::<SkillConfigGetJsonRequest>(
+            input_json,
+            "luaskills_ffi_skill_config_get_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine(request.engine_id, |engine| {
+            engine.get_skill_config_value(&request.skill_id, &request.key)
+        }) {
+            Ok(value) => ffi_ok(SkillConfigGetJsonResult {
+                found: value.is_some(),
+                skill_id: request.skill_id,
+                key: request.key,
+                value,
+            }),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Atomically insert or replace one package configuration batch through JSON FFI.
@@ -1061,33 +1136,35 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_get_json(
 pub unsafe extern "C" fn luaskills_ffi_skill_config_set_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<SkillConfigSetJsonRequest>(
-        input_json,
-        "luaskills_ffi_skill_config_set_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let response_skill_id = request.skill_id.clone();
-    match with_engine_mut(request.engine_id, |engine| {
-        engine.set_skill_config_values(
-            &request.skill_id,
-            request.values,
-            request.expected_revision.as_deref(),
-        )
-    }) {
-        Ok(result) => ffi_ok(SkillConfigMutationJsonResult {
-            action: "set".to_string(),
-            skill_id: response_skill_id,
-            revision: Some(result.revision),
-            changed: Some(result.changed),
-            values: Some(result.values),
-            changed_keys: Some(result.changed_keys),
-            key: None,
-            deleted: None,
-        }),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_skill_config_set_json", move || {
+        let request = match decode_json_request::<SkillConfigSetJsonRequest>(
+            input_json,
+            "luaskills_ffi_skill_config_set_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        let response_skill_id = request.skill_id.clone();
+        match with_engine_mut(request.engine_id, |engine| {
+            engine.set_skill_config_values(
+                &request.skill_id,
+                request.values,
+                request.expected_revision.as_deref(),
+            )
+        }) {
+            Ok(result) => ffi_ok(SkillConfigMutationJsonResult {
+                action: "set".to_string(),
+                skill_id: response_skill_id,
+                revision: Some(result.revision),
+                changed: Some(result.changed),
+                values: Some(result.values),
+                changed_keys: Some(result.changed_keys),
+                key: None,
+                deleted: None,
+            }),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Delete one skill config key through the JSON FFI surface.
@@ -1104,32 +1181,34 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_set_json(
 pub unsafe extern "C" fn luaskills_ffi_skill_config_delete_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<SkillConfigDeleteJsonRequest>(
-        input_json,
-        "luaskills_ffi_skill_config_delete_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine_mut(request.engine_id, |engine| {
-        engine.delete_skill_config_value(
-            &request.skill_id,
-            &request.key,
-            request.expected_revision.as_deref(),
-        )
-    }) {
-        Ok(result) => ffi_ok(SkillConfigMutationJsonResult {
-            action: "delete".to_string(),
-            skill_id: request.skill_id,
-            revision: Some(result.revision),
-            changed: Some(result.deleted),
-            values: None,
-            changed_keys: None,
-            key: Some(result.key),
-            deleted: Some(result.deleted),
-        }),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_skill_config_delete_json", move || {
+        let request = match decode_json_request::<SkillConfigDeleteJsonRequest>(
+            input_json,
+            "luaskills_ffi_skill_config_delete_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine_mut(request.engine_id, |engine| {
+            engine.delete_skill_config_value(
+                &request.skill_id,
+                &request.key,
+                request.expected_revision.as_deref(),
+            )
+        }) {
+            Ok(result) => ffi_ok(SkillConfigMutationJsonResult {
+                action: "delete".to_string(),
+                skill_id: request.skill_id,
+                revision: Some(result.revision),
+                changed: Some(result.deleted),
+                values: None,
+                changed_keys: None,
+                key: Some(result.key),
+                deleted: Some(result.deleted),
+            }),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Explicitly refresh one or both skill configuration stores through JSON FFI.
@@ -1142,19 +1221,21 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_delete_json(
 pub unsafe extern "C" fn luaskills_ffi_skill_config_refresh_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<SkillConfigRefreshJsonRequest>(
-        input_json,
-        "luaskills_ffi_skill_config_refresh_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        engine.refresh_skill_config(request.store_scope.as_deref())
-    }) {
-        Ok(result) => ffi_ok(result),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_skill_config_refresh_json", move || {
+        let request = match decode_json_request::<SkillConfigRefreshJsonRequest>(
+            input_json,
+            "luaskills_ffi_skill_config_refresh_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine(request.engine_id, |engine| {
+            engine.refresh_skill_config(request.store_scope.as_deref())
+        }) {
+            Ok(result) => ffi_ok(result),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Poll ordered skill configuration events through JSON FFI.
@@ -1167,19 +1248,21 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_refresh_json(
 pub unsafe extern "C" fn luaskills_ffi_skill_config_events_poll_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<SkillConfigEventsPollJsonRequest>(
-        input_json,
-        "luaskills_ffi_skill_config_events_poll_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        engine.poll_skill_config_events(request.after_sequence.as_deref(), request.limit)
-    }) {
-        Ok(result) => ffi_ok(result),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_skill_config_events_poll_json", move || {
+        let request = match decode_json_request::<SkillConfigEventsPollJsonRequest>(
+            input_json,
+            "luaskills_ffi_skill_config_events_poll_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine(request.engine_id, |engine| {
+            engine.poll_skill_config_events(request.after_sequence.as_deref(), request.limit)
+        }) {
+            Ok(result) => ffi_ok(result),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Call one loaded skill entry through the JSON FFI surface.
@@ -1196,23 +1279,25 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_events_poll_json(
 pub unsafe extern "C" fn luaskills_ffi_call_skill_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<CallSkillJsonRequest>(
-        input_json,
-        "luaskills_ffi_call_skill_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        engine.call_skill(
-            &request.tool_name,
-            &request.args,
-            request.invocation_context.as_ref(),
-        )
-    }) {
-        Ok(result) => ffi_ok::<RuntimeInvocationResult>(result),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_call_skill_json", move || {
+        let request = match decode_json_request::<CallSkillJsonRequest>(
+            input_json,
+            "luaskills_ffi_call_skill_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine(request.engine_id, |engine| {
+            engine.call_skill(
+                &request.tool_name,
+                &request.args,
+                request.invocation_context.as_ref(),
+            )
+        }) {
+            Ok(result) => ffi_ok::<RuntimeInvocationResult>(result),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Execute arbitrary Lua code through the JSON FFI surface.
@@ -1229,21 +1314,25 @@ pub unsafe extern "C" fn luaskills_ffi_call_skill_json(
 pub unsafe extern "C" fn luaskills_ffi_run_lua_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request =
-        match decode_json_request::<RunLuaJsonRequest>(input_json, "luaskills_ffi_run_lua_json") {
+    ffi_json_boundary("luaskills_ffi_run_lua_json", move || {
+        let request = match decode_json_request::<RunLuaJsonRequest>(
+            input_json,
+            "luaskills_ffi_run_lua_json",
+        ) {
             Ok(request) => request,
             Err(error) => return ffi_error(error),
         };
-    match with_engine(request.engine_id, |engine| {
-        engine.run_lua(
-            &request.code,
-            &request.args,
-            request.invocation_context.as_ref(),
-        )
-    }) {
-        Ok(result) => ffi_ok::<Value>(result),
-        Err(error) => ffi_error(error),
-    }
+        match with_engine(request.engine_id, |engine| {
+            engine.run_lua(
+                &request.code,
+                &request.args,
+                request.invocation_context.as_ref(),
+            )
+        }) {
+            Ok(result) => ffi_ok::<Value>(result),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Create one persistent public runtime lease through the JSON FFI surface.
@@ -1258,30 +1347,35 @@ pub unsafe extern "C" fn luaskills_ffi_run_lua_json(
 pub unsafe extern "C" fn luaskills_ffi_runtime_lease_create_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<RuntimeSessionCreateJsonRequest>(
-        input_json,
-        "luaskills_ffi_runtime_lease_create_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        let payload = json!({
-            "sid": request.sid,
-            "ttl_sec": request.ttl_sec,
-            "replace": request.replace,
-            "cwd": request.cwd,
-            "workspace_root": request.workspace_root,
-            "lua_roots": request.lua_roots,
-            "c_roots": request.c_roots,
-            "mounts": request.mounts
-        });
-        let response = engine.create_runtime_lease_json(&payload.to_string())?;
-        parse_runtime_session_engine_payload(response, "luaskills_ffi_runtime_lease_create_json")
-    }) {
-        Ok(result) => ffi_ok::<Value>(result),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_runtime_lease_create_json", move || {
+        let request = match decode_json_request::<RuntimeSessionCreateJsonRequest>(
+            input_json,
+            "luaskills_ffi_runtime_lease_create_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine(request.engine_id, |engine| {
+            let payload = json!({
+                "sid": request.sid,
+                "ttl_sec": request.ttl_sec,
+                "replace": request.replace,
+                "cwd": request.cwd,
+                "workspace_root": request.workspace_root,
+                "lua_roots": request.lua_roots,
+                "c_roots": request.c_roots,
+                "mounts": request.mounts
+            });
+            let response = engine.create_runtime_lease_json(&payload.to_string())?;
+            parse_runtime_session_engine_payload(
+                response,
+                "luaskills_ffi_runtime_lease_create_json",
+            )
+        }) {
+            Ok(result) => ffi_ok::<Value>(result),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Evaluate code inside one persistent public runtime lease through the JSON FFI surface.
@@ -1296,45 +1390,47 @@ pub unsafe extern "C" fn luaskills_ffi_runtime_lease_create_json(
 pub unsafe extern "C" fn luaskills_ffi_runtime_lease_eval_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<RuntimeSessionEvalJsonRequest>(
-        input_json,
-        "luaskills_ffi_runtime_lease_eval_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        let request_context = request
-            .invocation_context
-            .as_ref()
-            .and_then(|context| context.request_context.clone());
-        let client_budget = request
-            .invocation_context
-            .as_ref()
-            .map(|context| context.client_budget.clone())
-            .unwrap_or_else(default_json_object);
-        let tool_config = request
-            .invocation_context
-            .as_ref()
-            .map(|context| context.tool_config.clone())
-            .unwrap_or_else(default_json_object);
-        let payload = json!({
-            "lease_id": request.lease_id,
-            "sid": request.sid,
-            "generation": request.generation,
-            "code": request.code,
-            "args": request.args,
-            "timeout_ms": request.timeout_ms,
-            "request_context": request_context,
-            "client_budget": client_budget,
-            "tool_config": tool_config
-        });
-        let response = engine.eval_runtime_lease_json(&payload.to_string())?;
-        parse_runtime_session_engine_payload(response, "luaskills_ffi_runtime_lease_eval_json")
-    }) {
-        Ok(result) => ffi_ok::<Value>(result),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_runtime_lease_eval_json", move || {
+        let request = match decode_json_request::<RuntimeSessionEvalJsonRequest>(
+            input_json,
+            "luaskills_ffi_runtime_lease_eval_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine(request.engine_id, |engine| {
+            let request_context = request
+                .invocation_context
+                .as_ref()
+                .and_then(|context| context.request_context.clone());
+            let client_budget = request
+                .invocation_context
+                .as_ref()
+                .map(|context| context.client_budget.clone())
+                .unwrap_or_else(default_json_object);
+            let tool_config = request
+                .invocation_context
+                .as_ref()
+                .map(|context| context.tool_config.clone())
+                .unwrap_or_else(default_json_object);
+            let payload = json!({
+                "lease_id": request.lease_id,
+                "sid": request.sid,
+                "generation": request.generation,
+                "code": request.code,
+                "args": request.args,
+                "timeout_ms": request.timeout_ms,
+                "request_context": request_context,
+                "client_budget": client_budget,
+                "tool_config": tool_config
+            });
+            let response = engine.eval_runtime_lease_json(&payload.to_string())?;
+            parse_runtime_session_engine_payload(response, "luaskills_ffi_runtime_lease_eval_json")
+        }) {
+            Ok(result) => ffi_ok::<Value>(result),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Return one persistent public runtime lease status through the JSON FFI surface.
@@ -1349,25 +1445,30 @@ pub unsafe extern "C" fn luaskills_ffi_runtime_lease_eval_json(
 pub unsafe extern "C" fn luaskills_ffi_runtime_lease_status_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<RuntimeSessionLeaseJsonRequest>(
-        input_json,
-        "luaskills_ffi_runtime_lease_status_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        let payload = json!({
-            "lease_id": request.lease_id,
-            "sid": request.sid,
-            "generation": request.generation
-        });
-        let response = engine.runtime_lease_status_json(&payload.to_string())?;
-        parse_runtime_session_engine_payload(response, "luaskills_ffi_runtime_lease_status_json")
-    }) {
-        Ok(result) => ffi_ok::<Value>(result),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_runtime_lease_status_json", move || {
+        let request = match decode_json_request::<RuntimeSessionLeaseJsonRequest>(
+            input_json,
+            "luaskills_ffi_runtime_lease_status_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine(request.engine_id, |engine| {
+            let payload = json!({
+                "lease_id": request.lease_id,
+                "sid": request.sid,
+                "generation": request.generation
+            });
+            let response = engine.runtime_lease_status_json(&payload.to_string())?;
+            parse_runtime_session_engine_payload(
+                response,
+                "luaskills_ffi_runtime_lease_status_json",
+            )
+        }) {
+            Ok(result) => ffi_ok::<Value>(result),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// List active persistent public runtime leases through the JSON FFI surface.
@@ -1382,21 +1483,23 @@ pub unsafe extern "C" fn luaskills_ffi_runtime_lease_status_json(
 pub unsafe extern "C" fn luaskills_ffi_runtime_lease_list_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<RuntimeSessionListJsonRequest>(
-        input_json,
-        "luaskills_ffi_runtime_lease_list_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        let payload = json!({ "sid": request.sid });
-        let response = engine.list_runtime_leases_json(&payload.to_string())?;
-        parse_runtime_session_engine_payload(response, "luaskills_ffi_runtime_lease_list_json")
-    }) {
-        Ok(result) => ffi_ok::<Value>(result),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_runtime_lease_list_json", move || {
+        let request = match decode_json_request::<RuntimeSessionListJsonRequest>(
+            input_json,
+            "luaskills_ffi_runtime_lease_list_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine(request.engine_id, |engine| {
+            let payload = json!({ "sid": request.sid });
+            let response = engine.list_runtime_leases_json(&payload.to_string())?;
+            parse_runtime_session_engine_payload(response, "luaskills_ffi_runtime_lease_list_json")
+        }) {
+            Ok(result) => ffi_ok::<Value>(result),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Close one persistent public runtime lease through the JSON FFI surface.
@@ -1411,25 +1514,27 @@ pub unsafe extern "C" fn luaskills_ffi_runtime_lease_list_json(
 pub unsafe extern "C" fn luaskills_ffi_runtime_lease_close_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<RuntimeSessionLeaseJsonRequest>(
-        input_json,
-        "luaskills_ffi_runtime_lease_close_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        let payload = json!({
-            "lease_id": request.lease_id,
-            "sid": request.sid,
-            "generation": request.generation
-        });
-        let response = engine.close_runtime_lease_json(&payload.to_string())?;
-        parse_runtime_session_engine_payload(response, "luaskills_ffi_runtime_lease_close_json")
-    }) {
-        Ok(result) => ffi_ok::<Value>(result),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_runtime_lease_close_json", move || {
+        let request = match decode_json_request::<RuntimeSessionLeaseJsonRequest>(
+            input_json,
+            "luaskills_ffi_runtime_lease_close_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine(request.engine_id, |engine| {
+            let payload = json!({
+                "lease_id": request.lease_id,
+                "sid": request.sid,
+                "generation": request.generation
+            });
+            let response = engine.close_runtime_lease_json(&payload.to_string())?;
+            parse_runtime_session_engine_payload(response, "luaskills_ffi_runtime_lease_close_json")
+        }) {
+            Ok(result) => ffi_ok::<Value>(result),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Create one persistent `system_lua_lib` runtime lease through the system JSON FFI surface.
@@ -1444,51 +1549,56 @@ pub unsafe extern "C" fn luaskills_ffi_runtime_lease_close_json(
 pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_create_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    // Strict System create request with one required trusted package descriptor.
-    // 带必需可信包描述符的严格 System 创建请求。
-    let request = match decode_json_request::<SystemRuntimeSessionCreateJsonRequest>(
-        input_json,
+    ffi_json_boundary(
         "luaskills_ffi_system_runtime_lease_create_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    // Explicit high-level JSON authority gate.
-    // 显式高层 JSON 权限门禁。
-    let _authority = match require_json_authority(
-        request.authority,
-        "luaskills_ffi_system_runtime_lease_create_json",
-    ) {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        // Engine request deliberately excludes public lua_roots and c_roots.
-        // 引擎请求有意排除公开接口的 lua_roots 与 c_roots。
-        let payload = json!({
-            "sid": request.sid,
-            "ttl_sec": request.ttl_sec,
-            "replace": request.replace,
-            "cwd": request.cwd,
-            "workspace_root": request.workspace_root,
-            "mounts": request.mounts,
-            "system_package": {
-                "id": request.system_package.id,
-                "root": request.system_package.root,
-                "dependencies_file": request.system_package.dependencies_file,
+        move || {
+            // Strict System create request with one required trusted package descriptor.
+            // 带必需可信包描述符的严格 System 创建请求。
+            let request = match decode_json_request::<SystemRuntimeSessionCreateJsonRequest>(
+                input_json,
+                "luaskills_ffi_system_runtime_lease_create_json",
+            ) {
+                Ok(request) => request,
+                Err(error) => return ffi_error(error),
+            };
+            // Explicit high-level JSON authority gate.
+            // 显式高层 JSON 权限门禁。
+            let _authority = match require_json_authority(
+                request.authority,
+                "luaskills_ffi_system_runtime_lease_create_json",
+            ) {
+                Ok(authority) => authority,
+                Err(error) => return ffi_error(error),
+            };
+            match with_engine(request.engine_id, |engine| {
+                // Engine request deliberately excludes public lua_roots and c_roots.
+                // 引擎请求有意排除公开接口的 lua_roots 与 c_roots。
+                let payload = json!({
+                    "sid": request.sid,
+                    "ttl_sec": request.ttl_sec,
+                    "replace": request.replace,
+                    "cwd": request.cwd,
+                    "workspace_root": request.workspace_root,
+                    "mounts": request.mounts,
+                    "system_package": {
+                        "id": request.system_package.id,
+                        "root": request.system_package.root,
+                        "dependencies_file": request.system_package.dependencies_file,
+                    }
+                });
+                // Stable engine response parsed into the high-level JSON envelope.
+                // 解析到高层 JSON 包络中的稳定引擎响应。
+                let response = engine.create_system_runtime_lease_json(&payload.to_string())?;
+                parse_runtime_session_engine_payload(
+                    response,
+                    "luaskills_ffi_system_runtime_lease_create_json",
+                )
+            }) {
+                Ok(result) => ffi_ok::<Value>(result),
+                Err(error) => ffi_error(error),
             }
-        });
-        // Stable engine response parsed into the high-level JSON envelope.
-        // 解析到高层 JSON 包络中的稳定引擎响应。
-        let response = engine.create_system_runtime_lease_json(&payload.to_string())?;
-        parse_runtime_session_engine_payload(
-            response,
-            "luaskills_ffi_system_runtime_lease_create_json",
-        )
-    }) {
-        Ok(result) => ffi_ok::<Value>(result),
-        Err(error) => ffi_error(error),
-    }
+        },
+    )
 }
 
 /// Evaluate code inside one persistent `system_lua_lib` runtime lease through the system JSON FFI surface.
@@ -1503,55 +1613,57 @@ pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_create_json(
 pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_eval_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<RuntimeSessionEvalJsonRequest>(
-        input_json,
-        "luaskills_ffi_system_runtime_lease_eval_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let _authority = match require_json_authority(
-        request.authority,
-        "luaskills_ffi_system_runtime_lease_eval_json",
-    ) {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        let request_context = request
-            .invocation_context
-            .as_ref()
-            .and_then(|context| context.request_context.clone());
-        let client_budget = request
-            .invocation_context
-            .as_ref()
-            .map(|context| context.client_budget.clone())
-            .unwrap_or_else(default_json_object);
-        let tool_config = request
-            .invocation_context
-            .as_ref()
-            .map(|context| context.tool_config.clone())
-            .unwrap_or_else(default_json_object);
-        let payload = json!({
-            "lease_id": request.lease_id,
-            "sid": request.sid,
-            "generation": request.generation,
-            "code": request.code,
-            "args": request.args,
-            "timeout_ms": request.timeout_ms,
-            "request_context": request_context,
-            "client_budget": client_budget,
-            "tool_config": tool_config
-        });
-        let response = engine.eval_system_runtime_lease_json(&payload.to_string())?;
-        parse_runtime_session_engine_payload(
-            response,
+    ffi_json_boundary("luaskills_ffi_system_runtime_lease_eval_json", move || {
+        let request = match decode_json_request::<RuntimeSessionEvalJsonRequest>(
+            input_json,
             "luaskills_ffi_system_runtime_lease_eval_json",
-        )
-    }) {
-        Ok(result) => ffi_ok::<Value>(result),
-        Err(error) => ffi_error(error),
-    }
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        let _authority = match require_json_authority(
+            request.authority,
+            "luaskills_ffi_system_runtime_lease_eval_json",
+        ) {
+            Ok(authority) => authority,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine(request.engine_id, |engine| {
+            let request_context = request
+                .invocation_context
+                .as_ref()
+                .and_then(|context| context.request_context.clone());
+            let client_budget = request
+                .invocation_context
+                .as_ref()
+                .map(|context| context.client_budget.clone())
+                .unwrap_or_else(default_json_object);
+            let tool_config = request
+                .invocation_context
+                .as_ref()
+                .map(|context| context.tool_config.clone())
+                .unwrap_or_else(default_json_object);
+            let payload = json!({
+                "lease_id": request.lease_id,
+                "sid": request.sid,
+                "generation": request.generation,
+                "code": request.code,
+                "args": request.args,
+                "timeout_ms": request.timeout_ms,
+                "request_context": request_context,
+                "client_budget": client_budget,
+                "tool_config": tool_config
+            });
+            let response = engine.eval_system_runtime_lease_json(&payload.to_string())?;
+            parse_runtime_session_engine_payload(
+                response,
+                "luaskills_ffi_system_runtime_lease_eval_json",
+            )
+        }) {
+            Ok(result) => ffi_ok::<Value>(result),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Return one persistent `system_lua_lib` runtime lease status through the system JSON FFI surface.
@@ -1566,35 +1678,40 @@ pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_eval_json(
 pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_status_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<RuntimeSessionLeaseJsonRequest>(
-        input_json,
+    ffi_json_boundary(
         "luaskills_ffi_system_runtime_lease_status_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let _authority = match require_json_authority(
-        request.authority,
-        "luaskills_ffi_system_runtime_lease_status_json",
-    ) {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        let payload = json!({
-            "lease_id": request.lease_id,
-            "sid": request.sid,
-            "generation": request.generation
-        });
-        let response = engine.system_runtime_lease_status_json(&payload.to_string())?;
-        parse_runtime_session_engine_payload(
-            response,
-            "luaskills_ffi_system_runtime_lease_status_json",
-        )
-    }) {
-        Ok(result) => ffi_ok::<Value>(result),
-        Err(error) => ffi_error(error),
-    }
+        move || {
+            let request = match decode_json_request::<RuntimeSessionLeaseJsonRequest>(
+                input_json,
+                "luaskills_ffi_system_runtime_lease_status_json",
+            ) {
+                Ok(request) => request,
+                Err(error) => return ffi_error(error),
+            };
+            let _authority = match require_json_authority(
+                request.authority,
+                "luaskills_ffi_system_runtime_lease_status_json",
+            ) {
+                Ok(authority) => authority,
+                Err(error) => return ffi_error(error),
+            };
+            match with_engine(request.engine_id, |engine| {
+                let payload = json!({
+                    "lease_id": request.lease_id,
+                    "sid": request.sid,
+                    "generation": request.generation
+                });
+                let response = engine.system_runtime_lease_status_json(&payload.to_string())?;
+                parse_runtime_session_engine_payload(
+                    response,
+                    "luaskills_ffi_system_runtime_lease_status_json",
+                )
+            }) {
+                Ok(result) => ffi_ok::<Value>(result),
+                Err(error) => ffi_error(error),
+            }
+        },
+    )
 }
 
 /// List active persistent `system_lua_lib` runtime leases through the system JSON FFI surface.
@@ -1609,31 +1726,33 @@ pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_status_json(
 pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_list_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<RuntimeSessionListJsonRequest>(
-        input_json,
-        "luaskills_ffi_system_runtime_lease_list_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let _authority = match require_json_authority(
-        request.authority,
-        "luaskills_ffi_system_runtime_lease_list_json",
-    ) {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        let payload = json!({ "sid": request.sid });
-        let response = engine.list_system_runtime_leases_json(&payload.to_string())?;
-        parse_runtime_session_engine_payload(
-            response,
+    ffi_json_boundary("luaskills_ffi_system_runtime_lease_list_json", move || {
+        let request = match decode_json_request::<RuntimeSessionListJsonRequest>(
+            input_json,
             "luaskills_ffi_system_runtime_lease_list_json",
-        )
-    }) {
-        Ok(result) => ffi_ok::<Value>(result),
-        Err(error) => ffi_error(error),
-    }
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        let _authority = match require_json_authority(
+            request.authority,
+            "luaskills_ffi_system_runtime_lease_list_json",
+        ) {
+            Ok(authority) => authority,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine(request.engine_id, |engine| {
+            let payload = json!({ "sid": request.sid });
+            let response = engine.list_system_runtime_leases_json(&payload.to_string())?;
+            parse_runtime_session_engine_payload(
+                response,
+                "luaskills_ffi_system_runtime_lease_list_json",
+            )
+        }) {
+            Ok(result) => ffi_ok::<Value>(result),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Close one persistent `system_lua_lib` runtime lease through the system JSON FFI surface.
@@ -1648,35 +1767,37 @@ pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_list_json(
 pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_close_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<RuntimeSessionLeaseJsonRequest>(
-        input_json,
-        "luaskills_ffi_system_runtime_lease_close_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let _authority = match require_json_authority(
-        request.authority,
-        "luaskills_ffi_system_runtime_lease_close_json",
-    ) {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        let payload = json!({
-            "lease_id": request.lease_id,
-            "sid": request.sid,
-            "generation": request.generation
-        });
-        let response = engine.close_system_runtime_lease_json(&payload.to_string())?;
-        parse_runtime_session_engine_payload(
-            response,
+    ffi_json_boundary("luaskills_ffi_system_runtime_lease_close_json", move || {
+        let request = match decode_json_request::<RuntimeSessionLeaseJsonRequest>(
+            input_json,
             "luaskills_ffi_system_runtime_lease_close_json",
-        )
-    }) {
-        Ok(result) => ffi_ok::<Value>(result),
-        Err(error) => ffi_error(error),
-    }
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        let _authority = match require_json_authority(
+            request.authority,
+            "luaskills_ffi_system_runtime_lease_close_json",
+        ) {
+            Ok(authority) => authority,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine(request.engine_id, |engine| {
+            let payload = json!({
+                "lease_id": request.lease_id,
+                "sid": request.sid,
+                "generation": request.generation
+            });
+            let response = engine.close_system_runtime_lease_json(&payload.to_string())?;
+            parse_runtime_session_engine_payload(
+                response,
+                "luaskills_ffi_system_runtime_lease_close_json",
+            )
+        }) {
+            Ok(result) => ffi_ok::<Value>(result),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Poll one bounded batch of engine-level managed-session events through the JSON FFI surface.
@@ -1698,34 +1819,39 @@ pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_close_json(
 pub unsafe extern "C" fn luaskills_ffi_managed_session_events_poll_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    // Strict request decoded before the engine event center is acquired.
-    // 在获取引擎事件中心前解码的严格请求。
-    let request = match decode_json_request::<ManagedSessionEventsPollJsonRequest>(
-        input_json,
+    ffi_json_boundary(
         "luaskills_ffi_managed_session_events_poll_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    // Explicit authority gate for host-level process event visibility.
-    // 面向宿主级进程事件可见性的显式权限门禁。
-    let _authority = match require_json_authority(
-        request.authority,
-        "luaskills_ffi_managed_session_events_poll_json",
-    ) {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error(error),
-    };
-    // Detached center cloned while only the registry lock is held briefly; the engine lock is untouched.
-    // 仅在短暂持有注册表锁期间克隆分离式事件中心，不触碰引擎锁。
-    let event_center = match clone_managed_session_event_center(request.engine_id) {
-        Ok(event_center) => event_center,
-        Err(error) => return ffi_error(error),
-    };
-    match event_center.poll(request.max_events) {
-        Ok(batch) => ffi_ok(batch),
-        Err(error) => ffi_error(error),
-    }
+        move || {
+            // Strict request decoded before the engine event center is acquired.
+            // 在获取引擎事件中心前解码的严格请求。
+            let request = match decode_json_request::<ManagedSessionEventsPollJsonRequest>(
+                input_json,
+                "luaskills_ffi_managed_session_events_poll_json",
+            ) {
+                Ok(request) => request,
+                Err(error) => return ffi_error(error),
+            };
+            // Explicit authority gate for host-level process event visibility.
+            // 面向宿主级进程事件可见性的显式权限门禁。
+            let _authority = match require_json_authority(
+                request.authority,
+                "luaskills_ffi_managed_session_events_poll_json",
+            ) {
+                Ok(authority) => authority,
+                Err(error) => return ffi_error(error),
+            };
+            // Detached center cloned while only the registry lock is held briefly; the engine lock is untouched.
+            // 仅在短暂持有注册表锁期间克隆分离式事件中心，不触碰引擎锁。
+            let event_center = match clone_managed_session_event_center(request.engine_id) {
+                Ok(event_center) => event_center,
+                Err(error) => return ffi_error(error),
+            };
+            match event_center.poll(request.max_events) {
+                Ok(batch) => ffi_ok(batch),
+                Err(error) => ffi_error(error),
+            }
+        },
+    )
 }
 
 /// Wait for one bounded batch of engine-level managed-session events through the JSON FFI surface.
@@ -1747,34 +1873,39 @@ pub unsafe extern "C" fn luaskills_ffi_managed_session_events_poll_json(
 pub unsafe extern "C" fn luaskills_ffi_managed_session_events_wait_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    // Strict request decoded before any potentially blocking work begins.
-    // 在任何潜在阻塞工作开始前解码的严格请求。
-    let request = match decode_json_request::<ManagedSessionEventsWaitJsonRequest>(
-        input_json,
+    ffi_json_boundary(
         "luaskills_ffi_managed_session_events_wait_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    // Explicit authority gate for host-level process event visibility.
-    // 面向宿主级进程事件可见性的显式权限门禁。
-    let _authority = match require_json_authority(
-        request.authority,
-        "luaskills_ffi_managed_session_events_wait_json",
-    ) {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error(error),
-    };
-    // Detached center cloned before blocking so no registry or engine lock survives into wait.
-    // 在阻塞前克隆分离式事件中心，确保注册表锁与引擎锁都不会进入等待阶段。
-    let event_center = match clone_managed_session_event_center(request.engine_id) {
-        Ok(event_center) => event_center,
-        Err(error) => return ffi_error(error),
-    };
-    match event_center.wait(request.max_events, request.timeout_ms) {
-        Ok(batch) => ffi_ok(batch),
-        Err(error) => ffi_error(error),
-    }
+        move || {
+            // Strict request decoded before any potentially blocking work begins.
+            // 在任何潜在阻塞工作开始前解码的严格请求。
+            let request = match decode_json_request::<ManagedSessionEventsWaitJsonRequest>(
+                input_json,
+                "luaskills_ffi_managed_session_events_wait_json",
+            ) {
+                Ok(request) => request,
+                Err(error) => return ffi_error(error),
+            };
+            // Explicit authority gate for host-level process event visibility.
+            // 面向宿主级进程事件可见性的显式权限门禁。
+            let _authority = match require_json_authority(
+                request.authority,
+                "luaskills_ffi_managed_session_events_wait_json",
+            ) {
+                Ok(authority) => authority,
+                Err(error) => return ffi_error(error),
+            };
+            // Detached center cloned before blocking so no registry or engine lock survives into wait.
+            // 在阻塞前克隆分离式事件中心，确保注册表锁与引擎锁都不会进入等待阶段。
+            let event_center = match clone_managed_session_event_center(request.engine_id) {
+                Ok(event_center) => event_center,
+                Err(error) => return ffi_error(error),
+            };
+            match event_center.wait(request.max_events, request.timeout_ms) {
+                Ok(batch) => ffi_ok(batch),
+                Err(error) => ffi_error(error),
+            }
+        },
+    )
 }
 
 /// Disable one skill through the ordinary skills plane via the JSON FFI surface.
@@ -1789,25 +1920,27 @@ pub unsafe extern "C" fn luaskills_ffi_managed_session_events_wait_json(
 pub unsafe extern "C" fn luaskills_ffi_disable_skill_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<DisableSkillJsonRequest>(
-        input_json,
-        "luaskills_ffi_disable_skill_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine_mut(request.engine_id, |engine| {
-        engine
-            .disable_skill_in_roots(
-                &request.skill_roots,
-                &request.skill_id,
-                request.reason.as_deref(),
-            )
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(()) => ffi_ok(json!({ "disabled": true })),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_disable_skill_json", move || {
+        let request = match decode_json_request::<DisableSkillJsonRequest>(
+            input_json,
+            "luaskills_ffi_disable_skill_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine_mut(request.engine_id, |engine| {
+            engine
+                .disable_skill_in_roots(
+                    &request.skill_roots,
+                    &request.skill_id,
+                    request.reason.as_deref(),
+                )
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(()) => ffi_ok(json!({ "disabled": true })),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Disable one skill through the system plane via the JSON FFI surface.
@@ -1822,33 +1955,35 @@ pub unsafe extern "C" fn luaskills_ffi_disable_skill_json(
 pub unsafe extern "C" fn luaskills_ffi_system_disable_skill_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<DisableSkillJsonRequest>(
-        input_json,
-        "luaskills_ffi_system_disable_skill_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let authority = match require_json_authority(
-        request.authority,
-        "luaskills_ffi_system_disable_skill_json",
-    ) {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine_mut(request.engine_id, |engine| {
-        engine
-            .system_disable_skill_in_roots(
-                &request.skill_roots,
-                authority,
-                &request.skill_id,
-                request.reason.as_deref(),
-            )
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(()) => ffi_ok(json!({ "disabled": true })),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_system_disable_skill_json", move || {
+        let request = match decode_json_request::<DisableSkillJsonRequest>(
+            input_json,
+            "luaskills_ffi_system_disable_skill_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        let authority = match require_json_authority(
+            request.authority,
+            "luaskills_ffi_system_disable_skill_json",
+        ) {
+            Ok(authority) => authority,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine_mut(request.engine_id, |engine| {
+            engine
+                .system_disable_skill_in_roots(
+                    &request.skill_roots,
+                    authority,
+                    &request.skill_id,
+                    request.reason.as_deref(),
+                )
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(()) => ffi_ok(json!({ "disabled": true })),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Enable one skill through the ordinary skills plane via the JSON FFI surface.
@@ -1863,21 +1998,23 @@ pub unsafe extern "C" fn luaskills_ffi_system_disable_skill_json(
 pub unsafe extern "C" fn luaskills_ffi_enable_skill_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<EnableSkillJsonRequest>(
-        input_json,
-        "luaskills_ffi_enable_skill_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine_mut(request.engine_id, |engine| {
-        engine
-            .enable_skill(&request.skill_roots, &request.skill_id)
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(()) => ffi_ok(json!({ "enabled": true })),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_enable_skill_json", move || {
+        let request = match decode_json_request::<EnableSkillJsonRequest>(
+            input_json,
+            "luaskills_ffi_enable_skill_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine_mut(request.engine_id, |engine| {
+            engine
+                .enable_skill(&request.skill_roots, &request.skill_id)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(()) => ffi_ok(json!({ "enabled": true })),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Enable one skill through the system plane via the JSON FFI surface.
@@ -1892,26 +2029,30 @@ pub unsafe extern "C" fn luaskills_ffi_enable_skill_json(
 pub unsafe extern "C" fn luaskills_ffi_system_enable_skill_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<EnableSkillJsonRequest>(
-        input_json,
-        "luaskills_ffi_system_enable_skill_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let authority =
-        match require_json_authority(request.authority, "luaskills_ffi_system_enable_skill_json") {
+    ffi_json_boundary("luaskills_ffi_system_enable_skill_json", move || {
+        let request = match decode_json_request::<EnableSkillJsonRequest>(
+            input_json,
+            "luaskills_ffi_system_enable_skill_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        let authority = match require_json_authority(
+            request.authority,
+            "luaskills_ffi_system_enable_skill_json",
+        ) {
             Ok(authority) => authority,
             Err(error) => return ffi_error(error),
         };
-    match with_engine_mut(request.engine_id, |engine| {
-        engine
-            .system_enable_skill(&request.skill_roots, authority, &request.skill_id)
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(()) => ffi_ok(json!({ "enabled": true })),
-        Err(error) => ffi_error(error),
-    }
+        match with_engine_mut(request.engine_id, |engine| {
+            engine
+                .system_enable_skill(&request.skill_roots, authority, &request.skill_id)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(()) => ffi_ok(json!({ "enabled": true })),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Uninstall one skill through the ordinary skills plane via the JSON FFI surface.
@@ -1926,27 +2067,29 @@ pub unsafe extern "C" fn luaskills_ffi_system_enable_skill_json(
 pub unsafe extern "C" fn luaskills_ffi_uninstall_skill_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<UninstallSkillJsonRequest>(
-        input_json,
-        "luaskills_ffi_uninstall_skill_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine_mut(request.engine_id, |engine| {
-        if let Some(target_root) = request.target_root.as_ref() {
-            engine
-                .uninstall_skill_in_root(&request.skill_roots, target_root, &request.skill_id)
-                .map_err(|error| error.to_string())
-        } else {
-            engine
-                .uninstall_skill(&request.skill_roots, &request.skill_id)
-                .map_err(|error| error.to_string())
+    ffi_json_boundary("luaskills_ffi_uninstall_skill_json", move || {
+        let request = match decode_json_request::<UninstallSkillJsonRequest>(
+            input_json,
+            "luaskills_ffi_uninstall_skill_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine_mut(request.engine_id, |engine| {
+            if let Some(target_root) = request.target_root.as_ref() {
+                engine
+                    .uninstall_skill_in_root(&request.skill_roots, target_root, &request.skill_id)
+                    .map_err(|error| error.to_string())
+            } else {
+                engine
+                    .uninstall_skill(&request.skill_roots, &request.skill_id)
+                    .map_err(|error| error.to_string())
+            }
+        }) {
+            Ok(result) => ffi_ok::<SkillUninstallResult>(result),
+            Err(error) => ffi_error(error),
         }
-    }) {
-        Ok(result) => ffi_ok::<SkillUninstallResult>(result),
-        Err(error) => ffi_error(error),
-    }
+    })
 }
 
 /// Uninstall one skill through the system plane via the JSON FFI surface.
@@ -1961,39 +2104,41 @@ pub unsafe extern "C" fn luaskills_ffi_uninstall_skill_json(
 pub unsafe extern "C" fn luaskills_ffi_system_uninstall_skill_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<UninstallSkillJsonRequest>(
-        input_json,
-        "luaskills_ffi_system_uninstall_skill_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let authority = match require_json_authority(
-        request.authority,
-        "luaskills_ffi_system_uninstall_skill_json",
-    ) {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine_mut(request.engine_id, |engine| {
-        if let Some(target_root) = request.target_root.as_ref() {
-            engine
-                .system_uninstall_skill_in_root(
-                    &request.skill_roots,
-                    target_root,
-                    authority,
-                    &request.skill_id,
-                )
-                .map_err(|error| error.to_string())
-        } else {
-            engine
-                .system_uninstall_skill(&request.skill_roots, authority, &request.skill_id)
-                .map_err(|error| error.to_string())
+    ffi_json_boundary("luaskills_ffi_system_uninstall_skill_json", move || {
+        let request = match decode_json_request::<UninstallSkillJsonRequest>(
+            input_json,
+            "luaskills_ffi_system_uninstall_skill_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        let authority = match require_json_authority(
+            request.authority,
+            "luaskills_ffi_system_uninstall_skill_json",
+        ) {
+            Ok(authority) => authority,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine_mut(request.engine_id, |engine| {
+            if let Some(target_root) = request.target_root.as_ref() {
+                engine
+                    .system_uninstall_skill_in_root(
+                        &request.skill_roots,
+                        target_root,
+                        authority,
+                        &request.skill_id,
+                    )
+                    .map_err(|error| error.to_string())
+            } else {
+                engine
+                    .system_uninstall_skill(&request.skill_roots, authority, &request.skill_id)
+                    .map_err(|error| error.to_string())
+            }
+        }) {
+            Ok(result) => ffi_ok::<SkillUninstallResult>(result),
+            Err(error) => ffi_error(error),
         }
-    }) {
-        Ok(result) => ffi_ok::<SkillUninstallResult>(result),
-        Err(error) => ffi_error(error),
-    }
+    })
 }
 
 /// Install one managed skill through the ordinary skills plane via the JSON FFI surface.
@@ -2008,27 +2153,29 @@ pub unsafe extern "C" fn luaskills_ffi_system_uninstall_skill_json(
 pub unsafe extern "C" fn luaskills_ffi_install_skill_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<ApplySkillJsonRequest>(
-        input_json,
-        "luaskills_ffi_install_skill_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine_mut(request.engine_id, |engine| {
-        if let Some(target_root) = request.target_root.as_ref() {
-            engine
-                .install_skill_in_root(&request.skill_roots, target_root, &request.request)
-                .map_err(|error| error.to_string())
-        } else {
-            engine
-                .install_skill(&request.skill_roots, &request.request)
-                .map_err(|error| error.to_string())
+    ffi_json_boundary("luaskills_ffi_install_skill_json", move || {
+        let request = match decode_json_request::<ApplySkillJsonRequest>(
+            input_json,
+            "luaskills_ffi_install_skill_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine_mut(request.engine_id, |engine| {
+            if let Some(target_root) = request.target_root.as_ref() {
+                engine
+                    .install_skill_in_root(&request.skill_roots, target_root, &request.request)
+                    .map_err(|error| error.to_string())
+            } else {
+                engine
+                    .install_skill(&request.skill_roots, &request.request)
+                    .map_err(|error| error.to_string())
+            }
+        }) {
+            Ok(result) => ffi_ok::<SkillApplyResult>(result),
+            Err(error) => ffi_error(error),
         }
-    }) {
-        Ok(result) => ffi_ok::<SkillApplyResult>(result),
-        Err(error) => ffi_error(error),
-    }
+    })
 }
 
 /// Install one managed skill through the system plane via the JSON FFI surface.
@@ -2043,39 +2190,41 @@ pub unsafe extern "C" fn luaskills_ffi_install_skill_json(
 pub unsafe extern "C" fn luaskills_ffi_system_install_skill_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<ApplySkillJsonRequest>(
-        input_json,
-        "luaskills_ffi_system_install_skill_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let authority = match require_json_authority(
-        request.authority,
-        "luaskills_ffi_system_install_skill_json",
-    ) {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine_mut(request.engine_id, |engine| {
-        if let Some(target_root) = request.target_root.as_ref() {
-            engine
-                .system_install_skill_in_root(
-                    &request.skill_roots,
-                    target_root,
-                    authority,
-                    &request.request,
-                )
-                .map_err(|error| error.to_string())
-        } else {
-            engine
-                .system_install_skill(&request.skill_roots, authority, &request.request)
-                .map_err(|error| error.to_string())
+    ffi_json_boundary("luaskills_ffi_system_install_skill_json", move || {
+        let request = match decode_json_request::<ApplySkillJsonRequest>(
+            input_json,
+            "luaskills_ffi_system_install_skill_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        let authority = match require_json_authority(
+            request.authority,
+            "luaskills_ffi_system_install_skill_json",
+        ) {
+            Ok(authority) => authority,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine_mut(request.engine_id, |engine| {
+            if let Some(target_root) = request.target_root.as_ref() {
+                engine
+                    .system_install_skill_in_root(
+                        &request.skill_roots,
+                        target_root,
+                        authority,
+                        &request.request,
+                    )
+                    .map_err(|error| error.to_string())
+            } else {
+                engine
+                    .system_install_skill(&request.skill_roots, authority, &request.request)
+                    .map_err(|error| error.to_string())
+            }
+        }) {
+            Ok(result) => ffi_ok::<SkillApplyResult>(result),
+            Err(error) => ffi_error(error),
         }
-    }) {
-        Ok(result) => ffi_ok::<SkillApplyResult>(result),
-        Err(error) => ffi_error(error),
-    }
+    })
 }
 
 /// Install one private URL-manifest skill through a host-private system JSON FFI surface.
@@ -2090,45 +2239,50 @@ pub unsafe extern "C" fn luaskills_ffi_system_install_skill_json(
 pub unsafe extern "C" fn luaskills_ffi_system_private_install_skill_from_url_manifest_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<PrivateUrlManifestSkillJsonRequest>(
-        input_json,
+    ffi_json_boundary(
         "luaskills_ffi_system_private_install_skill_from_url_manifest_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let authority = match require_system_json_authority(
-        request.authority,
-        "luaskills_ffi_system_private_install_skill_from_url_manifest_json",
-    ) {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error(error),
-    };
-    let install_request = SkillInstallRequest {
-        skill_id: Some(request.skill_id),
-        source: Some(request.manifest_url),
-        source_type: SkillInstallSourceType::PrivateUrlManifest,
-        replace_source: false,
-    };
-    match with_engine_mut(request.engine_id, |engine| {
-        if let Some(target_root) = request.target_root.as_ref() {
-            engine
-                .system_install_skill_in_root(
-                    &request.skill_roots,
-                    target_root,
-                    authority,
-                    &install_request,
-                )
-                .map_err(|error| error.to_string())
-        } else {
-            engine
-                .system_install_skill(&request.skill_roots, authority, &install_request)
-                .map_err(|error| error.to_string())
-        }
-    }) {
-        Ok(result) => ffi_ok::<SkillApplyResult>(result),
-        Err(error) => ffi_error(error),
-    }
+        move || {
+            let request = match decode_json_request::<PrivateUrlManifestSkillJsonRequest>(
+                input_json,
+                "luaskills_ffi_system_private_install_skill_from_url_manifest_json",
+            ) {
+                Ok(request) => request,
+                Err(error) => return ffi_error(error),
+            };
+            let authority = match require_system_json_authority(
+                request.authority,
+                "luaskills_ffi_system_private_install_skill_from_url_manifest_json",
+            ) {
+                Ok(authority) => authority,
+                Err(error) => return ffi_error(error),
+            };
+            let install_request = SkillInstallRequest {
+                skill_id: Some(request.skill_id),
+                source: Some(request.manifest_url),
+                source_type: SkillInstallSourceType::PrivateUrlManifest,
+                replace_source: false,
+            };
+            match with_engine_mut(request.engine_id, |engine| {
+                if let Some(target_root) = request.target_root.as_ref() {
+                    engine
+                        .system_install_skill_in_root(
+                            &request.skill_roots,
+                            target_root,
+                            authority,
+                            &install_request,
+                        )
+                        .map_err(|error| error.to_string())
+                } else {
+                    engine
+                        .system_install_skill(&request.skill_roots, authority, &install_request)
+                        .map_err(|error| error.to_string())
+                }
+            }) {
+                Ok(result) => ffi_ok::<SkillApplyResult>(result),
+                Err(error) => ffi_error(error),
+            }
+        },
+    )
 }
 
 /// Update one managed skill through the ordinary skills plane via the JSON FFI surface.
@@ -2143,27 +2297,29 @@ pub unsafe extern "C" fn luaskills_ffi_system_private_install_skill_from_url_man
 pub unsafe extern "C" fn luaskills_ffi_update_skill_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<ApplySkillJsonRequest>(
-        input_json,
-        "luaskills_ffi_update_skill_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine_mut(request.engine_id, |engine| {
-        if let Some(target_root) = request.target_root.as_ref() {
-            engine
-                .update_skill_in_root(&request.skill_roots, target_root, &request.request)
-                .map_err(|error| error.to_string())
-        } else {
-            engine
-                .update_skill(&request.skill_roots, &request.request)
-                .map_err(|error| error.to_string())
+    ffi_json_boundary("luaskills_ffi_update_skill_json", move || {
+        let request = match decode_json_request::<ApplySkillJsonRequest>(
+            input_json,
+            "luaskills_ffi_update_skill_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine_mut(request.engine_id, |engine| {
+            if let Some(target_root) = request.target_root.as_ref() {
+                engine
+                    .update_skill_in_root(&request.skill_roots, target_root, &request.request)
+                    .map_err(|error| error.to_string())
+            } else {
+                engine
+                    .update_skill(&request.skill_roots, &request.request)
+                    .map_err(|error| error.to_string())
+            }
+        }) {
+            Ok(result) => ffi_ok::<SkillApplyResult>(result),
+            Err(error) => ffi_error(error),
         }
-    }) {
-        Ok(result) => ffi_ok::<SkillApplyResult>(result),
-        Err(error) => ffi_error(error),
-    }
+    })
 }
 
 /// Update one managed skill through the system plane via the JSON FFI surface.
@@ -2178,37 +2334,41 @@ pub unsafe extern "C" fn luaskills_ffi_update_skill_json(
 pub unsafe extern "C" fn luaskills_ffi_system_update_skill_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<ApplySkillJsonRequest>(
-        input_json,
-        "luaskills_ffi_system_update_skill_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let authority =
-        match require_json_authority(request.authority, "luaskills_ffi_system_update_skill_json") {
+    ffi_json_boundary("luaskills_ffi_system_update_skill_json", move || {
+        let request = match decode_json_request::<ApplySkillJsonRequest>(
+            input_json,
+            "luaskills_ffi_system_update_skill_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        let authority = match require_json_authority(
+            request.authority,
+            "luaskills_ffi_system_update_skill_json",
+        ) {
             Ok(authority) => authority,
             Err(error) => return ffi_error(error),
         };
-    match with_engine_mut(request.engine_id, |engine| {
-        if let Some(target_root) = request.target_root.as_ref() {
-            engine
-                .system_update_skill_in_root(
-                    &request.skill_roots,
-                    target_root,
-                    authority,
-                    &request.request,
-                )
-                .map_err(|error| error.to_string())
-        } else {
-            engine
-                .system_update_skill(&request.skill_roots, authority, &request.request)
-                .map_err(|error| error.to_string())
+        match with_engine_mut(request.engine_id, |engine| {
+            if let Some(target_root) = request.target_root.as_ref() {
+                engine
+                    .system_update_skill_in_root(
+                        &request.skill_roots,
+                        target_root,
+                        authority,
+                        &request.request,
+                    )
+                    .map_err(|error| error.to_string())
+            } else {
+                engine
+                    .system_update_skill(&request.skill_roots, authority, &request.request)
+                    .map_err(|error| error.to_string())
+            }
+        }) {
+            Ok(result) => ffi_ok::<SkillApplyResult>(result),
+            Err(error) => ffi_error(error),
         }
-    }) {
-        Ok(result) => ffi_ok::<SkillApplyResult>(result),
-        Err(error) => ffi_error(error),
-    }
+    })
 }
 
 /// Update one private URL-manifest skill through a host-private system JSON FFI surface.
@@ -2223,45 +2383,50 @@ pub unsafe extern "C" fn luaskills_ffi_system_update_skill_json(
 pub unsafe extern "C" fn luaskills_ffi_system_private_update_skill_from_url_manifest_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<PrivateUrlManifestSkillJsonRequest>(
-        input_json,
+    ffi_json_boundary(
         "luaskills_ffi_system_private_update_skill_from_url_manifest_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let authority = match require_system_json_authority(
-        request.authority,
-        "luaskills_ffi_system_private_update_skill_from_url_manifest_json",
-    ) {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error(error),
-    };
-    let update_request = SkillInstallRequest {
-        skill_id: Some(request.skill_id),
-        source: Some(request.manifest_url),
-        source_type: SkillInstallSourceType::PrivateUrlManifest,
-        replace_source: false,
-    };
-    match with_engine_mut(request.engine_id, |engine| {
-        if let Some(target_root) = request.target_root.as_ref() {
-            engine
-                .system_update_skill_in_root(
-                    &request.skill_roots,
-                    target_root,
-                    authority,
-                    &update_request,
-                )
-                .map_err(|error| error.to_string())
-        } else {
-            engine
-                .system_update_skill(&request.skill_roots, authority, &update_request)
-                .map_err(|error| error.to_string())
-        }
-    }) {
-        Ok(result) => ffi_ok::<SkillApplyResult>(result),
-        Err(error) => ffi_error(error),
-    }
+        move || {
+            let request = match decode_json_request::<PrivateUrlManifestSkillJsonRequest>(
+                input_json,
+                "luaskills_ffi_system_private_update_skill_from_url_manifest_json",
+            ) {
+                Ok(request) => request,
+                Err(error) => return ffi_error(error),
+            };
+            let authority = match require_system_json_authority(
+                request.authority,
+                "luaskills_ffi_system_private_update_skill_from_url_manifest_json",
+            ) {
+                Ok(authority) => authority,
+                Err(error) => return ffi_error(error),
+            };
+            let update_request = SkillInstallRequest {
+                skill_id: Some(request.skill_id),
+                source: Some(request.manifest_url),
+                source_type: SkillInstallSourceType::PrivateUrlManifest,
+                replace_source: false,
+            };
+            match with_engine_mut(request.engine_id, |engine| {
+                if let Some(target_root) = request.target_root.as_ref() {
+                    engine
+                        .system_update_skill_in_root(
+                            &request.skill_roots,
+                            target_root,
+                            authority,
+                            &update_request,
+                        )
+                        .map_err(|error| error.to_string())
+                } else {
+                    engine
+                        .system_update_skill(&request.skill_roots, authority, &update_request)
+                        .map_err(|error| error.to_string())
+                }
+            }) {
+                Ok(result) => ffi_ok::<SkillApplyResult>(result),
+                Err(error) => ffi_error(error),
+            }
+        },
+    )
 }
 
 /// Check managed skills of one PROJECT or USER root for newer versions via the JSON FFI surface.
@@ -2276,25 +2441,27 @@ pub unsafe extern "C" fn luaskills_ffi_system_private_update_skill_from_url_mani
 pub unsafe extern "C" fn luaskills_ffi_check_skill_updates_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<CheckSkillUpdatesJsonRequest>(
-        input_json,
-        "luaskills_ffi_check_skill_updates_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        engine
-            .check_skill_updates_in_root(
-                &request.skill_roots,
-                &request.target_root,
-                request.skill_ids.as_deref(),
-            )
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(result) => ffi_ok::<Vec<SkillUpdateCheck>>(result),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_check_skill_updates_json", move || {
+        let request = match decode_json_request::<CheckSkillUpdatesJsonRequest>(
+            input_json,
+            "luaskills_ffi_check_skill_updates_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine(request.engine_id, |engine| {
+            engine
+                .check_skill_updates_in_root(
+                    &request.skill_roots,
+                    &request.target_root,
+                    request.skill_ids.as_deref(),
+                )
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(result) => ffi_ok::<Vec<SkillUpdateCheck>>(result),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Check managed skills of one root for newer versions through the system plane via the JSON FFI surface.
@@ -2309,33 +2476,35 @@ pub unsafe extern "C" fn luaskills_ffi_check_skill_updates_json(
 pub unsafe extern "C" fn luaskills_ffi_system_check_skill_updates_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<CheckSkillUpdatesJsonRequest>(
-        input_json,
-        "luaskills_ffi_system_check_skill_updates_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    let authority = match require_json_authority(
-        request.authority,
-        "luaskills_ffi_system_check_skill_updates_json",
-    ) {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine(request.engine_id, |engine| {
-        engine
-            .system_check_skill_updates_in_root(
-                &request.skill_roots,
-                &request.target_root,
-                authority,
-                request.skill_ids.as_deref(),
-            )
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(result) => ffi_ok::<Vec<SkillUpdateCheck>>(result),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_system_check_skill_updates_json", move || {
+        let request = match decode_json_request::<CheckSkillUpdatesJsonRequest>(
+            input_json,
+            "luaskills_ffi_system_check_skill_updates_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        let authority = match require_json_authority(
+            request.authority,
+            "luaskills_ffi_system_check_skill_updates_json",
+        ) {
+            Ok(authority) => authority,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine(request.engine_id, |engine| {
+            engine
+                .system_check_skill_updates_in_root(
+                    &request.skill_roots,
+                    &request.target_root,
+                    authority,
+                    request.skill_ids.as_deref(),
+                )
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(result) => ffi_ok::<Vec<SkillUpdateCheck>>(result),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Replace the network policy of one engine; later installs, updates and downloads use it.
@@ -2353,27 +2522,31 @@ pub unsafe extern "C" fn luaskills_ffi_system_check_skill_updates_json(
 pub unsafe extern "C" fn luaskills_ffi_set_network_options_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<SetNetworkOptionsJsonRequest>(
-        input_json,
-        "luaskills_ffi_set_network_options_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match with_engine_mut(request.engine_id, |engine| {
-        engine.set_network_options(request.network);
-        Ok(())
-    }) {
-        Ok(()) => ffi_ok(json!({ "updated": true })),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_set_network_options_json", move || {
+        let request = match decode_json_request::<SetNetworkOptionsJsonRequest>(
+            input_json,
+            "luaskills_ffi_set_network_options_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match with_engine_mut(request.engine_id, |engine| {
+            engine.set_network_options(request.network);
+            Ok(())
+        }) {
+            Ok(()) => ffi_ok(json!({ "updated": true })),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Return the built-in GitHub release download mirror catalog.
 /// 返回内置 GitHub Release 下载镜像目录。
 #[unsafe(no_mangle)]
 pub extern "C" fn luaskills_ffi_github_mirror_catalog_json() -> FfiOwnedBuffer {
-    ffi_ok::<Vec<LuaRuntimeGithubMirror>>(builtin_github_mirrors())
+    ffi_json_boundary("luaskills_ffi_github_mirror_catalog_json", move || {
+        ffi_ok::<Vec<LuaRuntimeGithubMirror>>(builtin_github_mirrors())
+    })
 }
 
 /// Normalize one user-entered mirror URL into a base that replaces `https://github.com`.
@@ -2388,17 +2561,19 @@ pub extern "C" fn luaskills_ffi_github_mirror_catalog_json() -> FfiOwnedBuffer {
 pub unsafe extern "C" fn luaskills_ffi_normalize_github_mirror_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<NormalizeGithubMirrorJsonRequest>(
-        input_json,
-        "luaskills_ffi_normalize_github_mirror_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match normalize_github_mirror_base_url(&request.url) {
-        Ok(github_base_url) => ffi_ok(json!({ "github_base_url": github_base_url })),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_normalize_github_mirror_json", move || {
+        let request = match decode_json_request::<NormalizeGithubMirrorJsonRequest>(
+            input_json,
+            "luaskills_ffi_normalize_github_mirror_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match normalize_github_mirror_base_url(&request.url) {
+            Ok(github_base_url) => ffi_ok(json!({ "github_base_url": github_base_url })),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 /// Probe several GitHub release download mirrors in parallel and report their speed.
@@ -2413,17 +2588,19 @@ pub unsafe extern "C" fn luaskills_ffi_normalize_github_mirror_json(
 pub unsafe extern "C" fn luaskills_ffi_probe_github_mirrors_json(
     input_json: FfiBorrowedBuffer,
 ) -> FfiOwnedBuffer {
-    let request = match decode_json_request::<LuaRuntimeGithubMirrorProbeRequest>(
-        input_json,
-        "luaskills_ffi_probe_github_mirrors_json",
-    ) {
-        Ok(request) => request,
-        Err(error) => return ffi_error(error),
-    };
-    match probe_github_mirrors(&request) {
-        Ok(results) => ffi_ok::<Vec<LuaRuntimeGithubMirrorProbeResult>>(results),
-        Err(error) => ffi_error(error),
-    }
+    ffi_json_boundary("luaskills_ffi_probe_github_mirrors_json", move || {
+        let request = match decode_json_request::<LuaRuntimeGithubMirrorProbeRequest>(
+            input_json,
+            "luaskills_ffi_probe_github_mirrors_json",
+        ) {
+            Ok(request) => request,
+            Err(error) => return ffi_error(error),
+        };
+        match probe_github_mirrors(&request) {
+            Ok(results) => ffi_ok::<Vec<LuaRuntimeGithubMirrorProbeResult>>(results),
+            Err(error) => ffi_error(error),
+        }
+    })
 }
 
 #[cfg(test)]

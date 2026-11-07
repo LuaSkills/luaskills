@@ -12,6 +12,7 @@ pub mod entry;
 pub(crate) mod file_system;
 pub(crate) mod file_watcher;
 pub mod help;
+pub(crate) mod json_limits;
 pub mod logging;
 /// Native LuaJIT allocation and exclusive state ownership.
 /// 原生 LuaJIT 分配与独占状态所有权。

@@ -913,3 +913,59 @@ fn lua_quote(value: &str) -> String {
 fn lua_path_literal(path: &Path) -> String {
     lua_quote(&render_host_visible_path(path))
 }
+
+/// Verify a self-referencing or table-valued `encoding` option is a Lua error, not a stack overflow,
+/// while the flat option table form keeps working.
+/// 验证自引用或取值为表的 `encoding` 选项会产生 Lua 错误而不是栈溢出，同时单层选项表仍然可用。
+#[test]
+fn managed_io_encoding_option_rejects_nested_tables() {
+    let lua = Lua::new();
+    let io_table =
+        create_vulcan_io_table(&lua, RuntimeTextEncoding::Utf8, LuaRuntimeHostMode::Console)
+            .expect("create vulcan.io");
+    let path = std::env::temp_dir().join(format!(
+        "luaskills_managed_io_nested_encoding_{}.txt",
+        std::process::id()
+    ));
+    fs::write(&path, "flat").expect("write encoding option test file");
+    lua.globals().set("vio", io_table).expect("set io table");
+    let target = lua_path_literal(&path);
+    for options in [
+        "local t = {} t.encoding = t return t",
+        "local t = 'utf-8' for i = 1, 200 do t = { encoding = t } end return t",
+        "return { encoding = { encoding = 'utf-8' } }",
+    ] {
+        let script = format!(
+            "local options = (function() {options} end)()\n\
+             local ok, err = pcall(vio.read_text, {target}, options)\n\
+             return ok, tostring(err)"
+        );
+        let (ok, error): (bool, String) = lua.load(&script).eval().expect("pcall returns");
+        assert!(!ok, "{options} must be rejected");
+        assert!(
+            error.contains("options.encoding must be nil or string, got table"),
+            "{options}: {error}"
+        );
+        // popen accepts the same option shapes, so it rejects the same tables before spawning.
+        // popen 接受相同的选项形态，因此会在启动进程之前拒绝同样的表。
+        let script = format!(
+            "local options = (function() {options} end)()\n\
+             local ok, err = pcall(vio.popen, 'echo nested', options)\n\
+             return ok, tostring(err)"
+        );
+        let (ok, error): (bool, String) = lua.load(&script).eval().expect("pcall returns");
+        assert!(!ok, "popen {options} must be rejected");
+        assert!(
+            error.contains("vulcan.io.popen: options.encoding must be nil or string, got table"),
+            "popen {options}: {error}"
+        );
+    }
+    let flat: String = lua
+        .load(format!(
+            "return vio.read_text({target}, {{ encoding = 'utf-8' }})"
+        ))
+        .eval()
+        .expect("flat option table still works");
+    assert_eq!(flat, "flat");
+    let _ = fs::remove_file(path);
+}

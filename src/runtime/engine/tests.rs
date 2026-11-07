@@ -2,6 +2,7 @@ mod embedded;
 mod host_database;
 #[cfg(windows)]
 mod host_mode;
+mod value_boundaries;
 
 #[cfg(windows)]
 use super::configured_package_search_directory_exists;
@@ -6626,6 +6627,41 @@ fn lua_vm_pool_recovers_after_poisoned_state_lock_and_wait() {
     notifier
         .join()
         .expect("poison recovery notifier should finish");
+}
+
+/// Verify a VM whose lease is dropped while a panic unwinds is retired instead of reused.
+/// 验证租约在 panic 展开期间被释放的虚拟机会被淘汰，而不是被复用。
+#[test]
+fn lua_vm_pool_discards_vm_leased_during_panic() {
+    let pool = Arc::new(LuaVmPool::new(LuaVmPoolConfig {
+        min_size: 1,
+        max_size: 1,
+        idle_ttl_secs: 60,
+    }));
+    // Factory building one fresh VM per call.
+    // 每次调用构建一个新虚拟机的工厂。
+    let new_vm = || {
+        Ok(LuaVm {
+            lua: crate::runtime::lua_state::LuaState::new(mlua::StdLib::ALL_SAFE).unwrap(),
+            last_used_at: Instant::now(),
+        })
+    };
+    let available = |pool: &LuaVmPool| pool.lock_state().available.len();
+
+    drop(pool.acquire(new_vm).expect("first lease"));
+    assert_eq!((pool.total_count(), available(&pool)), (1, 1));
+
+    let panicked = panic::catch_unwind(AssertUnwindSafe(|| {
+        let _lease = pool.acquire(new_vm).expect("reused lease");
+        panic!("request interrupted mid-way");
+    }));
+    assert!(panicked.is_err());
+    assert_eq!((pool.total_count(), available(&pool)), (0, 0));
+
+    // The freed capacity is refilled with a new VM on the next request.
+    // 释放出的容量会在下一个请求时由新虚拟机补上。
+    drop(pool.acquire(new_vm).expect("lease after panic"));
+    assert_eq!((pool.total_count(), available(&pool)), (1, 1));
 }
 
 /// Verify a retired Lua VM lease reports an explicit error instead of panicking on later Lua access.

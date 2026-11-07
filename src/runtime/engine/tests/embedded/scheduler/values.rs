@@ -64,6 +64,15 @@ fn embedded_integer_scheduler_rejects_before_admission_and_initialization() {
             .unwrap();
         assert_eq!(error.code, EmbeddedErrorCode::InvalidArgument);
     }
+    // An undeclared export is reported as such even when its arguments are also invalid.
+    // 即使参数同样无效，未声明的导出也按未声明报告。
+    let mut undeclared = call(&pool, json!({"nested":[null,{"value":i64::MAX}]}));
+    undeclared.export = "missing".into();
+    let error = runtime
+        .submit(undeclared, Duration::from_secs(3))
+        .err()
+        .unwrap();
+    assert_eq!(error.message, "module export is not declared");
     // Context ingress must obey the same early scheduler rejection.
     // 上下文入口必须遵循相同调度器提前拒绝。
     let mut request = call(&pool, Value::Null);

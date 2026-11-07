@@ -51,3 +51,4 @@ sdk/**/node_modules/
 # 忽略本地任务计划与完成记录。
 docs/plan/
 docs/completed/
+docs/audit/

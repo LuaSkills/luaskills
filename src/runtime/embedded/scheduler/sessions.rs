@@ -517,16 +517,20 @@ impl SchedulerCenter {
             return Err(closed());
         }
         if let Some(call) = request.invocation() {
-            pool.inputs
+            // An undeclared export is reported first, whatever the arguments contain.
+            // 无论参数内容如何，都先报告未声明的导出。
+            let schema = pool
+                .inputs
                 .get(&call.export)
-                .ok_or_else(|| EmbeddedError::invalid("module export is not declared"))?
-                .validate(&call.arguments)?;
-            // Reject unsafe application integers before operation admission and cold VM initialization.
-            // 在操作入场及冷 VM 初始化前拒绝不安全应用整数。
+                .ok_or_else(|| EmbeddedError::invalid("module export is not declared"))?;
+            // Reject unsafe application integers and excessive nesting before schema validation,
+            // operation admission and cold VM initialization; the schema validator also recurses.
+            // 在 schema 校验、操作入场及冷 VM 初始化前拒绝不安全应用整数和过深嵌套；schema 校验器同样会递归。
             crate::runtime::engine::LuaEngine::validate_embedded_json_value(
                 &call.arguments,
                 "arguments",
             )?;
+            schema.validate(&call.arguments)?;
         }
         // The request's exact context will use the same shared JSON projector during dispatch.
         // 分发时请求的精确上下文将使用同一共享 JSON 投影器。

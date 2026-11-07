@@ -14,7 +14,29 @@ impl LuaEngine {
     /// 对不安全 JSON 整数返回 InvalidArgument；显式浮点数保持 IEEE-754 语义。
     /// Keep diagnostics independent of application keys and nesting so an error cannot expand with the value.
     /// 诊断不依赖应用键及嵌套深度，避免错误内容随应用值膨胀。
+    /// Containers deeper than `MAX_JSON_NESTING_DEPTH` are rejected before any recursive conversion.
+    /// 深于 `MAX_JSON_NESTING_DEPTH` 的容器在任何递归转换之前就会被拒绝。
     pub(crate) fn validate_embedded_json_value(value: &Value, path: &str) -> EmbeddedResult<()> {
+        Self::validate_embedded_json_value_at(value, path, 0)
+    }
+
+    /// Validate `value` found inside `depth` enclosing containers below root `path`.
+    /// 校验位于根 `path` 之下、外层已有 `depth` 层容器的 `value`。
+    fn validate_embedded_json_value_at(
+        value: &Value,
+        path: &str,
+        depth: usize,
+    ) -> EmbeddedResult<()> {
+        if matches!(value, Value::Array(_) | Value::Object(_))
+            && depth >= crate::runtime::json_limits::MAX_JSON_NESTING_DEPTH
+        {
+            return Err(EmbeddedError::invalid(format!(
+                "embedded Lua JSON value at {path}: {}",
+                crate::runtime::json_limits::nesting_error(
+                    crate::runtime::json_limits::MAX_JSON_NESTING_DEPTH
+                )
+            )));
+        }
         match value {
             Value::Number(number) if number.is_i64() => {
                 // This branch follows the actual JSON number variant, never a float's fractional part.
@@ -35,14 +57,14 @@ impl LuaEngine {
             }
             Value::Array(array) => {
                 for value in array {
-                    Self::validate_embedded_json_value(value, path)?;
+                    Self::validate_embedded_json_value_at(value, path, depth + 1)?;
                 }
             }
             Value::Object(object) => {
                 // Object keys are application content and can exceed the error envelope budget when escaped.
                 // 对象键属于应用内容，转义后可能超过错误信封预算。
                 for value in object.values() {
-                    Self::validate_embedded_json_value(value, path)?;
+                    Self::validate_embedded_json_value_at(value, path, depth + 1)?;
                 }
             }
             _ => {}

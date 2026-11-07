@@ -48,6 +48,7 @@ use crate::runtime::config_service::{
 use crate::runtime::encoding::{
     RuntimeTextEncoding, decode_runtime_text, default_runtime_text_encoding, encode_runtime_text,
 };
+use crate::runtime::json_limits::{MAX_JSON_NESTING_DEPTH, check_json_value_depth, nesting_error};
 use crate::runtime::managed_io::{create_vulcan_io_table, install_managed_io_compat};
 use crate::runtime::managed_package::{
     ManagedRuntimeOwnerState, ManagedRuntimePackageContext, ManagedRuntimePackageIdentity,
@@ -6451,6 +6452,12 @@ impl Drop for LuaVmRequestScopeGuard<'_> {
         if !self.active {
             return;
         }
+        // A panic left the request half-done; running Lua cleanup now could panic again and abort.
+        // 发生 panic 时请求只执行了一半；此时再运行 Lua 清理可能再次 panic 并中止进程。
+        if std::thread::panicking() {
+            self.lease.discard();
+            return;
+        }
         if let Err(error) = self
             .lua()
             .and_then(|lua| reset_pooled_vm_request_scope(lua, self.host_options))
@@ -6492,6 +6499,56 @@ fn finish_pooled_vm_request_scope<T>(
             "{}; {}: {}",
             main_error, cleanup_error_label, cleanup_error
         )),
+    }
+}
+
+/// Maximum number of `vulcan.call` frames active at once on one Lua state.
+/// 单个 Lua 状态上同时活动的 `vulcan.call` 帧数上限。
+///
+/// Every frame adds Rust and LuaJIT native stack; unbounded self-recursion overflowed the thread stack
+/// at about 100 levels in debug builds, which terminates the process before `pcall` can observe it.
+/// 每一帧都会占用 Rust 与 LuaJIT 原生栈；无界自递归在 debug 构建下约 100 层就会耗尽线程栈，
+/// 进程会在 `pcall` 能观察到之前直接终止。
+const MAX_LUA_NESTED_CALL_DEPTH: usize = 32;
+
+/// Number of `vulcan.call` frames currently active on one Lua state, kept in Rust app-data.
+/// 单个 Lua 状态上当前活动的 `vulcan.call` 帧数，保存在 Rust app-data 中。
+#[derive(Default)]
+struct LuaNestedCallDepth(std::cell::Cell<usize>);
+
+/// RAII guard that owns one level of `vulcan.call` nesting until the nested call returns.
+/// 在嵌套调用返回前占用一层 `vulcan.call` 嵌套深度的 RAII 守卫。
+struct LuaNestedCallDepthGuard<'lua> {
+    /// Lua state whose app-data counter this guard decrements when dropped.
+    /// 守卫释放时递减其 app-data 计数器的 Lua 状态。
+    lua: &'lua Lua,
+}
+
+impl<'lua> LuaNestedCallDepthGuard<'lua> {
+    /// Claim one nesting level on `lua`; return a Lua error once `MAX_LUA_NESTED_CALL_DEPTH` is reached.
+    /// 在 `lua` 上占用一层嵌套深度；达到 `MAX_LUA_NESTED_CALL_DEPTH` 时返回 Lua 错误。
+    fn enter(lua: &'lua Lua) -> mlua::Result<Self> {
+        let depth = lua.app_data_ref::<LuaNestedCallDepth>().ok_or_else(|| {
+            mlua::Error::runtime("vulcan.call: nested call depth counter is not installed")
+        })?;
+        let current = depth.0.get();
+        if current >= MAX_LUA_NESTED_CALL_DEPTH {
+            return Err(mlua::Error::runtime(format!(
+                "vulcan.call: nested call depth exceeds {MAX_LUA_NESTED_CALL_DEPTH} levels"
+            )));
+        }
+        depth.0.set(current + 1);
+        Ok(Self { lua })
+    }
+}
+
+impl Drop for LuaNestedCallDepthGuard<'_> {
+    /// Release the nesting level claimed by `enter`.
+    /// 释放 `enter` 占用的嵌套层级。
+    fn drop(&mut self) {
+        if let Some(depth) = self.lua.app_data_ref::<LuaNestedCallDepth>() {
+            depth.0.set(depth.0.get().saturating_sub(1));
+        }
     }
 }
 
@@ -6724,7 +6781,18 @@ impl LuaVmLease {
 }
 
 impl Drop for LuaVmLease {
+    /// Return the VM to the pool, or retire it when the lease is dropped while a panic unwinds.
+    /// 将虚拟机放回池中；若租约在 panic 展开期间被释放，则淘汰该虚拟机。
+    ///
+    /// Panics are caught at the FFI boundary, so the engine keeps serving requests afterwards; a VM
+    /// interrupted mid-request may still hold that request's scope and must not serve the next one.
+    /// panic 会在 FFI 边界被捕获，引擎之后会继续处理请求；中途被打断的虚拟机可能仍保留该请求的作用域，
+    /// 不能再服务下一个请求。
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.discard();
+            return;
+        }
         if let Some(mut vm) = self.vm.take() {
             vm.last_used_at = Instant::now();
             self.pool.release(vm);
@@ -10449,9 +10517,15 @@ impl LuaEngine {
             .map_err(|e| format!("vulcan module not found: {}", e))?;
 
         let dispatch_entries = build_lua_call_dispatch_entries(skills_map, entry_registry)?;
+        // The depth counter lives in Rust app-data so Lua code can neither read nor reset it.
+        // 深度计数器保存在 Rust app-data 中，Lua 代码既不能读取也不能重置它。
+        lua.set_app_data(LuaNestedCallDepth::default());
 
         let dispatcher = lua
             .create_host_function(move |lua, (name, args): (LuaValue, LuaValue)| {
+                // Held for the whole nested call so every exit path, including errors, releases one level.
+                // 在整个嵌套调用期间持有，确保包括错误在内的每条退出路径都释放一层。
+                let _depth_guard = LuaNestedCallDepthGuard::enter(lua)?;
                 let name = require_string_arg(name, "call", "name", false)?;
                 let args = require_table_arg(args, "call", "args")?;
                 let dispatch_entry = resolve_lua_call_dispatch_entry(&dispatch_entries, &name)?;
@@ -11433,6 +11507,7 @@ impl LuaEngine {
 fn json_to_lua_table(lua: &Lua, json: &Value) -> Result<Table, String> {
     // Typed argument table produced by the shared recursive JSON conversion path.
     // 由共享递归 JSON 转换路径生成的带类型参数 table。
+    check_json_value_depth(json, MAX_JSON_NESTING_DEPTH)?;
     let table = json_to_lua_table_inner(lua, json).map_err(|error| error.to_string())?;
     if let Some(project_path) = json
         .as_object()
@@ -11872,13 +11947,13 @@ fn json_to_lua_table_inner(lua: &Lua, json: &Value) -> mlua::Result<Table> {
     let kind = match json {
         Value::Object(object) => {
             for (key, value) in object {
-                table.raw_set(key.as_str(), json_value_to_lua(lua, value)?)?;
+                table.raw_set(key.as_str(), json_value_to_lua_unchecked(lua, value)?)?;
             }
             JsonContainerKind::Object
         }
         Value::Array(array) => {
             for (index, value) in array.iter().enumerate() {
-                table.raw_set(index + 1, json_value_to_lua(lua, value)?)?;
+                table.raw_set(index + 1, json_value_to_lua_unchecked(lua, value)?)?;
             }
             JsonContainerKind::Array
         }
@@ -11902,9 +11977,20 @@ fn json_to_lua_table_inner(lua: &Lua, json: &Value) -> mlua::Result<Table> {
 /// lua 参数用于创建字符串、表及共享元表。
 /// The json parameter is recursively converted without dropping JSON null values.
 /// json 参数会递归转换，且不会丢弃 JSON null 值。
-/// Returns the corresponding Lua value or an mlua allocation/conversion error.
-/// 返回对应 Lua 值或 mlua 分配/转换错误。
+/// Returns the corresponding Lua value, or an error when `json` nests deeper than
+/// `MAX_JSON_NESTING_DEPTH` containers or allocation/conversion fails.
+/// 返回对应 Lua 值；当 `json` 嵌套超过 `MAX_JSON_NESTING_DEPTH` 层容器或分配/转换失败时返回错误。
+///
+/// The depth limit matches `lua_value_to_json`, so every value delivered to Lua can be encoded back.
+/// 该层数上限与 `lua_value_to_json` 一致，因此交给 Lua 的每个值都能重新编码回去。
 fn json_value_to_lua(lua: &Lua, json: &Value) -> mlua::Result<LuaValue> {
+    check_json_value_depth(json, MAX_JSON_NESTING_DEPTH).map_err(mlua::Error::runtime)?;
+    json_value_to_lua_unchecked(lua, json)
+}
+
+/// Convert `json` to Lua after its nesting depth has already been checked by the caller.
+/// 在调用方已检查嵌套层数之后，将 `json` 转换为 Lua 值。
+fn json_value_to_lua_unchecked(lua: &Lua, json: &Value) -> mlua::Result<LuaValue> {
     match json {
         Value::Null => Ok(LuaValue::NULL),
         Value::Bool(b) => Ok(LuaValue::Boolean(*b)),
@@ -11928,9 +12014,22 @@ fn json_value_to_lua(lua: &Lua, json: &Value) -> mlua::Result<LuaValue> {
 /// The val parameter is the Lua value captured from runtime-visible tables or function output.
 /// val 参数是从运行时可见表或函数输出中捕获的 Lua 值。
 ///
-/// Return the JSON representation, or an explicit error when a Lua value cannot be represented.
-/// 返回 JSON 表示；当 Lua 值无法表示时返回显式错误。
+/// Return the JSON representation, or an explicit error when a Lua value cannot be represented,
+/// refers to itself, or nests deeper than `MAX_JSON_NESTING_DEPTH` tables.
+/// 返回 JSON 表示；当 Lua 值无法表示、引用自身或表嵌套超过 `MAX_JSON_NESTING_DEPTH` 层时返回显式错误。
 fn lua_value_to_json(val: &LuaValue) -> Result<Value, String> {
+    lua_value_to_json_within(val, &mut Vec::new())
+}
+
+/// Convert `val` while `ancestors` holds the identities of the tables currently being converted.
+/// 在 `ancestors` 保存当前正在转换的各个表身份的前提下转换 `val`。
+///
+/// A table already on the ancestor chain is a cycle; the chain length is the current nesting depth.
+/// 已在祖先链上的表构成环；祖先链长度就是当前嵌套深度。
+fn lua_value_to_json_within(
+    val: &LuaValue,
+    ancestors: &mut Vec<*const std::ffi::c_void>,
+) -> Result<Value, String> {
     // mlua represents JSON null as a null light-userdata value rather than Lua nil.
     // mlua 使用空指针 light userdata 表示 JSON null，而不是 Lua nil。
     if val.is_null() {
@@ -11953,21 +12052,42 @@ fn lua_value_to_json(val: &LuaValue) -> Result<Value, String> {
             .map(|text| Value::String(text.to_string()))
             .map_err(|error| format!("Cannot convert Lua string to JSON: invalid UTF-8: {error}")),
         LuaValue::Table(t) => {
-            match json_container_kind(t)? {
-                Some(JsonContainerKind::Object) => Ok(Value::Object(lua_table_to_object(t)?)),
-                Some(JsonContainerKind::Array) => Ok(Value::Array(lua_table_to_array(t)?)),
-                None if t.raw_len() > 0 => Ok(Value::Array(lua_table_to_array(t)?)),
-                None => {
+            // Identity of this table, pushed for the duration of its own conversion only.
+            // 当前表的身份，只在转换它自身期间压入祖先链。
+            let identity = t.to_pointer();
+            if ancestors.contains(&identity) {
+                return Err("Cannot convert cyclic Lua table to JSON".to_string());
+            }
+            if ancestors.len() >= MAX_JSON_NESTING_DEPTH {
+                return Err(format!(
+                    "Cannot convert Lua table to JSON: {}",
+                    nesting_error(MAX_JSON_NESTING_DEPTH)
+                ));
+            }
+            ancestors.push(identity);
+            let converted = match json_container_kind(t) {
+                Err(error) => Err(error),
+                Ok(Some(JsonContainerKind::Object)) => {
+                    lua_table_to_object(t, ancestors).map(Value::Object)
+                }
+                Ok(Some(JsonContainerKind::Array)) => {
+                    lua_table_to_array(t, ancestors).map(Value::Array)
+                }
+                Ok(None) if t.raw_len() > 0 => lua_table_to_array(t, ancestors).map(Value::Array),
+                Ok(None) => {
                     // Legacy empty-table behavior remains an empty array for unmarked Lua tables.
                     // 无标记 Lua 表继续保留空表编码为空数组的旧行为。
-                    let object = lua_table_to_object(t)?;
-                    if object.is_empty() {
-                        Ok(Value::Array(Vec::new()))
-                    } else {
-                        Ok(Value::Object(object))
-                    }
+                    lua_table_to_object(t, ancestors).map(|object| {
+                        if object.is_empty() {
+                            Value::Array(Vec::new())
+                        } else {
+                            Value::Object(object)
+                        }
+                    })
                 }
-            }
+            };
+            ancestors.pop();
+            converted
         }
         LuaValue::Function(_) => Err("Cannot convert Lua function to JSON".to_string()),
         LuaValue::Thread(_) => Err("Cannot convert Lua thread to JSON".to_string()),
@@ -12162,12 +12282,17 @@ fn create_json_container(
 ///
 /// The table parameter must contain only a dense one-based integer sequence.
 /// table 参数必须只包含从一开始的连续整数序列。
+/// The ancestors parameter is the cycle and depth chain owned by `lua_value_to_json_within`.
+/// ancestors 参数是由 `lua_value_to_json_within` 维护的环与深度检测链。
 /// Returns the recursively converted array or an explicit structural/value error.
 /// 返回递归转换后的数组或显式结构/值错误。
-fn lua_table_to_array(table: &Table) -> Result<Vec<Value>, String> {
+fn lua_table_to_array(
+    table: &Table,
+    ancestors: &mut Vec<*const std::ffi::c_void>,
+) -> Result<Vec<Value>, String> {
     collect_json_array_values(table)?
         .into_iter()
-        .map(|value| lua_value_to_json(&value))
+        .map(|value| lua_value_to_json_within(&value, ancestors))
         .collect()
 }
 
@@ -12176,14 +12301,19 @@ fn lua_table_to_array(table: &Table) -> Result<Vec<Value>, String> {
 ///
 /// The table parameter must contain only UTF-8 string keys.
 /// table 参数必须只包含 UTF-8 字符串键。
+/// The ancestors parameter is the cycle and depth chain owned by `lua_value_to_json_within`.
+/// ancestors 参数是由 `lua_value_to_json_within` 维护的环与深度检测链。
 /// Returns the recursively converted object map or an explicit structural/value error.
 /// 返回递归转换后的对象 Map 或显式结构/值错误。
-fn lua_table_to_object(table: &Table) -> Result<serde_json::Map<String, Value>, String> {
+fn lua_table_to_object(
+    table: &Table,
+    ancestors: &mut Vec<*const std::ffi::c_void>,
+) -> Result<serde_json::Map<String, Value>, String> {
     // JSON object map populated only after every Lua key passes strict validation.
     // 仅在所有 Lua 键都通过严格校验后填充的 JSON 对象 Map。
     let mut object = serde_json::Map::new();
     for (key, value) in collect_json_object_entries(table)? {
-        object.insert(key, lua_value_to_json(&value)?);
+        object.insert(key, lua_value_to_json_within(&value, ancestors)?);
     }
     Ok(object)
 }

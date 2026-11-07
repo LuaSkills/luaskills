@@ -1256,6 +1256,25 @@ fn parse_popen_mode(mode: &str) -> mlua::Result<ManagedIoOpenMode> {
     }
 }
 
+/// Parse the `encoding` field of an options table, which must be nil or a string.
+/// 解析选项表中的 `encoding` 字段，该字段必须为 nil 或字符串。
+///
+/// Rejecting a table here keeps every options shape one level deep, so `vulcan.io` and popen
+/// accept exactly the same forms.
+/// 在这里拒绝表，使所有选项形态都只有一层，从而 `vulcan.io` 与 popen 接受完全相同的形式。
+fn parse_encoding_field(
+    value: LuaValue,
+    fn_name: &str,
+    default_encoding: RuntimeTextEncoding,
+) -> mlua::Result<RuntimeTextEncoding> {
+    match value {
+        LuaValue::Table(_) => Err(mlua::Error::runtime(format!(
+            "{fn_name}: options.encoding must be nil or string, got table"
+        ))),
+        value => parse_encoding_options(value, fn_name, default_encoding),
+    }
+}
+
 /// Parse optional popen encoding and timeout options.
 /// 解析可选的 popen 编码与超时选项。
 fn parse_popen_options(
@@ -1277,7 +1296,7 @@ fn parse_popen_options(
             let encoding_value: LuaValue = table.get("encoding")?;
             let timeout_value: LuaValue = table.get("timeout_ms")?;
             Ok(ManagedPopenOptions {
-                encoding: parse_encoding_options(encoding_value, fn_name, default_encoding)?,
+                encoding: parse_encoding_field(encoding_value, fn_name, default_encoding)?,
                 timeout_ms: parse_timeout_ms_option(timeout_value, fn_name, default_timeout_ms)?,
             })
         }
@@ -1534,8 +1553,10 @@ fn parse_encoding_options(
                 .map_err(|error| mlua::Error::runtime(format!("{fn_name}: {error}")))
         }
         LuaValue::Table(table) => {
-            let encoding_value: LuaValue = table.get("encoding")?;
-            parse_encoding_options(encoding_value, fn_name, default_encoding)
+            // Only one table level is accepted; a table-valued field would recurse without bound
+            // and a self-referencing options table would overflow the native stack.
+            // 只接受一层表；字段本身为表时会无界递归，自引用的选项表会耗尽原生栈。
+            parse_encoding_field(table.get("encoding")?, fn_name, default_encoding)
         }
         other => Err(mlua::Error::runtime(format!(
             "{fn_name}: options must be nil, string, or table, got {}",

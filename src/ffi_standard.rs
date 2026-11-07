@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_void};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::Ordering;
@@ -9,7 +10,8 @@ use serde_json::Value;
 
 use crate::ffi::{
     FFI_ENGINE_COUNTER, clone_managed_session_event_center, destroy_removed_ffi_engine_slot,
-    lock_ffi_engine_registry, remove_ffi_engine_slot, with_engine, with_engine_mut,
+    ffi_panic_message, ffi_unit_boundary, lock_ffi_engine_registry, remove_ffi_engine_slot,
+    with_engine, with_engine_mut,
 };
 use crate::host::callbacks::{
     RuntimeHostToolCallback, RuntimeHostToolRequest, RuntimeModelEmbedCallback,
@@ -1570,6 +1572,54 @@ fn ffi_error_status(error_out: *mut FfiOwnedBuffer, message: impl Into<String>) 
     FFI_STATUS_ERROR
 }
 
+/// Run one status-returning export `body`; a panic becomes `FFI_STATUS_ERROR` with text in `error_out`.
+/// 运行一个返回状态码的导出函数体 `body`；panic 转为 `FFI_STATUS_ERROR`，错误文本写入 `error_out`。
+///
+/// `error_out` is cleared before `body` runs, so after a panic it holds either nothing or a buffer
+/// this library allocated; that buffer is freed before the panic text replaces it.
+/// `error_out` 会在 `body` 运行前被清空，因此 panic 之后它要么为空，要么是本库分配的缓冲；
+/// 该缓冲会在 panic 文本替换它之前被释放。
+///
+/// Other output slots are written only as the last step before `ffi_ok_status`, which cannot
+/// panic, so a panic never leaves a result behind next to an error status.
+/// 其他输出槽位只在 `ffi_ok_status` 之前的最后一步写入，而 `ffi_ok_status` 不会 panic，
+/// 因此 panic 不会在错误状态旁留下结果。
+fn ffi_status_boundary(
+    function_name: &str,
+    error_out: *mut FfiOwnedBuffer,
+    body: impl FnOnce() -> i32,
+) -> i32 {
+    clear_error_out(error_out);
+    match catch_unwind(AssertUnwindSafe(body)) {
+        Ok(status) => status,
+        Err(payload) => {
+            if !error_out.is_null() {
+                // Buffer set by `body` before it panicked; owned by this library since the clear above.
+                // `body` 在 panic 前写入的缓冲；由于上面的清空，它一定由本库分配。
+                let stale = unsafe { ptr::read(error_out) };
+                clear_error_out(error_out);
+                unsafe { free_ffi_bytes(stale.ptr, stale.len) };
+            }
+            ffi_error_status(
+                error_out,
+                ffi_panic_message(function_name, payload.as_ref()),
+            )
+        }
+    }
+}
+
+/// Run one pointer-returning export `body`; a panic returns null, the documented failure value.
+/// 运行一个返回指针的导出函数体 `body`；panic 时返回空指针，即文档约定的失败值。
+fn ffi_pointer_boundary<T>(function_name: &str, body: impl FnOnce() -> *mut T) -> *mut T {
+    match catch_unwind(AssertUnwindSafe(body)) {
+        Ok(pointer) => pointer,
+        Err(payload) => {
+            logging::error(ffi_panic_message(function_name, payload.as_ref()));
+            ptr::null_mut()
+        }
+    }
+}
+
 /// Serialize one managed-session event operation result into the caller-owned output slots.
 /// 将单次受管会话事件操作结果序列化到调用方拥有的输出槽位。
 ///
@@ -1683,14 +1733,16 @@ fn invoke_managed_session_wake_callback(
 /// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_string_clone(value: *const c_char) -> *mut c_char {
-    if value.is_null() {
-        return alloc_c_string(c"");
-    }
-    let source = unsafe { CStr::from_ptr(value) };
-    match source.to_str() {
-        Ok(_) => alloc_c_string(source),
-        Err(_) => ptr::null_mut(),
-    }
+    ffi_pointer_boundary("luaskills_ffi_string_clone", move || {
+        if value.is_null() {
+            return alloc_c_string(c"");
+        }
+        let source = unsafe { CStr::from_ptr(value) };
+        match source.to_str() {
+            Ok(_) => alloc_c_string(source),
+            Err(_) => ptr::null_mut(),
+        }
+    })
 }
 
 /// Clone one host buffer into one LuaSkills-owned buffer container for callback returns.
@@ -1708,23 +1760,25 @@ pub unsafe extern "C" fn luaskills_ffi_buffer_clone(
     buffer_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_buffer(buffer_out);
-    if buffer_out.is_null() {
-        return ffi_error_status(error_out, "buffer_out must not be null");
-    }
-    if value.is_null() && len != 0 {
-        return ffi_error_status(error_out, "value must not be null when len > 0");
-    }
-    let slice = if len == 0 {
-        &[][..]
-    } else {
-        unsafe { std::slice::from_raw_parts(value, len) }
-    };
-    unsafe {
-        *buffer_out = alloc_owned_buffer_from_bytes(slice);
-    }
-    ffi_ok_status(error_out)
+    ffi_status_boundary("luaskills_ffi_buffer_clone", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_buffer(buffer_out);
+        if buffer_out.is_null() {
+            return ffi_error_status(error_out, "buffer_out must not be null");
+        }
+        if value.is_null() && len != 0 {
+            return ffi_error_status(error_out, "value must not be null when len > 0");
+        }
+        let slice = if len == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(value, len) }
+        };
+        unsafe {
+            *buffer_out = alloc_owned_buffer_from_bytes(slice);
+        }
+        ffi_ok_status(error_out)
+    })
 }
 
 /// Clone one host byte buffer into one LuaSkills-owned heap buffer for standard callback returns.
@@ -1737,11 +1791,13 @@ pub unsafe extern "C" fn luaskills_ffi_buffer_clone(
 /// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_bytes_clone(value: *const u8, len: usize) -> *mut u8 {
-    if value.is_null() || len == 0 {
-        return ptr::null_mut();
-    }
-    let slice = unsafe { std::slice::from_raw_parts(value, len) };
-    alloc_owned_buffer_from_bytes(slice).ptr
+    ffi_pointer_boundary("luaskills_ffi_bytes_clone", move || {
+        if value.is_null() || len == 0 {
+            return ptr::null_mut();
+        }
+        let slice = unsafe { std::slice::from_raw_parts(value, len) };
+        alloc_owned_buffer_from_bytes(slice).ptr
+    })
 }
 
 /// Free one LuaSkills-owned heap byte buffer created by `luaskills_ffi_bytes_clone`.
@@ -1754,7 +1810,9 @@ pub unsafe extern "C" fn luaskills_ffi_bytes_clone(value: *const u8, len: usize)
 /// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_bytes_free(value: *mut u8, len: usize) {
-    unsafe { free_ffi_bytes(value, len) };
+    ffi_unit_boundary("luaskills_ffi_bytes_free", move || {
+        unsafe { free_ffi_bytes(value, len) };
+    })
 }
 
 /// Free one LuaSkills-owned buffer container created by `luaskills_ffi_buffer_clone`.
@@ -1767,7 +1825,9 @@ pub unsafe extern "C" fn luaskills_ffi_bytes_free(value: *mut u8, len: usize) {
 /// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_buffer_free(value: FfiOwnedBuffer) {
-    unsafe { free_ffi_bytes(value.ptr, value.len) };
+    ffi_unit_boundary("luaskills_ffi_buffer_free", move || {
+        unsafe { free_ffi_bytes(value.ptr, value.len) };
+    })
 }
 
 /// Register or clear one SQLite standard provider callback for host-managed database integration.
@@ -1784,15 +1844,21 @@ pub unsafe extern "C" fn luaskills_ffi_set_sqlite_provider_callback(
     user_data: *mut c_void,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    let wrapped = callback.map(|callback_fn| {
-        let user_data = user_data as usize;
-        std::sync::Arc::new(move |request: &RuntimeSqliteProviderRequest| {
-            invoke_standard_sqlite_provider_callback(callback_fn, user_data, request)
-        }) as RuntimeSqliteProviderCallback
-    });
-    set_sqlite_provider_callback(wrapped);
-    ffi_ok_status(error_out)
+    ffi_status_boundary(
+        "luaskills_ffi_set_sqlite_provider_callback",
+        error_out,
+        move || {
+            clear_error_out(error_out);
+            let wrapped = callback.map(|callback_fn| {
+                let user_data = user_data as usize;
+                std::sync::Arc::new(move |request: &RuntimeSqliteProviderRequest| {
+                    invoke_standard_sqlite_provider_callback(callback_fn, user_data, request)
+                }) as RuntimeSqliteProviderCallback
+            });
+            set_sqlite_provider_callback(wrapped);
+            ffi_ok_status(error_out)
+        },
+    )
 }
 
 /// Register or clear one SQLite JSON provider callback for cross-language host integration.
@@ -1809,15 +1875,21 @@ pub unsafe extern "C" fn luaskills_ffi_set_sqlite_provider_json_callback(
     user_data: *mut c_void,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    let wrapped = callback.map(|callback_fn| {
-        let user_data = user_data as usize;
-        std::sync::Arc::new(move |request_json: &str| {
-            invoke_json_provider_callback(callback_fn, user_data, request_json)
-        }) as crate::host::database::RuntimeSqliteProviderJsonCallback
-    });
-    set_sqlite_provider_json_callback(wrapped);
-    ffi_ok_status(error_out)
+    ffi_status_boundary(
+        "luaskills_ffi_set_sqlite_provider_json_callback",
+        error_out,
+        move || {
+            clear_error_out(error_out);
+            let wrapped = callback.map(|callback_fn| {
+                let user_data = user_data as usize;
+                std::sync::Arc::new(move |request_json: &str| {
+                    invoke_json_provider_callback(callback_fn, user_data, request_json)
+                }) as crate::host::database::RuntimeSqliteProviderJsonCallback
+            });
+            set_sqlite_provider_json_callback(wrapped);
+            ffi_ok_status(error_out)
+        },
+    )
 }
 
 /// Register or clear one host-tool JSON callback for Lua `vulcan.host.*` integration.
@@ -1834,20 +1906,28 @@ pub unsafe extern "C" fn luaskills_ffi_set_host_tool_json_callback(
     user_data: *mut c_void,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    let wrapped = callback.map(|callback_fn| {
-        let user_data = user_data as usize;
-        std::sync::Arc::new(move |request: &RuntimeHostToolRequest| {
-            let request_json = serde_json::to_string(request)
-                .map_err(|error| format!("host tool request JSON encode failed: {}", error))?;
-            let response_json =
-                invoke_json_provider_callback(callback_fn, user_data, &request_json)?;
-            serde_json::from_str::<Value>(&response_json)
-                .map_err(|error| format!("host tool response JSON decode failed: {}", error))
-        }) as RuntimeHostToolCallback
-    });
-    set_host_tool_callback(wrapped);
-    ffi_ok_status(error_out)
+    ffi_status_boundary(
+        "luaskills_ffi_set_host_tool_json_callback",
+        error_out,
+        move || {
+            clear_error_out(error_out);
+            let wrapped = callback.map(|callback_fn| {
+                let user_data = user_data as usize;
+                std::sync::Arc::new(move |request: &RuntimeHostToolRequest| {
+                    let request_json = serde_json::to_string(request).map_err(|error| {
+                        format!("host tool request JSON encode failed: {}", error)
+                    })?;
+                    let response_json =
+                        invoke_json_provider_callback(callback_fn, user_data, &request_json)?;
+                    serde_json::from_str::<Value>(&response_json).map_err(|error| {
+                        format!("host tool response JSON decode failed: {}", error)
+                    })
+                }) as RuntimeHostToolCallback
+            });
+            set_host_tool_callback(wrapped);
+            ffi_ok_status(error_out)
+        },
+    )
 }
 
 /// Register or clear one skill-operation progress JSON callback for host UI integration.
@@ -1864,17 +1944,24 @@ pub unsafe extern "C" fn luaskills_ffi_set_skill_operation_progress_json_callbac
     user_data: *mut c_void,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    let wrapped = callback.map(|callback_fn| {
-        let user_data = user_data as usize;
-        std::sync::Arc::new(move |event: &RuntimeSkillOperationProgressEvent| {
-            if let Ok(request_json) = serde_json::to_string(event) {
-                let _ = invoke_json_provider_callback(callback_fn, user_data, &request_json);
-            }
-        }) as RuntimeSkillOperationProgressCallback
-    });
-    set_skill_operation_progress_callback(wrapped);
-    ffi_ok_status(error_out)
+    ffi_status_boundary(
+        "luaskills_ffi_set_skill_operation_progress_json_callback",
+        error_out,
+        move || {
+            clear_error_out(error_out);
+            let wrapped = callback.map(|callback_fn| {
+                let user_data = user_data as usize;
+                std::sync::Arc::new(move |event: &RuntimeSkillOperationProgressEvent| {
+                    if let Ok(request_json) = serde_json::to_string(event) {
+                        let _ =
+                            invoke_json_provider_callback(callback_fn, user_data, &request_json);
+                    }
+                }) as RuntimeSkillOperationProgressCallback
+            });
+            set_skill_operation_progress_callback(wrapped);
+            ffi_ok_status(error_out)
+        },
+    )
 }
 
 /// Register or clear one model embedding JSON callback for Lua `vulcan.models.embed`.
@@ -1891,24 +1978,30 @@ pub unsafe extern "C" fn luaskills_ffi_set_model_embed_json_callback(
     user_data: *mut c_void,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    let wrapped = callback.map(|callback_fn| {
-        let user_data = user_data as usize;
-        std::sync::Arc::new(move |request: &RuntimeModelEmbedRequest| {
-            let request_json = serde_json::to_string(request).map_err(|error| {
-                runtime_model_callback_internal_error(format!(
-                    "model embed request JSON encode failed: {}",
-                    error
-                ))
-            })?;
-            let response_json =
-                invoke_json_provider_callback(callback_fn, user_data, &request_json)
-                    .map_err(runtime_model_error_from_callback_failure)?;
-            runtime_model_embed_response_from_json(&response_json)
-        }) as RuntimeModelEmbedCallback
-    });
-    set_model_embed_callback(wrapped);
-    ffi_ok_status(error_out)
+    ffi_status_boundary(
+        "luaskills_ffi_set_model_embed_json_callback",
+        error_out,
+        move || {
+            clear_error_out(error_out);
+            let wrapped = callback.map(|callback_fn| {
+                let user_data = user_data as usize;
+                std::sync::Arc::new(move |request: &RuntimeModelEmbedRequest| {
+                    let request_json = serde_json::to_string(request).map_err(|error| {
+                        runtime_model_callback_internal_error(format!(
+                            "model embed request JSON encode failed: {}",
+                            error
+                        ))
+                    })?;
+                    let response_json =
+                        invoke_json_provider_callback(callback_fn, user_data, &request_json)
+                            .map_err(runtime_model_error_from_callback_failure)?;
+                    runtime_model_embed_response_from_json(&response_json)
+                }) as RuntimeModelEmbedCallback
+            });
+            set_model_embed_callback(wrapped);
+            ffi_ok_status(error_out)
+        },
+    )
 }
 
 /// Register or clear one model LLM JSON callback for Lua `vulcan.models.llm`.
@@ -1925,24 +2018,30 @@ pub unsafe extern "C" fn luaskills_ffi_set_model_llm_json_callback(
     user_data: *mut c_void,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    let wrapped = callback.map(|callback_fn| {
-        let user_data = user_data as usize;
-        std::sync::Arc::new(move |request: &RuntimeModelLlmRequest| {
-            let request_json = serde_json::to_string(request).map_err(|error| {
-                runtime_model_callback_internal_error(format!(
-                    "model llm request JSON encode failed: {}",
-                    error
-                ))
-            })?;
-            let response_json =
-                invoke_json_provider_callback(callback_fn, user_data, &request_json)
-                    .map_err(runtime_model_error_from_callback_failure)?;
-            runtime_model_llm_response_from_json(&response_json)
-        }) as RuntimeModelLlmCallback
-    });
-    set_model_llm_callback(wrapped);
-    ffi_ok_status(error_out)
+    ffi_status_boundary(
+        "luaskills_ffi_set_model_llm_json_callback",
+        error_out,
+        move || {
+            clear_error_out(error_out);
+            let wrapped = callback.map(|callback_fn| {
+                let user_data = user_data as usize;
+                std::sync::Arc::new(move |request: &RuntimeModelLlmRequest| {
+                    let request_json = serde_json::to_string(request).map_err(|error| {
+                        runtime_model_callback_internal_error(format!(
+                            "model llm request JSON encode failed: {}",
+                            error
+                        ))
+                    })?;
+                    let response_json =
+                        invoke_json_provider_callback(callback_fn, user_data, &request_json)
+                            .map_err(runtime_model_error_from_callback_failure)?;
+                    runtime_model_llm_response_from_json(&response_json)
+                }) as RuntimeModelLlmCallback
+            });
+            set_model_llm_callback(wrapped);
+            ffi_ok_status(error_out)
+        },
+    )
 }
 
 /// Free one string array result allocated by the standard FFI layer.
@@ -1955,11 +2054,13 @@ pub unsafe extern "C" fn luaskills_ffi_set_model_llm_json_callback(
 /// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_string_array_free(value: *mut FfiStringArray) {
-    if value.is_null() {
-        return;
-    }
-    let value = unsafe { Box::from_raw(value) };
-    unsafe { free_string_array_parts(value.items, value.len) };
+    ffi_unit_boundary("luaskills_ffi_string_array_free", move || {
+        if value.is_null() {
+            return;
+        }
+        let value = unsafe { Box::from_raw(value) };
+        unsafe { free_string_array_parts(value.items, value.len) };
+    })
 }
 
 /// Free one entry descriptor list allocated by the standard FFI layer.
@@ -1972,15 +2073,17 @@ pub unsafe extern "C" fn luaskills_ffi_string_array_free(value: *mut FfiStringAr
 /// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_entry_list_free(value: *mut FfiRuntimeEntryDescriptorList) {
-    if value.is_null() {
-        return;
-    }
-    let value = unsafe { Box::from_raw(value) };
-    if let Some(items) = unsafe { take_ffi_boxed_slice(value.items, value.len) } {
-        for item in items {
-            unsafe { free_entry_descriptor(item) };
+    ffi_unit_boundary("luaskills_ffi_entry_list_free", move || {
+        if value.is_null() {
+            return;
         }
-    }
+        let value = unsafe { Box::from_raw(value) };
+        if let Some(items) = unsafe { take_ffi_boxed_slice(value.items, value.len) } {
+            for item in items {
+                unsafe { free_entry_descriptor(item) };
+            }
+        }
+    })
 }
 
 /// Free one help descriptor list allocated by the standard FFI layer.
@@ -1995,25 +2098,27 @@ pub unsafe extern "C" fn luaskills_ffi_entry_list_free(value: *mut FfiRuntimeEnt
 pub unsafe extern "C" fn luaskills_ffi_help_list_free(
     value: *mut FfiRuntimeSkillHelpDescriptorList,
 ) {
-    if value.is_null() {
-        return;
-    }
-    let value = unsafe { Box::from_raw(value) };
-    if let Some(items) = unsafe { take_ffi_boxed_slice(value.items, value.len) } {
-        for item in items {
-            unsafe { luaskills_ffi_buffer_free(item.skill_id) };
-            unsafe { luaskills_ffi_buffer_free(item.skill_name) };
-            unsafe { luaskills_ffi_buffer_free(item.skill_version) };
-            unsafe { luaskills_ffi_buffer_free(item.root_name) };
-            unsafe { luaskills_ffi_buffer_free(item.skill_dir) };
-            unsafe { free_help_node_descriptor(item.main) };
-            if let Some(flows) = unsafe { take_ffi_boxed_slice(item.flows, item.flows_len) } {
-                for flow in flows {
-                    unsafe { free_help_node_descriptor(flow) };
+    ffi_unit_boundary("luaskills_ffi_help_list_free", move || {
+        if value.is_null() {
+            return;
+        }
+        let value = unsafe { Box::from_raw(value) };
+        if let Some(items) = unsafe { take_ffi_boxed_slice(value.items, value.len) } {
+            for item in items {
+                unsafe { luaskills_ffi_buffer_free(item.skill_id) };
+                unsafe { luaskills_ffi_buffer_free(item.skill_name) };
+                unsafe { luaskills_ffi_buffer_free(item.skill_version) };
+                unsafe { luaskills_ffi_buffer_free(item.root_name) };
+                unsafe { luaskills_ffi_buffer_free(item.skill_dir) };
+                unsafe { free_help_node_descriptor(item.main) };
+                if let Some(flows) = unsafe { take_ffi_boxed_slice(item.flows, item.flows_len) } {
+                    for flow in flows {
+                        unsafe { free_help_node_descriptor(flow) };
+                    }
                 }
             }
         }
-    }
+    })
 }
 
 /// Free one help detail allocated by the standard FFI layer.
@@ -2026,20 +2131,22 @@ pub unsafe extern "C" fn luaskills_ffi_help_list_free(
 /// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_help_detail_free(value: *mut FfiRuntimeHelpDetail) {
-    if value.is_null() {
-        return;
-    }
-    let value = unsafe { *Box::from_raw(value) };
-    unsafe { luaskills_ffi_buffer_free(value.skill_id) };
-    unsafe { luaskills_ffi_buffer_free(value.skill_name) };
-    unsafe { luaskills_ffi_buffer_free(value.skill_version) };
-    unsafe { luaskills_ffi_buffer_free(value.root_name) };
-    unsafe { luaskills_ffi_buffer_free(value.skill_dir) };
-    unsafe { luaskills_ffi_buffer_free(value.flow_name) };
-    unsafe { luaskills_ffi_buffer_free(value.description) };
-    unsafe { free_string_array_parts(value.related_entries, value.related_entries_len) };
-    unsafe { luaskills_ffi_buffer_free(value.content_type) };
-    unsafe { luaskills_ffi_buffer_free(value.content) };
+    ffi_unit_boundary("luaskills_ffi_help_detail_free", move || {
+        if value.is_null() {
+            return;
+        }
+        let value = unsafe { *Box::from_raw(value) };
+        unsafe { luaskills_ffi_buffer_free(value.skill_id) };
+        unsafe { luaskills_ffi_buffer_free(value.skill_name) };
+        unsafe { luaskills_ffi_buffer_free(value.skill_version) };
+        unsafe { luaskills_ffi_buffer_free(value.root_name) };
+        unsafe { luaskills_ffi_buffer_free(value.skill_dir) };
+        unsafe { luaskills_ffi_buffer_free(value.flow_name) };
+        unsafe { luaskills_ffi_buffer_free(value.description) };
+        unsafe { free_string_array_parts(value.related_entries, value.related_entries_len) };
+        unsafe { luaskills_ffi_buffer_free(value.content_type) };
+        unsafe { luaskills_ffi_buffer_free(value.content) };
+    })
 }
 
 /// Free one invocation result allocated by the standard FFI layer.
@@ -2054,17 +2161,19 @@ pub unsafe extern "C" fn luaskills_ffi_help_detail_free(value: *mut FfiRuntimeHe
 pub unsafe extern "C" fn luaskills_ffi_invocation_result_free(
     value: *mut FfiRuntimeInvocationResult,
 ) {
-    if value.is_null() {
-        return;
-    }
-    let value = unsafe { *Box::from_raw(value) };
-    unsafe { luaskills_ffi_buffer_free(value.content) };
-    unsafe { luaskills_ffi_buffer_free(value.template_hint) };
-    if !value.host_result.is_null() {
-        let host_result = unsafe { *Box::from_raw(value.host_result) };
-        unsafe { luaskills_ffi_buffer_free(host_result.kind) };
-        unsafe { luaskills_ffi_buffer_free(host_result.payload_json) };
-    }
+    ffi_unit_boundary("luaskills_ffi_invocation_result_free", move || {
+        if value.is_null() {
+            return;
+        }
+        let value = unsafe { *Box::from_raw(value) };
+        unsafe { luaskills_ffi_buffer_free(value.content) };
+        unsafe { luaskills_ffi_buffer_free(value.template_hint) };
+        if !value.host_result.is_null() {
+            let host_result = unsafe { *Box::from_raw(value.host_result) };
+            unsafe { luaskills_ffi_buffer_free(host_result.kind) };
+            unsafe { luaskills_ffi_buffer_free(host_result.payload_json) };
+        }
+    })
 }
 
 /// Free one install or update result allocated by the standard FFI layer.
@@ -2077,15 +2186,17 @@ pub unsafe extern "C" fn luaskills_ffi_invocation_result_free(
 /// 输出槽位必须可写，返回的 LuaSkills 所有分配必须用匹配的释放函数处理，已注册 callback 必须保持可调用，且 callback 不得跨 FFI 边界展开异常。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaskills_ffi_skill_apply_result_free(value: *mut FfiSkillApplyResult) {
-    if value.is_null() {
-        return;
-    }
-    let value = unsafe { *Box::from_raw(value) };
-    unsafe { luaskills_ffi_buffer_free(value.skill_id) };
-    unsafe { luaskills_ffi_buffer_free(value.status) };
-    unsafe { luaskills_ffi_buffer_free(value.message) };
-    unsafe { luaskills_ffi_buffer_free(value.version) };
-    unsafe { luaskills_ffi_buffer_free(value.source_locator) };
+    ffi_unit_boundary("luaskills_ffi_skill_apply_result_free", move || {
+        if value.is_null() {
+            return;
+        }
+        let value = unsafe { *Box::from_raw(value) };
+        unsafe { luaskills_ffi_buffer_free(value.skill_id) };
+        unsafe { luaskills_ffi_buffer_free(value.status) };
+        unsafe { luaskills_ffi_buffer_free(value.message) };
+        unsafe { luaskills_ffi_buffer_free(value.version) };
+        unsafe { luaskills_ffi_buffer_free(value.source_locator) };
+    })
 }
 
 /// Free one uninstall result allocated by the standard FFI layer.
@@ -2100,12 +2211,14 @@ pub unsafe extern "C" fn luaskills_ffi_skill_apply_result_free(value: *mut FfiSk
 pub unsafe extern "C" fn luaskills_ffi_skill_uninstall_result_free(
     value: *mut FfiSkillUninstallResult,
 ) {
-    if value.is_null() {
-        return;
-    }
-    let value = unsafe { *Box::from_raw(value) };
-    unsafe { luaskills_ffi_buffer_free(value.skill_id) };
-    unsafe { luaskills_ffi_buffer_free(value.message) };
+    ffi_unit_boundary("luaskills_ffi_skill_uninstall_result_free", move || {
+        if value.is_null() {
+            return;
+        }
+        let value = unsafe { *Box::from_raw(value) };
+        unsafe { luaskills_ffi_buffer_free(value.skill_id) };
+        unsafe { luaskills_ffi_buffer_free(value.message) };
+    })
 }
 
 /// Return the stable FFI version string through the standard C ABI surface.
@@ -2121,13 +2234,15 @@ pub unsafe extern "C" fn luaskills_ffi_version(
     version_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_buffer(version_out);
-    if version_out.is_null() {
-        return ffi_error_status(error_out, "version_out must not be null");
-    }
-    unsafe { *version_out = alloc_owned_buffer_from_string(crate::ffi::FFI_VERSION) };
-    ffi_ok_status(error_out)
+    ffi_status_boundary("luaskills_ffi_version", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_buffer(version_out);
+        if version_out.is_null() {
+            return ffi_error_status(error_out, "version_out must not be null");
+        }
+        unsafe { *version_out = alloc_owned_buffer_from_string(crate::ffi::FFI_VERSION) };
+        ffi_ok_status(error_out)
+    })
 }
 
 /// Return the exported FFI entrypoint names through the standard C ABI surface.
@@ -2143,14 +2258,16 @@ pub unsafe extern "C" fn luaskills_ffi_describe(
     functions_out: *mut *mut FfiStringArray,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_ptr(functions_out);
-    if functions_out.is_null() {
-        return ffi_error_status(error_out, "functions_out must not be null");
-    }
-    let values = crate::ffi::exported_ffi_function_names();
-    unsafe { *functions_out = Box::into_raw(Box::new(alloc_string_array(&values))) };
-    ffi_ok_status(error_out)
+    ffi_status_boundary("luaskills_ffi_describe", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_ptr(functions_out);
+        if functions_out.is_null() {
+            return ffi_error_status(error_out, "functions_out must not be null");
+        }
+        let values = crate::ffi::exported_ffi_function_names();
+        unsafe { *functions_out = Box::into_raw(Box::new(alloc_string_array(&values))) };
+        ffi_ok_status(error_out)
+    })
 }
 
 /// Create one runtime engine through the standard C ABI surface.
@@ -2167,28 +2284,30 @@ pub unsafe extern "C" fn luaskills_ffi_engine_new(
     engine_id_out: *mut u64,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_u64(engine_id_out);
-    if options.is_null() {
-        return ffi_error_status(error_out, "options must not be null");
-    }
-    if engine_id_out.is_null() {
-        return ffi_error_status(error_out, "engine_id_out must not be null");
-    }
-    let options = match parse_engine_options(unsafe { &*options }) {
-        Ok(options) => options,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match LuaEngine::new(options) {
-        Ok(engine) => {
-            let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let mut registry = lock_ffi_engine_registry();
-            registry.insert(engine_id, crate::ffi::FfiEngineSlot::new(engine));
-            unsafe { *engine_id_out = engine_id };
-            ffi_ok_status(error_out)
+    ffi_status_boundary("luaskills_ffi_engine_new", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_u64(engine_id_out);
+        if options.is_null() {
+            return ffi_error_status(error_out, "options must not be null");
         }
-        Err(error) => ffi_error_status(error_out, error.to_string()),
-    }
+        if engine_id_out.is_null() {
+            return ffi_error_status(error_out, "engine_id_out must not be null");
+        }
+        let options = match parse_engine_options(unsafe { &*options }) {
+            Ok(options) => options,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match LuaEngine::new(options) {
+            Ok(engine) => {
+                let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let mut registry = lock_ffi_engine_registry();
+                registry.insert(engine_id, crate::ffi::FfiEngineSlot::new(engine));
+                unsafe { *engine_id_out = engine_id };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(error_out, error.to_string()),
+        }
+    })
 }
 
 /// Create one runtime engine through the standard C ABI v2 surface.
@@ -2205,28 +2324,30 @@ pub unsafe extern "C" fn luaskills_ffi_engine_new_v2(
     engine_id_out: *mut u64,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_u64(engine_id_out);
-    if options.is_null() {
-        return ffi_error_status(error_out, "options must not be null");
-    }
-    if engine_id_out.is_null() {
-        return ffi_error_status(error_out, "engine_id_out must not be null");
-    }
-    let options = match parse_engine_options_v2(unsafe { &*options }) {
-        Ok(options) => options,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match LuaEngine::new(options) {
-        Ok(engine) => {
-            let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let mut registry = lock_ffi_engine_registry();
-            registry.insert(engine_id, crate::ffi::FfiEngineSlot::new(engine));
-            unsafe { *engine_id_out = engine_id };
-            ffi_ok_status(error_out)
+    ffi_status_boundary("luaskills_ffi_engine_new_v2", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_u64(engine_id_out);
+        if options.is_null() {
+            return ffi_error_status(error_out, "options must not be null");
         }
-        Err(error) => ffi_error_status(error_out, error.to_string()),
-    }
+        if engine_id_out.is_null() {
+            return ffi_error_status(error_out, "engine_id_out must not be null");
+        }
+        let options = match parse_engine_options_v2(unsafe { &*options }) {
+            Ok(options) => options,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match LuaEngine::new(options) {
+            Ok(engine) => {
+                let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let mut registry = lock_ffi_engine_registry();
+                registry.insert(engine_id, crate::ffi::FfiEngineSlot::new(engine));
+                unsafe { *engine_id_out = engine_id };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(error_out, error.to_string()),
+        }
+    })
 }
 
 /// Create one runtime engine through the standard C ABI v3 surface.
@@ -2248,28 +2369,30 @@ pub unsafe extern "C" fn luaskills_ffi_engine_new_v3(
     engine_id_out: *mut u64,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_u64(engine_id_out);
-    if options.is_null() {
-        return ffi_error_status(error_out, "options must not be null");
-    }
-    if engine_id_out.is_null() {
-        return ffi_error_status(error_out, "engine_id_out must not be null");
-    }
-    let options = match parse_engine_options_v3(unsafe { &*options }) {
-        Ok(options) => options,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match LuaEngine::new(options) {
-        Ok(engine) => {
-            let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let mut registry = lock_ffi_engine_registry();
-            registry.insert(engine_id, crate::ffi::FfiEngineSlot::new(engine));
-            unsafe { *engine_id_out = engine_id };
-            ffi_ok_status(error_out)
+    ffi_status_boundary("luaskills_ffi_engine_new_v3", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_u64(engine_id_out);
+        if options.is_null() {
+            return ffi_error_status(error_out, "options must not be null");
         }
-        Err(error) => ffi_error_status(error_out, error.to_string()),
-    }
+        if engine_id_out.is_null() {
+            return ffi_error_status(error_out, "engine_id_out must not be null");
+        }
+        let options = match parse_engine_options_v3(unsafe { &*options }) {
+            Ok(options) => options,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match LuaEngine::new(options) {
+            Ok(engine) => {
+                let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let mut registry = lock_ffi_engine_registry();
+                registry.insert(engine_id, crate::ffi::FfiEngineSlot::new(engine));
+                unsafe { *engine_id_out = engine_id };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(error_out, error.to_string()),
+        }
+    })
 }
 
 /// Create an engine with an explicit per-engine desktop or console policy through the v4 ABI.
@@ -2288,36 +2411,38 @@ pub unsafe extern "C" fn luaskills_ffi_engine_new_v4(
     engine_id_out: *mut u64,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_u64(engine_id_out);
-    if options.is_null() {
-        return ffi_error_status(error_out, "options must not be null");
-    }
-    if engine_id_out.is_null() {
-        return ffi_error_status(error_out, "engine_id_out must not be null");
-    }
-    // The v4 entry is the only entry allowed to dereference the larger v4 input.
-    // v4 入口是唯一允许解引用较大 v4 输入的入口。
-    let options = match parse_engine_options_v4(unsafe { &*options }) {
-        Ok(options) => options,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match LuaEngine::new(options) {
-        Ok(engine) => {
-            // The handle registry owns the complete engine exactly as for earlier ABI versions.
-            // 句柄注册表与早期 ABI 版本一样拥有完整引擎。
-            let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            // The registry lock serializes handle publication across creation entry versions.
-            // 注册表锁串行化不同创建入口版本间的句柄发布。
-            let mut registry = lock_ffi_engine_registry();
-            registry.insert(engine_id, crate::ffi::FfiEngineSlot::new(engine));
-            // SAFETY: The caller supplies a valid writable output pointer checked above for null.
-            // 安全性：调用方提供有效可写输出指针，上文已检查非空。
-            unsafe { *engine_id_out = engine_id };
-            ffi_ok_status(error_out)
+    ffi_status_boundary("luaskills_ffi_engine_new_v4", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_u64(engine_id_out);
+        if options.is_null() {
+            return ffi_error_status(error_out, "options must not be null");
         }
-        Err(error) => ffi_error_status(error_out, error.to_string()),
-    }
+        if engine_id_out.is_null() {
+            return ffi_error_status(error_out, "engine_id_out must not be null");
+        }
+        // The v4 entry is the only entry allowed to dereference the larger v4 input.
+        // v4 入口是唯一允许解引用较大 v4 输入的入口。
+        let options = match parse_engine_options_v4(unsafe { &*options }) {
+            Ok(options) => options,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match LuaEngine::new(options) {
+            Ok(engine) => {
+                // The handle registry owns the complete engine exactly as for earlier ABI versions.
+                // 句柄注册表与早期 ABI 版本一样拥有完整引擎。
+                let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                // The registry lock serializes handle publication across creation entry versions.
+                // 注册表锁串行化不同创建入口版本间的句柄发布。
+                let mut registry = lock_ffi_engine_registry();
+                registry.insert(engine_id, crate::ffi::FfiEngineSlot::new(engine));
+                // SAFETY: The caller supplies a valid writable output pointer checked above for null.
+                // 安全性：调用方提供有效可写输出指针，上文已检查非空。
+                unsafe { *engine_id_out = engine_id };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(error_out, error.to_string()),
+        }
+    })
 }
 
 /// Create an engine from borrowed v4 options and instance database callbacks without reading global defaults.
@@ -2335,50 +2460,57 @@ pub unsafe extern "C" fn luaskills_ffi_engine_new_with_database_providers_v1(
     engine_id_out: *mut u64,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_u64(engine_id_out);
-    if options.is_null() || callbacks.is_null() || engine_id_out.is_null() {
-        return ffi_error_status(
-            error_out,
-            "options, callbacks and engine_id_out must not be null",
-        );
-    }
-    // Parse the same v4 options as the existing constructor; never reinterpret an older layout.
-    // 与现有构造入口解析相同的 v4 选项，不重新解释旧版布局。
-    let options = match parse_engine_options_v4(unsafe { &*options }) {
-        Ok(options) => options,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    // Copy callback pointers before publication; the input descriptor remains borrowed only for this call.
-    // 发布前复制回调指针；输入描述符只在本次调用期间借用。
-    let callbacks = unsafe { &*callbacks };
-    // Preserve the host pointer bits without transferring allocation ownership.
-    // 保留宿主指针位模式，不转移分配所有权。
-    let user_data = callbacks.user_data as usize;
-    // This collection starts empty and cannot inherit unrelated global registrations.
-    // 当前集合从空状态开始，不会继承无关全局注册。
-    let mut providers = crate::RuntimeDatabaseProviderCallbacks::default();
-    if let Some(callback) = callbacks.sqlite {
-        providers = providers.with_sqlite(std::sync::Arc::new(move |request| {
-            invoke_standard_sqlite_provider_callback(callback, user_data, request)
-        }));
-    }
-    if let Some(callback) = callbacks.sqlite_json {
-        providers = providers.with_sqlite_json(std::sync::Arc::new(move |request| {
-            invoke_json_provider_callback(callback, user_data, request)
-        }));
-    }
-    match LuaEngine::new_with_database_providers(options, providers) {
-        Ok(engine) => {
-            // Publish the complete engine through the unchanged handle registry.
-            // 通过保持不变的句柄注册表发布完整引擎。
-            let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            lock_ffi_engine_registry().insert(engine_id, crate::ffi::FfiEngineSlot::new(engine));
-            unsafe { *engine_id_out = engine_id };
-            ffi_ok_status(error_out)
-        }
-        Err(error) => ffi_error_status(error_out, error.to_string()),
-    }
+    ffi_status_boundary(
+        "luaskills_ffi_engine_new_with_database_providers_v1",
+        error_out,
+        move || {
+            clear_error_out(error_out);
+            clear_out_u64(engine_id_out);
+            if options.is_null() || callbacks.is_null() || engine_id_out.is_null() {
+                return ffi_error_status(
+                    error_out,
+                    "options, callbacks and engine_id_out must not be null",
+                );
+            }
+            // Parse the same v4 options as the existing constructor; never reinterpret an older layout.
+            // 与现有构造入口解析相同的 v4 选项，不重新解释旧版布局。
+            let options = match parse_engine_options_v4(unsafe { &*options }) {
+                Ok(options) => options,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            // Copy callback pointers before publication; the input descriptor remains borrowed only for this call.
+            // 发布前复制回调指针；输入描述符只在本次调用期间借用。
+            let callbacks = unsafe { &*callbacks };
+            // Preserve the host pointer bits without transferring allocation ownership.
+            // 保留宿主指针位模式，不转移分配所有权。
+            let user_data = callbacks.user_data as usize;
+            // This collection starts empty and cannot inherit unrelated global registrations.
+            // 当前集合从空状态开始，不会继承无关全局注册。
+            let mut providers = crate::RuntimeDatabaseProviderCallbacks::default();
+            if let Some(callback) = callbacks.sqlite {
+                providers = providers.with_sqlite(std::sync::Arc::new(move |request| {
+                    invoke_standard_sqlite_provider_callback(callback, user_data, request)
+                }));
+            }
+            if let Some(callback) = callbacks.sqlite_json {
+                providers = providers.with_sqlite_json(std::sync::Arc::new(move |request| {
+                    invoke_json_provider_callback(callback, user_data, request)
+                }));
+            }
+            match LuaEngine::new_with_database_providers(options, providers) {
+                Ok(engine) => {
+                    // Publish the complete engine through the unchanged handle registry.
+                    // 通过保持不变的句柄注册表发布完整引擎。
+                    let engine_id = FFI_ENGINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    lock_ffi_engine_registry()
+                        .insert(engine_id, crate::ffi::FfiEngineSlot::new(engine));
+                    unsafe { *engine_id_out = engine_id };
+                    ffi_ok_status(error_out)
+                }
+                Err(error) => ffi_error_status(error_out, error.to_string()),
+            }
+        },
+    )
 }
 
 /// Free one runtime engine through the standard C ABI surface.
@@ -2394,15 +2526,19 @@ pub unsafe extern "C" fn luaskills_ffi_engine_free(
     engine_id: u64,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    // Removed slot whose callback-quiescing engine teardown must run outside the registry lock.
-    // 已移除的槽；其等待回调收敛的引擎清理必须在注册表锁外运行。
-    let removed_slot = match remove_ffi_engine_slot(engine_id) {
-        Some(removed_slot) => removed_slot,
-        None => return ffi_error_status(error_out, format!("FFI engine {} not found", engine_id)),
-    };
-    destroy_removed_ffi_engine_slot(removed_slot);
-    ffi_ok_status(error_out)
+    ffi_status_boundary("luaskills_ffi_engine_free", error_out, move || {
+        clear_error_out(error_out);
+        // Removed slot whose callback-quiescing engine teardown must run outside the registry lock.
+        // 已移除的槽；其等待回调收敛的引擎清理必须在注册表锁外运行。
+        let removed_slot = match remove_ffi_engine_slot(engine_id) {
+            Some(removed_slot) => removed_slot,
+            None => {
+                return ffi_error_status(error_out, format!("FFI engine {} not found", engine_id));
+            }
+        };
+        destroy_removed_ffi_engine_slot(removed_slot);
+        ffi_ok_status(error_out)
+    })
 }
 
 /// Load skills from one ordered root chain through the standard C ABI surface.
@@ -2420,19 +2556,21 @@ pub unsafe extern "C" fn luaskills_ffi_load_from_roots(
     skill_roots_len: usize,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
-        Ok(skill_roots) => skill_roots,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine_mut(engine_id, |engine| {
-        engine
-            .load_from_roots(&skill_roots)
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(()) => ffi_ok_status(error_out),
-        Err(error) => ffi_error_status(error_out, error),
-    }
+    ffi_status_boundary("luaskills_ffi_load_from_roots", error_out, move || {
+        clear_error_out(error_out);
+        let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
+            Ok(skill_roots) => skill_roots,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine_mut(engine_id, |engine| {
+            engine
+                .load_from_roots(&skill_roots)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(()) => ffi_ok_status(error_out),
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// Reload skills from one ordered root chain through the standard C ABI surface.
@@ -2450,19 +2588,21 @@ pub unsafe extern "C" fn luaskills_ffi_reload_from_roots(
     skill_roots_len: usize,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
-        Ok(skill_roots) => skill_roots,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine_mut(engine_id, |engine| {
-        engine
-            .reload_from_roots(&skill_roots)
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(()) => ffi_ok_status(error_out),
-        Err(error) => ffi_error_status(error_out, error),
-    }
+    ffi_status_boundary("luaskills_ffi_reload_from_roots", error_out, move || {
+        clear_error_out(error_out);
+        let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
+            Ok(skill_roots) => skill_roots,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine_mut(engine_id, |engine| {
+            engine
+                .reload_from_roots(&skill_roots)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(()) => ffi_ok_status(error_out),
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// List runtime entries visible to one host-injected authority through the standard C ABI surface.
@@ -2480,27 +2620,29 @@ pub unsafe extern "C" fn luaskills_ffi_list_entries(
     entries_out: *mut *mut FfiRuntimeEntryDescriptorList,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_ptr(entries_out);
-    if entries_out.is_null() {
-        return ffi_error_status(error_out, "entries_out must not be null");
-    }
-    let authority = match parse_skill_management_authority(authority, "authority") {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine(engine_id, |engine| {
-        engine.list_entries_for_authority(authority)
-    }) {
-        Ok(entries) => match alloc_entry_descriptor_list(&entries) {
-            Ok(list) => {
-                unsafe { *entries_out = Box::into_raw(Box::new(list)) };
-                ffi_ok_status(error_out)
-            }
+    ffi_status_boundary("luaskills_ffi_list_entries", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_ptr(entries_out);
+        if entries_out.is_null() {
+            return ffi_error_status(error_out, "entries_out must not be null");
+        }
+        let authority = match parse_skill_management_authority(authority, "authority") {
+            Ok(authority) => authority,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine(engine_id, |engine| {
+            engine.list_entries_for_authority(authority)
+        }) {
+            Ok(entries) => match alloc_entry_descriptor_list(&entries) {
+                Ok(list) => {
+                    unsafe { *entries_out = Box::into_raw(Box::new(list)) };
+                    ffi_ok_status(error_out)
+                }
+                Err(error) => ffi_error_status(error_out, error),
+            },
             Err(error) => ffi_error_status(error_out, error),
-        },
-        Err(error) => ffi_error_status(error_out, error),
-    }
+        }
+    })
 }
 
 /// List runtime help trees visible to one host-injected authority through the standard C ABI surface.
@@ -2518,30 +2660,32 @@ pub unsafe extern "C" fn luaskills_ffi_list_skill_help(
     help_out: *mut *mut FfiRuntimeSkillHelpDescriptorList,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_ptr(help_out);
-    if help_out.is_null() {
-        return ffi_error_status(error_out, "help_out must not be null");
-    }
-    let authority = match parse_skill_management_authority(authority, "authority") {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine(engine_id, |engine| {
-        engine.list_skill_help_for_authority(authority)
-    }) {
-        Ok(help_descriptors) => {
-            // Exact top-level help array matching the shared boxed-slice free contract.
-            // 与共享 boxed-slice 释放契约匹配的精确顶层帮助数组。
-            let items: Vec<FfiRuntimeSkillHelpDescriptor> =
-                help_descriptors.iter().map(alloc_help_descriptor).collect();
-            let (items, len) = alloc_ffi_boxed_slice(items);
-            let list = FfiRuntimeSkillHelpDescriptorList { items, len };
-            unsafe { *help_out = Box::into_raw(Box::new(list)) };
-            ffi_ok_status(error_out)
+    ffi_status_boundary("luaskills_ffi_list_skill_help", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_ptr(help_out);
+        if help_out.is_null() {
+            return ffi_error_status(error_out, "help_out must not be null");
         }
-        Err(error) => ffi_error_status(error_out, error),
-    }
+        let authority = match parse_skill_management_authority(authority, "authority") {
+            Ok(authority) => authority,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine(engine_id, |engine| {
+            engine.list_skill_help_for_authority(authority)
+        }) {
+            Ok(help_descriptors) => {
+                // Exact top-level help array matching the shared boxed-slice free contract.
+                // 与共享 boxed-slice 释放契约匹配的精确顶层帮助数组。
+                let items: Vec<FfiRuntimeSkillHelpDescriptor> =
+                    help_descriptors.iter().map(alloc_help_descriptor).collect();
+                let (items, len) = alloc_ffi_boxed_slice(items);
+                let list = FfiRuntimeSkillHelpDescriptorList { items, len };
+                unsafe { *help_out = Box::into_raw(Box::new(list)) };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// Render one help detail visible to one host-injected authority through the standard C ABI surface.
@@ -2562,43 +2706,49 @@ pub unsafe extern "C" fn luaskills_ffi_render_skill_help_detail(
     detail_out: *mut *mut FfiRuntimeHelpDetail,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_ptr(detail_out);
-    if detail_out.is_null() {
-        return ffi_error_status(error_out, "detail_out must not be null");
-    }
-    let skill_id = match parse_required_string(skill_id, "skill_id") {
-        Ok(skill_id) => skill_id,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let flow_name = match parse_required_string(flow_name, "flow_name") {
-        Ok(flow_name) => flow_name,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let authority = match parse_skill_management_authority(authority, "authority") {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let request_context =
-        match parse_request_context_buffer(&request_context_json, "request_context_json") {
-            Ok(request_context) => request_context,
-            Err(error) => return ffi_error_status(error_out, error),
-        };
-    match with_engine(engine_id, |engine| {
-        engine.render_skill_help_detail_for_authority(
-            authority,
-            &skill_id,
-            &flow_name,
-            request_context.as_ref(),
-        )
-    }) {
-        Ok(Some(detail)) => {
-            unsafe { *detail_out = Box::into_raw(Box::new(alloc_help_detail(&detail))) };
-            ffi_ok_status(error_out)
-        }
-        Ok(None) => ffi_error_status(error_out, "Requested help detail was not found"),
-        Err(error) => ffi_error_status(error_out, error),
-    }
+    ffi_status_boundary(
+        "luaskills_ffi_render_skill_help_detail",
+        error_out,
+        move || {
+            clear_error_out(error_out);
+            clear_out_ptr(detail_out);
+            if detail_out.is_null() {
+                return ffi_error_status(error_out, "detail_out must not be null");
+            }
+            let skill_id = match parse_required_string(skill_id, "skill_id") {
+                Ok(skill_id) => skill_id,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            let flow_name = match parse_required_string(flow_name, "flow_name") {
+                Ok(flow_name) => flow_name,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            let authority = match parse_skill_management_authority(authority, "authority") {
+                Ok(authority) => authority,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            let request_context =
+                match parse_request_context_buffer(&request_context_json, "request_context_json") {
+                    Ok(request_context) => request_context,
+                    Err(error) => return ffi_error_status(error_out, error),
+                };
+            match with_engine(engine_id, |engine| {
+                engine.render_skill_help_detail_for_authority(
+                    authority,
+                    &skill_id,
+                    &flow_name,
+                    request_context.as_ref(),
+                )
+            }) {
+                Ok(Some(detail)) => {
+                    unsafe { *detail_out = Box::into_raw(Box::new(alloc_help_detail(&detail))) };
+                    ffi_ok_status(error_out)
+                }
+                Ok(None) => ffi_error_status(error_out, "Requested help detail was not found"),
+                Err(error) => ffi_error_status(error_out, error),
+            }
+        },
+    )
 }
 
 /// Resolve prompt argument completions through the standard C ABI surface.
@@ -2618,40 +2768,46 @@ pub unsafe extern "C" fn luaskills_ffi_prompt_argument_completions(
     values_out: *mut *mut FfiStringArray,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_ptr(values_out);
-    if values_out.is_null() {
-        return ffi_error_status(error_out, "values_out must not be null");
-    }
-    let prompt_name = match parse_required_string(prompt_name, "prompt_name") {
-        Ok(prompt_name) => prompt_name,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let argument_name = match parse_required_string(argument_name, "argument_name") {
-        Ok(argument_name) => argument_name,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let authority = match parse_skill_management_authority(authority, "authority") {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine(engine_id, |engine| {
-        Ok(engine.prompt_argument_completions_for_authority(
-            authority,
-            &prompt_name,
-            &argument_name,
-        ))
-    }) {
-        Ok(Some(values)) => {
-            unsafe { *values_out = Box::into_raw(Box::new(alloc_string_array(&values))) };
-            ffi_ok_status(error_out)
-        }
-        Ok(None) => {
-            unsafe { *values_out = Box::into_raw(Box::new(alloc_string_array(&[]))) };
-            ffi_ok_status(error_out)
-        }
-        Err(error) => ffi_error_status(error_out, error),
-    }
+    ffi_status_boundary(
+        "luaskills_ffi_prompt_argument_completions",
+        error_out,
+        move || {
+            clear_error_out(error_out);
+            clear_out_ptr(values_out);
+            if values_out.is_null() {
+                return ffi_error_status(error_out, "values_out must not be null");
+            }
+            let prompt_name = match parse_required_string(prompt_name, "prompt_name") {
+                Ok(prompt_name) => prompt_name,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            let argument_name = match parse_required_string(argument_name, "argument_name") {
+                Ok(argument_name) => argument_name,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            let authority = match parse_skill_management_authority(authority, "authority") {
+                Ok(authority) => authority,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            match with_engine(engine_id, |engine| {
+                Ok(engine.prompt_argument_completions_for_authority(
+                    authority,
+                    &prompt_name,
+                    &argument_name,
+                ))
+            }) {
+                Ok(Some(values)) => {
+                    unsafe { *values_out = Box::into_raw(Box::new(alloc_string_array(&values))) };
+                    ffi_ok_status(error_out)
+                }
+                Ok(None) => {
+                    unsafe { *values_out = Box::into_raw(Box::new(alloc_string_array(&[]))) };
+                    ffi_ok_status(error_out)
+                }
+                Err(error) => ffi_error_status(error_out, error),
+            }
+        },
+    )
 }
 
 /// Check whether one tool belongs to a visible Lua skill through the standard C ABI surface.
@@ -2670,28 +2826,30 @@ pub unsafe extern "C" fn luaskills_ffi_is_skill(
     value_out: *mut u8,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_u8(value_out);
-    if value_out.is_null() {
-        return ffi_error_status(error_out, "value_out must not be null");
-    }
-    let tool_name = match parse_required_string(tool_name, "tool_name") {
-        Ok(tool_name) => tool_name,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let authority = match parse_skill_management_authority(authority, "authority") {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine(engine_id, |engine| {
-        engine.is_skill_for_authority(authority, &tool_name)
-    }) {
-        Ok(value) => {
-            unsafe { *value_out = u8::from(value) };
-            ffi_ok_status(error_out)
+    ffi_status_boundary("luaskills_ffi_is_skill", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_u8(value_out);
+        if value_out.is_null() {
+            return ffi_error_status(error_out, "value_out must not be null");
         }
-        Err(error) => ffi_error_status(error_out, error),
-    }
+        let tool_name = match parse_required_string(tool_name, "tool_name") {
+            Ok(tool_name) => tool_name,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let authority = match parse_skill_management_authority(authority, "authority") {
+            Ok(authority) => authority,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine(engine_id, |engine| {
+            engine.is_skill_for_authority(authority, &tool_name)
+        }) {
+            Ok(value) => {
+                unsafe { *value_out = u8::from(value) };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// Resolve the visible owning skill id of one tool through the standard C ABI surface.
@@ -2710,28 +2868,32 @@ pub unsafe extern "C" fn luaskills_ffi_skill_name_for_tool(
     skill_id_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_buffer(skill_id_out);
-    if skill_id_out.is_null() {
-        return ffi_error_status(error_out, "skill_id_out must not be null");
-    }
-    let tool_name = match parse_required_string(tool_name, "tool_name") {
-        Ok(tool_name) => tool_name,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let authority = match parse_skill_management_authority(authority, "authority") {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine(engine_id, |engine| {
-        engine.skill_name_for_tool_for_authority(authority, &tool_name)
-    }) {
-        Ok(skill_id) => {
-            unsafe { *skill_id_out = alloc_optional_owned_buffer_from_string(skill_id.as_deref()) };
-            ffi_ok_status(error_out)
+    ffi_status_boundary("luaskills_ffi_skill_name_for_tool", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_buffer(skill_id_out);
+        if skill_id_out.is_null() {
+            return ffi_error_status(error_out, "skill_id_out must not be null");
         }
-        Err(error) => ffi_error_status(error_out, error),
-    }
+        let tool_name = match parse_required_string(tool_name, "tool_name") {
+            Ok(tool_name) => tool_name,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let authority = match parse_skill_management_authority(authority, "authority") {
+            Ok(authority) => authority,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine(engine_id, |engine| {
+            engine.skill_name_for_tool_for_authority(authority, &tool_name)
+        }) {
+            Ok(skill_id) => {
+                unsafe {
+                    *skill_id_out = alloc_optional_owned_buffer_from_string(skill_id.as_deref())
+                };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// List flattened skill config records through the standard C ABI surface.
@@ -2749,33 +2911,35 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_list(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_buffer(result_json_out);
-    if result_json_out.is_null() {
-        return ffi_error_status(error_out, "result_json_out must not be null");
-    }
-    let skill_id = match parse_optional_string(skill_id, "skill_id") {
-        Ok(skill_id) => skill_id,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine(engine_id, |engine| {
-        engine.list_skill_config_entries(skill_id.as_deref())
-    }) {
-        Ok(entries) => match serde_json::to_string(&entries) {
-            Ok(result_json) => {
-                unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
-                ffi_ok_status(error_out)
-            }
-            Err(error) => ffi_error_status(
-                error_out,
-                format!(
-                    "CONFIG_DECLARATION_INVALID: failed to serialize skill config entries: {}",
-                    error
+    ffi_status_boundary("luaskills_ffi_skill_config_list", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_buffer(result_json_out);
+        if result_json_out.is_null() {
+            return ffi_error_status(error_out, "result_json_out must not be null");
+        }
+        let skill_id = match parse_optional_string(skill_id, "skill_id") {
+            Ok(skill_id) => skill_id,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine(engine_id, |engine| {
+            engine.list_skill_config_entries(skill_id.as_deref())
+        }) {
+            Ok(entries) => match serde_json::to_string(&entries) {
+                Ok(result_json) => {
+                    unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
+                    ffi_ok_status(error_out)
+                }
+                Err(error) => ffi_error_status(
+                    error_out,
+                    format!(
+                        "CONFIG_DECLARATION_INVALID: failed to serialize skill config entries: {}",
+                        error
+                    ),
                 ),
-            ),
-        },
-        Err(error) => ffi_error_status(error_out, error),
-    }
+            },
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// Describe effective package configuration declarations through the standard C ABI.
@@ -2800,36 +2964,42 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_describe(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_buffer(result_json_out);
-    if result_json_out.is_null() {
-        return ffi_error_status(error_out, "result_json_out must not be null");
-    }
-    if include_values > 1 {
-        return ffi_error_status(error_out, "include_values must be 0 or 1");
-    }
-    let skill_id = match parse_optional_string(skill_id, "skill_id") {
-        Ok(skill_id) => skill_id,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine(engine_id, |engine| {
-        engine.describe_skill_package_config(skill_id.as_deref(), include_values == 1)
-    }) {
-        Ok(descriptors) => match serde_json::to_string(&descriptors) {
-            Ok(result_json) => {
-                unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
-                ffi_ok_status(error_out)
+    ffi_status_boundary(
+        "luaskills_ffi_skill_config_describe",
+        error_out,
+        move || {
+            clear_error_out(error_out);
+            clear_out_buffer(result_json_out);
+            if result_json_out.is_null() {
+                return ffi_error_status(error_out, "result_json_out must not be null");
             }
-            Err(error) => ffi_error_status(
-                error_out,
-                format!(
-                    "CONFIG_DECLARATION_INVALID: failed to serialize skill package configuration descriptors: {}",
-                    error
-                ),
-            ),
+            if include_values > 1 {
+                return ffi_error_status(error_out, "include_values must be 0 or 1");
+            }
+            let skill_id = match parse_optional_string(skill_id, "skill_id") {
+                Ok(skill_id) => skill_id,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            match with_engine(engine_id, |engine| {
+                engine.describe_skill_package_config(skill_id.as_deref(), include_values == 1)
+            }) {
+                Ok(descriptors) => match serde_json::to_string(&descriptors) {
+                    Ok(result_json) => {
+                        unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
+                        ffi_ok_status(error_out)
+                    }
+                    Err(error) => ffi_error_status(
+                        error_out,
+                        format!(
+                            "CONFIG_DECLARATION_INVALID: failed to serialize skill package configuration descriptors: {}",
+                            error
+                        ),
+                    ),
+                },
+                Err(error) => ffi_error_status(error_out, error),
+            }
         },
-        Err(error) => ffi_error_status(error_out, error),
-    }
+    )
 }
 
 /// Validate one effective package configuration through the standard C ABI.
@@ -2850,33 +3020,39 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_validate(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_buffer(result_json_out);
-    if result_json_out.is_null() {
-        return ffi_error_status(error_out, "result_json_out must not be null");
-    }
-    let skill_id = match parse_required_string(skill_id, "skill_id") {
-        Ok(skill_id) => skill_id,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine(engine_id, |engine| {
-        engine.validate_skill_package_config(&skill_id)
-    }) {
-        Ok(status) => match serde_json::to_string(&status) {
-            Ok(result_json) => {
-                unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
-                ffi_ok_status(error_out)
+    ffi_status_boundary(
+        "luaskills_ffi_skill_config_validate",
+        error_out,
+        move || {
+            clear_error_out(error_out);
+            clear_out_buffer(result_json_out);
+            if result_json_out.is_null() {
+                return ffi_error_status(error_out, "result_json_out must not be null");
             }
-            Err(error) => ffi_error_status(
-                error_out,
-                format!(
-                    "CONFIG_DECLARATION_INVALID: failed to serialize skill package configuration status: {}",
-                    error
-                ),
-            ),
+            let skill_id = match parse_required_string(skill_id, "skill_id") {
+                Ok(skill_id) => skill_id,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            match with_engine(engine_id, |engine| {
+                engine.validate_skill_package_config(&skill_id)
+            }) {
+                Ok(status) => match serde_json::to_string(&status) {
+                    Ok(result_json) => {
+                        unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
+                        ffi_ok_status(error_out)
+                    }
+                    Err(error) => ffi_error_status(
+                        error_out,
+                        format!(
+                            "CONFIG_DECLARATION_INVALID: failed to serialize skill package configuration status: {}",
+                            error
+                        ),
+                    ),
+                },
+                Err(error) => ffi_error_status(error_out, error),
+            }
         },
-        Err(error) => ffi_error_status(error_out, error),
-    }
+    )
 }
 
 /// Read one optional skill config value through the standard C ABI surface.
@@ -2896,35 +3072,37 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_get(
     found_out: *mut u8,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_buffer(value_out);
-    clear_out_u8(found_out);
-    if value_out.is_null() {
-        return ffi_error_status(error_out, "value_out must not be null");
-    }
-    if found_out.is_null() {
-        return ffi_error_status(error_out, "found_out must not be null");
-    }
-    let skill_id = match parse_required_string(skill_id, "skill_id") {
-        Ok(skill_id) => skill_id,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let key = match parse_required_string(key, "key") {
-        Ok(key) => key,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine(engine_id, |engine| {
-        engine.get_skill_config_value(&skill_id, &key)
-    }) {
-        Ok(value) => {
-            unsafe {
-                *found_out = u8::from(value.is_some());
-                *value_out = alloc_optional_owned_buffer_from_string(value.as_deref());
-            }
-            ffi_ok_status(error_out)
+    ffi_status_boundary("luaskills_ffi_skill_config_get", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_buffer(value_out);
+        clear_out_u8(found_out);
+        if value_out.is_null() {
+            return ffi_error_status(error_out, "value_out must not be null");
         }
-        Err(error) => ffi_error_status(error_out, error),
-    }
+        if found_out.is_null() {
+            return ffi_error_status(error_out, "found_out must not be null");
+        }
+        let skill_id = match parse_required_string(skill_id, "skill_id") {
+            Ok(skill_id) => skill_id,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let key = match parse_required_string(key, "key") {
+            Ok(key) => key,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine(engine_id, |engine| {
+            engine.get_skill_config_value(&skill_id, &key)
+        }) {
+            Ok(value) => {
+                unsafe {
+                    *found_out = u8::from(value.is_some());
+                    *value_out = alloc_optional_owned_buffer_from_string(value.as_deref());
+                }
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// Atomically insert or replace one package configuration batch through the standard C ABI.
@@ -2944,50 +3122,57 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_set_values(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_buffer(result_json_out);
-    if result_json_out.is_null() {
-        return ffi_error_status(error_out, "result_json_out must not be null");
-    }
-    let skill_id = match parse_required_string(skill_id, "skill_id") {
-        Ok(skill_id) => skill_id,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let values_json = match parse_required_string(values_json, "values_json") {
-        Ok(values_json) => values_json,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let values = match serde_json::from_str::<StrictSkillConfigInputValues>(&values_json) {
-        Ok(values) => values.0,
-        Err(error) => {
-            return ffi_error_status(
-                error_out,
-                format!("values_json must be one typed JSON object: {}", error),
-            );
-        }
-    };
-    let expected_revision = match parse_optional_string(expected_revision, "expected_revision") {
-        Ok(expected_revision) => expected_revision,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine_mut(engine_id, |engine| {
-        engine.set_skill_config_values(&skill_id, values, expected_revision.as_deref())
-    }) {
-        Ok(result) => match serde_json::to_string(&result) {
-            Ok(result_json) => {
-                unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
-                ffi_ok_status(error_out)
+    ffi_status_boundary(
+        "luaskills_ffi_skill_config_set_values",
+        error_out,
+        move || {
+            clear_error_out(error_out);
+            clear_out_buffer(result_json_out);
+            if result_json_out.is_null() {
+                return ffi_error_status(error_out, "result_json_out must not be null");
             }
-            Err(error) => ffi_error_status(
-                error_out,
-                format!(
-                    "CONFIG_DECLARATION_INVALID: failed to serialize skill config write result: {}",
-                    error
-                ),
-            ),
+            let skill_id = match parse_required_string(skill_id, "skill_id") {
+                Ok(skill_id) => skill_id,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            let values_json = match parse_required_string(values_json, "values_json") {
+                Ok(values_json) => values_json,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            let values = match serde_json::from_str::<StrictSkillConfigInputValues>(&values_json) {
+                Ok(values) => values.0,
+                Err(error) => {
+                    return ffi_error_status(
+                        error_out,
+                        format!("values_json must be one typed JSON object: {}", error),
+                    );
+                }
+            };
+            let expected_revision =
+                match parse_optional_string(expected_revision, "expected_revision") {
+                    Ok(expected_revision) => expected_revision,
+                    Err(error) => return ffi_error_status(error_out, error),
+                };
+            match with_engine_mut(engine_id, |engine| {
+                engine.set_skill_config_values(&skill_id, values, expected_revision.as_deref())
+            }) {
+                Ok(result) => match serde_json::to_string(&result) {
+                    Ok(result_json) => {
+                        unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
+                        ffi_ok_status(error_out)
+                    }
+                    Err(error) => ffi_error_status(
+                        error_out,
+                        format!(
+                            "CONFIG_DECLARATION_INVALID: failed to serialize skill config write result: {}",
+                            error
+                        ),
+                    ),
+                },
+                Err(error) => ffi_error_status(error_out, error),
+            }
         },
-        Err(error) => ffi_error_status(error_out, error),
-    }
+    )
 }
 
 /// Delete one skill config key through the standard C ABI surface.
@@ -3007,41 +3192,44 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_delete(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_buffer(result_json_out);
-    if result_json_out.is_null() {
-        return ffi_error_status(error_out, "result_json_out must not be null");
-    }
-    let skill_id = match parse_required_string(skill_id, "skill_id") {
-        Ok(skill_id) => skill_id,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let key = match parse_required_string(key, "key") {
-        Ok(key) => key,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let expected_revision = match parse_optional_string(expected_revision, "expected_revision") {
-        Ok(expected_revision) => expected_revision,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine_mut(engine_id, |engine| {
-        engine.delete_skill_config_value(&skill_id, &key, expected_revision.as_deref())
-    }) {
-        Ok(result) => match serde_json::to_string(&result) {
-            Ok(result_json) => {
-                unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
-                ffi_ok_status(error_out)
-            }
-            Err(error) => ffi_error_status(
-                error_out,
-                format!(
-                    "CONFIG_DECLARATION_INVALID: failed to serialize skill config delete result: {}",
-                    error
+    ffi_status_boundary("luaskills_ffi_skill_config_delete", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_buffer(result_json_out);
+        if result_json_out.is_null() {
+            return ffi_error_status(error_out, "result_json_out must not be null");
+        }
+        let skill_id = match parse_required_string(skill_id, "skill_id") {
+            Ok(skill_id) => skill_id,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let key = match parse_required_string(key, "key") {
+            Ok(key) => key,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let expected_revision = match parse_optional_string(expected_revision, "expected_revision")
+        {
+            Ok(expected_revision) => expected_revision,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine_mut(engine_id, |engine| {
+            engine.delete_skill_config_value(&skill_id, &key, expected_revision.as_deref())
+        }) {
+            Ok(result) => match serde_json::to_string(&result) {
+                Ok(result_json) => {
+                    unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
+                    ffi_ok_status(error_out)
+                }
+                Err(error) => ffi_error_status(
+                    error_out,
+                    format!(
+                        "CONFIG_DECLARATION_INVALID: failed to serialize skill config delete result: {}",
+                        error
+                    ),
                 ),
-            ),
-        },
-        Err(error) => ffi_error_status(error_out, error),
-    }
+            },
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// Explicitly refresh one selected skill configuration store or both stores.
@@ -3057,32 +3245,34 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_refresh(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_buffer(result_json_out);
-    if result_json_out.is_null() {
-        return ffi_error_status(error_out, "result_json_out must not be null");
-    }
-    let store_scope = match parse_optional_string(store_scope, "store_scope") {
-        Ok(store_scope) => store_scope,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine(engine_id, |engine| {
-        engine.refresh_skill_config(store_scope.as_deref())
-    }) {
-        Ok(result) => match serde_json::to_string(&result) {
-            Ok(result_json) => {
-                unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
-                ffi_ok_status(error_out)
-            }
-            Err(error) => ffi_error_status(
-                error_out,
-                format!(
-                    "CONFIG_DECLARATION_INVALID: failed to serialize skill config refresh result: {error}"
+    ffi_status_boundary("luaskills_ffi_skill_config_refresh", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_buffer(result_json_out);
+        if result_json_out.is_null() {
+            return ffi_error_status(error_out, "result_json_out must not be null");
+        }
+        let store_scope = match parse_optional_string(store_scope, "store_scope") {
+            Ok(store_scope) => store_scope,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine(engine_id, |engine| {
+            engine.refresh_skill_config(store_scope.as_deref())
+        }) {
+            Ok(result) => match serde_json::to_string(&result) {
+                Ok(result_json) => {
+                    unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
+                    ffi_ok_status(error_out)
+                }
+                Err(error) => ffi_error_status(
+                    error_out,
+                    format!(
+                        "CONFIG_DECLARATION_INVALID: failed to serialize skill config refresh result: {error}"
+                    ),
                 ),
-            ),
-        },
-        Err(error) => ffi_error_status(error_out, error),
-    }
+            },
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// Poll ordered skill configuration events through the standard C ABI.
@@ -3099,41 +3289,47 @@ pub unsafe extern "C" fn luaskills_ffi_skill_config_events_poll(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_buffer(result_json_out);
-    if result_json_out.is_null() {
-        return ffi_error_status(error_out, "result_json_out must not be null");
-    }
-    let after_sequence = match parse_optional_string(after_sequence, "after_sequence") {
-        Ok(after_sequence) => after_sequence,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let limit = match usize::try_from(limit) {
-        Ok(limit) => limit,
-        Err(_) => {
-            return ffi_error_status(
-                error_out,
-                "event poll limit is outside the platform usize range",
-            );
-        }
-    };
-    match with_engine(engine_id, |engine| {
-        engine.poll_skill_config_events(after_sequence.as_deref(), limit)
-    }) {
-        Ok(result) => match serde_json::to_string(&result) {
-            Ok(result_json) => {
-                unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
-                ffi_ok_status(error_out)
+    ffi_status_boundary(
+        "luaskills_ffi_skill_config_events_poll",
+        error_out,
+        move || {
+            clear_error_out(error_out);
+            clear_out_buffer(result_json_out);
+            if result_json_out.is_null() {
+                return ffi_error_status(error_out, "result_json_out must not be null");
             }
-            Err(error) => ffi_error_status(
-                error_out,
-                format!(
-                    "CONFIG_DECLARATION_INVALID: failed to serialize skill config event batch: {error}"
-                ),
-            ),
+            let after_sequence = match parse_optional_string(after_sequence, "after_sequence") {
+                Ok(after_sequence) => after_sequence,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            let limit = match usize::try_from(limit) {
+                Ok(limit) => limit,
+                Err(_) => {
+                    return ffi_error_status(
+                        error_out,
+                        "event poll limit is outside the platform usize range",
+                    );
+                }
+            };
+            match with_engine(engine_id, |engine| {
+                engine.poll_skill_config_events(after_sequence.as_deref(), limit)
+            }) {
+                Ok(result) => match serde_json::to_string(&result) {
+                    Ok(result_json) => {
+                        unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
+                        ffi_ok_status(error_out)
+                    }
+                    Err(error) => ffi_error_status(
+                        error_out,
+                        format!(
+                            "CONFIG_DECLARATION_INVALID: failed to serialize skill config event batch: {error}"
+                        ),
+                    ),
+                },
+                Err(error) => ffi_error_status(error_out, error),
+            }
         },
-        Err(error) => ffi_error_status(error_out, error),
-    }
+    )
 }
 
 /// Call one loaded skill entry through the standard C ABI surface.
@@ -3153,35 +3349,37 @@ pub unsafe extern "C" fn luaskills_ffi_call_skill(
     result_out: *mut *mut FfiRuntimeInvocationResult,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_ptr(result_out);
-    if result_out.is_null() {
-        return ffi_error_status(error_out, "result_out must not be null");
-    }
-    let tool_name = match parse_required_string(tool_name, "tool_name") {
-        Ok(tool_name) => tool_name,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let args = match parse_json_value_or_empty_object_buffer(&args_json, "args_json") {
-        Ok(args) => args,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let invocation_context = match parse_invocation_context(invocation_context) {
-        Ok(invocation_context) => invocation_context,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine(engine_id, |engine| {
-        engine.call_skill(&tool_name, &args, invocation_context.as_ref())
-    }) {
-        Ok(result) => match alloc_invocation_result(&result) {
-            Ok(ffi_result) => {
-                unsafe { *result_out = Box::into_raw(Box::new(ffi_result)) };
-                ffi_ok_status(error_out)
-            }
+    ffi_status_boundary("luaskills_ffi_call_skill", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_ptr(result_out);
+        if result_out.is_null() {
+            return ffi_error_status(error_out, "result_out must not be null");
+        }
+        let tool_name = match parse_required_string(tool_name, "tool_name") {
+            Ok(tool_name) => tool_name,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let args = match parse_json_value_or_empty_object_buffer(&args_json, "args_json") {
+            Ok(args) => args,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let invocation_context = match parse_invocation_context(invocation_context) {
+            Ok(invocation_context) => invocation_context,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine(engine_id, |engine| {
+            engine.call_skill(&tool_name, &args, invocation_context.as_ref())
+        }) {
+            Ok(result) => match alloc_invocation_result(&result) {
+                Ok(ffi_result) => {
+                    unsafe { *result_out = Box::into_raw(Box::new(ffi_result)) };
+                    ffi_ok_status(error_out)
+                }
+                Err(error) => ffi_error_status(error_out, error),
+            },
             Err(error) => ffi_error_status(error_out, error),
-        },
-        Err(error) => ffi_error_status(error_out, error),
-    }
+        }
+    })
 }
 
 /// Execute arbitrary Lua code through the standard C ABI surface.
@@ -3201,38 +3399,40 @@ pub unsafe extern "C" fn luaskills_ffi_run_lua(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_buffer(result_json_out);
-    if result_json_out.is_null() {
-        return ffi_error_status(error_out, "result_json_out must not be null");
-    }
-    let code = match parse_required_string(code, "code") {
-        Ok(code) => code,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let args = match parse_json_value_or_empty_object_buffer(&args_json, "args_json") {
-        Ok(args) => args,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let invocation_context = match parse_invocation_context(invocation_context) {
-        Ok(invocation_context) => invocation_context,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine(engine_id, |engine| {
-        engine.run_lua(&code, &args, invocation_context.as_ref())
-    }) {
-        Ok(result) => match serde_json::to_string(&result) {
-            Ok(result_json) => {
-                unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
-                ffi_ok_status(error_out)
-            }
-            Err(error) => ffi_error_status(
-                error_out,
-                format!("Failed to serialize Lua result: {}", error),
-            ),
-        },
-        Err(error) => ffi_error_status(error_out, error),
-    }
+    ffi_status_boundary("luaskills_ffi_run_lua", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_buffer(result_json_out);
+        if result_json_out.is_null() {
+            return ffi_error_status(error_out, "result_json_out must not be null");
+        }
+        let code = match parse_required_string(code, "code") {
+            Ok(code) => code,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let args = match parse_json_value_or_empty_object_buffer(&args_json, "args_json") {
+            Ok(args) => args,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let invocation_context = match parse_invocation_context(invocation_context) {
+            Ok(invocation_context) => invocation_context,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine(engine_id, |engine| {
+            engine.run_lua(&code, &args, invocation_context.as_ref())
+        }) {
+            Ok(result) => match serde_json::to_string(&result) {
+                Ok(result_json) => {
+                    unsafe { *result_json_out = alloc_owned_buffer_from_string(result_json) };
+                    ffi_ok_status(error_out)
+                }
+                Err(error) => ffi_error_status(
+                    error_out,
+                    format!("Failed to serialize Lua result: {}", error),
+                ),
+            },
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// Create one public runtime lease through the standard C ABI surface using one JSON request payload.
@@ -3250,14 +3450,16 @@ pub unsafe extern "C" fn luaskills_ffi_runtime_lease_create(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    run_engine_json_text_call(
-        engine_id,
-        &request_json,
-        result_json_out,
-        error_out,
-        "request_json",
-        |engine, request_json| engine.create_runtime_lease_json(request_json),
-    )
+    ffi_status_boundary("luaskills_ffi_runtime_lease_create", error_out, move || {
+        run_engine_json_text_call(
+            engine_id,
+            &request_json,
+            result_json_out,
+            error_out,
+            "request_json",
+            |engine, request_json| engine.create_runtime_lease_json(request_json),
+        )
+    })
 }
 
 /// Evaluate one public runtime lease through the standard C ABI surface using one JSON request payload.
@@ -3275,14 +3477,16 @@ pub unsafe extern "C" fn luaskills_ffi_runtime_lease_eval(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    run_engine_json_text_call(
-        engine_id,
-        &request_json,
-        result_json_out,
-        error_out,
-        "request_json",
-        |engine, request_json| engine.eval_runtime_lease_json(request_json),
-    )
+    ffi_status_boundary("luaskills_ffi_runtime_lease_eval", error_out, move || {
+        run_engine_json_text_call(
+            engine_id,
+            &request_json,
+            result_json_out,
+            error_out,
+            "request_json",
+            |engine, request_json| engine.eval_runtime_lease_json(request_json),
+        )
+    })
 }
 
 /// Return one public runtime lease status through the standard C ABI surface using one JSON request payload.
@@ -3300,14 +3504,16 @@ pub unsafe extern "C" fn luaskills_ffi_runtime_lease_status(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    run_engine_json_text_call(
-        engine_id,
-        &request_json,
-        result_json_out,
-        error_out,
-        "request_json",
-        |engine, request_json| engine.runtime_lease_status_json(request_json),
-    )
+    ffi_status_boundary("luaskills_ffi_runtime_lease_status", error_out, move || {
+        run_engine_json_text_call(
+            engine_id,
+            &request_json,
+            result_json_out,
+            error_out,
+            "request_json",
+            |engine, request_json| engine.runtime_lease_status_json(request_json),
+        )
+    })
 }
 
 /// List public runtime leases through the standard C ABI surface using one JSON request payload.
@@ -3325,14 +3531,16 @@ pub unsafe extern "C" fn luaskills_ffi_runtime_lease_list(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    run_engine_json_text_call(
-        engine_id,
-        &request_json,
-        result_json_out,
-        error_out,
-        "request_json",
-        |engine, request_json| engine.list_runtime_leases_json(request_json),
-    )
+    ffi_status_boundary("luaskills_ffi_runtime_lease_list", error_out, move || {
+        run_engine_json_text_call(
+            engine_id,
+            &request_json,
+            result_json_out,
+            error_out,
+            "request_json",
+            |engine, request_json| engine.list_runtime_leases_json(request_json),
+        )
+    })
 }
 
 /// Close one public runtime lease through the standard C ABI surface using one JSON request payload.
@@ -3350,14 +3558,16 @@ pub unsafe extern "C" fn luaskills_ffi_runtime_lease_close(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    run_engine_json_text_call(
-        engine_id,
-        &request_json,
-        result_json_out,
-        error_out,
-        "request_json",
-        |engine, request_json| engine.close_runtime_lease_json(request_json),
-    )
+    ffi_status_boundary("luaskills_ffi_runtime_lease_close", error_out, move || {
+        run_engine_json_text_call(
+            engine_id,
+            &request_json,
+            result_json_out,
+            error_out,
+            "request_json",
+            |engine, request_json| engine.close_runtime_lease_json(request_json),
+        )
+    })
 }
 
 /// Create one `system_lua_lib` runtime lease through the standard C ABI surface using one JSON request payload.
@@ -3375,13 +3585,19 @@ pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_create(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    run_engine_json_text_call(
-        engine_id,
-        &request_json,
-        result_json_out,
+    ffi_status_boundary(
+        "luaskills_ffi_system_runtime_lease_create",
         error_out,
-        "request_json",
-        |engine, request_json| engine.create_system_runtime_lease_json(request_json),
+        move || {
+            run_engine_json_text_call(
+                engine_id,
+                &request_json,
+                result_json_out,
+                error_out,
+                "request_json",
+                |engine, request_json| engine.create_system_runtime_lease_json(request_json),
+            )
+        },
     )
 }
 
@@ -3400,13 +3616,19 @@ pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_eval(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    run_engine_json_text_call(
-        engine_id,
-        &request_json,
-        result_json_out,
+    ffi_status_boundary(
+        "luaskills_ffi_system_runtime_lease_eval",
         error_out,
-        "request_json",
-        |engine, request_json| engine.eval_system_runtime_lease_json(request_json),
+        move || {
+            run_engine_json_text_call(
+                engine_id,
+                &request_json,
+                result_json_out,
+                error_out,
+                "request_json",
+                |engine, request_json| engine.eval_system_runtime_lease_json(request_json),
+            )
+        },
     )
 }
 
@@ -3425,13 +3647,19 @@ pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_status(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    run_engine_json_text_call(
-        engine_id,
-        &request_json,
-        result_json_out,
+    ffi_status_boundary(
+        "luaskills_ffi_system_runtime_lease_status",
         error_out,
-        "request_json",
-        |engine, request_json| engine.system_runtime_lease_status_json(request_json),
+        move || {
+            run_engine_json_text_call(
+                engine_id,
+                &request_json,
+                result_json_out,
+                error_out,
+                "request_json",
+                |engine, request_json| engine.system_runtime_lease_status_json(request_json),
+            )
+        },
     )
 }
 
@@ -3450,13 +3678,19 @@ pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_list(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    run_engine_json_text_call(
-        engine_id,
-        &request_json,
-        result_json_out,
+    ffi_status_boundary(
+        "luaskills_ffi_system_runtime_lease_list",
         error_out,
-        "request_json",
-        |engine, request_json| engine.list_system_runtime_leases_json(request_json),
+        move || {
+            run_engine_json_text_call(
+                engine_id,
+                &request_json,
+                result_json_out,
+                error_out,
+                "request_json",
+                |engine, request_json| engine.list_system_runtime_leases_json(request_json),
+            )
+        },
     )
 }
 
@@ -3475,13 +3709,19 @@ pub unsafe extern "C" fn luaskills_ffi_system_runtime_lease_close(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    run_engine_json_text_call(
-        engine_id,
-        &request_json,
-        result_json_out,
+    ffi_status_boundary(
+        "luaskills_ffi_system_runtime_lease_close",
         error_out,
-        "request_json",
-        |engine, request_json| engine.close_system_runtime_lease_json(request_json),
+        move || {
+            run_engine_json_text_call(
+                engine_id,
+                &request_json,
+                result_json_out,
+                error_out,
+                "request_json",
+                |engine, request_json| engine.close_system_runtime_lease_json(request_json),
+            )
+        },
     )
 }
 
@@ -3510,18 +3750,28 @@ pub unsafe extern "C" fn luaskills_ffi_managed_session_events_poll(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_buffer(result_json_out);
-    if result_json_out.is_null() {
-        return ffi_error_status(error_out, "result_json_out must not be null");
-    }
-    // Detached event center acquired before the destructive nonblocking drain.
-    // 在破坏性非阻塞排空前获取的分离式事件中心。
-    let event_center = match clone_managed_session_event_center(engine_id) {
-        Ok(event_center) => event_center,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    write_managed_session_event_batch(event_center.poll(max_events), result_json_out, error_out)
+    ffi_status_boundary(
+        "luaskills_ffi_managed_session_events_poll",
+        error_out,
+        move || {
+            clear_error_out(error_out);
+            clear_out_buffer(result_json_out);
+            if result_json_out.is_null() {
+                return ffi_error_status(error_out, "result_json_out must not be null");
+            }
+            // Detached event center acquired before the destructive nonblocking drain.
+            // 在破坏性非阻塞排空前获取的分离式事件中心。
+            let event_center = match clone_managed_session_event_center(engine_id) {
+                Ok(event_center) => event_center,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            write_managed_session_event_batch(
+                event_center.poll(max_events),
+                result_json_out,
+                error_out,
+            )
+        },
+    )
 }
 
 /// Wait for one bounded batch of engine-level managed-session events through the standard C ABI.
@@ -3550,21 +3800,27 @@ pub unsafe extern "C" fn luaskills_ffi_managed_session_events_wait(
     result_json_out: *mut FfiOwnedBuffer,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_buffer(result_json_out);
-    if result_json_out.is_null() {
-        return ffi_error_status(error_out, "result_json_out must not be null");
-    }
-    // Detached center cloned before blocking so the global registry and engine locks are released.
-    // 在阻塞前克隆分离式事件中心，确保全局注册表锁与引擎锁已经释放。
-    let event_center = match clone_managed_session_event_center(engine_id) {
-        Ok(event_center) => event_center,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    write_managed_session_event_batch(
-        event_center.wait(max_events, timeout_ms),
-        result_json_out,
+    ffi_status_boundary(
+        "luaskills_ffi_managed_session_events_wait",
         error_out,
+        move || {
+            clear_error_out(error_out);
+            clear_out_buffer(result_json_out);
+            if result_json_out.is_null() {
+                return ffi_error_status(error_out, "result_json_out must not be null");
+            }
+            // Detached center cloned before blocking so the global registry and engine locks are released.
+            // 在阻塞前克隆分离式事件中心，确保全局注册表锁与引擎锁已经释放。
+            let event_center = match clone_managed_session_event_center(engine_id) {
+                Ok(event_center) => event_center,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            write_managed_session_event_batch(
+                event_center.wait(max_events, timeout_ms),
+                result_json_out,
+                error_out,
+            )
+        },
     )
 }
 
@@ -3597,27 +3853,33 @@ pub unsafe extern "C" fn luaskills_ffi_set_managed_session_wake_callback(
     user_data: *mut c_void,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    // Detached center ensures catch-up invocation and quiescent replacement do not hold engine locks.
-    // 分离式事件中心确保补偿调用与静默替换不会持有引擎锁。
-    let event_center = match clone_managed_session_event_center(engine_id) {
-        Ok(event_center) => event_center,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    // Rust callback bridge retaining only the ABI function, engine id, and opaque pointer value.
-    // 仅保留 ABI 函数、引擎标识与不透明指针值的 Rust 回调桥接。
-    let wrapped = callback.map(|callback_fn| {
-        // Pointer bits stored as a Send-compatible integer until callback invocation.
-        // 在回调调用前以 Send 兼容整数形式保存的指针位。
-        let user_data = user_data as usize;
-        std::sync::Arc::new(move || {
-            invoke_managed_session_wake_callback(callback_fn, user_data, engine_id)
-        }) as FallibleRuntimeManagedSessionWakeCallback
-    });
-    match event_center.set_fallible_wake_callback(wrapped) {
-        Ok(()) => ffi_ok_status(error_out),
-        Err(error) => ffi_error_status(error_out, error),
-    }
+    ffi_status_boundary(
+        "luaskills_ffi_set_managed_session_wake_callback",
+        error_out,
+        move || {
+            clear_error_out(error_out);
+            // Detached center ensures catch-up invocation and quiescent replacement do not hold engine locks.
+            // 分离式事件中心确保补偿调用与静默替换不会持有引擎锁。
+            let event_center = match clone_managed_session_event_center(engine_id) {
+                Ok(event_center) => event_center,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            // Rust callback bridge retaining only the ABI function, engine id, and opaque pointer value.
+            // 仅保留 ABI 函数、引擎标识与不透明指针值的 Rust 回调桥接。
+            let wrapped = callback.map(|callback_fn| {
+                // Pointer bits stored as a Send-compatible integer until callback invocation.
+                // 在回调调用前以 Send 兼容整数形式保存的指针位。
+                let user_data = user_data as usize;
+                std::sync::Arc::new(move || {
+                    invoke_managed_session_wake_callback(callback_fn, user_data, engine_id)
+                }) as FallibleRuntimeManagedSessionWakeCallback
+            });
+            match event_center.set_fallible_wake_callback(wrapped) {
+                Ok(()) => ffi_ok_status(error_out),
+                Err(error) => ffi_error_status(error_out, error),
+            }
+        },
+    )
 }
 
 /// Disable one skill through one ordered root chain via the standard C ABI surface.
@@ -3637,27 +3899,29 @@ pub unsafe extern "C" fn luaskills_ffi_disable_skill(
     reason: *const c_char,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
-        Ok(skill_roots) => skill_roots,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let skill_id = match parse_required_string(skill_id, "skill_id") {
-        Ok(skill_id) => skill_id,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let reason = match parse_optional_string(reason, "reason") {
-        Ok(reason) => reason,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine_mut(engine_id, |engine| {
-        engine
-            .disable_skill_in_roots(&skill_roots, &skill_id, reason.as_deref())
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(()) => ffi_ok_status(error_out),
-        Err(error) => ffi_error_status(error_out, error),
-    }
+    ffi_status_boundary("luaskills_ffi_disable_skill", error_out, move || {
+        clear_error_out(error_out);
+        let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
+            Ok(skill_roots) => skill_roots,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let skill_id = match parse_required_string(skill_id, "skill_id") {
+            Ok(skill_id) => skill_id,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let reason = match parse_optional_string(reason, "reason") {
+            Ok(reason) => reason,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine_mut(engine_id, |engine| {
+            engine
+                .disable_skill_in_roots(&skill_roots, &skill_id, reason.as_deref())
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(()) => ffi_ok_status(error_out),
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// Disable one skill on the system plane through one ordered root chain.
@@ -3678,31 +3942,38 @@ pub unsafe extern "C" fn luaskills_ffi_system_disable_skill(
     reason: *const c_char,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
-        Ok(skill_roots) => skill_roots,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let skill_id = match parse_required_string(skill_id, "skill_id") {
-        Ok(skill_id) => skill_id,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let reason = match parse_optional_string(reason, "reason") {
-        Ok(reason) => reason,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let authority = match parse_skill_management_authority(authority, "authority") {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine_mut(engine_id, |engine| {
-        engine
-            .system_disable_skill_in_roots(&skill_roots, authority, &skill_id, reason.as_deref())
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(()) => ffi_ok_status(error_out),
-        Err(error) => ffi_error_status(error_out, error),
-    }
+    ffi_status_boundary("luaskills_ffi_system_disable_skill", error_out, move || {
+        clear_error_out(error_out);
+        let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
+            Ok(skill_roots) => skill_roots,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let skill_id = match parse_required_string(skill_id, "skill_id") {
+            Ok(skill_id) => skill_id,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let reason = match parse_optional_string(reason, "reason") {
+            Ok(reason) => reason,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let authority = match parse_skill_management_authority(authority, "authority") {
+            Ok(authority) => authority,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine_mut(engine_id, |engine| {
+            engine
+                .system_disable_skill_in_roots(
+                    &skill_roots,
+                    authority,
+                    &skill_id,
+                    reason.as_deref(),
+                )
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(()) => ffi_ok_status(error_out),
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// Enable one skill through one ordered root chain via the standard C ABI surface.
@@ -3721,23 +3992,25 @@ pub unsafe extern "C" fn luaskills_ffi_enable_skill(
     skill_id: *const c_char,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
-        Ok(skill_roots) => skill_roots,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let skill_id = match parse_required_string(skill_id, "skill_id") {
-        Ok(skill_id) => skill_id,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine_mut(engine_id, |engine| {
-        engine
-            .enable_skill(&skill_roots, &skill_id)
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(()) => ffi_ok_status(error_out),
-        Err(error) => ffi_error_status(error_out, error),
-    }
+    ffi_status_boundary("luaskills_ffi_enable_skill", error_out, move || {
+        clear_error_out(error_out);
+        let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
+            Ok(skill_roots) => skill_roots,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let skill_id = match parse_required_string(skill_id, "skill_id") {
+            Ok(skill_id) => skill_id,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine_mut(engine_id, |engine| {
+            engine
+                .enable_skill(&skill_roots, &skill_id)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(()) => ffi_ok_status(error_out),
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// Enable one skill on the system plane through one ordered root chain.
@@ -3757,27 +4030,29 @@ pub unsafe extern "C" fn luaskills_ffi_system_enable_skill(
     skill_id: *const c_char,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
-        Ok(skill_roots) => skill_roots,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let skill_id = match parse_required_string(skill_id, "skill_id") {
-        Ok(skill_id) => skill_id,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let authority = match parse_skill_management_authority(authority, "authority") {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine_mut(engine_id, |engine| {
-        engine
-            .system_enable_skill(&skill_roots, authority, &skill_id)
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(()) => ffi_ok_status(error_out),
-        Err(error) => ffi_error_status(error_out, error),
-    }
+    ffi_status_boundary("luaskills_ffi_system_enable_skill", error_out, move || {
+        clear_error_out(error_out);
+        let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
+            Ok(skill_roots) => skill_roots,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let skill_id = match parse_required_string(skill_id, "skill_id") {
+            Ok(skill_id) => skill_id,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let authority = match parse_skill_management_authority(authority, "authority") {
+            Ok(authority) => authority,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine_mut(engine_id, |engine| {
+            engine
+                .system_enable_skill(&skill_roots, authority, &skill_id)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(()) => ffi_ok_status(error_out),
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// Uninstall one skill through one ordered root chain via the standard C ABI surface.
@@ -3797,30 +4072,34 @@ pub unsafe extern "C" fn luaskills_ffi_uninstall_skill(
     result_out: *mut *mut FfiSkillUninstallResult,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_ptr(result_out);
-    if result_out.is_null() {
-        return ffi_error_status(error_out, "result_out must not be null");
-    }
-    let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
-        Ok(skill_roots) => skill_roots,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let skill_id = match parse_required_string(skill_id, "skill_id") {
-        Ok(skill_id) => skill_id,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine_mut(engine_id, |engine| {
-        engine
-            .uninstall_skill(&skill_roots, &skill_id)
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(result) => {
-            unsafe { *result_out = Box::into_raw(Box::new(alloc_skill_uninstall_result(&result))) };
-            ffi_ok_status(error_out)
+    ffi_status_boundary("luaskills_ffi_uninstall_skill", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_ptr(result_out);
+        if result_out.is_null() {
+            return ffi_error_status(error_out, "result_out must not be null");
         }
-        Err(error) => ffi_error_status(error_out, error),
-    }
+        let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
+            Ok(skill_roots) => skill_roots,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let skill_id = match parse_required_string(skill_id, "skill_id") {
+            Ok(skill_id) => skill_id,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine_mut(engine_id, |engine| {
+            engine
+                .uninstall_skill(&skill_roots, &skill_id)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(result) => {
+                unsafe {
+                    *result_out = Box::into_raw(Box::new(alloc_skill_uninstall_result(&result)))
+                };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// Uninstall one skill on the system plane through one ordered root chain.
@@ -3841,34 +4120,42 @@ pub unsafe extern "C" fn luaskills_ffi_system_uninstall_skill(
     result_out: *mut *mut FfiSkillUninstallResult,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_ptr(result_out);
-    if result_out.is_null() {
-        return ffi_error_status(error_out, "result_out must not be null");
-    }
-    let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
-        Ok(skill_roots) => skill_roots,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let skill_id = match parse_required_string(skill_id, "skill_id") {
-        Ok(skill_id) => skill_id,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let authority = match parse_skill_management_authority(authority, "authority") {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine_mut(engine_id, |engine| {
-        engine
-            .system_uninstall_skill(&skill_roots, authority, &skill_id)
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(result) => {
-            unsafe { *result_out = Box::into_raw(Box::new(alloc_skill_uninstall_result(&result))) };
-            ffi_ok_status(error_out)
-        }
-        Err(error) => ffi_error_status(error_out, error),
-    }
+    ffi_status_boundary(
+        "luaskills_ffi_system_uninstall_skill",
+        error_out,
+        move || {
+            clear_error_out(error_out);
+            clear_out_ptr(result_out);
+            if result_out.is_null() {
+                return ffi_error_status(error_out, "result_out must not be null");
+            }
+            let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
+                Ok(skill_roots) => skill_roots,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            let skill_id = match parse_required_string(skill_id, "skill_id") {
+                Ok(skill_id) => skill_id,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            let authority = match parse_skill_management_authority(authority, "authority") {
+                Ok(authority) => authority,
+                Err(error) => return ffi_error_status(error_out, error),
+            };
+            match with_engine_mut(engine_id, |engine| {
+                engine
+                    .system_uninstall_skill(&skill_roots, authority, &skill_id)
+                    .map_err(|error| error.to_string())
+            }) {
+                Ok(result) => {
+                    unsafe {
+                        *result_out = Box::into_raw(Box::new(alloc_skill_uninstall_result(&result)))
+                    };
+                    ffi_ok_status(error_out)
+                }
+                Err(error) => ffi_error_status(error_out, error),
+            }
+        },
+    )
 }
 
 /// Install one managed skill through one ordered root chain via the standard C ABI surface.
@@ -3888,33 +4175,35 @@ pub unsafe extern "C" fn luaskills_ffi_install_skill(
     result_out: *mut *mut FfiSkillApplyResult,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_ptr(result_out);
-    if result_out.is_null() {
-        return ffi_error_status(error_out, "result_out must not be null");
-    }
-    if request.is_null() {
-        return ffi_error_status(error_out, "request must not be null");
-    }
-    let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
-        Ok(skill_roots) => skill_roots,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let request = match parse_install_request(unsafe { &*request }) {
-        Ok(request) => request,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine_mut(engine_id, |engine| {
-        engine
-            .install_skill(&skill_roots, &request)
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(result) => {
-            unsafe { *result_out = Box::into_raw(Box::new(alloc_skill_apply_result(&result))) };
-            ffi_ok_status(error_out)
+    ffi_status_boundary("luaskills_ffi_install_skill", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_ptr(result_out);
+        if result_out.is_null() {
+            return ffi_error_status(error_out, "result_out must not be null");
         }
-        Err(error) => ffi_error_status(error_out, error),
-    }
+        if request.is_null() {
+            return ffi_error_status(error_out, "request must not be null");
+        }
+        let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
+            Ok(skill_roots) => skill_roots,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let request = match parse_install_request(unsafe { &*request }) {
+            Ok(request) => request,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine_mut(engine_id, |engine| {
+            engine
+                .install_skill(&skill_roots, &request)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(result) => {
+                unsafe { *result_out = Box::into_raw(Box::new(alloc_skill_apply_result(&result))) };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// Install one managed skill on the system plane through one ordered root chain.
@@ -3935,37 +4224,39 @@ pub unsafe extern "C" fn luaskills_ffi_system_install_skill(
     result_out: *mut *mut FfiSkillApplyResult,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_ptr(result_out);
-    if result_out.is_null() {
-        return ffi_error_status(error_out, "result_out must not be null");
-    }
-    if request.is_null() {
-        return ffi_error_status(error_out, "request must not be null");
-    }
-    let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
-        Ok(skill_roots) => skill_roots,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let request = match parse_install_request(unsafe { &*request }) {
-        Ok(request) => request,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let authority = match parse_skill_management_authority(authority, "authority") {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine_mut(engine_id, |engine| {
-        engine
-            .system_install_skill(&skill_roots, authority, &request)
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(result) => {
-            unsafe { *result_out = Box::into_raw(Box::new(alloc_skill_apply_result(&result))) };
-            ffi_ok_status(error_out)
+    ffi_status_boundary("luaskills_ffi_system_install_skill", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_ptr(result_out);
+        if result_out.is_null() {
+            return ffi_error_status(error_out, "result_out must not be null");
         }
-        Err(error) => ffi_error_status(error_out, error),
-    }
+        if request.is_null() {
+            return ffi_error_status(error_out, "request must not be null");
+        }
+        let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
+            Ok(skill_roots) => skill_roots,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let request = match parse_install_request(unsafe { &*request }) {
+            Ok(request) => request,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let authority = match parse_skill_management_authority(authority, "authority") {
+            Ok(authority) => authority,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine_mut(engine_id, |engine| {
+            engine
+                .system_install_skill(&skill_roots, authority, &request)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(result) => {
+                unsafe { *result_out = Box::into_raw(Box::new(alloc_skill_apply_result(&result))) };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// Update one managed skill through one ordered root chain via the standard C ABI surface.
@@ -3985,33 +4276,35 @@ pub unsafe extern "C" fn luaskills_ffi_update_skill(
     result_out: *mut *mut FfiSkillApplyResult,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_ptr(result_out);
-    if result_out.is_null() {
-        return ffi_error_status(error_out, "result_out must not be null");
-    }
-    if request.is_null() {
-        return ffi_error_status(error_out, "request must not be null");
-    }
-    let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
-        Ok(skill_roots) => skill_roots,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let request = match parse_install_request(unsafe { &*request }) {
-        Ok(request) => request,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine_mut(engine_id, |engine| {
-        engine
-            .update_skill(&skill_roots, &request)
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(result) => {
-            unsafe { *result_out = Box::into_raw(Box::new(alloc_skill_apply_result(&result))) };
-            ffi_ok_status(error_out)
+    ffi_status_boundary("luaskills_ffi_update_skill", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_ptr(result_out);
+        if result_out.is_null() {
+            return ffi_error_status(error_out, "result_out must not be null");
         }
-        Err(error) => ffi_error_status(error_out, error),
-    }
+        if request.is_null() {
+            return ffi_error_status(error_out, "request must not be null");
+        }
+        let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
+            Ok(skill_roots) => skill_roots,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let request = match parse_install_request(unsafe { &*request }) {
+            Ok(request) => request,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine_mut(engine_id, |engine| {
+            engine
+                .update_skill(&skill_roots, &request)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(result) => {
+                unsafe { *result_out = Box::into_raw(Box::new(alloc_skill_apply_result(&result))) };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 /// Update one managed skill on the system plane through one ordered root chain.
@@ -4032,37 +4325,39 @@ pub unsafe extern "C" fn luaskills_ffi_system_update_skill(
     result_out: *mut *mut FfiSkillApplyResult,
     error_out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    clear_error_out(error_out);
-    clear_out_ptr(result_out);
-    if result_out.is_null() {
-        return ffi_error_status(error_out, "result_out must not be null");
-    }
-    if request.is_null() {
-        return ffi_error_status(error_out, "request must not be null");
-    }
-    let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
-        Ok(skill_roots) => skill_roots,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let request = match parse_install_request(unsafe { &*request }) {
-        Ok(request) => request,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    let authority = match parse_skill_management_authority(authority, "authority") {
-        Ok(authority) => authority,
-        Err(error) => return ffi_error_status(error_out, error),
-    };
-    match with_engine_mut(engine_id, |engine| {
-        engine
-            .system_update_skill(&skill_roots, authority, &request)
-            .map_err(|error| error.to_string())
-    }) {
-        Ok(result) => {
-            unsafe { *result_out = Box::into_raw(Box::new(alloc_skill_apply_result(&result))) };
-            ffi_ok_status(error_out)
+    ffi_status_boundary("luaskills_ffi_system_update_skill", error_out, move || {
+        clear_error_out(error_out);
+        clear_out_ptr(result_out);
+        if result_out.is_null() {
+            return ffi_error_status(error_out, "result_out must not be null");
         }
-        Err(error) => ffi_error_status(error_out, error),
-    }
+        if request.is_null() {
+            return ffi_error_status(error_out, "request must not be null");
+        }
+        let skill_roots = match parse_skill_roots(skill_roots, skill_roots_len) {
+            Ok(skill_roots) => skill_roots,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let request = match parse_install_request(unsafe { &*request }) {
+            Ok(request) => request,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        let authority = match parse_skill_management_authority(authority, "authority") {
+            Ok(authority) => authority,
+            Err(error) => return ffi_error_status(error_out, error),
+        };
+        match with_engine_mut(engine_id, |engine| {
+            engine
+                .system_update_skill(&skill_roots, authority, &request)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(result) => {
+                unsafe { *result_out = Box::into_raw(Box::new(alloc_skill_apply_result(&result))) };
+                ffi_ok_status(error_out)
+            }
+            Err(error) => ffi_error_status(error_out, error),
+        }
+    })
 }
 
 #[cfg(test)]

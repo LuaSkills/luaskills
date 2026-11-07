@@ -405,6 +405,7 @@ return result
 - `args` 必须是 table，不能传字符串或其他标量。
 - `vulcan.call` 会继承当前请求上下文、预算快照、tool config，并切换到目标 skill 的文件上下文与数据库绑定。
 - 在 `luaexec` 场景下，存在额外重入保护，不能无限递归调回当前运行时调用方。
+- 同一个 VM 上最多同时有 32 层 `vulcan.call`。更深的调用会抛出运行时错误（`nested call depth exceeds 32 levels`），`pcall` 可以捕获，不会耗尽原生栈。
 
 ## 4.5 `vulcan.models.*`
 
@@ -1561,6 +1562,8 @@ local decoded = vulcan.json.decode(text)
 - `vulcan.json.null` 以外的 `lightuserdata`
 
 这些值传给 `vulcan.json.encode(...)` 会直接报运行时错误。
+
+直接或经由其他表引用自身的表，以及嵌套超过 100 层表的值，同样会报运行时错误。运行时把 Lua 值转换为 JSON 的其他地方（包括 skill 的返回值）使用同样的限制。反方向上，`vulcan.json.decode` 和工具参数同样限制在 100 层以内，所以 skill 收到的任何值都能重新编码。
 
 ## 11. `vulcan.cache.*`
 

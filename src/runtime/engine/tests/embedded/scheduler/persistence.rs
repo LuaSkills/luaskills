@@ -6,6 +6,7 @@ use super::*;
 mod context;
 mod finalization;
 mod intent;
+mod nesting;
 mod outcome;
 mod prewarm;
 mod reusable;

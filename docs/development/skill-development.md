@@ -400,6 +400,7 @@ return result
 - `args` must be a table, not a string or another scalar.
 - `vulcan.call` inherits the current request context, budget snapshot, and tool config, then switches to the target skill's file context and database bindings.
 - In `luaexec` scenarios, extra reentry protection prevents unbounded recursion back into the current runtime caller.
+- At most 32 `vulcan.call` frames can be active at once on one VM. A deeper call raises a runtime error (`nested call depth exceeds 32 levels`) that `pcall` can catch, instead of overflowing the native stack.
 
 ## 4.5 `vulcan.models.*`
 
@@ -1556,6 +1557,8 @@ Unsupported input values:
 - `lightuserdata` other than `vulcan.json.null`
 
 Passing those values to `vulcan.json.encode(...)` raises a runtime error.
+
+Tables that refer to themselves (directly or through other tables) and values nested deeper than 100 tables also raise a runtime error. The same limits apply wherever the runtime converts a Lua value to JSON, including skill results. In the other direction, `vulcan.json.decode` and tool arguments are also limited to 100 levels, so any value a skill receives can be encoded again.
 
 ## 11. `vulcan.cache.*`
 

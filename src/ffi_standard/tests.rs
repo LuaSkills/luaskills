@@ -2049,3 +2049,53 @@ fn standard_ffi_disable_and_enable_skill_round_trip() {
 
     let _ = std::fs::remove_dir_all(&temp_root);
 }
+
+/// Verify status-returning and pointer-returning export bodies report a panic through their
+/// documented failure values instead of unwinding into C.
+/// 验证返回状态码和返回指针的导出函数体通过文档约定的失败值报告 panic，而不是展开进 C 栈帧。
+#[test]
+fn ffi_status_and_pointer_boundaries_contain_panics() {
+    let mut error_out = FfiOwnedBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let status = ffi_status_boundary("luaskills_ffi_probe", &mut error_out, || {
+        panic!("status failure")
+    });
+    assert_eq!(status, FFI_STATUS_ERROR);
+    assert_eq!(
+        read_owned_buffer_text(&error_out),
+        "luaskills_ffi_probe panicked: status failure"
+    );
+    unsafe { luaskills_ffi_buffer_free(error_out) };
+
+    // An uninitialized caller slot is cleared, never freed; an error the body wrote before panicking
+    // is released and replaced by the panic text.
+    // 调用方未初始化的槽位只会被清空而不会被释放；函数体在 panic 前写入的错误会被释放并由 panic 文本替换。
+    let mut error_out = FfiOwnedBuffer {
+        ptr: ptr::NonNull::<u8>::dangling().as_ptr(),
+        len: 7,
+    };
+    let slot: *mut FfiOwnedBuffer = &mut error_out;
+    let status = ffi_status_boundary("luaskills_ffi_probe", slot, || {
+        set_error_out(slot, "earlier error");
+        panic!("late failure")
+    });
+    assert_eq!(status, FFI_STATUS_ERROR);
+    assert_eq!(
+        read_owned_buffer_text(&error_out),
+        "luaskills_ffi_probe panicked: late failure"
+    );
+    unsafe { luaskills_ffi_buffer_free(error_out) };
+
+    // A missing error slot is tolerated: the status alone reports the failure.
+    // 缺少错误槽时也能容忍：仅凭状态码报告失败。
+    let status = ffi_status_boundary("luaskills_ffi_probe", ptr::null_mut(), || {
+        panic!("status failure")
+    });
+    assert_eq!(status, FFI_STATUS_ERROR);
+
+    let pointer: *mut c_char =
+        ffi_pointer_boundary("luaskills_ffi_probe_clone", || panic!("pointer failure"));
+    assert!(pointer.is_null());
+}
