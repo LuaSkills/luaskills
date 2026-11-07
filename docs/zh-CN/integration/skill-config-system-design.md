@@ -172,6 +172,8 @@ end
 
 校验器错误不得把敏感值写入错误消息。运行时会对 issue 消息中的已声明敏感有效值做替换，并把脚本异常收敛为不包含原始异常文本的稳定错误。
 
+校验器无法运行或返回非法结果时，`describe` 不会因此失败：该包以 `complete=false` 返回，并计入一条不带 key、代码为 `config_validator_error` 的业务问题；`status` 和 `validate` 仍直接返回校验器错误。
+
 ## `runtime-config` 共同工具契约
 
 建议上级统一封装工具名 `runtime-config`，支持：

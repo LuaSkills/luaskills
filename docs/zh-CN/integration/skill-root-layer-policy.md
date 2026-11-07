@@ -40,6 +40,7 @@ ROOT -> PROJECT -> USER
 4. `ROOT` 级 skill 一旦通过 system tools 安装，就表示宿主声明该 skill 属于系统控制级，低层同名实现必须让位。
 5. 无论调用方是 `System` 还是 `DelegatedTool`，只要 `ROOT` 已存在同名 `skill_id`，都禁止向 `PROJECT` / `USER` 主动 install 或 update 同名 skill。
 6. `PROJECT` / `USER` 中已经存在的同名残留允许通过显式目标 uninstall 清理；清理残留不会影响 `ROOT` 中的系统 skill。
+7. 单个 skill 加载失败时只跳过该 skill 并记录错误日志，其他 skill 照常加载。包括 `skill.yaml` 无法读取或解析、声明了 `skill_id`、`enable` 取值非法，以及入口编译或初始化失败。损坏的目录仍占用其 `skill_id`，低优先级层中的同名 skill 不会顶替它。安装、更新、启用 skill 时则不同：该 skill 加载失败会让操作失败，安装和更新会回滚，正在运行的 skill 保持不变。
 
 LuaSkills 不再使用 `protected_skills` 或按 `skill_id` 配置的默认保护清单。保护不是配置出来的，而是由 `ROOT` 层级归属天然决定。
 

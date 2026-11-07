@@ -8015,10 +8015,27 @@ impl LuaEngine {
 
     /// Load skills from an ordered root chain where earlier roots override later roots.
     /// 从有序根目录覆盖链加载技能，前面的根目录会覆盖后面的同名技能。
+    ///
+    /// A skill that fails to load is skipped with an error in the log; only errors that are not
+    /// specific to one skill fail the call.
+    /// 加载失败的技能会被跳过并记录错误日志；只有与具体技能无关的错误才让调用失败。
     pub fn load_from_roots(
         &mut self,
         skill_roots: &[RuntimeSkillRoot],
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.load_from_roots_reporting_failures(skill_roots)
+            .map(|_| ())
+    }
+
+    /// Load skills like [`Self::load_from_roots`] and return why each skipped skill failed, by skill id.
+    /// 与 [`Self::load_from_roots`] 相同地加载技能，并按技能标识返回每个被跳过技能的失败原因。
+    fn load_from_roots_reporting_failures(
+        &mut self,
+        skill_roots: &[RuntimeSkillRoot],
+    ) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+        // Skills skipped because of an error, with that error.
+        // 因错误被跳过的技能及其错误。
+        let mut failures = BTreeMap::new();
         Self::validate_formal_skill_root_chain(skill_roots)
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
         self.runtime_skill_roots = skill_roots.to_vec();
@@ -8032,7 +8049,7 @@ impl LuaEngine {
             .replace_installed_catalog(skill_roots)
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
         if !any_root_exists {
-            return Ok(());
+            return Ok(failures);
         }
 
         for resolved_instance in collect_effective_skill_instances_from_roots(skill_roots)
@@ -8053,12 +8070,23 @@ impl LuaEngine {
             let resolved_skill_manager = self
                 .skill_manager_for(&resolved_root)
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
-            if !resolved_skill_manager.is_skill_enabled(&skill_name)? {
-                log_warn(format!(
-                    "[LuaSkill] Skipped disabled skill '{}'",
-                    skill_name
-                ));
-                continue;
+            match resolved_skill_manager.is_skill_enabled(&skill_name) {
+                Ok(true) => {}
+                Ok(false) => {
+                    log_warn(format!(
+                        "[LuaSkill] Skipped disabled skill '{}'",
+                        skill_name
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    log_error(format!(
+                        "[LuaSkill] Failed to read the enable state of {}: {}",
+                        skill_name, error
+                    ));
+                    failures.insert(skill_name, error);
+                    continue;
+                }
             }
             let actual_dir = resolved_instance.actual_dir;
             log_info(format!(
@@ -8076,6 +8104,7 @@ impl LuaEngine {
                             "[LuaSkill] Failed to prepare dependencies for {}: {}",
                             skill_name, error
                         ));
+                        failures.insert(skill_name, error);
                         continue;
                     }
                 };
@@ -8086,8 +8115,13 @@ impl LuaEngine {
                 dependency_manifest,
             ) {
                 log_error(format!("[LuaSkill] Failed to load {}: {}", skill_name, e));
+                failures.insert(skill_name, e.to_string());
             }
         }
+        failures.extend(
+            self.drop_skills_failing_vm_registration()
+                .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?,
+        );
 
         self.rebuild_entry_registry()
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
@@ -8111,7 +8145,7 @@ impl LuaEngine {
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
 
         log_info(format!("[LuaSkill] {} skills loaded", self.skills.len()));
-        Ok(())
+        Ok(failures)
     }
 
     /// Reload all skills from one ordered root chain and rebuild runtime state from scratch.
@@ -8119,6 +8153,22 @@ impl LuaEngine {
     pub fn reload_from_roots(
         &mut self,
         skill_roots: &[RuntimeSkillRoot],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.reload_from_roots_requiring(skill_roots, None)
+    }
+
+    /// Reload like [`Self::reload_from_roots`]; when `required_skill` fails to load, fail instead
+    /// and keep the active state.
+    /// 与 [`Self::reload_from_roots`] 相同地重载；`required_skill` 加载失败时改为报错，并保留活动状态。
+    ///
+    /// Lifecycle changes require the skill they install, update or enable: without this, a broken
+    /// package would be committed and its skill silently dropped instead of rolled back.
+    /// 生命周期变更要求其安装、更新或启用的技能加载成功：否则损坏的包会被提交、技能被悄悄移除，
+    /// 而不是回滚。
+    fn reload_from_roots_requiring(
+        &mut self,
+        skill_roots: &[RuntimeSkillRoot],
+        required_skill: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         Self::validate_formal_skill_root_chain(skill_roots)
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
@@ -8133,7 +8183,12 @@ impl LuaEngine {
             .map(|skill| skill.managed_package.owner_token())
             .collect();
         let mut next = self.empty_reload_candidate()?;
-        next.load_from_roots(skill_roots)?;
+        let failures = next.load_from_roots_reporting_failures(skill_roots)?;
+        if let Some(skill_id) = required_skill
+            && let Some(error) = failures.get(skill_id)
+        {
+            return Err(format!("skill '{skill_id}' failed to load: {error}").into());
+        }
         self.replace_runtime_state_from(next);
         for owner_token in retired_skill_owner_tokens {
             if let Err(error) = self.retire_managed_runtime_owner(owner_token) {
@@ -8233,7 +8288,9 @@ impl LuaEngine {
                 )
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
         }
-        self.reload_from_roots(skill_roots)?;
+        let required_skill =
+            (action == crate::skill::manager::SkillLifecycleAction::Enable).then_some(skill_id);
+        self.reload_from_roots_requiring(skill_roots, required_skill)?;
         self.emit_skill_lifecycle_event(SkillLifecycleEventDraft {
             plane,
             action,
@@ -8562,7 +8619,14 @@ impl LuaEngine {
                     "started",
                     Some("reloading LuaSkills runtime after staged change".to_string()),
                 );
-                if let Err(reload_error) = self.reload_from_roots(skill_roots) {
+                let required_skill = match &prepared {
+                    PreparedSkillApply::Install(install) => install.result.skill_id.as_str(),
+                    PreparedSkillApply::Update(update) => update.result.skill_id.as_str(),
+                    PreparedSkillApply::Immediate(result) => result.skill_id.as_str(),
+                };
+                if let Err(reload_error) =
+                    self.reload_from_roots_requiring(skill_roots, Some(required_skill))
+                {
                     let rollback_error = manager.rollback_prepared_skill_apply(&prepared);
                     let restore_error = self.reload_from_roots(skill_roots);
                     let message = format_lifecycle_recovery_error(
@@ -9429,6 +9493,52 @@ impl LuaEngine {
         Ok(vm)
     }
 
+    /// Drop every loaded skill whose entries fail to compile or initialize; log and return why.
+    /// 移除入口编译或初始化失败的已加载技能；记录并返回原因。
+    ///
+    /// Every VM registers all loaded skills, so one failing entry would otherwise make every VM
+    /// build, and with it the whole load, fail. Each skill is tried in one skill VM and one runLua VM
+    /// built without skills, because the runLua VM is hardened and an entry can fail in only one of
+    /// the two. An error building the empty VMs is not specific to a skill and is returned.
+    /// 每个 VM 都会注册全部已加载技能，因此一个失败的入口会让每次 VM 构建失败，进而让整次加载失败。
+    /// 每个技能分别在一个不含技能的技能 VM 和 runLua VM 中试编译：runLua VM 经过加固，入口可能只在
+    /// 其中一种 VM 里失败。构建空 VM 时的错误与具体技能无关，直接返回。
+    fn drop_skills_failing_vm_registration(&mut self) -> Result<Vec<(String, String)>, String> {
+        if self.skills.is_empty() {
+            return Ok(Vec::new());
+        }
+        let empty_skills = HashMap::new();
+        let empty_registry = BTreeMap::new();
+        let skill_probe =
+            self.create_vm_with_runtime_state(Arc::new(HashMap::new()), Arc::new(BTreeMap::new()))?;
+        let runlua_probe = Self::create_runlua_vm(RunLuaVmBuildContext::from_engine(
+            self,
+            &empty_skills,
+            &empty_registry,
+        ))?;
+        // Sorted so that the probe order, and therefore the log, is stable between loads.
+        // 排序使探测顺序及日志在多次加载间保持稳定。
+        let mut skill_ids: Vec<&String> = self.skills.keys().collect();
+        skill_ids.sort();
+        let mut failures = Vec::new();
+        for skill_id in skill_ids {
+            let skill = &self.skills[skill_id];
+            let failure = [&skill_probe, &runlua_probe].into_iter().find_map(|probe| {
+                skill.meta.entries().find_map(|tool| {
+                    Self::compile_skill_into_lua(&probe.lua, skill, tool, false).err()
+                })
+            });
+            if let Some(error) = failure {
+                failures.push((skill_id.clone(), error));
+            }
+        }
+        for (skill_id, error) in &failures {
+            Arc::make_mut(&mut self.skills).remove(skill_id);
+            log_error(format!("[LuaSkill] Failed to load {}: {}", skill_id, error));
+        }
+        Ok(failures)
+    }
+
     /// Register all tool-bearing skill entries into a specific Lua VM.
     /// 将所有声明了工具入口的 skill 条目注册到指定 Lua 虚拟机中。
     fn register_skill_functions(
@@ -9437,7 +9547,20 @@ impl LuaEngine {
     ) -> Result<(), String> {
         for skill in skills.values() {
             for tool in skill.meta.entries() {
-                Self::compile_skill_into_lua(lua, skill, tool, false)?;
+                if let Err(error) = Self::compile_skill_into_lua(lua, skill, tool, false) {
+                    // A debug skill is read from disk again for every VM, so the load-time probe
+                    // cannot vouch for later edits. A broken edit must fail only calls into this
+                    // skill: a host call recompiles the entry and reports the error, and
+                    // `vulcan.call` finds no handler. It must not fail building the VM.
+                    // 调试技能在每个 VM 中都重新从磁盘读取，加载时的试编译无法担保之后的修改。写坏的修改
+                    // 只应让对该技能的调用失败：宿主调用会重新编译入口并报告错误，`vulcan.call` 则找不到
+                    // 处理函数。它不应让 VM 构建失败。
+                    if skill.meta.debug {
+                        log_warn(format!("[LuaSkill] Skipped debug entry: {error}"));
+                        continue;
+                    }
+                    return Err(error);
+                }
             }
         }
         Ok(())

@@ -2610,6 +2610,10 @@ pub fn collect_effective_skill_instances(
 
 /// Resolve the currently effective skill directories after applying ordered root precedence rules.
 /// 在应用有序根目录优先级规则后解析当前实际生效的技能目录集合。
+///
+/// Only an unreadable root is an error. A skill directory whose manifest cannot be read or parsed
+/// is still returned, so that loading it reports the error for that skill alone.
+/// 只有无法读取的根才报错。清单无法读取或解析的技能目录仍会返回，加载时只针对该技能报告错误。
 pub fn collect_effective_skill_instances_from_roots(
     roots: &[RuntimeSkillRoot],
 ) -> Result<Vec<ResolvedSkillInstance>, String> {
@@ -2627,10 +2631,16 @@ pub fn collect_effective_skill_instances_from_roots(
             let Some(skill_dir) = root_map.get(&skill_id) else {
                 continue;
             };
-            if is_effective_disable_override(skill_dir)? {
+            // A directory that cannot be probed stays the effective instance for its skill_id: the
+            // loader then reports the full error for this skill alone, and the other skills, in this
+            // root or any other, still resolve. Falling back to a lower root would silently run a
+            // different copy of a skill the user meant to override.
+            // 无法探测的目录仍是该 skill_id 的生效实例：由加载器只针对这个技能报告完整错误，同一根
+            // 和其他根中的技能照常解析。退回到更低的根会悄悄运行用户本想覆盖的另一份技能。
+            if matches!(is_effective_disable_override(skill_dir), Ok(true)) {
                 break;
             }
-            if !is_skill_manifest_enabled(skill_dir)? {
+            if matches!(is_skill_manifest_enabled(skill_dir), Ok(false)) {
                 break;
             }
             resolved.push(ResolvedSkillInstance {

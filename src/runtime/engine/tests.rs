@@ -4,6 +4,7 @@ mod execution_budget;
 mod host_database;
 #[cfg(windows)]
 mod host_mode;
+mod load_isolation;
 mod value_boundaries;
 
 #[cfg(windows)]
@@ -5383,8 +5384,8 @@ fn assert_vm_scope_is_clean(lua: &mlua::Lua) {
     ));
 }
 
-/// Verify that skill manifests must not declare skill_id explicitly.
-/// 验证 skill 清单不允许再显式声明 skill_id 字段。
+/// Verify that skill manifests must not declare skill_id explicitly; such a skill is skipped.
+/// 验证 skill 清单不允许再显式声明 skill_id 字段；这样的技能会被跳过。
 #[test]
 fn load_from_roots_rejects_explicit_skill_id_field() {
     let temp_root = std::env::temp_dir().join(format!(
@@ -5409,11 +5410,18 @@ fn load_from_roots_rejects_explicit_skill_id_field() {
         try_make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions::default())
             .expect("create engine");
 
-    let error = engine
+    engine
         .load_from_roots(&[crate::host::options::RuntimeSkillRoot {
             name: "ROOT".to_string(),
             skills_dir: skill_root,
         }])
+        .expect("a rejected skill does not fail the whole load");
+    assert!(
+        engine.list_entries().expect("list entries").is_empty(),
+        "the skill declaring skill_id must not load"
+    );
+    let error = engine
+        .load_single_skill(&skill_dir, "ROOT", None)
         .expect_err("explicit skill_id should be rejected");
     let rendered = error.to_string();
     assert!(rendered.contains("must not declare skill_id"));
@@ -6005,25 +6013,30 @@ fn debug_vm_creation_keeps_live_source_reload() {
 
     fs::write(
         skill_dir.join("runtime/ping.lua"),
-        "this is intentionally invalid lua",
+        "return function(args)\n  return 'v2'\nend\n",
     )
     .expect("replace debug source after initial load");
-    // Compilation error returned after the debug VM rereads invalid live source.
-    // 调试 VM 重读无效实时源码后返回的编译错误。
-    let error = match engine.create_vm() {
-        Ok(_) => panic!("debug VM should reread and reject invalid live source"),
-        Err(error) => error,
-    };
-    assert!(
-        error.contains("Failed to compile"),
-        "unexpected error: {error}"
-    );
+    // New VM whose debug handler must come from the live source, not the load-time cache.
+    // 新 VM 的调试处理函数必须来自实时源码，而不是加载时的缓存。
+    let vm = engine
+        .create_vm()
+        .expect("debug VM builds from the live source");
+    let handler: mlua::Function = vm
+        .lua
+        .globals()
+        .get(crate::lua_engine::lua_skill_handler_global_name(
+            "debug-skill.ping",
+        ))
+        .expect("debug handler registered");
+    let response: String = handler.call(()).expect("call debug handler");
+    assert_eq!(response, "v2");
 
     let _ = fs::remove_dir_all(&runtime_root);
 }
 
-/// Verify a reload candidate that cannot compile never replaces the active source generation.
-/// 验证无法编译的重载候选绝不会替换活动源码代。
+/// Verify a reload candidate whose required skill cannot compile never replaces the active
+/// source generation, while a plain reload drops only that skill.
+/// 验证所需技能无法编译的重载候选绝不会替换活动源码代，而普通重载只移除该技能。
 #[test]
 fn failed_reload_preserves_active_source_generation() {
     // Temporary formal ROOT shared by the active and candidate generations.
@@ -6053,9 +6066,16 @@ fn failed_reload_preserves_active_source_generation() {
         "this is intentionally invalid lua",
     )
     .expect("write invalid candidate source");
-    engine
-        .reload_from_roots(std::slice::from_ref(&skill_root))
-        .expect_err("invalid candidate generation should fail prewarm");
+    let error = engine
+        .reload_from_roots_requiring(
+            std::slice::from_ref(&skill_root),
+            Some("reload-generation-skill"),
+        )
+        .expect_err("a candidate whose required skill fails must not replace the active state");
+    assert!(
+        error.to_string().contains("Failed to compile"),
+        "unexpected error: {error}"
+    );
 
     // Invocation result proving that the previous VM generation remains active.
     // 证明上一 VM 代仍保持活动的调用结果。
@@ -6063,6 +6083,14 @@ fn failed_reload_preserves_active_source_generation() {
         .call_skill("reload-generation-skill-ping", &json!({}), None)
         .expect("call active generation after failed reload");
     assert_eq!(result.content, "stable");
+
+    engine
+        .reload_from_roots(std::slice::from_ref(&skill_root))
+        .expect("a plain reload skips the broken skill");
+    assert!(
+        engine.list_entries().expect("list entries").is_empty(),
+        "the broken skill is dropped by a plain reload"
+    );
 
     let _ = fs::remove_dir_all(&runtime_root);
 }

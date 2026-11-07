@@ -9514,3 +9514,43 @@
 - `cargo test --lib`：1106 通过、0 失败、3 忽略。
 - 4 个集成测试目标共 13 项通过。
 - 去掉“每次 eval 都设置截止时间”这一处修复后，`runlua_deadline_caps_process_exec`（29.6 秒）和 `runlua_deadline_caps_process_session_read`（20.2 秒）都失败；恢复后通过。
+
+## 2026-11-08：第 5 组审核修复，单个技能的加载错误不再拖垮全部加载
+
+### 概述
+
+- 审核编号：A2-04、B4-02、B3-07。详见 `docs/audit/20261106/FIX_STATUS.md`。
+- 以下错误原来会让整次加载失败，现在只跳过出错的技能并写错误日志：
+  - 清单探测失败：读不了、解析失败、写了 `skill_id`、`enable` 取值非法；
+  - 读取启用状态失败；
+  - 入口编译或初始化失败。
+- 入口在预热前分别在技能 VM 和 runLua VM 中试编译，失败的技能被移除。
+- 调试技能加载后被改坏，不再让之后的 VM 构建失败。
+- 一个包的配置校验器出错，`describe` 不再对所有包失败，错误计入该包自己的业务问题。
+- 安装、更新、启用的目标技能加载失败时，重载仍然报错：安装和更新照常回滚，活动状态不变。
+
+### 文件变更清单
+
+- `src/runtime/engine.rs`：
+  - 新增 `drop_skills_failing_vm_registration`，在 `load_from_roots` 预热前调用；
+  - 新增 `load_from_roots_reporting_failures` 和 `reload_from_roots_requiring`，安装、更新、启用流程改用后者；
+  - 启用状态读取出错时跳过该技能；
+  - `register_skill_functions` 跳过失败的调试入口。
+- `src/skill/manager.rs`：`collect_effective_skill_instances_from_roots` 把清单无法探测的目录照常列为生效实例。
+- `src/runtime/config_service.rs`：`status_for_package` 新增 `validator_error_as_issue` 参数，`describe` 传 true；新增 `CONFIG_VALIDATOR_ERROR_ISSUE_CODE`。
+- 测试：
+  - 新增 `engine/tests/load_isolation.rs`；
+  - `config_service` 新增 `describe_reports_failing_validator_inside_its_own_package`；
+  - `load_from_roots_rejects_explicit_skill_id_field` 改为断言跳过；
+  - `debug_vm_creation_keeps_live_source_reload`、`failed_reload_preserves_active_source_generation` 按新行为改写。
+- 文档：
+  - `docs/integration/runtime-model.md`、`docs/zh-CN/integration/skill-root-layer-policy.md`；
+  - `docs/integration/package-configuration.md`、`docs/zh-CN/integration/skill-config-system-design.md`。
+
+### 验证记录
+
+- `cargo fmt --check`、`cargo clippy --all-targets` 无警告。
+- `cargo test --lib`：1111 通过、0 失败、3 忽略。
+- 4 个集成测试目标共 13 项通过。
+- 去掉 `drop_skills_failing_vm_registration` 后，`load_from_roots_drops_only_skills_whose_entries_fail_in_a_vm` 失败；只在技能 VM 中试编译时同样失败；恢复后通过。
+- 还原 `skill/manager.rs` 后，`load_from_roots_skips_only_skills_with_malformed_user_manifests` 失败；恢复后通过。

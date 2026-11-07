@@ -1253,7 +1253,7 @@ impl SkillPackageConfigService {
         let (revision, stored) = self
             .store_for_package(&package)?
             .skill_values_snapshot(skill_id)?;
-        Self::status_for_package(skill_id, &package, &stored, revision)
+        Self::status_for_package(skill_id, &package, &stored, revision, false)
     }
 
     /// Poll ordered configuration events after one optional engine-local cursor.
@@ -1314,7 +1314,10 @@ impl SkillPackageConfigService {
         let (revision, stored) = self
             .store_for_package(package)?
             .skill_values_snapshot(skill_id)?;
-        let status = Self::status_for_package(skill_id, package, &stored, revision)?;
+        // A failing validator is this package's problem: report it among its issues so that
+        // describing every package still succeeds.
+        // 校验器出错只是该包自身的问题：将其列入该包的问题，使描述全部包仍能成功。
+        let status = Self::status_for_package(skill_id, package, &stored, revision, true)?;
         let items = package
             .declarations
             .iter()
@@ -1432,11 +1435,17 @@ impl SkillPackageConfigService {
 
     /// Build one package status from declarations and raw persisted values.
     /// 基于声明与原始持久化值构建单个技能包状态。
+    ///
+    /// With `validator_error_as_issue`, an error running the package validator becomes one
+    /// business issue with code [`CONFIG_VALIDATOR_ERROR_ISSUE_CODE`] instead of failing the call.
+    /// 设置 `validator_error_as_issue` 时，运行包校验器的错误会变为一条代码为
+    /// [`CONFIG_VALIDATOR_ERROR_ISSUE_CODE`] 的业务问题，而不是让调用失败。
     fn status_for_package(
         skill_id: &str,
         package: &SkillPackageConfigRegistryEntry,
         stored: &BTreeMap<String, String>,
         revision: String,
+        validator_error_as_issue: bool,
     ) -> Result<RuntimeSkillPackageConfigStatus, String> {
         let declared_keys = package
             .declarations
@@ -1484,7 +1493,17 @@ impl SkillPackageConfigService {
         }
 
         let business_issues = if invalid.is_empty() {
-            run_business_validator(package, stored)?
+            match run_business_validator(package, stored) {
+                Ok(issues) => issues,
+                Err(error) if validator_error_as_issue => {
+                    vec![RuntimeSkillPackageConfigBusinessIssue {
+                        key: None,
+                        code: CONFIG_VALIDATOR_ERROR_ISSUE_CODE.to_string(),
+                        message: error,
+                    }]
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             Vec::new()
         };
@@ -1857,6 +1876,11 @@ fn install_validator_memory_limit(
     // 每个核心状态都使用原生分配器；直接包装该精确分配器，不再切换策略。
     ValidatorAllocatorGuard::install(lua, SKILL_CONFIG_VALIDATOR_MAX_MEMORY_BYTES)
 }
+
+/// Business issue code `describe` reports when a package validator fails to run or returns an
+/// invalid result; the message carries the validator error.
+/// 包校验器无法运行或返回非法结果时 `describe` 报告的业务问题代码；消息中带有校验器错误。
+pub(crate) const CONFIG_VALIDATOR_ERROR_ISSUE_CODE: &str = "config_validator_error";
 
 /// Execute one optional package business validator in an isolated capability-free Lua state.
 /// 在隔离且无能力的 Lua 状态中执行一个可选技能包业务校验器。
@@ -2822,6 +2846,66 @@ end"#,
             assert!(error.contains(expected), "unexpected error: {error}");
             let _ = std::fs::remove_dir_all(&test_root);
         }
+    }
+
+    /// Verify a failing validator is reported in its own package description and does not stop
+    /// the other packages from being described.
+    /// 验证出错的校验器只在其所属包的描述中报告，不妨碍描述其他包。
+    #[test]
+    fn describe_reports_failing_validator_inside_its_own_package() {
+        let test_root = test_config_file("describe_failing_validator");
+        let _ = std::fs::remove_dir_all(&test_root);
+        let broken_dir = test_root.join("broken-package");
+        let broken = package_manifest_with_validator(
+            &broken_dir,
+            "broken-package",
+            r#"return function(values) error("validator exploded") end"#,
+        );
+        let healthy_dir = test_root.join("healthy-package");
+        let healthy = package_manifest_with_validator(
+            &healthy_dir,
+            "healthy-package",
+            "return function(values) return {} end",
+        );
+        let service = SkillPackageConfigService::new(
+            Some(test_root.join("config")),
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+        )
+        .expect("create service");
+        service.replace_registry([
+            (&broken, "USER", broken_dir.as_path()),
+            (&healthy, "USER", healthy_dir.as_path()),
+        ]);
+
+        let described = service
+            .describe(None, false)
+            .expect("one failing validator must not fail describing every package");
+        assert_eq!(described.len(), 2);
+        let broken_descriptor = described
+            .iter()
+            .find(|descriptor| descriptor.skill_id == "broken-package")
+            .expect("broken package is still described");
+        assert!(!broken_descriptor.complete);
+        assert_eq!(broken_descriptor.business_issue_count, 1);
+        let healthy_descriptor = described
+            .iter()
+            .find(|descriptor| descriptor.skill_id == "healthy-package")
+            .expect("healthy package is described");
+        assert_eq!(healthy_descriptor.business_issue_count, 0);
+
+        let single = service
+            .describe(Some("broken-package"), false)
+            .expect("describing the broken package alone also succeeds");
+        assert_eq!(single[0].business_issue_count, 1);
+
+        // An explicit status check still fails with the validator error itself.
+        // 显式状态检查仍以校验器错误本身失败。
+        let error = service
+            .status("broken-package")
+            .expect_err("status reports the validator error");
+        assert!(error.starts_with("CONFIG_VALIDATOR_FAILED"), "{error}");
+        let _ = std::fs::remove_dir_all(&test_root);
     }
 
     /// Verify installed discovery reports shadowing and disable markers without executing Lua.
