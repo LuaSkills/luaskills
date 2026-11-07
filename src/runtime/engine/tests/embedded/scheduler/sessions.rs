@@ -509,7 +509,7 @@ fn embedded_session_idle_close_waits_for_actual_vm_retirement() {
     let source = with_barrier_backstop(
         r#"
         local open, now = io.open, os.time
-        local proxy = newproxy(true)
+        local proxy = test_newproxy(true)
         getmetatable(proxy).__gc = function()
             local f=assert(open('session-finalizer-entered','w')); f:write('yes'); f:close()
             local deadline = now() + __BARRIER_SECS__
@@ -695,7 +695,7 @@ fn embedded_session_failure_closes_admission_before_retirement_finishes() {
     let source = with_barrier_backstop(
         r#"
         local open, now = io.open, os.time
-        local proxy = newproxy(true)
+        local proxy = test_newproxy(true)
         getmetatable(proxy).__gc = function()
             local f=assert(open('failed-session-entered','w')); f:close()
             local deadline = now() + __BARRIER_SECS__

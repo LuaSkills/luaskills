@@ -9426,3 +9426,47 @@
 - `cargo test --lib` 连续 5 次全量运行：每次 1088 通过、0 失败。其中 3 次在输出改为文件之前，2 次在之后。
 - `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings` 通过；4 个集成测试目标共 13 项通过。
 - 这几次全量运行耗时 284–370 秒，比之前的约 92 秒长。原因是同时有 vulcan-code 的 clippy 构建和 node 进程在运行（CPU 占用约 62%），慢的主要是 python/node 运行时和 process_session 测试。本次改动涉及的两组测试单独运行都不到 1 秒。
+
+## 2026-11-07：第 3 组审核修复，截止时间无法被捕获或绕开
+
+### 概述
+
+- 审核编号：A3-01、A3-02 / G05-C01、A1-01（含 B2-01）、B3-01 / G02-001。详见 `docs/audit/20261106/FIX_STATUS.md`。
+- 修复后：
+  - 超时一旦到达，`pcall`、`xpcall`、`coroutine.resume` 会重新抛出超时，重试循环会结束；
+  - JIT 永久关闭，`jit` 只保留平台字段；
+  - Lua 代码不能注册 `__gc` 终结器；
+  - `debug.sethook` 被移除。
+- 修复过程中发现一个原有的绕过：mlua 的线程级钩子在 LuaJIT 下，进入协程就会把钩子清掉，之后所有超时都失效。现在改用全局钩子。
+- 配置校验器：
+  - 状态做同样的加固；
+  - 预算保留到状态销毁；
+  - 结果按原始字段读取；
+  - 在配置锁之外运行，提交前复核值，被并发改动就重新校验，最多 3 次。
+
+### 文件变更清单
+
+- `src/runtime/execution_budget.rs`（新增）：`install`、`remove`、`harden` 和加固用的 Lua 前置代码。测试构建会把 `newproxy` 保留为 `test_newproxy`。
+- `src/runtime/engine.rs`：`create_runlua_vm` 创建 VM 时调用 `harden`。
+- `src/runtime/engine/runlua.rs`、`src/runtime/engine/lease/embedded.rs`：改用 `execution_budget::install` / `remove`，删掉每次执行的 `jit.off(); jit.flush()` 代码块。
+- `src/runtime/config_service.rs`：校验器状态调用 `harden`，预算不提前移除，结果改用 `raw_get` 读取。
+- `src/runtime/config.rs`：`set_values_validated` 在锁外校验，加了带上限的复核重试。
+- 测试：
+  - 新增 `engine/tests/execution_budget.rs`、`engine/tests/embedded/budget.rs`；
+  - 在 config 和 config_service 中新增测试；
+  - 12 个用 `newproxy` 终结器做探针的嵌入式测试改为调用 `test_newproxy`。
+- 文档：
+  - `docs/development/skill-development.md` 及中文版：3.3 节、新增 3.4 节、校验器说明；
+  - `docs/integration/package-configuration.md`、`docs/zh-CN/integration/skill-config-system-design.md`。
+
+### 验证记录
+
+- `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings` 通过。
+- `cargo test --lib`：1097 通过、0 失败、3 忽略（含 diff 审查后的修复）。
+- 4 个集成测试目标共 13 项通过。
+- diff 审查后补了 6 项修复，详见 FIX_STATUS 的“diff 审查后补的修复”：
+  - 先加固 VM，再执行技能代码；
+  - 校验结论在锁内确认，修订号检查在前；
+  - 通过 C API 关闭 JIT；
+  - 文档写明主技能 VM 池不受限制；
+  - 并发测试遇到回归时判定失败，不再卡住。

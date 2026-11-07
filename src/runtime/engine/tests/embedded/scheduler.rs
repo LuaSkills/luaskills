@@ -100,7 +100,7 @@ fn embedded_scheduler_operation_stays_cleaning_until_actual_vm_retirement() {
     let source = with_barrier_backstop(
         r#"
         local open, now = io.open, os.time
-        local proxy = newproxy(true)
+        local proxy = test_newproxy(true)
         getmetatable(proxy).__gc = function()
             local entered = assert(open('entered-cleanup', 'w'))
             entered:write('entered'); entered:close()

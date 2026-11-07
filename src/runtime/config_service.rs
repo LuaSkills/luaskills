@@ -11,10 +11,7 @@ use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 use std::time::Instant;
 
-use mlua::{
-    Function as LuaFunction, HookTriggers, Lua, StdLib, Table as LuaTable, Value as LuaValue,
-    VmState, ffi,
-};
+use mlua::{Function as LuaFunction, Lua, StdLib, Table as LuaTable, Value as LuaValue, ffi};
 
 use crate::host::options::RuntimeSkillRoot;
 use crate::lua_skill::{validate_luaskills_identifier, validate_luaskills_version};
@@ -1909,29 +1906,35 @@ fn run_business_validator(
             .set(forbidden, LuaValue::Nil)
             .map_err(|error| format!("CONFIG_VALIDATOR_UNAVAILABLE: {error}"))?;
     }
+    // Protected calls cannot swallow the budget, the JIT cannot skip it, and no finalizer can
+    // run unbudgeted when the state is destroyed.
+    // 保护调用无法吞掉预算，JIT 无法跳过它，状态销毁时也不会有不受预算约束的终结器运行。
+    crate::runtime::execution_budget::harden(&lua)
+        .map_err(|error| format!("CONFIG_VALIDATOR_UNAVAILABLE: {error}"))?;
     let instruction_count = Arc::new(AtomicU64::new(0));
     let hook_count = Arc::clone(&instruction_count);
     // Derive counting increments from the same authoritative hook interval.
     // 从同一权威钩子间隔派生计数增量。
     let hook_interval = u64::from(crate::runtime::engine::LUA_BUDGET_HOOK_INTERVAL);
     let deadline = Instant::now() + SKILL_CONFIG_VALIDATOR_TIMEOUT;
-    lua.set_hook(
-        HookTriggers::new().every_nth_instruction(crate::runtime::engine::LUA_BUDGET_HOOK_INTERVAL),
-        move |_, _| {
-            let executed = hook_count.fetch_add(hook_interval, Ordering::AcqRel) + hook_interval;
-            if executed > SKILL_CONFIG_VALIDATOR_MAX_INSTRUCTIONS {
-                return Err(mlua::Error::runtime(
-                    "CONFIG_VALIDATOR_LIMIT_EXCEEDED: instruction limit exceeded",
-                ));
-            }
-            if Instant::now() >= deadline {
-                return Err(mlua::Error::runtime(
-                    "CONFIG_VALIDATOR_TIMEOUT: execution timed out",
-                ));
-            }
-            Ok(VmState::Continue)
-        },
-    )
+    // Both limits only grow past their threshold, so once exceeded the check keeps failing.
+    // 两项上限都只会越过阈值后继续增长，因此一旦超出，检查会持续失败。
+    // The budget stays installed until the state is dropped at the end of this function.
+    // 预算一直保留到本函数末尾销毁状态为止。
+    crate::runtime::execution_budget::install(&lua, move || {
+        let executed = hook_count.fetch_add(hook_interval, Ordering::AcqRel) + hook_interval;
+        if executed > SKILL_CONFIG_VALIDATOR_MAX_INSTRUCTIONS {
+            return Err(mlua::Error::runtime(
+                "CONFIG_VALIDATOR_LIMIT_EXCEEDED: instruction limit exceeded",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(mlua::Error::runtime(
+                "CONFIG_VALIDATOR_TIMEOUT: execution timed out",
+            ));
+        }
+        Ok(())
+    })
     .map_err(|error| format!("CONFIG_VALIDATOR_UNAVAILABLE: {error}"))?;
     let validator = lua
         .load(&source)
@@ -1957,7 +1960,8 @@ fn run_business_validator(
     let returned = validator
         .call::<LuaValue>(values)
         .map_err(|error| map_validator_runtime_error(&error.to_string()))?;
-    lua.remove_hook();
+    // Results are read with raw access only, so no validator metamethod runs after the call.
+    // 结果只用原始访问读取，因此调用结束后不会再运行校验器的元方法。
     let table = match returned {
         LuaValue::Table(table) => table,
         _ => {
@@ -2004,7 +2008,7 @@ fn run_business_validator(
         .collect::<BTreeSet<_>>();
     let mut issues = Vec::with_capacity(issue_count);
     for index in 1..=issue_count {
-        let issue = table.get::<LuaTable>(index).map_err(|error| {
+        let issue = table.raw_get::<LuaTable>(index).map_err(|error| {
             format!(
                 "CONFIG_VALIDATOR_FAILED: validator issue {} must be an object: {}",
                 index, error
@@ -2033,7 +2037,7 @@ fn run_business_validator(
             }
         }
         let key = issue
-            .get::<Option<String>>("key")
+            .raw_get::<Option<String>>("key")
             .map_err(|error| format!("CONFIG_VALIDATOR_FAILED: invalid issue key: {error}"))?;
         if let Some(key) = key.as_deref()
             && !declared_keys.contains(key)
@@ -2044,7 +2048,7 @@ fn run_business_validator(
             ));
         }
         let code = issue
-            .get::<String>("code")
+            .raw_get::<String>("code")
             .map_err(|error| format!("CONFIG_VALIDATOR_FAILED: invalid issue code: {error}"))?;
         if !is_valid_skill_config_key(&code) {
             return Err(
@@ -2053,7 +2057,7 @@ fn run_business_validator(
             );
         }
         let message = issue
-            .get::<String>("message")
+            .raw_get::<String>("message")
             .map_err(|error| format!("CONFIG_VALIDATOR_FAILED: invalid issue message: {error}"))?;
         if message.is_empty() || message.len() > 8_192 {
             return Err(
@@ -2655,6 +2659,124 @@ end"#,
                 .is_empty()
         );
         let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    /// Run one validator write on a worker thread and fail instead of hanging when it never returns.
+    /// 在工作线程上执行一次校验器写入；若永不返回则判定失败而不是挂起。
+    fn validator_write_with_watchdog(label: &'static str, source: &'static str) -> String {
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let test_root = test_config_file(label);
+            let _ = std::fs::remove_dir_all(&test_root);
+            let skill_dir = test_root.join("package");
+            let manifest = package_manifest_with_validator(&skill_dir, "demo-package", source);
+            let service = SkillPackageConfigService::new(
+                Some(test_root.join("config")),
+                Duration::from_secs(5),
+                Duration::from_millis(20),
+            )
+            .expect("create service");
+            service.replace_registry([(&manifest, "USER", skill_dir.as_path())]);
+            let outcome = service.set_declared_values(
+                "demo-package",
+                BTreeMap::from([
+                    (
+                        "token".to_string(),
+                        SkillPackageConfigInputValue::String("secret".to_string()),
+                    ),
+                    (
+                        "mode".to_string(),
+                        SkillPackageConfigInputValue::String("local".to_string()),
+                    ),
+                ]),
+                None,
+            );
+            let stored = service
+                .list_raw_entries(Some("demo-package"))
+                .expect("list package")
+                .len();
+            let _ = std::fs::remove_dir_all(&test_root);
+            let _ = result_tx.send(match outcome {
+                Ok(_) => format!("committed {stored}"),
+                Err(error) => format!("rejected {stored}: {error}"),
+            });
+        });
+        result_rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("validator case '{label}' did not return"))
+    }
+
+    /// Verify protected calls, finalizers and metamethods cannot run a validator past its budget.
+    /// 验证保护调用、终结器与元方法都无法让校验器越过其预算。
+    #[test]
+    fn business_validator_budget_cannot_be_caught_or_outrun() {
+        for (label, source) in [
+            (
+                "validator_counting_loop",
+                "return function(values) local x = 0 while true do x = x + 1 end end",
+            ),
+            (
+                "validator_pcall_spin",
+                "local function spin() while true do end end
+return function(values) while true do pcall(spin) end end",
+            ),
+            (
+                "validator_xpcall_spin",
+                "local function spin() while true do end end
+return function(values) while true do xpcall(spin, function(e) return e end) end end",
+            ),
+            (
+                "validator_coroutine_spin",
+                "local function spin() while true do end end
+return function(values) while true do coroutine.resume(coroutine.create(spin)) end end",
+            ),
+        ] {
+            let outcome = validator_write_with_watchdog(label, source);
+            assert!(
+                outcome.starts_with("rejected 0:")
+                    && (outcome.contains("CONFIG_VALIDATOR_TIMEOUT")
+                        || outcome.contains("CONFIG_VALIDATOR_LIMIT_EXCEEDED")),
+                "{label}: {outcome}"
+            );
+        }
+        // Results are read raw, so an issue whose metatable loops is read as its plain fields.
+        // 结果按原始方式读取，因此元表会死循环的问题对象只按其普通字段读取。
+        let outcome = validator_write_with_watchdog(
+            "validator_looping_index",
+            r#"return function(values)
+  return { setmetatable({code = "invalid_shape", message = "fixture"},
+                        {__index = function() while true do end end}) }
+end"#,
+        );
+        assert!(
+            outcome.starts_with("rejected 0:") && outcome.contains("CONFIG_VALIDATOR_FAILED"),
+            "looping __index: {outcome}"
+        );
+        // Finalizers would run with hooks disabled when the state is dropped, so none can be made.
+        // 终结器会在状态销毁时以屏蔽钩子的方式运行，因此不允许创建任何终结器。
+        for (label, source) in [
+            (
+                "validator_gc_metatable",
+                "return function(values) KEEP = setmetatable({}, {__gc = function() while true do end end}) return {} end",
+            ),
+            (
+                "validator_newproxy",
+                "return function(values) local p = newproxy(true) getmetatable(p).__gc = function() while true do end end KEEP = p return {} end",
+            ),
+        ] {
+            let outcome = validator_write_with_watchdog(label, source);
+            assert!(
+                outcome.starts_with("rejected 0:") && outcome.contains("CONFIG_VALIDATOR_FAILED"),
+                "{label}: {outcome}"
+            );
+        }
+        // An ordinary validator, including one that uses pcall for its own errors, still works.
+        // 普通校验器（包括用 pcall 处理自身错误的校验器）仍可正常工作。
+        let outcome = validator_write_with_watchdog(
+            "validator_ordinary_pcall",
+            "return function(values) local ok = pcall(error, 'x') assert(not ok) return {} end",
+        );
+        assert_eq!(outcome, "committed 2");
     }
 
     /// Verify validator results reject sparse arrays and undeclared issue object fields.

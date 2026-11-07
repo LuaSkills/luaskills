@@ -297,7 +297,7 @@ fn embedded_capacity_physical_retirement_keeps_execution_charge() {
         local open, now = io.open, os.time
         -- Retain the finalizable object until actual physical VM destruction.
         -- 保留可关闭对象，直到真实物理 VM 销毁。
-        local proxy = newproxy(true)
+        local proxy = test_newproxy(true)
         -- Expose actual destructor entry and await external release.
         -- 暴露真实析构入口并等待外部释放。
         getmetatable(proxy).__gc=function()

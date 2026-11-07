@@ -1732,27 +1732,21 @@ impl LuaEngine {
             lua.set_app_data(logical_cwd::EvaluationDeadline(deadline));
         }
         let timeout_text = format!("luaexec execution timed out after {} ms", timeout_ms);
-        // LuaJIT traces bypass instruction hooks, so the whole engine stays off for every evaluation.
-        // LuaJIT 跟踪代码会绕过指令钩子，因此每次执行都整体关闭编译引擎。
-        lua.load("jit.off(); jit.flush()")
-            .set_name("=luaexec_timeout_guard")
-            .exec()?;
-
-        lua.set_hook(
-            HookTriggers::new().every_nth_instruction(LUA_BUDGET_HOOK_INTERVAL),
-            move |_, _| {
-                if Instant::now() >= deadline {
-                    return Err(mlua::Error::runtime(timeout_text.clone()));
-                }
-                Ok(VmState::Continue)
-            },
-        )
+        // The VM was hardened at creation, so the JIT is already off and the deadline, once
+        // passed, cannot be caught by pcall-style retry loops.
+        // VM 在创建时已加固，因此 JIT 早已关闭，截止时间一旦到达就无法被 pcall 类重试循环捕获。
+        crate::runtime::execution_budget::install(lua, move || {
+            if Instant::now() >= deadline {
+                return Err(mlua::Error::runtime(timeout_text.clone()));
+            }
+            Ok(())
+        })
     }
 
     /// Remove the previously installed timeout guard from the isolated luaexec VM.
     /// 移除隔离 luaexec 虚拟机上已安装的超时保护。
     pub(super) fn remove_runlua_timeout_guard(lua: &Lua) {
-        lua.remove_hook();
+        crate::runtime::execution_budget::remove(lua);
         lua.remove_app_data::<logical_cwd::EvaluationDeadline>();
     }
 

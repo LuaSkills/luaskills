@@ -875,7 +875,7 @@ impl SkillConfigStore {
         validate_candidate: F,
     ) -> Result<SkillConfigWriteResult, String>
     where
-        F: FnOnce(&BTreeMap<String, String>) -> Result<(), String>,
+        F: Fn(&BTreeMap<String, String>) -> Result<(), String>,
     {
         let normalized_skill_id = validate_skill_config_skill_id(skill_id)?;
         if values.is_empty() {
@@ -901,29 +901,70 @@ impl SkillConfigStore {
         }
         let expected_revision = expected_revision.map(parse_expected_revision).transpose()?;
         let submitted_values = normalized_values.clone();
-        let (changed_keys, revision, changed, durability_error) =
-            self.with_document_mut(expected_revision, |document| {
-                let package_values = document
-                    .skills
-                    .entry(normalized_skill_id.clone())
-                    .or_default();
-                let mut changed_keys = Vec::new();
-                for (key, value) in &normalized_values {
-                    if package_values.get(key) != Some(value) {
-                        package_values.insert(key.clone(), value.clone());
-                        changed_keys.push(key.clone());
+        // The validator runs skill code, so it runs before the path mutex and the cross-process lock
+        // are taken; a slow validator then delays only its own write. Its verdict, pass or fail, is
+        // settled under the locks: the revision check runs first, then the package values it judged
+        // must still be the ones on disk, otherwise the write validates again against them.
+        // 校验器会运行技能代码，因此在获取路径互斥锁与跨进程锁之前运行；慢校验器只会拖慢它自己的
+        // 写入。无论通过还是拒绝，结论都在锁内确认：先检查修订号，再要求它所判断的包配置值仍与磁盘
+        // 一致，否则针对磁盘上的值重新校验。
+        let mut base = self.with_document_read(|document| {
+            Ok(document
+                .skills
+                .get(&normalized_skill_id)
+                .cloned()
+                .unwrap_or_default())
+        })?;
+        for _ in 0..SKILL_CONFIG_VALIDATION_ATTEMPTS {
+            let mut candidate = base.clone();
+            candidate.extend(
+                normalized_values
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+            let verdict = validate_candidate(&candidate);
+            let (outcome, revision, changed, durability_error) =
+                self.with_document_mut(expected_revision, |document| {
+                    let current = document
+                        .skills
+                        .get(&normalized_skill_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    if current != base {
+                        return Ok((ValidatedWrite::Stale(current), false));
                     }
+                    verdict?;
+                    let package_values = document
+                        .skills
+                        .entry(normalized_skill_id.clone())
+                        .or_default();
+                    let mut changed_keys = Vec::new();
+                    for (key, value) in &normalized_values {
+                        if package_values.get(key) != Some(value) {
+                            package_values.insert(key.clone(), value.clone());
+                            changed_keys.push(key.clone());
+                        }
+                    }
+                    let changed = !changed_keys.is_empty();
+                    Ok((ValidatedWrite::Committed(changed_keys), changed))
+                })?;
+            match outcome {
+                ValidatedWrite::Committed(changed_keys) => {
+                    return Ok(SkillConfigWriteResult {
+                        revision: revision.to_string(),
+                        changed,
+                        values: submitted_values,
+                        changed_keys,
+                        durability_error,
+                    });
                 }
-                validate_candidate(package_values)?;
-                Ok((changed_keys.clone(), !changed_keys.is_empty()))
-            })?;
-        Ok(SkillConfigWriteResult {
-            revision: revision.to_string(),
-            changed,
-            values: submitted_values,
-            changed_keys,
-            durability_error,
-        })
+                ValidatedWrite::Stale(current) => base = current,
+            }
+        }
+        Err(format!(
+            "CONFIG_REVISION_CONFLICT: skill package '{}' configuration changed during validation {} times in a row",
+            normalized_skill_id, SKILL_CONFIG_VALIDATION_ATTEMPTS
+        ))
     }
 
     /// Delete one config key under one skill namespace and report whether one value was removed.
@@ -1759,6 +1800,21 @@ fn validate_skill_config_key(key: &str) -> Result<String, String> {
         ));
     }
     Ok(key.to_string())
+}
+
+/// Times one validated write re-validates after concurrent writes changed its package values.
+/// 并发写入改变包配置值后，单次带校验写入最多重新校验的次数。
+const SKILL_CONFIG_VALIDATION_ATTEMPTS: usize = 3;
+
+/// Outcome of committing one write whose candidate was validated outside the locks.
+/// 提交一次在锁外完成候选校验的写入的结果。
+enum ValidatedWrite {
+    /// The write was applied; carries the keys whose values changed.
+    /// 写入已应用；携带值发生变化的键。
+    Committed(Vec<String>),
+    /// A concurrent write changed the package values; carries the values now on disk.
+    /// 并发写入改变了包配置值；携带当前磁盘上的值。
+    Stale(BTreeMap<String, String>),
 }
 
 #[cfg(test)]
@@ -2976,5 +3032,145 @@ mod tests {
         ))
         .expect("normalize forward verbatim UNC lock path");
         assert_eq!(forward_unc, PathBuf::from(r"\\server\share\config.json"));
+    }
+
+    /// Verify a validated write runs its validator outside the config locks and re-validates
+    /// against values another write committed meanwhile.
+    /// 验证带校验写入在配置锁之外运行校验器，并针对期间其他写入提交的值重新校验。
+    #[test]
+    fn validated_write_runs_validator_outside_locks_and_revalidates_stale_values() {
+        let runtime_root = unique_temp_runtime_root("validated_outside_locks");
+        let file_path = runtime_root.join("config").join("skill_config.json");
+        let store = Arc::new(SkillConfigStore::new(file_path).expect("create store"));
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<BTreeMap<String, String>>::new()));
+        let writer = {
+            let store = Arc::clone(&store);
+            let seen = Arc::clone(&seen);
+            thread::spawn(move || {
+                store.set_values_validated(
+                    "demo-package",
+                    BTreeMap::from([("mode".to_string(), "remote".to_string())]),
+                    None,
+                    |candidate| {
+                        let first = seen.lock().unwrap().is_empty();
+                        seen.lock().unwrap().push(candidate.clone());
+                        if first {
+                            // Hold the first validation open until the concurrent write committed.
+                            // 让第一次校验保持未完成，直到并发写入已提交。
+                            entered_tx.send(()).unwrap();
+                            release_rx.lock().unwrap().recv().unwrap();
+                        }
+                        Ok(())
+                    },
+                )
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("validator should start");
+        // This write needs both config locks; it must not wait for the running validator. It runs on
+        // its own thread so a regression fails the test instead of blocking it on the path mutex.
+        // 该写入需要两把配置锁；它不得等待正在运行的校验器。它在独立线程上运行，
+        // 使回归表现为测试失败，而不是在路径互斥锁上阻塞测试。
+        let (written_tx, written_rx) = mpsc::channel();
+        {
+            let store = Arc::clone(&store);
+            thread::spawn(move || {
+                let _ = written_tx.send(store.set_values(
+                    "demo-package",
+                    BTreeMap::from([("token".to_string(), "concurrent".to_string())]),
+                    None,
+                ));
+            });
+        }
+        let written = written_rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).unwrap();
+        written
+            .expect("a concurrent write must not wait for a running validator")
+            .expect("concurrent write");
+        let result = writer.join().unwrap().expect("validated write");
+        assert!(result.changed);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "the stale candidate must be validated again");
+        assert_eq!(
+            seen[0],
+            BTreeMap::from([("mode".to_string(), "remote".to_string())])
+        );
+        assert_eq!(
+            seen[1],
+            BTreeMap::from([
+                ("mode".to_string(), "remote".to_string()),
+                ("token".to_string(), "concurrent".to_string()),
+            ])
+        );
+        let _ = fs::remove_dir_all(&runtime_root);
+    }
+
+    /// Verify a rejection computed from a stale cached snapshot is confirmed against disk and the
+    /// write validates again when another store already changed the package values.
+    /// 验证基于过期缓存快照得出的拒绝会针对磁盘复核；若另一个存储已改变包配置值，写入会重新校验。
+    #[test]
+    fn validated_write_rechecks_rejection_made_against_stale_cache() {
+        let runtime_root = unique_temp_runtime_root("validated_stale_rejection");
+        let file_path = runtime_root.join("config").join("skill_config.json");
+        let stale = SkillConfigStore::new(file_path.clone()).expect("create stale store");
+        // A second store stands in for another process; the first store's cache never sees it.
+        // 第二个存储代表另一个进程；第一个存储的缓存不会看到它的写入。
+        SkillConfigStore::new(file_path)
+            .expect("create other store")
+            .set_values(
+                "demo-package",
+                BTreeMap::from([("mode".to_string(), "local".to_string())]),
+                None,
+            )
+            .expect("other process write");
+        let calls = std::sync::Mutex::new(0_usize);
+        let result = stale
+            .set_values_validated(
+                "demo-package",
+                BTreeMap::from([("token".to_string(), "value".to_string())]),
+                None,
+                |candidate| {
+                    *calls.lock().unwrap() += 1;
+                    if candidate.get("mode").map(String::as_str) == Some("local") {
+                        Ok(())
+                    } else {
+                        Err("CONFIG_VALIDATOR_FAILED: mode must be local".to_string())
+                    }
+                },
+            )
+            .expect("the write is valid against the values on disk");
+        assert!(result.changed);
+        assert_eq!(*calls.lock().unwrap(), 2);
+        let _ = fs::remove_dir_all(&runtime_root);
+    }
+
+    /// Verify a stale expected revision is reported as a conflict even when the values are invalid.
+    /// 验证即使配置值无效，过期的期望修订号也按冲突报告。
+    #[test]
+    fn validated_write_reports_revision_conflict_before_validation_failure() {
+        let runtime_root = unique_temp_runtime_root("validated_revision_first");
+        let file_path = runtime_root.join("config").join("skill_config.json");
+        let store = SkillConfigStore::new(file_path).expect("create store");
+        store
+            .set_values(
+                "demo-package",
+                BTreeMap::from([("mode".to_string(), "local".to_string())]),
+                None,
+            )
+            .expect("advance revision");
+        let error = store
+            .set_values_validated(
+                "demo-package",
+                BTreeMap::from([("mode".to_string(), "remote".to_string())]),
+                Some("0"),
+                |_| Err("CONFIG_VALIDATOR_FAILED: always invalid".to_string()),
+            )
+            .expect_err("stale revision must fail");
+        assert!(error.starts_with("CONFIG_REVISION_CONFLICT"), "{error}");
+        let _ = fs::remove_dir_all(&runtime_root);
     }
 }

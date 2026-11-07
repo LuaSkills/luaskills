@@ -362,16 +362,35 @@ return vulcan.json.encode({
 
 ## 3.3 终结器与 VM 关闭
 
-`__gc` 终结器（例如 `newproxy(true)` 对象上的终结器）不是释放宿主资源的可靠位置：
+凡是带截止时间运行代码的 VM，都会限制可能绕开截止时间的内置函数，包括 runLua、运行时租约、System 租约、
+嵌入式插件和配置校验器。这些限制在任何技能代码加载之前生效，所以把 `pcall` 或 `setmetatable` 缓存到局部
+变量的库拿到的也是受限版本。宿主直接调用的入口运行在主技能 VM 池中，那里没有超时，这些内置函数保持原样。
+同一个入口也可能经由 runLua 或租约里的 `vulcan.call` 调用，所以技能应按受限环境来写。
 
-- VM 关闭前，运行时会执行一次完整回收。此时已不可达对象的终结器在 VM 存活时运行，可以调用宿主函数。
-- VM 关闭时仍可达对象（全局变量、被保留函数的上值）的终结器在 `lua_close` 内运行，此时运行时已释放实例。
-  所有宿主函数都会以 Lua 错误 `host functions are unavailable while the Lua VM is closing; ...` 失败，
-  包括 `vulcan.*`、托管 `io.*` 与 `os.*` 函数，以及托管文件句柄和进程会话的方法。`string`、`table`、
-  `math` 等纯 Lua 库仍可使用。
+在这些 VM 中，技能代码不能注册 `__gc` 终结器。LuaJIT 运行终结器时会屏蔽钩子，任何超时都停不下它：
+
+- 元表带有 `__gc` 字段时，`setmetatable` 会抛出 `setmetatable: __gc metamethods are not supported`。
+  其他元表照常可用，包括 `__index`、`__newindex` 和 `__call`。
+- `newproxy` 和 `debug.setmetatable` 不可用。
 - 文件、进程与会话应在使用它们的工作结束时显式释放。
 - 嵌入式模块如需在 VM 退役时清理，应在模块定义中声明终结导出（`finalizer`：`export`、`arguments`、
   `timeout_ms`）。宿主会在 VM 关闭之前、于存活 VM 上以独立时间预算调用该导出。
+
+## 3.4 超时与受限的内置函数
+
+超时无法被捕获，包括 runLua 的 `timeout_ms`、运行时租约的 eval、嵌入式调用的截止时间和配置校验器的预算：
+
+- 时间用完后，`pcall`、`xpcall` 和 `coroutine.resume` 会重新抛出超时错误，而不是把它返回。包在保护调用外的
+  重试循环也会结束。普通错误照常可以捕获。
+- 同一个运行时租约上的下一次 eval 会拿到新的预算。
+
+这些 VM 在整个生命周期内都关闭 JIT 编译器，因为编译后的代码会跳过执行超时所依赖的指令检查：
+
+- `jit.os`、`jit.arch`、`jit.version` 和 `jit.version_num` 保持原值，`require('jit')` 返回同一个表。
+- `jit.status()` 返回 `false`，`jit.off()` 和 `jit.flush()` 不做任何事。`jit.on`、`jit.opt`、`jit.util` 和
+  `jit.profile` 不可用。
+- `debug.sethook` 不可用。其他 `debug` 函数照常可用，例如 `debug.getupvalue`、`debug.getmetatable` 和
+  `debug.traceback`。
 
 ## 4. `vulcan.call`
 
@@ -1131,7 +1150,9 @@ return use_service(api_token)
 - 这组 API **要求当前存在活动 skill 上下文**；如果在没有当前 skill 身份的系统运行时里调用，会直接报错。
 - 缺失或非法配置不会阻止技能包加载，具体 entry 应在需要时检查并提示。
 - 宿主必须提供绝对用户级 `skill_config_root`；普通包与系统包分别路由到其下的 `skills/config.json` 与 `system-skills/config.json`。
-- 可选 `config_validator` 在同一个原子事务内通过隔离且无能力的 Lua 状态执行跨字段校验。
+- 可选 `config_validator` 在隔离且无能力的 Lua 状态中执行跨字段校验。它在写入获取配置锁之前运行，慢校验器只会拖慢
+  它自己的写入。如果期间另一次写入改变了同一个包的配置值，写入会针对新值重新校验，最多 3 次，之后以
+  `CONFIG_REVISION_CONFLICT` 失败。
 - 声明中的人类可读字段使用技能包作者选择的单一语言；面向广泛分发的技能包建议使用英文，但不强制。
 - 完整声明格式、类型存储规则、宿主权限边界和 FFI 对接见 [Skill 包级配置声明、运行时控制与宿主对接](../integration/skill-config-system-design.md)。
 

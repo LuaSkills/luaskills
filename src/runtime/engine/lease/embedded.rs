@@ -93,13 +93,9 @@ impl<'a> ModuleBudgetGuard<'a> {
         // The guard exists before fallible hook installation, so failure removes app data.
         // 在可失败的钩子安装前创建保护对象，确保失败时移除应用数据。
         let guard = Self { lua };
-        lua.set_hook(
-            HookTriggers::new().every_nth_instruction(LUA_BUDGET_HOOK_INTERVAL),
-            move |_, _| {
-                control.check().map_err(mlua::Error::external)?;
-                Ok(VmState::Continue)
-            },
-        )
+        crate::runtime::execution_budget::install(lua, move || {
+            control.check().map_err(mlua::Error::external)
+        })
         .map_err(execution_error)?;
         Ok(guard)
     }
@@ -109,7 +105,7 @@ impl Drop for ModuleBudgetGuard<'_> {
     /// Remove this invocation's hook, deadline, and cancellation reference.
     /// 移除本次调用的钩子、截止时间与取消引用。
     fn drop(&mut self) {
-        self.lua.remove_hook();
+        crate::runtime::execution_budget::remove(self.lua);
         self.lua
             .remove_app_data::<logical_cwd::EvaluationDeadline>();
         self.lua.remove_app_data::<Arc<CallControl>>();
@@ -217,13 +213,9 @@ impl LuaEngine {
         // Keep the scalar for emission after the surrounding allocation has returned and all locks are released.
         // 保留标量，在外围分配返回且全部锁释放后发送。
         let diagnostic_vm_creation_elapsed = vm_creation_started.map(|started| started.elapsed());
-        // LuaJIT traces can bypass instruction hooks; disable the engine before any plugin code loads.
-        // LuaJIT 跟踪代码可能绕过指令钩子；在任何插件源码加载前禁用编译引擎。
-        vm.lua
-            .load("jit.off(); jit.flush()")
-            .set_name("embedded_execution_budget")
-            .exec()
-            .map_err(execution_error)?;
+        // `create_system_runtime_vm` already hardened this VM: the JIT is off for good and budgets
+        // cannot be caught or bypassed before any plugin code loads.
+        // `create_system_runtime_vm` 已加固该 VM：JIT 永久关闭，在任何插件源码加载前预算都无法被捕获或绕过。
         Self::configure_runtime_lease_vm(&vm.lua, &paths).map_err(execution_error)?;
         logical_cwd::install(
             &vm.lua,

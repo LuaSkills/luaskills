@@ -89,7 +89,7 @@ fn embedded_pool_host_owner_waits_for_real_finalizer_and_failed_initialization()
             r#"
             collectgarbage('stop')
             local open, now = io.open, os.time
-            local finalizer = newproxy(true)
+            local finalizer = test_newproxy(true)
             getmetatable(finalizer).__gc = function()
                 local entered = assert(open('entered-host-finalizer', 'w'))
                 entered:write('entered'); entered:close()

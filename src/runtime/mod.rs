@@ -9,6 +9,7 @@ pub mod embedded;
 pub mod encoding;
 pub mod engine;
 pub mod entry;
+pub(crate) mod execution_budget;
 pub(crate) mod file_system;
 pub(crate) mod file_watcher;
 pub mod help;

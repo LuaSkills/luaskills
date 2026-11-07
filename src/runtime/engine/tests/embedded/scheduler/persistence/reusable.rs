@@ -17,7 +17,7 @@ fn embedded_scheduler_reusable_idle_close_waits_for_actual_retirement() {
         -- Keep the resource proxy reachable until the owning VM is really destroyed.
         -- 保持资源代理可达，直到所属 VM 真实销毁。
         local open, now = io.open, os.time
-        local proxy = newproxy(true)
+        local proxy = test_newproxy(true)
         getmetatable(proxy).__gc = function()
             local entered=assert(open('retirement-entered','w')); entered:write('yes'); entered:close()
             -- The host releases this destructor after verifying capacity and independent execution.

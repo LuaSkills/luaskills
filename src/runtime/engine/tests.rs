@@ -1,4 +1,5 @@
 mod embedded;
+mod execution_budget;
 mod host_database;
 #[cfg(windows)]
 mod host_mode;

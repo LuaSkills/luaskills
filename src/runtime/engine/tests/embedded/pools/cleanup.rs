@@ -11,7 +11,7 @@ fn embedded_pool_global_finalizer_failure_does_not_prove_worker_failure() {
     let layout = SystemRuntimeTestLayout::new("embedded global finalizer failure");
     let manager = pool_manager(&layout);
     let bad = manager.create_pool("failed-finalizer".into(), definition(&layout,
-        "retained_finalizer=newproxy(true); getmetatable(retained_finalizer).__gc=function() io.open('late-native-open','w') end; return {call=function() return true end}"),
+        "retained_finalizer=test_newproxy(true); getmetatable(retained_finalizer).__gc=function() io.open('late-native-open','w') end; return {call=function() return true end}"),
         pool_policy(InstanceReuse::SingleCall)).unwrap();
     let good = manager
         .create_pool(
@@ -96,7 +96,7 @@ fn embedded_pool_close_finalizer_host_call_fails_clearly_and_retirement_complete
             definition(
                 &layout,
                 r#"
-                retained_finalizer = newproxy(true)
+                retained_finalizer = test_newproxy(true)
                 getmetatable(retained_finalizer).__gc = function()
                     pcall(io.open, 'closing-host-call.marker', 'w')
                     io.open('closing-host-call.marker', 'w')
@@ -164,7 +164,7 @@ fn embedded_pool_retirement_receipt_waits_for_actual_lua_finalizer() {
     let source = with_barrier_backstop(
         r#"
         local open, now = io.open, os.time
-        local finalizer = newproxy(true)
+        local finalizer = test_newproxy(true)
         getmetatable(finalizer).__gc = function()
             local entered = assert(open('entered-finalizer', 'w'))
             entered:write('entered'); entered:close()

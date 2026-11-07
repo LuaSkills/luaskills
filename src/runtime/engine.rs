@@ -1,8 +1,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use mlua::{
-    AnyUserData, Function, HookTriggers, LightUserData, Lua, LuaSerdeExt, MultiValue, Table,
-    Value as LuaValue, VmState,
+    AnyUserData, Function, LightUserData, Lua, LuaSerdeExt, MultiValue, Table, Value as LuaValue,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -9282,6 +9281,12 @@ impl LuaEngine {
         } = context;
         let lua = crate::runtime::lua_state::LuaState::new(mlua::StdLib::ALL)
             .map_err(|error| error.to_string())?;
+        // Every evaluation in this VM runs under a deadline. Close the routes around it before any
+        // skill code runs: entry chunks and the libraries they require execute during registration
+        // below and often cache `pcall` or `setmetatable` in locals.
+        // 该 VM 中的每次执行都受截止时间约束。须在任何技能代码运行前封堵绕开它的途径：入口代码块及其
+        // require 的库会在下面的注册过程中执行，并且常把 `pcall` 或 `setmetatable` 缓存到局部变量。
+        crate::runtime::execution_budget::harden(&lua).map_err(|error| error.to_string())?;
         lua.set_app_data(managed_runtime_services);
         lua.set_app_data(managed_runtime_workers);
         Self::setup_package_paths(&lua, host_options.as_ref())

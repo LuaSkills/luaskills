@@ -361,12 +361,27 @@ This capability preserves the host and user's final choice. If users should stil
 
 ## 3.3 Finalizers And VM Close
 
-A `__gc` finalizer (for example on a `newproxy(true)` object) is not a reliable place to release host resources:
+Every VM that runs code under a deadline restricts the built-ins that could get around it: runLua, runtime leases, System leases, embedded plugins and the config validator. The restrictions apply before any skill code loads, so a library that caches `pcall` or `setmetatable` in a local gets the restricted version. Entries the host calls directly run in the main skill VM pool, which has no timeout and keeps these built-ins. The same entry can also be reached through `vulcan.call` from runLua or a lease, so write skills that work under the restrictions.
 
-- Before a VM closes, the runtime runs a full collection. Finalizers of objects that are already unreachable run then, while the VM is alive, and may call host functions.
-- Finalizers of objects that are still reachable when the VM closes (globals, upvalues of retained functions) run inside `lua_close`, after the runtime has released the instance. Every host function then fails with the Lua error `host functions are unavailable while the Lua VM is closing; ...`. This covers `vulcan.*`, the managed `io.*` and `os.*` functions, and methods of managed file handles and process sessions. Pure Lua libraries such as `string`, `table` and `math` keep working.
+Skill code cannot register `__gc` finalizers in these VMs. LuaJIT runs finalizers with hooks disabled, so no timeout could stop one:
+
+- `setmetatable` raises `setmetatable: __gc metamethods are not supported` when the metatable has a `__gc` field. Other metatables, including `__index`, `__newindex` and `__call`, work as usual.
+- `newproxy` and `debug.setmetatable` are not available.
 - Release files, processes and sessions explicitly when the work that uses them finishes.
 - An embedded module that must clean up when its VM retires declares a finalizer export in its module definition (`finalizer`: `export`, `arguments`, `timeout_ms`). The host calls that export on the live VM, with its own time budget, before the VM closes.
+
+## 3.4 Timeouts And Restricted Built-ins
+
+A timeout (runLua `timeout_ms`, a runtime-lease eval, an embedded call deadline, or the config validator budget) cannot be caught:
+
+- Once the time is up, `pcall`, `xpcall` and `coroutine.resume` re-raise the timeout error instead of returning it. A retry loop around a protected call still ends. Ordinary errors are caught as usual.
+- The next evaluation on the same runtime lease starts with a fresh budget.
+
+The JIT compiler is off for the whole life of these VMs, because compiled code skips the instruction checks that enforce timeouts:
+
+- `jit.os`, `jit.arch`, `jit.version` and `jit.version_num` keep their values, and `require('jit')` returns the same table.
+- `jit.status()` returns `false`, and `jit.off()` and `jit.flush()` do nothing. `jit.on`, `jit.opt`, `jit.util` and `jit.profile` are not available.
+- `debug.sethook` is not available. The other `debug` functions, such as `debug.getupvalue`, `debug.getmetatable` and `debug.traceback`, keep working.
 
 ## 4. `vulcan.call`
 
@@ -1126,7 +1141,7 @@ Notes:
 - These APIs **require one active skill context**. They raise an error in system runtimes that do not currently represent one skill identity.
 - Missing or invalid configuration does not prevent package loading. Check it only where an entry needs it.
 - Hosts must provide one absolute user-level `skill_config_root`; normal and system packages route to `skills/config.json` and `system-skills/config.json` under that root.
-- Optional `config_validator` runs cross-field checks in an isolated, capability-free Lua state during the same atomic transaction.
+- Optional `config_validator` runs cross-field checks in an isolated, capability-free Lua state. It runs before the write takes the config locks, so a slow validator delays only its own write. If another write changes the same package's values in the meantime, the write validates again against the new values, up to 3 times, and then fails with `CONFIG_REVISION_CONFLICT`.
 - Human-readable declaration fields use the single language chosen by the package author. English is recommended for broadly distributed packages but is not enforced.
 - The complete declaration schema, storage formats, host authorization boundary, and FFI contract are documented in [Skill package configuration](../zh-CN/integration/skill-config-system-design.md).
 

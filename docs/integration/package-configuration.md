@@ -23,7 +23,7 @@ config_validator: runtime/config-validator.lua
 
 - Supported types are `integer`, `string`, `float`, `enum`, and `boolean`.
 - Human-readable metadata is single-language package content; there are no configuration-specific i18n fields or language fallback.
-- The optional `config_validator` runs cross-field checks in an isolated, capability-free Lua state inside the same atomic write.
+- The optional `config_validator` runs cross-field checks in an isolated, capability-free Lua state before the write takes the config locks. The write commits only if the package's values on disk are still the ones that were validated; otherwise it validates again, up to 3 times, and then fails with `CONFIG_REVISION_CONFLICT`.
 - `sensitive=true` hides values, not declarations. Never put a secret in `default`.
 
 Lua code reads and writes its own package through `vulcan.config.get/has/list/status/delete` and `set(key, value)` or `set(table)`. LuaSkills binds these calls to the calling package, so one package cannot touch another. See the [skill development manual](../development/skill-development.md) for the Lua API.

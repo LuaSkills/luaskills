@@ -570,7 +570,7 @@ fn embedded_scheduler_persistence_late_session_close_preserves_prepared_result()
         local open, now = io.open, os.time
         -- The proxy remains reachable through the session export until the VM is actually destroyed.
         -- 代理通过会话导出保持可达，直到 VM 实际销毁。
-        local proxy = newproxy(true)
+        local proxy = test_newproxy(true)
         getmetatable(proxy).__gc = function()
             -- Signal actual VM finalization rather than a provisional scheduler flag.
             -- 标记真实 VM 析构，而非调度器临时标记。

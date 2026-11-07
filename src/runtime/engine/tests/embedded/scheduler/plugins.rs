@@ -658,7 +658,7 @@ fn embedded_plugin_generation_retirement_keeps_aggregate_reservation() {
     let source = with_barrier_backstop(
         r#"
         local open, now = io.open, os.time
-        local proxy = newproxy(true)
+        local proxy = test_newproxy(true)
         getmetatable(proxy).__gc=function()
             local f=assert(open('plugin-retirement-entered','w')); f:close()
             local deadline = now() + __BARRIER_SECS__

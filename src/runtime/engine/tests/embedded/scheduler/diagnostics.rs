@@ -120,7 +120,7 @@ fn embedded_diagnostics_observe_real_reuse_host_wait_heap_and_retirement() {
     // 在声明导出中捕获真实 GC 根，使其仅由实际 VM 销毁释放。
     let source = r#"
         local open = io.open
-        local proxy = newproxy(true)
+        local proxy = test_newproxy(true)
         getmetatable(proxy).__gc = function()
             local file = assert(open('diagnostic-gc-finished', 'w'))
             file:write('finished'); file:close()

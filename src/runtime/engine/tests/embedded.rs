@@ -7,6 +7,7 @@ use crate::runtime::embedded::{
     CallControl, EmbeddedErrorCode, ModuleDefinition, ModuleExport, ModuleInvocation,
 };
 
+mod budget;
 mod capabilities;
 mod ffi;
 mod finalization;
