@@ -9588,3 +9588,32 @@
 - `cargo test --lib`：1117 通过、0 失败、3 忽略。
 - 4 个集成测试目标共 13 项通过。
 - 同时撤掉 4 处修复（直接解压到最终路径、不写记录且只用原始版本号、校验文件改回缓存、缓存键去掉来源和摘要）后，6 个新测试全部失败；恢复后通过。
+
+## 2026-11-08：第 7 组审核修复，卸载被遮蔽的副本不再删除上层根的记录
+
+### 概述
+
+- 审核编号：B4-01。详见 `docs/audit/20261106/FIX_STATUS.md`。
+- 同一父目录下的根共用状态目录和依赖目录。卸载低优先级根中的同名副本时，高优先级根中的同名技能还在的话，只删除包目录。停用标记、安装记录和私有依赖都保留。
+- 原来的问题：系统禁用的 ROOT 技能，会在卸载 USER 同名残留后重新运行。
+
+### 文件变更清单
+
+- `src/runtime/engine.rs`：
+  - 新增 `SharedDerivedDirs` 和 `shared_dirs_with_shadowing_roots`；
+  - `uninstall_skill_and_reload_in_root` 遇到共用目录时，不提交记录删除，也不清理依赖。
+- `src/skill/manager.rs`：`PreparedSkillUninstall` 新增 `keep_state_records`。设置后提交和回滚都不改动停用标记和安装记录。
+  - 二次审核发现：最初的做法是把记下的两条记录清成 `None`。重载失败回滚时，`restore_*_record(None)` 会删除当前记录，也就把 ROOT 副本的记录删掉了。
+- 测试：
+  - 新增 `engine/tests/shared_root_layout.rs`；
+  - `skill/manager/tests.rs` 新增 `uninstall_keeping_state_records_leaves_them_on_rollback_and_commit`。
+- 文档：
+  - `docs/integration/runtime-model.md`；
+  - `docs/zh-CN/integration/skill-root-layer-policy.md` 规则 6。
+
+### 验证记录
+
+- `cargo fmt --check`、`cargo clippy --all-targets` 无警告。
+- `cargo test --lib`：1119 通过、0 失败、3 忽略。
+- 4 个集成测试目标共 13 项通过。
+- 让 `shared_dirs_with_shadowing_roots` 始终返回「不共用」时，`uninstalling_shadowed_copy_keeps_records_of_root_copy` 失败；让提交忽略 `keep_state_records` 时，`uninstall_keeping_state_records_leaves_them_on_rollback_and_commit` 失败。恢复后都通过。

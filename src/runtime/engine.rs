@@ -151,6 +151,18 @@ fn render_log_friendly_path(path: &Path) -> String {
     render_host_visible_path(path)
 }
 
+/// Derived directories a skill root shares with a higher-priority root holding the same skill.
+/// 技能根与包含同一技能的高优先级根共用的派生目录。
+#[derive(Debug, Default, Clone, Copy)]
+struct SharedDerivedDirs {
+    /// The state directory with disabled markers and install records is shared.
+    /// 存放停用标记和安装记录的状态目录是共用的。
+    state: bool,
+    /// The private dependency directory is shared.
+    /// 私有依赖目录是共用的。
+    dependencies: bool,
+}
+
 /// Normalize one runtime-root path with stable lexical component folding.
 /// 使用稳定的词法组件折叠规则规范化单个运行时根目录路径。
 fn normalize_runtime_root_path(path: &Path) -> PathBuf {
@@ -7526,6 +7538,43 @@ impl LuaEngine {
             .join(self.host_options.dependency_dir_name.as_str())
     }
 
+    /// Report which derived directories `target` shares with a higher-priority root that also
+    /// holds `skill_id`.
+    /// 报告 `target` 与同样包含 `skill_id` 的高优先级根共用了哪些派生目录。
+    ///
+    /// Roots under one parent directory derive the same state and dependency directories, and the
+    /// records there are keyed by `skill_id` alone. While a higher-priority copy of the skill
+    /// exists, those records belong to it, so removing a shadowed copy must leave them in place.
+    /// 同一父目录下的根派生出相同的状态目录和依赖目录，其中的记录只按 `skill_id` 区分。只要高优先级
+    /// 根中还有该技能，这些记录就属于它，删除被遮蔽的副本时必须保留它们。
+    fn shared_dirs_with_shadowing_roots(
+        &self,
+        skill_roots: &[RuntimeSkillRoot],
+        target: &RuntimeSkillRoot,
+        skill_id: &str,
+    ) -> Result<SharedDerivedDirs, String> {
+        let target_label = Self::normalized_skill_root_label(target);
+        let state_root = normalize_runtime_root_path(&self.state_root_for(target));
+        let dependency_root = normalize_runtime_root_path(&self.dependency_root_for(target));
+        let mut shared = SharedDerivedDirs::default();
+        // The chain is validated to be ordered by priority, so every root before the target shadows it.
+        // 根链已验证按优先级排序，因此目标之前的每个根都会遮蔽它。
+        for root in skill_roots {
+            if Self::normalized_skill_root_label(root) == target_label {
+                break;
+            }
+            if resolve_declared_skill_instance_from_roots(std::slice::from_ref(root), skill_id)?
+                .is_none()
+            {
+                continue;
+            }
+            shared.state |= normalize_runtime_root_path(&self.state_root_for(root)) == state_root;
+            shared.dependencies |=
+                normalize_runtime_root_path(&self.dependency_root_for(root)) == dependency_root;
+        }
+        Ok(shared)
+    }
+
     /// Return whether the host policy forces one skill identifier to be ignored.
     /// 返回宿主策略是否强制忽略指定技能标识符。
     fn is_host_ignored_skill(&self, skill_id: &str) -> bool {
@@ -8359,6 +8408,9 @@ impl LuaEngine {
         let removed_dependency_manifest = self
             .load_skill_dependency_manifest(&resolved_instance.actual_dir)
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        let shared_with_shadowing_root = self
+            .shared_dirs_with_shadowing_roots(skill_roots, &resolved_root, skill_id)
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
         if let Err(error) = manager.guard_operation(
             plane,
             crate::skill::manager::SkillLifecycleAction::Uninstall,
@@ -8375,7 +8427,7 @@ impl LuaEngine {
             });
             return Err(error.into());
         }
-        let prepared_uninstall = match manager.prepare_uninstall_skill_at_path_in_plane(
+        let mut prepared_uninstall = match manager.prepare_uninstall_skill_at_path_in_plane(
             plane,
             skill_id,
             &resolved_instance.actual_dir,
@@ -8395,6 +8447,11 @@ impl LuaEngine {
                 return Err(error.into());
             }
         };
+        if shared_with_shadowing_root.state {
+            // The disabled marker and install record belong to the higher-priority copy.
+            // 停用标记和安装记录属于高优先级根中的副本。
+            prepared_uninstall.keep_state_records = true;
+        }
         if let Err(reload_error) = self.reload_from_roots(skill_roots) {
             let rollback_error = manager.rollback_prepared_skill_uninstall(&prepared_uninstall);
             let restore_error = self.reload_from_roots(skill_roots);
@@ -8443,11 +8500,20 @@ impl LuaEngine {
             self.dependency_manager_config_for(&resolved_root)
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?,
         );
-        if let Err(error) = dependency_manager.cleanup_uninstalled_skill_dependencies_from_roots(
-            skill_roots,
-            skill_id,
-            removed_dependency_manifest.as_ref(),
-        ) {
+        if shared_with_shadowing_root.dependencies {
+            // The private dependencies belong to the higher-priority copy.
+            // 私有依赖属于高优先级根中的副本。
+            log_info(format!(
+                "[LuaSkills:uninstall] Kept dependencies of skill '{}' shared with a higher-priority root",
+                skill_id
+            ));
+        } else if let Err(error) = dependency_manager
+            .cleanup_uninstalled_skill_dependencies_from_roots(
+                skill_roots,
+                skill_id,
+                removed_dependency_manifest.as_ref(),
+            )
+        {
             log_warn(format!(
                 "[LuaSkills:uninstall] Stale dependency cleanup warning for skill '{}': {}",
                 skill_id, error

@@ -1554,6 +1554,7 @@ fn rollback_staged_uninstall_rejects_target_dir_probe_errors() {
         backup_dir: Some(backup_dir),
         previous_disabled_record: None,
         previous_install_record: None,
+        keep_state_records: false,
     };
 
     // Error returned before the invalid target can behave like a missing rollback target.
@@ -1607,6 +1608,7 @@ fn rollback_staged_uninstall_rejects_backup_probe_errors_before_removing_target(
         backup_dir: Some(std::path::PathBuf::from("invalid\0backup")),
         previous_disabled_record: None,
         previous_install_record: None,
+        keep_state_records: false,
     };
 
     // Error returned before rollback removes the valid staged target directory.
@@ -1981,4 +1983,72 @@ fn replacement_source_is_validated_before_network() {
             "{source_type:?} {source:?}"
         );
     }
+}
+
+/// Verify an uninstall told to keep state records leaves them in place on rollback and commit.
+/// 验证被要求保留状态记录的卸载在回滚和提交时都不改动这些记录。
+#[test]
+fn uninstall_keeping_state_records_leaves_them_on_rollback_and_commit() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "luaskills_uninstall_keep_state_records_test_{}",
+        std::process::id()
+    ));
+    if temp_root.exists() {
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+    let skill_root = temp_root.join("skills");
+    let skill_dir = skill_root.join("vulcan-codekit");
+    std::fs::create_dir_all(&skill_dir).expect("skill directory should be created");
+    let manager = SkillManager::new(test_manager_config(
+        &temp_root,
+        RuntimeSkillRoot {
+            name: "USER".to_string(),
+            skills_dir: skill_root,
+        },
+    ));
+    manager.ensure_state_layout().expect("state layout");
+    manager
+        .persist_disabled_record(&super::DisabledSkillRecord {
+            skill_id: "vulcan-codekit".to_string(),
+            reason: None,
+            disabled_at_unix_ms: 1,
+        })
+        .expect("disabled record should be written");
+    manager
+        .persist_install_record(&test_installed_record("0.1.0"))
+        .expect("install record should be written");
+    let records_present = || {
+        manager
+            .disabled_record("vulcan-codekit")
+            .expect("read disabled record")
+            .is_some()
+            && manager
+                .install_record("vulcan-codekit")
+                .expect("read install record")
+                .is_some()
+    };
+
+    for commit in [false, true] {
+        let mut prepared = manager
+            .prepare_uninstall_skill_at_path_in_plane(
+                SkillOperationPlane::Skills,
+                "vulcan-codekit",
+                &skill_dir,
+            )
+            .expect("uninstall should be prepared");
+        prepared.keep_state_records = true;
+        if commit {
+            manager
+                .commit_prepared_skill_uninstall(&prepared)
+                .expect("uninstall should commit");
+            assert!(!skill_dir.exists(), "package directory removed on commit");
+        } else {
+            manager
+                .rollback_prepared_skill_uninstall(&prepared)
+                .expect("uninstall should roll back");
+            assert!(skill_dir.is_dir(), "package directory restored on rollback");
+        }
+        assert!(records_present(), "records kept (commit = {})", commit);
+    }
+    let _ = std::fs::remove_dir_all(&temp_root);
 }

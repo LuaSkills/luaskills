@@ -215,6 +215,8 @@ When the same `skill_id` exists in multiple layers, higher-priority layers win.
 
 A skill that fails to load is skipped with an error in the log, and every other skill still loads. This covers a `skill.yaml` that cannot be read or parsed, declares `skill_id` or has an invalid `enable`, and an entry that fails to compile or initialize. A broken directory keeps its `skill_id`: a same-named skill in a lower-priority layer does not take its place. Installing, updating or enabling a skill is different: if that skill fails to load, the operation fails, an install or update is rolled back, and the running skills stay as they were.
 
+Skill state (disabled markers, install records) and private dependencies live in directories derived from each root's parent directory, keyed by `skill_id` alone, so roots under one parent share them. Uninstalling a lower-layer copy of a skill that a higher layer sharing those directories also holds removes only the package directory; the disabled marker, install record and private dependencies stay with the higher-layer copy.
+
 ## Help Model
 
 LuaSkills treats help as structured runtime data, not as ordinary tool output.

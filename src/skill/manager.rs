@@ -435,6 +435,10 @@ pub struct PreparedSkillUninstall {
     /// Previous managed install record that should be restored if uninstall rollback is needed.
     /// 如果需要回滚卸载则应恢复的旧受管安装记录。
     pub(crate) previous_install_record: Option<InstalledSkillRecord>,
+    /// Leave the disabled marker and install record untouched on commit and rollback, because
+    /// they belong to a higher-priority copy of the skill that shares the state directory.
+    /// 提交和回滚时都不改动停用标记和安装记录，因为它们属于共用状态目录的高优先级副本。
+    pub(crate) keep_state_records: bool,
 }
 
 /// Structured uninstall result that reports whether code and databases were removed or retained.
@@ -813,6 +817,7 @@ impl SkillManager {
             backup_dir,
             previous_disabled_record,
             previous_install_record,
+            keep_state_records: false,
         })
     }
 
@@ -2076,22 +2081,18 @@ impl SkillManager {
         &self,
         prepared: &PreparedSkillUninstall,
     ) -> Result<SkillUninstallResult, String> {
-        if prepared.previous_disabled_record.is_some() {
-            self.remove_disabled_record(&prepared.result.skill_id)?;
-        }
-        if prepared.previous_install_record.is_some() {
-            self.remove_install_record(&prepared.result.skill_id)?;
+        if !prepared.keep_state_records {
+            if prepared.previous_disabled_record.is_some() {
+                self.remove_disabled_record(&prepared.result.skill_id)?;
+            }
+            if prepared.previous_install_record.is_some() {
+                self.remove_install_record(&prepared.result.skill_id)?;
+            }
         }
         if let Some(backup_dir) = &prepared.backup_dir {
             fs::remove_dir_all(backup_dir).map_err(|error| {
-                let disabled_restore_error = self.restore_disabled_record(
-                    &prepared.result.skill_id,
-                    prepared.previous_disabled_record.as_ref(),
-                );
-                let install_restore_error = self.restore_install_record(
-                    &prepared.result.skill_id,
-                    prepared.previous_install_record.as_ref(),
-                );
+                let (disabled_restore_error, install_restore_error) =
+                    self.restore_uninstalled_state_records(prepared);
                 let mut message = format!(
                     "Failed to remove uninstall backup {}: {}",
                     render_skill_manager_path(backup_dir),
@@ -2148,15 +2149,33 @@ impl SkillManager {
                 })?;
             }
         }
-        self.restore_disabled_record(
-            &prepared.result.skill_id,
-            prepared.previous_disabled_record.as_ref(),
-        )?;
-        self.restore_install_record(
-            &prepared.result.skill_id,
-            prepared.previous_install_record.as_ref(),
-        )?;
+        let (disabled_restore_error, install_restore_error) =
+            self.restore_uninstalled_state_records(prepared);
+        disabled_restore_error?;
+        install_restore_error?;
         Ok(())
+    }
+
+    /// Restore the disabled marker and install record captured before one uninstall, unless the
+    /// uninstall was told to leave them untouched.
+    /// 恢复卸载前记下的停用标记和安装记录；卸载被要求不改动它们时跳过。
+    fn restore_uninstalled_state_records(
+        &self,
+        prepared: &PreparedSkillUninstall,
+    ) -> (Result<(), String>, Result<(), String>) {
+        if prepared.keep_state_records {
+            return (Ok(()), Ok(()));
+        }
+        (
+            self.restore_disabled_record(
+                &prepared.result.skill_id,
+                prepared.previous_disabled_record.as_ref(),
+            ),
+            self.restore_install_record(
+                &prepared.result.skill_id,
+                prepared.previous_install_record.as_ref(),
+            ),
+        )
     }
 
     /// Build one downloader configured for managed install and update flows.

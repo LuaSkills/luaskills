@@ -5,6 +5,7 @@ mod host_database;
 #[cfg(windows)]
 mod host_mode;
 mod load_isolation;
+mod shared_root_layout;
 mod value_boundaries;
 
 #[cfg(windows)]
