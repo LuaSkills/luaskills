@@ -9399,3 +9399,30 @@
   - 2 个是并发运行时 PATH 互相干扰（报 `cmd.exe` 找不到），单独运行通过。
   - 1 个 `embedded_diagnostics_*` 在基线上同样失败（另一个这次碰巧通过），与本次改动无关。
 - 用审核里 G02-004 的触发条件做端到端检查：原来宿主以 `0xC0000409` 中止，现在返回失败信封。
+
+## 2026-11-07：隔离改写 PATH 的测试，消除并行干扰
+
+### 概述
+
+- 全量测试里 `system_runtime_lease_ignores_process_cwd_guard` 和 `system_runtime_lease_process_session_inherits_non_verbatim_package_cwd` 经常失败，单独运行却能通过。
+- 原因是有 7 个测试会改写进程级的 `PATH` 或 `PATHEXT`：
+  - 有的把 PATH 换成只含临时目录；
+  - 有的在 PATH 里放一个假的 `cmd.exe`；
+  - 有的把 PATHEXT 清空。
+- System 租约用逻辑 cwd 启动子进程时，会按进程 PATH 查找 `cmd`（`resolve_vulcan_process_which_in_directory`）。两者并行时，要么找不到 `cmd`，要么启动了假的那个（os error 216）。
+- 现在这 7 个测试都在独立的子测试进程里运行，环境变量只在子进程里改写，本进程里并行的测试完全看不到。读取 PATH 的测试不需要逐个加锁。
+
+### 文件变更清单
+
+- `src/runtime/test_support.rs`：新增 `run_in_isolated_env_process` 和 `isolate_process_env!`。
+  - 父进程用 `--exact` 把当前测试重跑到子进程里，并断言子进程恰好跑了这一个测试且通过；
+  - 子进程靠环境变量 `LUASKILLS_ISOLATED_ENV_TEST` 识别自己，然后照常执行测试体；
+  - 子进程输出写入临时文件而不是管道，免得其他测试并发启动的进程继承管道句柄、拖住 EOF。
+- `src/runtime/engine/tests.rs`：7 个改写 PATH/PATHEXT 的测试开头调用 `isolate_process_env!()`，测试体不变。
+
+### 验证记录
+
+- 在宏之后临时插入 panic 做探针：父进程报告子进程失败，证明子进程确实执行了测试体。探针已移除。
+- `cargo test --lib` 连续 5 次全量运行：每次 1088 通过、0 失败。其中 3 次在输出改为文件之前，2 次在之后。
+- `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings` 通过；4 个集成测试目标共 13 项通过。
+- 这几次全量运行耗时 284–370 秒，比之前的约 92 秒长。原因是同时有 vulcan-code 的 clippy 构建和 node 进程在运行（CPU 占用约 62%），慢的主要是 python/node 运行时和 process_session 测试。本次改动涉及的两组测试单独运行都不到 1 秒。

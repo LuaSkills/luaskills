@@ -397,6 +397,9 @@ fn mark_test_program_executable(_path: &Path) {}
 #[cfg(windows)]
 #[test]
 fn vulcan_process_candidate_paths_appends_windows_pathexts() {
+    // PATH lookups made by parallel tests must never see this test's environment rewrite.
+    // 并行测试的 PATH 查找绝不能看到本测试对环境的改写。
+    crate::runtime::test_support::isolate_process_env!();
     // Process-wide environment guard that serializes PATHEXT mutation in this test.
     // 串行化本测试中 PATHEXT 修改的进程级环境保护锁。
     let _env_guard = process_env_test_guard();
@@ -424,6 +427,9 @@ fn vulcan_process_candidate_paths_appends_windows_pathexts() {
 #[cfg(windows)]
 #[test]
 fn vulcan_process_candidate_paths_respects_empty_windows_pathext() {
+    // PATH lookups made by parallel tests must never see this test's environment rewrite.
+    // 并行测试的 PATH 查找绝不能看到本测试对环境的改写。
+    crate::runtime::test_support::isolate_process_env!();
     // Process-wide environment guard that serializes PATHEXT mutation in this test.
     // 串行化本测试中 PATHEXT 修改的进程级环境保护锁。
     let _env_guard = process_env_test_guard();
@@ -450,6 +456,9 @@ fn vulcan_process_candidate_paths_respects_empty_windows_pathext() {
 #[cfg(windows)]
 #[test]
 fn vulcan_process_candidate_paths_uses_default_windows_pathext_when_missing() {
+    // PATH lookups made by parallel tests must never see this test's environment rewrite.
+    // 并行测试的 PATH 查找绝不能看到本测试对环境的改写。
+    crate::runtime::test_support::isolate_process_env!();
     // Process-wide environment guard that serializes PATHEXT mutation in this test.
     // 串行化本测试中 PATHEXT 修改的进程级环境保护锁。
     let _env_guard = process_env_test_guard();
@@ -7703,6 +7712,9 @@ fn execute_runlua_request_inline_reports_vulcan_process_launchers_with_default_s
 /// 验证 `vulcan.process.launchers` 会发现通过 PATH 提供的类 Unix shell 启动器，例如 `bash` 与 `zsh`。
 #[test]
 fn execute_runlua_request_inline_detects_vulcan_process_launchers_from_path() {
+    // PATH lookups made by parallel tests must never see this test's environment rewrite.
+    // 并行测试的 PATH 查找绝不能看到本测试对环境的改写。
+    crate::runtime::test_support::isolate_process_env!();
     let _env_guard = process_env_test_guard();
     let engine = make_runtime_test_engine();
     let temp_root = make_temp_runtime_root("vulcan-process-launchers-path");
@@ -7865,6 +7877,9 @@ fn execute_runlua_request_inline_reports_vulcan_process_exec_timeout_ms() {
 #[cfg(windows)]
 #[test]
 fn execute_runlua_request_inline_supports_vulcan_process_exec_with_path_resolved_shell_launcher() {
+    // PATH lookups made by parallel tests must never see this test's environment rewrite.
+    // 并行测试的 PATH 查找绝不能看到本测试对环境的改写。
+    crate::runtime::test_support::isolate_process_env!();
     let _env_guard = process_env_test_guard();
     let engine = make_runtime_test_engine();
     let temp_root = make_temp_runtime_root("vulcan-process-exec-shell-path");
@@ -7899,6 +7914,9 @@ fn execute_runlua_request_inline_supports_vulcan_process_exec_with_path_resolved
 #[cfg(windows)]
 #[test]
 fn execute_runlua_request_inline_keeps_default_shell_outside_path_shadowing() {
+    // PATH lookups made by parallel tests must never see this test's environment rewrite.
+    // 并行测试的 PATH 查找绝不能看到本测试对环境的改写。
+    crate::runtime::test_support::isolate_process_env!();
     let _env_guard = process_env_test_guard();
     let engine = make_runtime_test_engine();
     let temp_root = make_temp_runtime_root("vulcan-process-exec-default-shell-shadow");
@@ -8000,6 +8018,9 @@ fn vulcan_process_candidate_lookup_reports_metadata_probe_errors() {
 /// 验证 `vulcan.process.which` 会搜索 PATH，并在宿主上遵循 PATHEXT 风格的解析规则。
 #[test]
 fn execute_runlua_request_inline_supports_vulcan_process_which_via_path_search() {
+    // PATH lookups made by parallel tests must never see this test's environment rewrite.
+    // 并行测试的 PATH 查找绝不能看到本测试对环境的改写。
+    crate::runtime::test_support::isolate_process_env!();
     let _env_guard = process_env_test_guard();
     let engine = make_runtime_test_engine();
     let temp_root = make_temp_runtime_root("vulcan-process-which-path");
