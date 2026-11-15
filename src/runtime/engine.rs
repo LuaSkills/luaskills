@@ -141,8 +141,37 @@ struct LoadedSkill {
     /// Trusted managed-runtime package context built by the skill loader.
     /// 由 Skill 加载器构造的可信受管运行时包上下文。
     managed_package: Arc<ManagedRuntimePackageContext>,
+    /// Private dependency roots prepared for this exact load generation.
+    /// 为当前加载代实际准备的技能私有依赖根目录。
+    ready_dependency_roots: BTreeSet<PathBuf>,
     sqlite_binding: Option<Arc<SqliteSkillBinding>>,
     resolved_entry_names: HashMap<String, String>,
+}
+
+/// A pending enable whose marker is cleared only after the candidate runtime is ready.
+/// 仅在候选运行时就绪后清除停用记录的待提交启用操作。
+struct PendingSkillEnable<'a> {
+    /// The declared instance whose disabled marker the candidate can bypass.
+    /// 候选运行时可忽略其停用记录的已声明实例。
+    instance: &'a ResolvedSkillInstance,
+    /// Manager that owns the instance's persisted disabled state.
+    /// 持有该实例持久停用状态的管理器。
+    manager: &'a SkillManager,
+    /// Authorization plane used to clear the marker.
+    /// 清除停用记录所使用的操作权限平面。
+    plane: SkillOperationPlane,
+}
+
+/// Manifest and private roots from one dependency preparation pass.
+/// 单次依赖准备返回的清单及技能私有安装根目录。
+#[derive(Debug, Default)]
+struct PreparedSkillDependencies {
+    /// Optional package manifest consumed by the managed runtime.
+    /// 供受管运行时使用的可选包依赖清单。
+    manifest: Option<PackageDependencyManifest>,
+    /// The exact private roots whose exports were ready during preparation.
+    /// 本次准备期间导出内容已就绪的技能私有根目录。
+    ready_roots: BTreeSet<PathBuf>,
 }
 
 /// Render one filesystem path for user-facing logs with safe Windows drive/UNC prefix cleanup.
@@ -7754,18 +7783,21 @@ impl LuaEngine {
         ))
     }
 
-    /// Ensure dependencies declared by one skill directory are installed before the skill is loaded.
-    /// 在真正加载 skill 前确保该目录声明的依赖已经安装完成。
+    /// Prepare the dependencies of a skill in the given root and return its manifest and ready paths.
+    /// 准备指定根目录内技能的依赖，返回其清单及已就绪的路径。
     fn ensure_skill_dependencies(
         &self,
         skill_root: &RuntimeSkillRoot,
         skill_dir: &Path,
-    ) -> Result<Option<PackageDependencyManifest>, String> {
+    ) -> Result<PreparedSkillDependencies, String> {
         let Some(manifest) = self.load_skill_dependency_manifest(skill_dir)? else {
-            return Ok(None);
+            return Ok(PreparedSkillDependencies::default());
         };
         if manifest.is_empty() {
-            return Ok(Some(manifest));
+            return Ok(PreparedSkillDependencies {
+                manifest: Some(manifest),
+                ready_roots: BTreeSet::new(),
+            });
         }
 
         let skill_name = skill_dir
@@ -7773,8 +7805,14 @@ impl LuaEngine {
             .and_then(|value| value.to_str())
             .unwrap_or("unknown-skill");
         let manager = DependencyManager::new(self.dependency_manager_config_for(skill_root)?);
-        manager.ensure_skill_dependencies(skill_name, skill_dir, &manifest)?;
-        Ok(Some(manifest))
+        // Capture the ready roots before any later update cleanup can observe a stale disk record.
+        // 在后续更新清理可能看到过期磁盘记录前，记录本次已就绪的路径。
+        let ready_roots =
+            manager.prepare_skill_dependency_roots(skill_name, skill_dir, &manifest)?;
+        Ok(PreparedSkillDependencies {
+            manifest: Some(manifest),
+            ready_roots,
+        })
     }
 
     /// Load one optional dependency manifest from one skill directory when the file exists.
@@ -8072,15 +8110,17 @@ impl LuaEngine {
         &mut self,
         skill_roots: &[RuntimeSkillRoot],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.load_from_roots_reporting_failures(skill_roots)
+        self.load_from_roots_reporting_failures(skill_roots, None)
             .map(|_| ())
     }
 
-    /// Load skills like [`Self::load_from_roots`] and return why each skipped skill failed, by skill id.
-    /// 与 [`Self::load_from_roots`] 相同地加载技能，并按技能标识返回每个被跳过技能的失败原因。
+    /// Load the ordered roots and return failures by skill ID. A pending enable bypasses only its
+    /// own persisted marker while this candidate is built.
+    /// 按顺序加载根目录并按技能标识返回失败原因。构建候选运行时时，待提交启用仅忽略自身的持久停用记录。
     fn load_from_roots_reporting_failures(
         &mut self,
         skill_roots: &[RuntimeSkillRoot],
+        pending_enable: Option<&ResolvedSkillInstance>,
     ) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
         // Skills skipped because of an error, with that error.
         // 因错误被跳过的技能及其错误。
@@ -8104,6 +8144,13 @@ impl LuaEngine {
         for resolved_instance in collect_effective_skill_instances_from_roots(skill_roots)
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?
         {
+            // The collector already honors manifest disabling and root precedence.
+            // 实例收集器已处理清单停用与根目录优先级。
+            let enabling_this_instance = pending_enable.is_some_and(|instance| {
+                instance.skill_id == resolved_instance.skill_id
+                    && instance.root_name == resolved_instance.root_name
+                    && instance.actual_dir == resolved_instance.actual_dir
+            });
             let skill_name = resolved_instance.skill_id;
             if self.is_host_ignored_skill(&skill_name) {
                 log_info(format!(
@@ -8116,25 +8163,27 @@ impl LuaEngine {
                 name: resolved_instance.root_name.clone(),
                 skills_dir: resolved_instance.skills_root.clone(),
             };
-            let resolved_skill_manager = self
-                .skill_manager_for(&resolved_root)
-                .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
-            match resolved_skill_manager.is_skill_enabled(&skill_name) {
-                Ok(true) => {}
-                Ok(false) => {
-                    log_warn(format!(
-                        "[LuaSkill] Skipped disabled skill '{}'",
-                        skill_name
-                    ));
-                    continue;
-                }
-                Err(error) => {
-                    log_error(format!(
-                        "[LuaSkill] Failed to read the enable state of {}: {}",
-                        skill_name, error
-                    ));
-                    failures.insert(skill_name, error);
-                    continue;
+            if !enabling_this_instance {
+                let resolved_skill_manager = self
+                    .skill_manager_for(&resolved_root)
+                    .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+                match resolved_skill_manager.is_skill_enabled(&skill_name) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        log_warn(format!(
+                            "[LuaSkill] Skipped disabled skill '{}'",
+                            skill_name
+                        ));
+                        continue;
+                    }
+                    Err(error) => {
+                        log_error(format!(
+                            "[LuaSkill] Failed to read the enable state of {}: {}",
+                            skill_name, error
+                        ));
+                        failures.insert(skill_name, error);
+                        continue;
+                    }
                 }
             }
             let actual_dir = resolved_instance.actual_dir;
@@ -8143,26 +8192,23 @@ impl LuaEngine {
                 skill_name, resolved_instance.root_name
             ));
 
-            // Parsed manifest returned by dependency preparation and retained without a second read.
-            // 由依赖准备返回并在不二次读取的情况下保留的已解析清单。
-            let dependency_manifest =
-                match self.ensure_skill_dependencies(&resolved_root, &actual_dir) {
-                    Ok(manifest) => manifest,
-                    Err(error) => {
-                        log_error(format!(
-                            "[LuaSkill] Failed to prepare dependencies for {}: {}",
-                            skill_name, error
-                        ));
-                        failures.insert(skill_name, error);
-                        continue;
-                    }
-                };
+            // Keep the manifest and actual ready paths together for this generation.
+            // 在当前加载代中共同保留清单和实际就绪路径。
+            let dependencies = match self.ensure_skill_dependencies(&resolved_root, &actual_dir) {
+                Ok(dependencies) => dependencies,
+                Err(error) => {
+                    log_error(format!(
+                        "[LuaSkill] Failed to prepare dependencies for {}: {}",
+                        skill_name, error
+                    ));
+                    failures.insert(skill_name, error);
+                    continue;
+                }
+            };
 
-            if let Err(e) = self.load_single_skill(
-                &actual_dir,
-                &resolved_instance.root_name,
-                dependency_manifest,
-            ) {
+            if let Err(e) =
+                self.load_single_skill(&actual_dir, &resolved_instance.root_name, dependencies)
+            {
                 log_error(format!("[LuaSkill] Failed to load {}: {}", skill_name, e));
                 failures.insert(skill_name, e.to_string());
             }
@@ -8219,6 +8265,19 @@ impl LuaEngine {
         skill_roots: &[RuntimeSkillRoot],
         required_skill: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.reload_candidate_and_publish(skill_roots, required_skill, None)
+    }
+
+    /// Build and publish a replacement runtime, committing a pending enable only after readiness.
+    /// 构建并发布替换运行时，候选运行时就绪后才提交待处理的启用。
+    /// A load failure for the required skill aborts publication with the current state intact.
+    /// 指定技能加载失败时中止发布，保留当前状态。
+    fn reload_candidate_and_publish(
+        &mut self,
+        skill_roots: &[RuntimeSkillRoot],
+        required_skill: Option<&str>,
+        pending_enable: Option<PendingSkillEnable<'_>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         Self::validate_formal_skill_root_chain(skill_roots)
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
         let previous_entries = self
@@ -8232,11 +8291,24 @@ impl LuaEngine {
             .map(|skill| skill.managed_package.owner_token())
             .collect();
         let mut next = self.empty_reload_candidate()?;
-        let failures = next.load_from_roots_reporting_failures(skill_roots)?;
+        // The disk marker remains in place throughout candidate preparation.
+        // 候选运行时准备期间保留磁盘上的停用记录。
+        let failures = next.load_from_roots_reporting_failures(
+            skill_roots,
+            pending_enable.as_ref().map(|enable| enable.instance),
+        )?;
         if let Some(skill_id) = required_skill
             && let Some(error) = failures.get(skill_id)
         {
             return Err(format!("skill '{skill_id}' failed to load: {error}").into());
+        }
+        // Materialize the notification before the disk or active runtime is changed.
+        // 变更磁盘或活动运行时前，先获取用于发出通知的入口快照。
+        let current_entries = next.list_entries()?;
+        if let Some(enable) = pending_enable {
+            enable
+                .manager
+                .enable_skill_in_plane(enable.plane, &enable.instance.skill_id)?;
         }
         self.replace_runtime_state_from(next);
         for owner_token in retired_skill_owner_tokens {
@@ -8246,8 +8318,7 @@ impl LuaEngine {
                 ));
             }
         }
-        self.emit_entry_registry_delta(previous_entries)
-            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        Self::emit_entry_registry_delta(previous_entries, current_entries);
         Ok(())
     }
 
@@ -8277,13 +8348,6 @@ impl LuaEngine {
         let manager = self
             .skill_manager_for(&resolved_root)
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
-        let removed_dependency_manifest =
-            if action == crate::skill::manager::SkillLifecycleAction::Uninstall {
-                self.load_skill_dependency_manifest(&resolved_instance.actual_dir)
-                    .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?
-            } else {
-                None
-            };
         if let Err(error) = manager.guard_operation(plane, action, skill_id) {
             self.emit_skill_lifecycle_event(SkillLifecycleEventDraft {
                 plane,
@@ -8299,14 +8363,18 @@ impl LuaEngine {
         let action_result = match action {
             crate::skill::manager::SkillLifecycleAction::Disable => manager
                 .disable_skill_in_plane(plane, skill_id, reason)
-                .map_err(|error| -> Box<dyn std::error::Error> { error.into() }),
-            crate::skill::manager::SkillLifecycleAction::Enable => manager
-                .enable_skill_in_plane(plane, skill_id)
-                .map_err(|error| -> Box<dyn std::error::Error> { error.into() }),
-            crate::skill::manager::SkillLifecycleAction::Uninstall => manager
-                .uninstall_skill_at_path_in_plane(plane, skill_id, &resolved_instance.actual_dir)
-                .map(|_| ())
-                .map_err(|error| -> Box<dyn std::error::Error> { error.into() }),
+                .map_err(|error| -> Box<dyn std::error::Error> { error.into() })
+                .and_then(|()| self.reload_from_roots(skill_roots)),
+            crate::skill::manager::SkillLifecycleAction::Enable => self
+                .reload_candidate_and_publish(
+                    skill_roots,
+                    Some(skill_id),
+                    Some(PendingSkillEnable {
+                        instance: &resolved_instance,
+                        manager: &manager,
+                        plane,
+                    }),
+                ),
             _ => {
                 return Err(format!("unsupported state mutation action {:?}", action).into());
             }
@@ -8324,22 +8392,6 @@ impl LuaEngine {
             });
             return Err(error);
         }
-        if action == crate::skill::manager::SkillLifecycleAction::Uninstall {
-            let dependency_manager = DependencyManager::new(
-                self.dependency_manager_config_for(&resolved_root)
-                    .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?,
-            );
-            dependency_manager
-                .cleanup_uninstalled_skill_dependencies_from_roots(
-                    skill_roots,
-                    skill_id,
-                    removed_dependency_manifest.as_ref(),
-                )
-                .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
-        }
-        let required_skill =
-            (action == crate::skill::manager::SkillLifecycleAction::Enable).then_some(skill_id);
-        self.reload_from_roots_requiring(skill_roots, required_skill)?;
         self.emit_skill_lifecycle_event(SkillLifecycleEventDraft {
             plane,
             action,
@@ -8733,27 +8785,43 @@ impl LuaEngine {
                 committed
             }
         };
-        if action == crate::skill::manager::SkillLifecycleAction::Update
-            && result.status == "updated"
-        {
-            let current_dependency_manifest =
-                resolve_declared_skill_instance_from_roots(operation_roots, &result.skill_id)
-                    .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?
-                    .and_then(|resolved| {
-                        self.load_skill_dependency_manifest(&resolved.actual_dir)
-                            .transpose()
-                    })
-                    .transpose()
-                    .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        if apply_action == SkillApplyLifecycleAction::Update && result.status == "updated" {
             let dependency_manager = DependencyManager::new(
                 self.dependency_manager_config_for(&target_root)
                     .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?,
             );
-            if let Err(error) = dependency_manager.cleanup_updated_skill_dependencies(
-                &result.skill_id,
-                previous_dependency_manifest.as_ref(),
-                current_dependency_manifest.as_ref(),
-            ) {
+            // Use the manifest and roots from the same load, even if a callback edited the disk.
+            // 即使回调修改了磁盘清单，也使用同一次加载的清单和依赖根目录。
+            let loaded_skill = self.skills.get(&result.skill_id).filter(|skill| {
+                skill
+                    .root_name
+                    .trim()
+                    .eq_ignore_ascii_case(target_root.name.trim())
+            });
+            // Updated packages can be disabled and therefore have no load result.
+            // 更新后的包可能处于停用状态，因此没有加载结果。
+            let cleanup_result = if let Some(skill) = loaded_skill {
+                dependency_manager.cleanup_updated_skill_dependencies_using_roots(
+                    &result.skill_id,
+                    previous_dependency_manifest.as_ref(),
+                    skill.managed_package.dependency_manifest(),
+                    Some(&skill.ready_dependency_roots),
+                )
+            } else {
+                let current_dependency_manifest =
+                    resolve_declared_skill_instance_from_roots(operation_roots, &result.skill_id)?
+                        .and_then(|resolved| {
+                            self.load_skill_dependency_manifest(&resolved.actual_dir)
+                                .transpose()
+                        })
+                        .transpose()?;
+                dependency_manager.cleanup_updated_skill_dependencies(
+                    &result.skill_id,
+                    previous_dependency_manifest.as_ref(),
+                    current_dependency_manifest.as_ref(),
+                )
+            };
+            if let Err(error) = cleanup_result {
                 log_warn(format!(
                     "[LuaSkills:update] Stale dependency cleanup warning for skill '{}': {}",
                     result.skill_id, error
@@ -9176,10 +9244,9 @@ impl LuaEngine {
     /// Compare pre-reload and post-reload entry snapshots and emit one host-visible registry delta.
     /// 对比重载前后入口快照并发出一条宿主可见的注册表差异事件。
     fn emit_entry_registry_delta(
-        &self,
         previous_entries: Vec<RuntimeEntryDescriptor>,
-    ) -> Result<(), String> {
-        let current_entries = self.list_entries()?;
+        current_entries: Vec<RuntimeEntryDescriptor>,
+    ) {
         let previous_map = previous_entries
             .into_iter()
             .map(|entry| (entry.canonical_name.clone(), entry))
@@ -9211,7 +9278,7 @@ impl LuaEngine {
 
         if added_entries.is_empty() && updated_entries.is_empty() && removed_entry_names.is_empty()
         {
-            return Ok(());
+            return;
         }
 
         crate::host::callbacks::emit_entry_registry_delta(&RuntimeEntryRegistryDelta {
@@ -9219,15 +9286,15 @@ impl LuaEngine {
             removed_entry_names,
             updated_entries,
         });
-        Ok(())
     }
 
-    /// Load a single skill from its directory.
+    /// Register the skill from `dir` and retain its prepared dependencies for this generation.
+    /// 注册 `dir` 中的技能，并为当前加载代保留已准备的依赖。
     fn load_single_skill(
         &mut self,
         dir: &Path,
         root_name: &str,
-        dependency_manifest: Option<PackageDependencyManifest>,
+        dependencies: PreparedSkillDependencies,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let skill_yaml = dir.join("skill.yaml");
         // Skill manifest existence probe that preserves filesystem errors before reading YAML.
@@ -9408,7 +9475,7 @@ impl LuaEngine {
             meta.effective_skill_id(),
             dir,
             managed_runtime_roots,
-            dependency_manifest,
+            dependencies.manifest,
         )?;
 
         Arc::make_mut(&mut self.skills).insert(
@@ -9419,6 +9486,7 @@ impl LuaEngine {
                 root_name: root_name.to_string(),
                 entry_sources,
                 managed_package,
+                ready_dependency_roots: dependencies.ready_roots,
                 sqlite_binding,
                 resolved_entry_names: HashMap::new(),
             },
@@ -9562,26 +9630,20 @@ impl LuaEngine {
     /// Drop every loaded skill whose entries fail to compile or initialize; log and return why.
     /// 移除入口编译或初始化失败的已加载技能；记录并返回原因。
     ///
-    /// Every VM registers all loaded skills, so one failing entry would otherwise make every VM
-    /// build, and with it the whole load, fail. Each skill is tried in one skill VM and one runLua VM
-    /// built without skills, because the runLua VM is hardened and an entry can fail in only one of
-    /// the two. An error building the empty VMs is not specific to a skill and is returned.
-    /// 每个 VM 都会注册全部已加载技能，因此一个失败的入口会让每次 VM 构建失败，进而让整次加载失败。
-    /// 每个技能分别在一个不含技能的技能 VM 和 runLua VM 中试编译：runLua VM 经过加固，入口可能只在
-    /// 其中一种 VM 里失败。构建空 VM 时的错误与具体技能无关，直接返回。
+    /// Each skill gets its own ordinary and hardened runLua probes. An initializer can mutate
+    /// globals or loaded modules before failing, so another skill must never reuse either state.
+    /// 每个技能都有独立的普通探测 VM 和加固的 runLua 探测 VM。初始化可能在失败前修改全局变量或已加载
+    /// 模块，因此其他技能不能复用其中任何一个状态。
     fn drop_skills_failing_vm_registration(&mut self) -> Result<Vec<(String, String)>, String> {
         if self.skills.is_empty() {
             return Ok(Vec::new());
         }
-        let empty_skills = HashMap::new();
-        let empty_registry = BTreeMap::new();
-        let skill_probe =
-            self.create_vm_with_runtime_state(Arc::new(HashMap::new()), Arc::new(BTreeMap::new()))?;
-        let runlua_probe = Self::create_runlua_vm(RunLuaVmBuildContext::from_engine(
-            self,
-            &empty_skills,
-            &empty_registry,
-        ))?;
+        // Empty snapshots prevent the probes from registering unrelated entries.
+        // 空快照阻止探测 VM 注册其他技能的入口。
+        let empty_skills = Arc::new(HashMap::new());
+        // Entry registration is tested before the actual dispatch registry is built.
+        // 在构建实际分发注册表前测试入口注册。
+        let empty_registry = Arc::new(BTreeMap::new());
         // Sorted so that the probe order, and therefore the log, is stable between loads.
         // 排序使探测顺序及日志在多次加载间保持稳定。
         let mut skill_ids: Vec<&String> = self.skills.keys().collect();
@@ -9589,6 +9651,19 @@ impl LuaEngine {
         let mut failures = Vec::new();
         for skill_id in skill_ids {
             let skill = &self.skills[skill_id];
+            // Build fresh states for this skill, even if the previous initializer failed.
+            // 即使上一个初始化失败，也为当前技能构造全新的状态。
+            let skill_probe = self.create_vm_with_runtime_state(
+                Arc::clone(&empty_skills),
+                Arc::clone(&empty_registry),
+            )?;
+            // The hardened VM exercises built-ins with the same restrictions as runLua.
+            // 加固 VM 使用与 runLua 相同的内置函数限制。
+            let runlua_probe = Self::create_runlua_vm(RunLuaVmBuildContext::from_engine(
+                self,
+                &empty_skills,
+                &empty_registry,
+            ))?;
             let failure = [&skill_probe, &runlua_probe].into_iter().find_map(|probe| {
                 skill.meta.entries().find_map(|tool| {
                     Self::compile_skill_into_lua(&probe.lua, skill, tool, false).err()

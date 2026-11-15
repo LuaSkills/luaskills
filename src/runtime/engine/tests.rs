@@ -26,12 +26,12 @@ use super::{
     LoadedSkill, LuaEngine, LuaVm, LuaVmPool, LuaVmPoolConfig, LuaVmPoolState,
     LuaVmRequestScopeGuard, MAX_RUNTIME_SESSION_LEASES_PER_MANAGER, ManagedRuntimeServices,
     ManagedRuntimeWorkerKey, ManagedRuntimeWorkerService, NativeLibrarySearchGuard,
-    ResolvedEntryTarget, RunLuaVmBuildContext, SkillApplyLifecycleAction,
-    SkillPackageConfigService, VulcanInternalExecutionContext, build_lua_call_dispatch_entries,
-    copy_managed_node_package_import_root, default_runlua_vm_pool_config,
-    find_vulcan_process_candidate, format_lifecycle_recovery_error, get_vulcan_context_table,
-    get_vulcan_deps_table, get_vulcan_runtime_internal_table, get_vulcan_table,
-    invoke_managed_runtime_worker, json_to_lua_table, lua_value_to_json,
+    PreparedSkillDependencies, ResolvedEntryTarget, RunLuaVmBuildContext,
+    SkillApplyLifecycleAction, SkillPackageConfigService, VulcanInternalExecutionContext,
+    build_lua_call_dispatch_entries, copy_managed_node_package_import_root,
+    default_runlua_vm_pool_config, find_vulcan_process_candidate, format_lifecycle_recovery_error,
+    get_vulcan_context_table, get_vulcan_deps_table, get_vulcan_runtime_internal_table,
+    get_vulcan_table, invoke_managed_runtime_worker, json_to_lua_table, lua_value_to_json,
     managed_runtime_status_from_plan, managed_runtime_worker_result_to_json,
     parse_runtime_request_context_json, populate_vulcan_dependency_context,
     populate_vulcan_file_context, populate_vulcan_internal_execution_context,
@@ -77,7 +77,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use mlua::{Lua, Table, UserData, Value as LuaValue};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
@@ -637,6 +637,7 @@ fn make_loaded_skill(
         dir: skill_dir,
         root_name: "ROOT".to_string(),
         managed_package,
+        ready_dependency_roots: BTreeSet::new(),
         sqlite_binding: None,
         resolved_entry_names: HashMap::new(),
         entry_sources: HashMap::new(),
@@ -5422,7 +5423,7 @@ fn load_from_roots_rejects_explicit_skill_id_field() {
         "the skill declaring skill_id must not load"
     );
     let error = engine
-        .load_single_skill(&skill_dir, "ROOT", None)
+        .load_single_skill(&skill_dir, "ROOT", PreparedSkillDependencies::default())
         .expect_err("explicit skill_id should be rejected");
     let rendered = error.to_string();
     assert!(rendered.contains("must not declare skill_id"));
@@ -5619,7 +5620,11 @@ fn load_single_skill_reports_skill_yaml_probe_errors() {
     // Error returned before the invalid manifest can behave like a missing skill.yaml file.
     // 在非法清单表现得像缺失 skill.yaml 文件之前返回的错误。
     let error = engine
-        .load_single_skill(&invalid_skill_dir, "ROOT", None)
+        .load_single_skill(
+            &invalid_skill_dir,
+            "ROOT",
+            PreparedSkillDependencies::default(),
+        )
         .expect_err("invalid skill.yaml probe should fail");
 
     assert!(
@@ -5653,7 +5658,7 @@ fn load_single_skill_reports_lua_entry_probe_errors() {
     // Error returned before the invalid Lua entry can behave like a missing file.
     // 在非法 Lua 入口表现得像缺失文件之前返回的错误。
     let error = engine
-        .load_single_skill(&skill_dir, "ROOT", None)
+        .load_single_skill(&skill_dir, "ROOT", PreparedSkillDependencies::default())
         .expect_err("invalid Lua entry probe should fail");
 
     assert!(
@@ -5695,7 +5700,7 @@ fn load_single_skill_rejects_directory_skill_yaml() {
     // Error returned before the directory manifest can fall through to YAML reading.
     // 在目录清单继续进入 YAML 读取之前返回的错误。
     let error = engine
-        .load_single_skill(&skill_dir, "ROOT", None)
+        .load_single_skill(&skill_dir, "ROOT", PreparedSkillDependencies::default())
         .expect_err("directory skill.yaml should fail");
     // Expected diagnostic fragment rendered with the shared host-visible path formatter.
     // 使用共享宿主可见路径渲染器生成的期望诊断片段。
@@ -5747,7 +5752,7 @@ fn load_single_skill_rejects_directory_lua_entry() {
     // Error returned before the directory Lua entry can fall through to compilation.
     // 在目录 Lua 入口继续进入编译之前返回的错误。
     let error = engine
-        .load_single_skill(&skill_dir, "ROOT", None)
+        .load_single_skill(&skill_dir, "ROOT", PreparedSkillDependencies::default())
         .expect_err("directory Lua entry should fail");
     // Expected diagnostic fragment rendered with the shared host-visible path formatter.
     // 使用共享宿主可见路径渲染器生成的期望诊断片段。
@@ -5791,7 +5796,7 @@ fn load_single_skill_missing_skill_yaml_error_uses_host_visible_path() {
     // Error returned by the real single-skill loading helper.
     // 真实单个 skill 加载辅助函数返回的错误。
     let error = engine
-        .load_single_skill(&skill_dir, "ROOT", None)
+        .load_single_skill(&skill_dir, "ROOT", PreparedSkillDependencies::default())
         .expect_err("missing skill.yaml should fail");
     // Expected diagnostic fragment rendered with the shared host-visible path formatter.
     // 使用共享宿主可见路径渲染器生成的期望诊断片段。
@@ -5839,7 +5844,7 @@ fn load_single_skill_invalid_skill_directory_error_uses_host_visible_path() {
     // Error returned by the real single-skill loading helper.
     // 真实单个 skill 加载辅助函数返回的错误。
     let error = engine
-        .load_single_skill(&skill_dir, "ROOT", None)
+        .load_single_skill(&skill_dir, "ROOT", PreparedSkillDependencies::default())
         .expect_err("invalid skill directory name should fail");
     // Expected diagnostic fragment rendered with the shared host-visible path formatter.
     // 使用共享宿主可见路径渲染器生成的期望诊断片段。
@@ -5882,7 +5887,7 @@ fn load_single_skill_missing_lua_entry_error_uses_host_visible_path() {
     // Error returned by the real single-skill loading helper.
     // 真实单个 skill 加载辅助函数返回的错误。
     let error = engine
-        .load_single_skill(&skill_dir, "ROOT", None)
+        .load_single_skill(&skill_dir, "ROOT", PreparedSkillDependencies::default())
         .expect_err("missing Lua entry should fail");
     // Expected diagnostic fragment rendered with the shared host-visible path formatter.
     // 使用共享宿主可见路径渲染器生成的期望诊断片段。

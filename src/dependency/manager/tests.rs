@@ -1530,6 +1530,77 @@ fn cleanup_keeps_the_root_an_unpinned_dependency_reuses() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// Verify that a stale on-disk record cannot override the root prepared by the update.
+/// 验证过期的磁盘记录无法覆盖本次更新实际准备的根目录。
+#[test]
+fn cleanup_ignores_a_stale_record_for_a_retained_dependency() {
+    // Platform-specific installation paths use the same key as the manager.
+    // 平台安装路径使用与依赖管理器相同的平台键。
+    let platform_key = current_platform_key();
+    if platform_key == "unknown" {
+        return;
+    }
+    // The temporary manager disables network downloads, so missing exports cannot be repaired.
+    // 临时依赖管理器禁用网络下载，缺失的导出无法被重新下载掩盖。
+    let (manager, root) = test_manager();
+    // The skill directory is required even when both dependencies are already installed.
+    // 即使前后版本的依赖均已安装，解析仍需要技能目录。
+    let skill_dir = root.join("skills").join("demo-skill");
+    fs::create_dir_all(&skill_dir).unwrap();
+    // The old version exposes a different filename, making the new selection deterministic.
+    // 旧版本暴露不同的文件名，使新版本的选择保持确定。
+    let old_root = install_demo_tool(&manager, "1.0.0", platform_key);
+    fs::rename(old_root.join("bin/demo.bin"), old_root.join("bin/old.bin")).unwrap();
+    // The new version is the only one that satisfies the unpinned manifest.
+    // 新版本是唯一满足未锁版本清单的版本。
+    let new_root = install_demo_tool(&manager, "2.0.0", platform_key);
+    // The previous manifest still resolves the previous version and its original export.
+    // 旧清单仍解析到旧版本及原有导出。
+    let mut previous = demo_tool_manifest(Some("1.0.0"), platform_key);
+    previous.tool_dependencies[0]
+        .packages
+        .get_mut(platform_key)
+        .unwrap()
+        .exports[0]
+        .target_path = "bin/old.bin".to_string();
+    // The updated skill drops the version pin and requests the new export.
+    // 更新后的技能移除版本锁并请求新导出。
+    let current = demo_tool_manifest(None, platform_key);
+    // Capture the exact root the updated runtime prepared before the old hint reappears.
+    // 在旧磁盘提示重新出现之前捕获更新后运行时实际准备的路径。
+    let ready_roots = manager
+        .prepare_skill_dependency_roots("demo-skill", &skill_dir, &current)
+        .unwrap();
+    assert_eq!(ready_roots, BTreeSet::from([new_root.clone()]));
+    manager
+        .ensure_skill_dependencies("demo-skill", &skill_dir, &previous)
+        .unwrap();
+    assert_eq!(
+        read_active_dependency_root(new_root.parent().unwrap().parent().unwrap(), platform_key),
+        Some(old_root.clone()),
+    );
+
+    manager
+        .cleanup_updated_skill_dependencies("demo-skill", Some(&previous), Some(&current))
+        .unwrap();
+    assert!(new_root.join("bin/demo.bin").is_file());
+    assert!(old_root.join("bin/old.bin").is_file());
+    manager
+        .cleanup_updated_skill_dependencies_using_roots(
+            "demo-skill",
+            Some(&previous),
+            Some(&current),
+            Some(&ready_roots),
+        )
+        .unwrap();
+    assert!(new_root.join("bin/demo.bin").is_file());
+    assert!(!old_root.exists());
+    manager
+        .ensure_skill_dependencies("demo-skill", &skill_dir, &current)
+        .unwrap();
+    let _ = fs::remove_dir_all(root);
+}
+
 /// A `v`-prefixed version installed without the prefix is removed once the update moves on.
 /// 以去掉 `v` 前缀的目录安装的版本，在更新换版后会被删除。
 #[test]

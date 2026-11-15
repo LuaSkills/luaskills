@@ -45,6 +45,9 @@ fn eval(engine: &LuaEngine, lease: &Value, code: &str) -> Value {
 /// 通道证明顺序；超时仅为回归失败提供时间边界。
 #[test]
 fn system_runtime_lease_host_wait_does_not_block_another_lease() {
+    // Keep the process cwd assertion independent of ordinary file-based runLua tests.
+    // 将进程工作目录断言与普通文件模式的 runLua 测试隔离。
+    crate::runtime::test_support::isolate_process_env!();
     let _guard = host_tool_callback_test_guard();
     let layout = SystemRuntimeTestLayout::new("system-concurrent 中文 空格");
     let engine = Arc::new(make_runtime_test_engine_with_host_options(
@@ -103,6 +106,9 @@ fn system_runtime_lease_host_wait_does_not_block_another_lease() {
 /// 即使普通文件执行持有进程目录锁，系统相对读取仍绑定自身目录。
 #[test]
 fn system_runtime_lease_ignores_process_cwd_guard() {
+    // The test must change the process cwd while a System lease runs concurrently.
+    // 测试需要在系统租约并发执行时更改进程工作目录。
+    crate::runtime::test_support::isolate_process_env!();
     let layout = SystemRuntimeTestLayout::new("system-independent 中文 cwd");
     let engine = Arc::new(make_runtime_test_engine_with_host_options(
         layout.host_options(),

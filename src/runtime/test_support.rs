@@ -83,10 +83,10 @@ const ISOLATED_ENV_TEST: &str = "LUASKILLS_ISOLATED_ENV_TEST";
 /// Run test `test_path` in its own child test process unless this process already is that child.
 /// 除非当前进程本身就是该子进程，否则在独立的子测试进程中运行测试 `test_path`。
 ///
-/// Tests that rewrite process-wide variables such as `PATH` call this first, so the rewrite happens
+/// Tests that change process-wide state such as `PATH` or cwd call this first, so the change happens
 /// only in the child and parallel tests in this process never observe it. The parent asserts the
 /// child ran exactly that one test and it passed.
-/// 改写 `PATH` 等进程级变量的测试会先调用它，使改写只发生在子进程中，本进程内并行的测试永远看不到。
+/// 修改 `PATH` 或工作目录等进程级状态的测试会先调用它，使修改只发生在子进程中，本进程内并行的测试永远看不到。
 /// 父进程断言子进程恰好运行了这一个测试并且通过。
 ///
 /// Return `true` in the child, where the caller continues with its body, and `false` in the parent.
@@ -106,7 +106,10 @@ pub(crate) fn run_in_isolated_env_process(test_path: &str) -> bool {
         test_path.replace("::", "-")
     ));
     let log = std::fs::File::create(&log_path).expect("create the isolated test log");
+    // An ordinary file-based test may have temporarily changed the parent's working directory.
+    // 普通文件模式测试可能已临时改动父进程的工作目录。
     let status = Command::new(executable)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .args([test_path, "--exact", "--test-threads=1", "--nocapture"])
         .env(ISOLATED_ENV_TEST, test_path)
         .stdin(Stdio::null())
@@ -124,8 +127,8 @@ pub(crate) fn run_in_isolated_env_process(test_path: &str) -> bool {
     false
 }
 
-/// Re-run the enclosing test in its own process before it touches process-wide environment variables.
-/// 在所在测试触碰进程级环境变量之前，把它放到独立进程中重新运行。
+/// Re-run the enclosing test in its own process before it touches process-wide state.
+/// 在所在测试触碰进程级状态之前，把它放到独立进程中重新运行。
 ///
 /// Expands to an early `return` in the parent; only the child process executes the rest of the test.
 /// 在父进程中展开为提前 `return`；只有子进程会执行测试的其余部分。

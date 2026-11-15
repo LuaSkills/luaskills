@@ -76,6 +76,18 @@ pub struct DependencyManager {
     downloader: DownloadManager,
 }
 
+/// Version paths allowed by the manifest for one private dependency on this platform.
+/// 清单允许单个技能私有依赖在当前平台使用的版本路径。
+#[derive(Default)]
+struct DependencyCleanupCandidates {
+    /// Paths derived directly from the declared version.
+    /// 直接由声明版本派生的路径。
+    paths: BTreeSet<PathBuf>,
+    /// Whether the dependency may reuse an installed version absent from those paths.
+    /// 依赖是否可复用这些路径之外的已安装版本。
+    unpinned: bool,
+}
+
 impl DependencyManager {
     /// Create one dependency manager from a shared configuration object.
     /// 基于共享配置对象创建一个依赖管理器实例。
@@ -101,6 +113,20 @@ impl DependencyManager {
         skill_dir: &Path,
         manifest: &PackageDependencyManifest,
     ) -> Result<(), String> {
+        self.prepare_skill_dependency_roots(skill_id, skill_dir, manifest)
+            .map(|_| ())
+    }
+
+    /// Prepare the declared dependencies and return the ready private install roots for this load.
+    /// 准备清单声明的依赖并返回本次加载已就绪的技能私有安装根目录。
+    /// The package directory resolves bundled paths. Missing optional dependencies have no root.
+    /// 技能包目录用于解析内置载荷路径。缺失的可选依赖没有对应根目录。
+    pub(crate) fn prepare_skill_dependency_roots(
+        &self,
+        skill_id: &str,
+        skill_dir: &Path,
+        manifest: &PackageDependencyManifest,
+    ) -> Result<BTreeSet<PathBuf>, String> {
         validate_luaskills_identifier(skill_id, "skill_id")?;
         let platform_key = current_platform_key();
         if platform_key == "unknown" {
@@ -109,27 +135,45 @@ impl DependencyManager {
             );
         }
 
+        // Only ready private roots authorize version pruning after this package is loaded.
+        // 只有已就绪的技能私有根目录才能作为本次加载后清理版本的依据。
+        let mut ready_roots = BTreeSet::new();
         for dependency in &manifest.tool_dependencies {
-            self.ensure_tool_dependency(skill_id, skill_dir, dependency, platform_key)?;
+            ready_roots.extend(self.ensure_tool_dependency(
+                skill_id,
+                skill_dir,
+                dependency,
+                platform_key,
+            )?);
         }
         for dependency in &manifest.lua_dependencies {
-            self.ensure_lua_dependency(skill_id, skill_dir, dependency, platform_key)?;
+            ready_roots.extend(self.ensure_lua_dependency(
+                skill_id,
+                skill_dir,
+                dependency,
+                platform_key,
+            )?);
         }
         for dependency in &manifest.ffi_dependencies {
-            self.ensure_ffi_dependency(skill_id, skill_dir, dependency, platform_key)?;
+            ready_roots.extend(self.ensure_ffi_dependency(
+                skill_id,
+                skill_dir,
+                dependency,
+                platform_key,
+            )?);
         }
-        Ok(())
+        Ok(ready_roots)
     }
 
-    /// Ensure one tool dependency is installed for the current platform.
-    /// 确保单个工具依赖在当前平台上已安装完成。
+    /// Ensure the tool declared by `spec` and return its private install root when ready.
+    /// 确保 `spec` 声明的工具依赖已就绪，并返回其技能私有安装根目录。
     fn ensure_tool_dependency(
         &self,
         skill_id: &str,
         skill_dir: &Path,
         spec: &ToolDependencySpec,
         platform_key: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Option<PathBuf>, String> {
         self.ensure_dependency(
             skill_id,
             skill_dir,
@@ -146,15 +190,15 @@ impl DependencyManager {
         )
     }
 
-    /// Ensure one Lua dependency is installed for the current platform.
-    /// 确保单个 Lua 依赖在当前平台上已安装完成。
+    /// Ensure the Lua dependency declared by `spec` and return its private install root when ready.
+    /// 确保 `spec` 声明的 Lua 依赖已就绪，并返回其技能私有安装根目录。
     fn ensure_lua_dependency(
         &self,
         skill_id: &str,
         skill_dir: &Path,
         spec: &LuaDependencySpec,
         platform_key: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Option<PathBuf>, String> {
         self.ensure_dependency(
             skill_id,
             skill_dir,
@@ -171,15 +215,15 @@ impl DependencyManager {
         )
     }
 
-    /// Ensure one FFI dependency is installed for the current platform.
-    /// 确保单个 FFI 依赖在当前平台上已安装完成。
+    /// Ensure the FFI dependency declared by `spec` and return its private install root when ready.
+    /// 确保 `spec` 声明的 FFI 依赖已就绪，并返回其技能私有安装根目录。
     fn ensure_ffi_dependency(
         &self,
         skill_id: &str,
         skill_dir: &Path,
         spec: &FfiDependencySpec,
         platform_key: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Option<PathBuf>, String> {
         self.ensure_dependency(
             skill_id,
             skill_dir,
@@ -209,14 +253,10 @@ impl DependencyManager {
         }
     }
 
-    /// Shared dependency ensure pipeline used by tool/lua/ffi dependency kinds.
-    /// tool
-    /// lua
-    /// ffi 三类依赖共用的统一安装确保流程。
-    ///
-    /// A required dependency propagates every failure; an optional one only logs a warning so the
-    /// skill still loads without it.
-    /// 必需依赖传播一切失败；可选依赖只记录警告，使技能在缺少它时仍能加载。
+    /// Prepare a dependency from its source, package and install root for the requested platform.
+    /// 按指定平台、来源、载荷和安装根目录准备单个依赖。
+    /// Return its private root when ready. Propagate required failures and log optional failures.
+    /// 就绪时返回技能私有根目录。必需依赖失败时返回错误，可选依赖失败时记录警告。
     #[allow(clippy::too_many_arguments)]
     fn ensure_dependency(
         &self,
@@ -232,8 +272,10 @@ impl DependencyManager {
         package: Option<&crate::skill::dependencies::DependencyPackageSpec>,
         platform_key: &str,
         install_root: &Path,
-    ) -> Result<(), String> {
-        let result = self.install_dependency(
+    ) -> Result<Option<PathBuf>, String> {
+        // Readiness comes from the install pipeline, which also handles local reuse.
+        // 就绪路径由安装流程返回，该流程也处理本地复用。
+        let result = self.make_dependency_ready(
             skill_id,
             skill_dir,
             kind,
@@ -247,55 +289,21 @@ impl DependencyManager {
             install_root,
         );
         match result {
+            Ok(ready_root) if scope == DependencyScope::Skill => {
+                // Keep the persisted hint for removing dropped dependencies across upgrades.
+                // 保留磁盘提示，以便跨版本更新时清理已移除的依赖。
+                record_active_dependency_root(&ready_root);
+                Ok(Some(ready_root))
+            }
             Err(error) if !required => {
                 log_warn(format!(
                     "[LuaSkills:dependency] Skill '{}' loads without optional dependency '{}' on {}: {}",
                     skill_id, dependency_name, platform_key, error
                 ));
-                Ok(())
+                Ok(None)
             }
-            result => result,
+            result => result.map(|_| None),
         }
-    }
-
-    /// Reuse, install or download one dependency, failing whenever it cannot be made ready.
-    /// 复用、安装或下载单个依赖，无法就绪时一律失败。
-    ///
-    /// A skill-private dependency also records which version directory it now uses, so update
-    /// cleanup keeps exactly that directory.
-    /// 技能私有依赖还会记录它当前使用的版本目录，使更新后的清理恰好保留该目录。
-    #[allow(clippy::too_many_arguments)]
-    fn install_dependency(
-        &self,
-        skill_id: &str,
-        skill_dir: &Path,
-        kind: SkillDependencyKind,
-        dependency_name: &str,
-        version: Option<String>,
-        scope: DependencyScope,
-        source_type: DependencySourceType,
-        source: &crate::skill::dependencies::DependencySourceSpec,
-        package: Option<&crate::skill::dependencies::DependencyPackageSpec>,
-        platform_key: &str,
-        install_root: &Path,
-    ) -> Result<(), String> {
-        let ready_root = self.make_dependency_ready(
-            skill_id,
-            skill_dir,
-            kind,
-            dependency_name,
-            version,
-            scope,
-            source_type,
-            source,
-            package,
-            platform_key,
-            install_root,
-        )?;
-        if scope == DependencyScope::Skill {
-            record_active_dependency_root(&ready_root);
-        }
-        Ok(())
     }
 
     /// Reuse, install or download one dependency and return the install root that is now ready.
@@ -835,17 +843,33 @@ impl DependencyManager {
     /// Remove stale skill-private dependency roots after one successful skill update.
     /// 在单个技能更新成功后移除已经过期的技能私有依赖根目录。
     ///
-    /// Call it after the updated skill reloaded, so each still-declared dependency has recorded
-    /// the version directory it now uses. That directory is always kept, and every other version
-    /// directory of the dependency for this platform is removed. Without a record, the roots
-    /// derived from the previous manifest are removed unless the current manifest derives them too.
-    /// 应在更新后的技能重载之后调用，此时每个仍声明的依赖都已记录它当前使用的版本目录。该目录总会保留，
-    /// 该依赖在当前平台的其他版本目录都会删除。没有记录时，删除由旧清单派生、且当前清单不再派生的根目录。
+    /// The manifests identify stale pinned versions and removed dependencies. Without a current
+    /// load result, retained unpinned dependencies are left intact.
+    /// 前后清单用于识别过期的锁定版本和已移除的依赖。没有本次加载结果时，保留仍声明的未锁版本依赖。
     pub fn cleanup_updated_skill_dependencies(
         &self,
         skill_id: &str,
         previous_manifest: Option<&PackageDependencyManifest>,
         current_manifest: Option<&PackageDependencyManifest>,
+    ) -> Result<(), String> {
+        self.cleanup_updated_skill_dependencies_using_roots(
+            skill_id,
+            previous_manifest,
+            current_manifest,
+            None,
+        )
+    }
+
+    /// Clean up after an update using the private install roots from the same package load.
+    /// 用本次技能包加载返回的私有安装根目录执行更新清理。
+    /// A supplied set can be empty for a package with no ready private dependencies.
+    /// 提供的集合可以为空，表示该包没有已就绪的技能私有依赖。
+    pub(crate) fn cleanup_updated_skill_dependencies_using_roots(
+        &self,
+        skill_id: &str,
+        previous_manifest: Option<&PackageDependencyManifest>,
+        current_manifest: Option<&PackageDependencyManifest>,
+        ready_roots: Option<&BTreeSet<PathBuf>>,
     ) -> Result<(), String> {
         validate_luaskills_identifier(skill_id, "skill_id")?;
         let platform_key = current_platform_key();
@@ -860,26 +884,54 @@ impl DependencyManager {
             self.collect_skill_local_dependency_roots(skill_id, current_manifest, platform_key)?;
 
         for (dependency_dir, previous_candidates) in &previous_roots {
-            let current_candidates = current_roots.get(dependency_dir);
-            let mut stale = previous_candidates.clone();
-            let mut keep = current_candidates.cloned().unwrap_or_default();
-            if let Some(active_root) =
-                read_active_dependency_root(dependency_dir, &normalized_platform)
-            {
-                if current_candidates.is_some() {
-                    // The record names the root the reload just used; every other version is unused.
-                    // 记录指向刚才重载使用的根目录；其他版本都已不再使用。
-                    keep.insert(active_root);
+            // Only the previous declarations are proven stale without a current load result.
+            // 没有本次加载结果时，只有旧清单声明的路径可以确定已过期。
+            let mut stale = previous_candidates.paths.clone();
+            // Keep paths allowed by the new declaration and exact paths prepared for this load.
+            // 保留新清单允许的路径以及本次加载实际准备的路径。
+            let mut keep = BTreeSet::new();
+            if let Some(current_candidates) = current_roots.get(dependency_dir) {
+                keep.extend(current_candidates.paths.iter().cloned());
+                if let Some(ready_roots) = ready_roots {
+                    // Match <dependency>/<version>/<platform> from the prepare result.
+                    // 匹配准备结果中的 <依赖>/<版本>/<平台> 路径。
+                    let prepared = ready_roots
+                        .iter()
+                        .filter(|root| {
+                            root.parent().and_then(Path::parent) == Some(dependency_dir.as_path())
+                        })
+                        .collect::<Vec<_>>();
+                    if prepared.is_empty() {
+                        continue;
+                    }
+                    keep.extend(prepared.into_iter().cloned());
                     stale.extend(collect_dependency_platform_roots(
                         dependency_dir,
                         &normalized_platform,
                     )?);
-                } else {
-                    stale.insert(active_root);
-                    remove_active_dependency_record(dependency_dir, &normalized_platform);
+                } else if current_candidates.unpinned {
+                    // An unpinned package can reuse any installed version, even if the disk hint
+                    // still names the previous version. Only a same-load result permits pruning.
+                    // 未锁版本的包可以复用任一已安装版本，即使磁盘提示仍指向旧版本。只有同次加载结果
+                    // 才能用于清理。
+                    continue;
                 }
+            } else if let Some(recorded_root) =
+                read_active_dependency_root(dependency_dir, &normalized_platform)
+            {
+                stale.insert(recorded_root);
+                remove_active_dependency_record(dependency_dir, &normalized_platform);
             }
-            for stale_root in stale.difference(&keep) {
+            for stale_root in &stale {
+                // A ready root can also appear in the scan with the casing stored on disk.
+                // 扫描结果也可能以磁盘保存的大小写形式指向一个已就绪的根目录。
+                if keep
+                    .iter()
+                    .chain(ready_roots.into_iter().flatten())
+                    .any(|root| cleanup_paths_may_alias(root, stale_root))
+                {
+                    continue;
+                }
                 remove_stale_dependency_root(stale_root)?;
             }
         }
@@ -910,7 +962,7 @@ impl DependencyManager {
         skill_id: &str,
         manifest: Option<&PackageDependencyManifest>,
         platform_key: &str,
-    ) -> Result<BTreeMap<PathBuf, BTreeSet<PathBuf>>, String> {
+    ) -> Result<BTreeMap<PathBuf, DependencyCleanupCandidates>, String> {
         let mut roots = BTreeMap::new();
         let Some(manifest) = manifest else {
             return Ok(roots);
@@ -924,7 +976,8 @@ impl DependencyManager {
                 spec.name.as_str(),
                 spec.version.as_deref(),
                 spec.scope,
-                spec.package_for_platform(platform_key).is_some(),
+                spec.package_for_platform(platform_key).is_some()
+                    || spec.source.source_type == DependencySourceType::SkillList,
                 platform_key,
             );
         }
@@ -936,7 +989,8 @@ impl DependencyManager {
                 spec.name.as_str(),
                 spec.version.as_deref(),
                 spec.scope,
-                spec.package_for_platform(platform_key).is_some(),
+                spec.package_for_platform(platform_key).is_some()
+                    || spec.source.source_type == DependencySourceType::SkillList,
                 platform_key,
             );
         }
@@ -948,7 +1002,8 @@ impl DependencyManager {
                 spec.name.as_str(),
                 spec.version.as_deref(),
                 spec.scope,
-                spec.package_for_platform(platform_key).is_some(),
+                spec.package_for_platform(platform_key).is_some()
+                    || spec.source.source_type == DependencySourceType::SkillList,
                 platform_key,
             );
         }
@@ -961,7 +1016,7 @@ impl DependencyManager {
     #[allow(clippy::too_many_arguments)]
     fn push_dependency_root_if_applicable(
         &self,
-        roots: &mut BTreeMap<PathBuf, BTreeSet<PathBuf>>,
+        roots: &mut BTreeMap<PathBuf, DependencyCleanupCandidates>,
         skill_id: &str,
         kind: SkillDependencyKind,
         dependency_name: &str,
@@ -979,10 +1034,11 @@ impl DependencyManager {
             .join(skill_id)
             .join(normalize_dependency_path_component(dependency_name));
         let candidates = roots.entry(dependency_dir).or_default();
+        candidates.unpinned |= version.is_none();
         // The installer strips a leading `v` from resolved release versions, so both spellings can exist.
         // 安装器会去掉解析出的 Release 版本的前导 `v`，因此两种写法都可能存在。
         for version_candidate in local_dependency_version_candidates(version) {
-            candidates.insert(build_dependency_install_root(
+            candidates.paths.insert(build_dependency_install_root(
                 kind_root,
                 scope,
                 skill_id,
@@ -1323,6 +1379,16 @@ fn collect_dependency_platform_roots(
         }
     }
     Ok(roots)
+}
+
+/// Compare cleanup paths conservatively on platforms with case-insensitive installations.
+/// 在可能使用不区分大小写的文件系统的平台上，保守比较清理路径。
+/// The dependency-specific path components are normalized to ASCII.
+/// 依赖专用路径片段已规范为 ASCII。
+fn cleanup_paths_may_alias(left: &Path, right: &Path) -> bool {
+    left == right
+        || (cfg!(any(windows, target_os = "macos"))
+            && left.as_os_str().eq_ignore_ascii_case(right.as_os_str()))
 }
 
 /// Remove one stale dependency root while treating an already-missing root as cleaned.
