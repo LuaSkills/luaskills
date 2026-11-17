@@ -79,9 +79,7 @@ use crate::runtime::process_session::{
     create_process_session_table,
 };
 use crate::runtime_context::{RuntimeClientInfo, RuntimeRequestContext};
-use crate::runtime_help::{
-    RuntimeHelpDetail, RuntimeHelpNodeDescriptor, RuntimeSkillHelpDescriptor,
-};
+use crate::runtime_help::{RuntimeHelpDetail, RuntimeSkillHelpDescriptor};
 use crate::runtime_logging::{error as log_error, info as log_info, warn as log_warn};
 use crate::runtime_options::{
     LuaInvocationContext, LuaRuntimeHostMode, LuaRuntimeHostOptions,
@@ -138,6 +136,9 @@ struct LoadedSkill {
     /// Non-debug Lua entry sources cached for the lifetime of this immutable load generation.
     /// 在当前不可变加载代生命周期内缓存的非调试 Lua 入口源码。
     entry_sources: HashMap<String, Arc<str>>,
+    /// Entry validators compiled once for packages opting into implicit dispatch.
+    /// 为选择隐式调度的包缓存一次编译的入口校验器。
+    implicit_entry_contracts: HashMap<String, crate::runtime::embedded::JsonContract>,
     /// Trusted managed-runtime package context built by the skill loader.
     /// 由 Skill 加载器构造的可信受管运行时包上下文。
     managed_package: Arc<ManagedRuntimePackageContext>,
@@ -926,6 +927,7 @@ fn resolve_engine_managed_runtime_roots(
 impl LoadedSkill {
     /// Return the resolved canonical entry name for one local entry name.
     /// 返回某个局部入口名称对应的已解析 canonical 名称。
+    #[cfg(test)]
     fn resolved_tool_name(&self, local_name: &str) -> Option<&str> {
         self.resolved_entry_names
             .get(local_name)
@@ -6056,147 +6058,6 @@ fn managed_node_status(lua: &Lua) -> Result<LuaValue, mlua::Error> {
     }
 }
 
-/// Return whether one help payload should be executed as Lua instead of read as plain text.
-/// 判断某个帮助载荷是否应按 Lua 执行，而不是按纯文本读取。
-fn is_lua_help_file(relative_path: &str) -> bool {
-    Path::new(relative_path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("lua"))
-        .unwrap_or(false)
-}
-
-/// Read one UTF-8 text file relative to the skill directory.
-/// 读取相对于 skill 目录的一份 UTF-8 文本文件。
-fn read_skill_text_file(
-    skill_dir: &Path,
-    relative_path: &str,
-    label: &str,
-) -> Result<String, String> {
-    let file_path = skill_dir.join(relative_path);
-    std::fs::read_to_string(&file_path).map_err(|error| {
-        format!(
-            "Failed to read {label} file {}: {}",
-            render_log_friendly_path(&file_path),
-            error
-        )
-    })
-}
-
-/// Source file data required to execute one Lua help payload.
-/// 执行单个 Lua 帮助载荷所需的源码文件数据。
-struct LuaHelpPayloadSource {
-    /// Resolved help file path used for file context and diagnostics.
-    /// 用于文件上下文与诊断信息的已解析帮助文件路径。
-    helper_path: PathBuf,
-
-    /// UTF-8 Lua source loaded from the help file.
-    /// 从帮助文件加载得到的 UTF-8 Lua 源码。
-    source: String,
-}
-
-/// Read one Lua help payload source file relative to a loaded skill directory.
-/// 读取相对于已加载 skill 目录的单个 Lua 帮助载荷源码文件。
-///
-/// The skill_dir parameter is the loaded skill directory that owns the help file.
-/// skill_dir 参数是拥有帮助文件的已加载 skill 目录。
-///
-/// The relative_path parameter is the manifest-declared help file path.
-/// relative_path 参数是 manifest 中声明的帮助文件路径。
-///
-/// Return the resolved help path together with the loaded Lua source.
-/// 返回已解析帮助路径以及已加载的 Lua 源码。
-fn read_lua_help_payload_source(
-    skill_dir: &Path,
-    relative_path: &str,
-) -> Result<LuaHelpPayloadSource, String> {
-    let helper_path = skill_dir.join(relative_path);
-    let source = std::fs::read_to_string(&helper_path).map_err(|error| {
-        format!(
-            "Failed to read help file {}: {}",
-            render_log_friendly_path(&helper_path),
-            error
-        )
-    })?;
-
-    Ok(LuaHelpPayloadSource {
-        helper_path,
-        source,
-    })
-}
-
-/// Execute one Lua help payload and render it as plain UTF-8 text.
-/// 执行一个 Lua 帮助载荷，并将其渲染为普通 UTF-8 文本。
-///
-/// The lua parameter is the scoped Lua VM with the help context already installed.
-/// lua 参数是已经安装帮助上下文的作用域内 Lua VM。
-///
-/// The helper_path parameter is the absolute help file path used in diagnostics.
-/// helper_path 参数是用于诊断信息的帮助文件绝对路径。
-///
-/// The helper_source parameter contains the Lua help file source code.
-/// helper_source 参数包含 Lua 帮助文件源码。
-///
-/// The chunk_name parameter is the diagnostic chunk name assigned to the Lua source.
-/// chunk_name 参数是分配给 Lua 源码的诊断 chunk 名称。
-///
-/// Return the plain string produced by the Lua help payload.
-/// 返回 Lua 帮助载荷产生的普通字符串。
-fn render_lua_help_payload_text(
-    lua: &Lua,
-    helper_path: &Path,
-    helper_source: &str,
-    chunk_name: &str,
-) -> Result<String, String> {
-    let chunk = lua.load(helper_source).set_name(chunk_name);
-    let exported: LuaValue = chunk
-        .into_function()
-        .map_err(|error| {
-            format!(
-                "Help compile error for {}: {}",
-                render_log_friendly_path(helper_path),
-                error
-            )
-        })?
-        .call(())
-        .map_err(|error| {
-            format!(
-                "Help init error for {}: {}",
-                render_log_friendly_path(helper_path),
-                error
-            )
-        })?;
-
-    let rendered_value = match exported {
-        LuaValue::Function(function) => function.call(()).map_err(|error| {
-            format!(
-                "Help runtime error for {}: {}",
-                render_log_friendly_path(helper_path),
-                error
-            )
-        })?,
-        other => other,
-    };
-
-    match rendered_value {
-        LuaValue::String(text) => text
-            .to_str()
-            .map(|value| value.to_string())
-            .map_err(|error| {
-                format!(
-                    "Help {} returned invalid UTF-8 text: {}",
-                    render_log_friendly_path(helper_path),
-                    error
-                )
-            }),
-        other => Err(format!(
-            "Help {} must return a plain string, actual_type='{}'",
-            render_log_friendly_path(helper_path),
-            lua_value_type_name(&other)
-        )),
-    }
-}
-
 /// Return the root `vulcan` Lua table.
 /// 返回根级 `vulcan` Lua 表。
 fn get_vulcan_table(lua: &Lua) -> Result<Table, String> {
@@ -8096,6 +7957,19 @@ impl LuaEngine {
                 .insert(seed.local_name.clone(), canonical_name);
         }
 
+        // Reject public-name collisions before any request can resolve to the wrong entry.
+        // 发布前拒绝公开名冲突，防止调用解析到错误入口。
+        let mut public_names = BTreeSet::new();
+        for canonical_name in registry.keys() {
+            // The portable name is generated in one place for all registrations.
+            // 所有注册复用同一规则生成通用名称。
+            let public_name = crate::public_tool_name(canonical_name);
+            if !public_names.insert(public_name.clone()) {
+                return Err(format!(
+                    "Duplicate LuaSkills public tool name: {public_name}"
+                ));
+            }
+        }
         self.entry_registry = Arc::new(registry);
         Ok(())
     }
@@ -9343,6 +9217,11 @@ impl LuaEngine {
         }
         meta.resolve_entry_input_schemas(dir)
             .map_err(|error| format!("skill {}: {}", meta.name, error))?;
+        if let Some(registration) = &meta.registration {
+            registration
+                .validate(dir)
+                .map_err(|error| format!("skill {}: {error}", meta.name))?;
+        }
         validate_luaskills_identifier(meta.effective_skill_id(), "skill_id")
             .map_err(|error| format!("skill {}: {}", meta.name, error))?;
         validate_luaskills_version(meta.version(), "version")
@@ -9352,6 +9231,9 @@ impl LuaEngine {
             return Err(format!("skill {} must declare at least one entry", meta.name).into());
         }
 
+        // Compile strict schemas once for guide-backed entries, including opt-in implicit calls.
+        // 为附带指南的入口按加载代编译严格 Schema，覆盖手动切换的隐式调用。
+        let mut implicit_entry_contracts = HashMap::new();
         for tool in meta.entries() {
             validate_luaskills_identifier(tool.name.trim(), "entry.name").map_err(|error| {
                 format!("skill {} entry {}: {}", meta.name, tool.name.trim(), error)
@@ -9382,6 +9264,20 @@ impl LuaEngine {
                 )
                 .into());
             }
+            if meta
+                .registration
+                .as_ref()
+                .is_some_and(crate::SkillRegistration::supports_implicit)
+            {
+                // Compile with the same offline schema engine used by embedded contracts.
+                // 使用内嵌契约共用的离线 Schema 引擎编译校验器。
+                let contract =
+                    crate::runtime::embedded::JsonContract::compile(tool.resolved_input_schema()?)
+                        .map_err(|error| {
+                            format!("skill {} entry {}: {error}", meta.name, tool.name)
+                        })?;
+                implicit_entry_contracts.insert(tool.name.trim().to_string(), contract);
+            }
         }
 
         // Non-debug source cache published only after every entry has been read successfully.
@@ -9405,23 +9301,6 @@ impl LuaEngine {
                     .into();
                 entry_sources.insert(tool.lua_entry.clone(), source);
             }
-        }
-
-        if !meta.help.main.file.trim().is_empty() {
-            validate_skill_relative_path(&meta.help.main.file, "help", "help.main.file")
-                .map_err(|error| format!("skill {} help main: {}", meta.name, error))?;
-        }
-        for topic in &meta.help.topics {
-            validate_skill_relative_path(&topic.file, "help", "help.topic.file").map_err(
-                |error| {
-                    format!(
-                        "skill {} help topic {}: {}",
-                        meta.name,
-                        topic.name.trim(),
-                        error
-                    )
-                },
-            )?;
         }
 
         let effective_sqlite = meta.effective_sqlite();
@@ -9485,6 +9364,7 @@ impl LuaEngine {
                 dir: dir.to_path_buf(),
                 root_name: root_name.to_string(),
                 entry_sources,
+                implicit_entry_contracts,
                 managed_package,
                 ready_dependency_roots: dependencies.ready_roots,
                 sqlite_binding,
@@ -9850,204 +9730,55 @@ impl LuaEngine {
             .collect())
     }
 
-    /// List all structured help trees currently registered in the runtime.
-    /// 列出当前运行时中已注册的全部结构化帮助树。
-    pub fn list_skill_help(&self) -> Result<Vec<RuntimeSkillHelpDescriptor>, String> {
-        // Help descriptors collected from loaded skills before deterministic skill-id sorting.
-        // 在按 skill id 确定性排序前，从已加载 skill 中收集的帮助描述。
-        let mut descriptors = Vec::with_capacity(self.skills.len());
-        for skill in self.skills.values() {
-            // Main help node descriptor resolved against the current entry registry names.
-            // 基于当前入口注册表名称解析出的主帮助节点描述。
-            let main = self.build_help_node_descriptor(skill, skill.meta.main_help(), true)?;
-            // Flow help node descriptors resolved against the current entry registry names.
-            // 基于当前入口注册表名称解析出的流程帮助节点描述。
-            let mut flows = Vec::new();
-            for topic in skill.meta.help_topics() {
-                flows.push(self.build_help_node_descriptor(skill, topic, false)?);
-            }
-            descriptors.push(RuntimeSkillHelpDescriptor {
-                skill_id: skill.meta.effective_skill_id().to_string(),
-                skill_name: skill.meta.name.clone(),
-                skill_version: skill.meta.version().to_string(),
-                root_name: skill.root_name.clone(),
-                skill_dir: render_host_visible_path(&skill.dir),
-                main,
-                flows,
-            });
-        }
-
-        descriptors.sort_by(|left, right| left.skill_id.cmp(&right.skill_id));
-        Ok(descriptors)
-    }
-
-    /// List structured help trees visible to one host-injected skill-management authority.
-    /// 列出单个宿主注入技能管理权限可见的结构化帮助树。
-    pub fn list_skill_help_for_authority(
+    /// Return the registered package manifests visible to the requested authority.
+    /// 返回指定管理权限可见的已注册包声明。
+    pub fn list_skill_registrations(
         &self,
         authority: SkillManagementAuthority,
-    ) -> Result<Vec<RuntimeSkillHelpDescriptor>, String> {
-        Ok(self
-            .list_skill_help()?
-            .into_iter()
-            .filter(|help| {
-                authority == SkillManagementAuthority::System
-                    || Self::normalized_skill_root_name(&help.root_name) != "ROOT"
-            })
-            .collect())
-    }
-
-    /// Render one structured help detail payload for one skill flow node.
-    /// 为单个 skill 流程节点渲染一份结构化帮助详情载荷。
-    pub fn render_skill_help_detail(
-        &self,
-        skill_id: &str,
-        flow_name: &str,
-        request_context: Option<&RuntimeRequestContext>,
-    ) -> Result<Option<RuntimeHelpDetail>, String> {
-        let Some(skill) = self
+    ) -> Vec<crate::RuntimeSkillRegistration> {
+        // Only enabled loaded packages have registrations in the current generation.
+        // 当前加载代只有已启用并加载的包拥有注册记录。
+        let mut registrations = self
             .skills
             .values()
-            .find(|skill| skill.meta.effective_skill_id() == skill_id)
-        else {
-            return Ok(None);
-        };
-
-        let normalized_flow_name = flow_name.trim();
-        if normalized_flow_name.is_empty() {
-            return Err("Help flow name must not be empty".to_string());
-        }
-
-        let (selected_help, is_main) = if normalized_flow_name == "main" {
-            (skill.meta.main_help(), true)
-        } else {
-            (
-                skill
-                    .meta
-                    .find_help_topic(normalized_flow_name)
-                    .ok_or_else(|| {
-                        format!(
-                            "Skill '{}' does not declare help flow '{}'",
-                            skill.meta.effective_skill_id(),
-                            normalized_flow_name
-                        )
-                    })?,
-                false,
-            )
-        };
-
-        let rendered_body =
-            self.render_help_payload(skill, &selected_help.file, request_context)?;
-        let descriptor = self.build_help_node_descriptor(skill, selected_help, is_main)?;
-        Ok(Some(RuntimeHelpDetail {
-            skill_id: skill.meta.effective_skill_id().to_string(),
-            skill_name: skill.meta.name.clone(),
-            skill_version: skill.meta.version().to_string(),
-            root_name: skill.root_name.clone(),
-            skill_dir: render_host_visible_path(&skill.dir),
-            flow_name: descriptor.flow_name,
-            description: descriptor.description,
-            related_entries: descriptor.related_entries,
-            is_main: descriptor.is_main,
-            content_type: "markdown".to_string(),
-            content: rendered_body,
-        }))
+            .filter(|skill| {
+                authority == SkillManagementAuthority::System
+                    || Self::normalized_skill_root_name(&skill.root_name) != "ROOT"
+            })
+            .filter_map(|skill| {
+                Some(crate::RuntimeSkillRegistration {
+                    skill_id: skill.meta.effective_skill_id().to_string(),
+                    root_name: skill.root_name.clone(),
+                    skill_dir: skill.dir.clone(),
+                    declaration: skill.meta.registration.clone()?,
+                })
+            })
+            .collect::<Vec<_>>();
+        registrations.sort_by(|left, right| {
+            (&left.skill_id, &left.root_name).cmp(&(&right.skill_id, &right.root_name))
+        });
+        registrations
     }
 
-    /// Render help detail only when visible to one host-injected skill-management authority.
-    /// 仅在单个宿主注入技能管理权限可见时渲染帮助详情。
+    /// Reject the retired package-help API while preserving the existing FFI entry point.
+    /// 保留既有 FFI 入口，明确拒绝已停用的包帮助 API。
+    pub fn list_skill_help_for_authority(
+        &self,
+        _authority: SkillManagementAuthority,
+    ) -> Result<Vec<RuntimeSkillHelpDescriptor>, String> {
+        Err("Package help was removed; use the registered prompt skills.".into())
+    }
+
+    /// Reject the retired help renderer without loading or executing old help files.
+    /// 不加载或执行旧帮助文件，明确拒绝已停用的帮助渲染器。
     pub fn render_skill_help_detail_for_authority(
         &self,
-        authority: SkillManagementAuthority,
-        skill_id: &str,
-        flow_name: &str,
-        request_context: Option<&RuntimeRequestContext>,
+        _authority: SkillManagementAuthority,
+        _skill_id: &str,
+        _flow_name: &str,
+        _request_context: Option<&RuntimeRequestContext>,
     ) -> Result<Option<RuntimeHelpDetail>, String> {
-        if authority == SkillManagementAuthority::DelegatedTool
-            && self
-                .skills
-                .values()
-                .find(|skill| skill.meta.effective_skill_id() == skill_id)
-                .map(|skill| Self::normalized_skill_root_name(&skill.root_name) == "ROOT")
-                .unwrap_or(false)
-        {
-            return Ok(None);
-        }
-        self.render_skill_help_detail(skill_id, flow_name, request_context)
-    }
-
-    /// Build one structured help node descriptor with related canonical entries.
-    /// 构建单个结构化帮助节点描述及其关联 canonical 入口列表。
-    fn build_help_node_descriptor(
-        &self,
-        skill: &LoadedSkill,
-        help_node: &crate::lua_skill::SkillHelpNodeMeta,
-        is_main: bool,
-    ) -> Result<RuntimeHelpNodeDescriptor, String> {
-        let flow_name = if is_main {
-            "main".to_string()
-        } else {
-            help_node.name.trim().to_string()
-        };
-        // Related canonical entries that must resolve through the load-time entry registry mapping.
-        // 必须通过加载期入口注册表映射解析出的关联 canonical 入口。
-        let mut related_entries = Vec::new();
-        if is_main {
-            for entry in skill.meta.entries() {
-                related_entries.push(Self::resolve_help_related_entry_name(
-                    skill,
-                    entry.name.trim(),
-                    &flow_name,
-                )?);
-            }
-        } else {
-            for entry in skill.meta.entries_for_help_topic(help_node.name.trim()) {
-                related_entries.push(Self::resolve_help_related_entry_name(
-                    skill,
-                    entry.name.trim(),
-                    &flow_name,
-                )?);
-            }
-        }
-
-        Ok(RuntimeHelpNodeDescriptor {
-            flow_name,
-            description: help_node.description.trim().to_string(),
-            related_entries,
-            is_main,
-        })
-    }
-
-    /// Resolve one help-related local entry name into its canonical runtime entry name.
-    /// 将单个帮助关联的局部入口名称解析为其 canonical 运行时入口名称。
-    ///
-    /// The skill parameter is the loaded skill whose registry mapping must contain the local entry.
-    /// skill 参数是已加载 skill，其注册表映射必须包含该局部入口。
-    ///
-    /// The local_name parameter is the manifest-local entry name referenced by one help node.
-    /// local_name 参数是某个帮助节点引用的 manifest 局部入口名称。
-    ///
-    /// The flow_name parameter names the help flow used in diagnostics.
-    /// flow_name 参数命名用于诊断的帮助流程。
-    ///
-    /// Return the canonical runtime entry name, or an explicit consistency error.
-    /// 返回 canonical 运行时入口名称；若不一致则返回显式错误。
-    fn resolve_help_related_entry_name(
-        skill: &LoadedSkill,
-        local_name: &str,
-        flow_name: &str,
-    ) -> Result<String, String> {
-        skill
-            .resolved_tool_name(local_name)
-            .map(str::to_string)
-            .ok_or_else(|| {
-                format!(
-                    "help flow '{}' in skill '{}' references local entry '{}' without a resolved canonical name",
-                    flow_name,
-                    skill.meta.effective_skill_id(),
-                    local_name
-                )
-            })
+        Err("Package help was removed; use the registered prompt skills.".into())
     }
 
     /// Return configured completion candidates for a prompt argument, if declared by a skill.
@@ -10756,49 +10487,43 @@ impl LuaEngine {
         )
     }
 
-    /// Prepare the loaded-skill Lua context used while rendering one Lua help payload.
-    /// 准备渲染单个 Lua 帮助载荷时使用的已加载 skill Lua 上下文。
-    ///
-    /// The lua parameter is the scoped Lua VM that will execute the help payload.
-    /// lua 参数是即将执行帮助载荷的作用域内 Lua VM。
-    ///
-    /// The skill parameter is the loaded skill that owns the help file.
-    /// skill 参数是拥有帮助文件的已加载 skill。
-    ///
-    /// The relative_path parameter is the manifest-declared help file path.
-    /// relative_path 参数是 manifest 中声明的帮助文件路径。
-    ///
-    /// The helper_path parameter is the resolved help file path used for file context.
-    /// helper_path 参数是用于文件上下文的已解析帮助文件路径。
-    ///
-    /// The request_context parameter is the optional host request context to expose.
-    /// request_context 参数是要暴露的可选宿主请求上下文。
-    ///
-    /// Return `Ok(())` after the `vulcan-help` context is installed.
-    /// 安装 `vulcan-help` 上下文后返回 `Ok(())`。
-    fn prepare_lua_help_context(
+    /// Invoke the implicit entry selected in a host snapshot, verifying the owning instance.
+    /// 执行宿主快照选中的隐式入口，并复核所属安装实例。
+    pub fn call_implicit_skill(
         &self,
-        lua: &Lua,
-        skill: &LoadedSkill,
-        relative_path: &str,
-        helper_path: &Path,
-        request_context: Option<&RuntimeRequestContext>,
-    ) -> Result<(), String> {
-        let help_invocation_context = LuaInvocationContext::new(
-            request_context.cloned(),
-            Value::Object(serde_json::Map::new()),
-            Value::Object(serde_json::Map::new()),
-        );
-        self.populate_loaded_skill_lua_context(
-            lua,
-            skill,
-            LoadedSkillLuaContext {
-                display_tool_name: "vulcan-help",
-                entry_name: relative_path,
-                entry_path: helper_path,
-                invocation_context: Some(&help_invocation_context),
-            },
-        )
+        entry: &RuntimeEntryDescriptor,
+        args: &Value,
+        invocation_context: Option<&LuaInvocationContext>,
+    ) -> Result<RuntimeInvocationResult, String> {
+        // Recheck the declaration after a runtime reload before executing this snapshot's target.
+        // 执行快照目标前复核运行时重载后的声明。
+        let target = self.resolve_call_skill_invocation_target(&entry.canonical_name)?;
+        if target.local_entry_name != entry.local_name
+            || target.skill.meta.effective_skill_id() != entry.skill_id
+            || target.skill.root_name != entry.root_name
+            || render_host_visible_path(&target.skill.dir) != entry.skill_dir
+        {
+            return Err(format!(
+                "LuaSkills tool {} is no longer registered for implicit dispatch",
+                entry.public_tool_name()
+            ));
+        }
+        // The guide-backed contract applies even when the package defaults to direct registration.
+        // 即使包默认直接注册，隐式调用也执行随包指南对应的参数校验。
+        let contract = target
+            .skill
+            .implicit_entry_contracts
+            .get(target.local_entry_name)
+            .ok_or_else(|| {
+                format!(
+                    "LuaSkills tool {} is no longer registered for implicit dispatch",
+                    entry.public_tool_name()
+                )
+            })?;
+        contract
+            .validate(args)
+            .map_err(|error| format!("Invalid arguments for {}: {error}", entry.canonical_name))?;
+        self.invoke_resolved_skill(target, args, invocation_context)
     }
 
     /// Call one active loaded Lua skill with the given JSON arguments.
@@ -10812,6 +10537,34 @@ impl LuaEngine {
         invocation_context: Option<&LuaInvocationContext>,
     ) -> Result<RuntimeInvocationResult, String> {
         let invocation_target = self.resolve_call_skill_invocation_target(tool_name)?;
+        if invocation_target
+            .skill
+            .meta
+            .registration
+            .as_ref()
+            .is_some_and(|registration| registration.mode == crate::SkillRegistrationMode::Implicit)
+            && let Some(contract) = invocation_target
+                .skill
+                .implicit_entry_contracts
+                .get(invocation_target.local_entry_name)
+        {
+            contract
+                .validate(args)
+                .map_err(|error| format!("Invalid arguments for {tool_name}: {error}"))?;
+        }
+        self.invoke_resolved_skill(invocation_target, args, invocation_context)
+    }
+
+    /// Executes the resolved target with validated or direct-call `args` and its host invocation context.
+    /// 使用已解析目标、已校验或直接调用的 `args` 及宿主调用上下文执行技能。
+    /// Returns the Lua result after releasing the pooled VM or the execution failure.
+    /// 释放池化 VM 后返回 Lua 结果或执行错误。
+    fn invoke_resolved_skill(
+        &self,
+        invocation_target: CallSkillInvocationTarget<'_>,
+        args: &Value,
+        invocation_context: Option<&LuaInvocationContext>,
+    ) -> Result<RuntimeInvocationResult, String> {
         let module_name = invocation_target.tool.lua_module.clone();
 
         let mut lease = self.acquire_vm()?;
@@ -10828,40 +10581,6 @@ impl LuaEngine {
             invocation_context,
         );
         finish_pooled_vm_request_scope(call_result, scope_guard, "pooled Lua VM cleanup failed")
-    }
-
-    /// Render one help payload from either Markdown or Lua.
-    /// 从 Markdown 或 Lua 渲染单个帮助载荷。
-    fn render_help_payload(
-        &self,
-        skill: &LoadedSkill,
-        relative_path: &str,
-        request_context: Option<&RuntimeRequestContext>,
-    ) -> Result<String, String> {
-        if !is_lua_help_file(relative_path) {
-            return read_skill_text_file(&skill.dir, relative_path, "help");
-        }
-
-        let help_payload_source = read_lua_help_payload_source(&skill.dir, relative_path)?;
-        let mut lease = self.acquire_vm()?;
-        let scope_guard = LuaVmRequestScopeGuard::new(&mut lease, self.host_options.as_ref())?;
-        let lua = scope_guard.lua()?;
-        self.prepare_lua_help_context(
-            lua,
-            skill,
-            relative_path,
-            &help_payload_source.helper_path,
-            request_context,
-        )?;
-
-        let chunk_name = format!("{}-{}", skill.meta.effective_skill_id(), relative_path);
-        let rendered_result = render_lua_help_payload_text(
-            lua,
-            &help_payload_source.helper_path,
-            &help_payload_source.source,
-            &chunk_name,
-        );
-        finish_pooled_vm_request_scope(rendered_result, scope_guard, "pooled Lua VM cleanup failed")
     }
 
     /// Populate the vulcan.call function to dispatch to loaded skills.

@@ -120,7 +120,11 @@ pub use skill::manager::{
     SkillOperationPlane, SkillUninstallResult, SkillUpdateCheck, collect_effective_skill_instances,
     resolve_declared_skill_instance_from_roots, resolve_effective_skill_instance,
 };
-pub use skill::manifest::{SkillHelpMeta, SkillHelpNodeMeta, SkillMeta, SkillToolMeta};
+pub use skill::manifest::{SkillMeta, SkillToolMeta};
+pub use skill::registration::{
+    BundledPromptSkill, LocalizedSkillIntroduction, RuntimeSkillRegistration, SkillRegistration,
+    SkillRegistrationMode, public_tool_name,
+};
 pub use skill::source::{InstalledSkillRecord, InstalledSkillSourceRecord, SkillInstallSourceType};
 
 pub use host::options as runtime_options;

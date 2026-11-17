@@ -35,8 +35,7 @@ use super::{
     managed_runtime_status_from_plan, managed_runtime_worker_result_to_json,
     parse_runtime_request_context_json, populate_vulcan_dependency_context,
     populate_vulcan_file_context, populate_vulcan_internal_execution_context,
-    prepare_managed_node_import_root, read_lua_help_payload_source, read_skill_text_file,
-    render_host_visible_path, render_lua_help_payload_text, render_lua_print_argument,
+    prepare_managed_node_import_root, render_host_visible_path, render_lua_print_argument,
     resolve_vulcan_fs_copy_effective_destination_path, spawn_managed_runtime_worker,
     system_time_to_unix_millis_i64, vulcan_fs_target_exists, vulcan_fs_target_is_dir,
 };
@@ -640,6 +639,7 @@ fn make_loaded_skill(
         ready_dependency_roots: BTreeSet::new(),
         sqlite_binding: None,
         resolved_entry_names: HashMap::new(),
+        implicit_entry_contracts: HashMap::new(),
         entry_sources: HashMap::new(),
     }
 }
@@ -2685,33 +2685,6 @@ fn delegated_authority_query_helpers_hide_root_skills() {
             .all(|entry| !entry.root_name.trim().eq_ignore_ascii_case("ROOT"))
     );
 
-    // System-visible help trees that should include ROOT-owned runtime help.
-    // 系统权限可见的帮助树，应包含 ROOT 拥有的运行时帮助。
-    let system_help = engine
-        .list_skill_help_for_authority(SkillManagementAuthority::System)
-        .expect("list system-visible help");
-    // Delegated-visible help trees that should hide ROOT-owned runtime help.
-    // 委托权限可见的帮助树，应隐藏 ROOT 拥有的运行时帮助。
-    let delegated_help = engine
-        .list_skill_help_for_authority(SkillManagementAuthority::DelegatedTool)
-        .expect("list delegated-visible help");
-    assert!(system_help.iter().any(|help| help.root_name == " root "));
-    assert!(
-        delegated_help
-            .iter()
-            .all(|help| !help.root_name.trim().eq_ignore_ascii_case("ROOT"))
-    );
-
-    let delegated_detail = engine
-        .render_skill_help_detail_for_authority(
-            SkillManagementAuthority::DelegatedTool,
-            "vulcan-root-skill",
-            "main",
-            None,
-        )
-        .expect("delegated detail should be filtered");
-    assert!(delegated_detail.is_none());
-
     let root_call = engine
         .call_skill("vulcan-root-skill-ping", &json!({}), None)
         .expect("runtime call should reach any active skill");
@@ -2854,37 +2827,6 @@ fn list_entries_rejects_stale_registry_targets() {
     assert!(missing_entry_error.contains("alpha-skill-missing"));
     assert!(missing_entry_error.contains("missing"));
     assert!(missing_entry_error.contains("alpha-skill"));
-}
-
-/// Verify help listing rejects entries that lost their resolved canonical names.
-/// 验证帮助列表会拒绝丢失已解析 canonical 名称的入口。
-///
-/// This test has no parameters and fails through assertions when related entries are silently omitted.
-/// 本测试不接收参数；当关联入口被静默省略时会通过断言失败。
-///
-/// Return unit after validating the unresolved related-entry diagnostic.
-/// 校验未解析关联入口诊断后返回 unit。
-#[test]
-fn list_skill_help_rejects_unresolved_related_entries() {
-    // Skill map containing one loaded skill whose resolved-entry mapping is intentionally empty.
-    // 包含一个已加载 skill 的映射，其已解析入口映射被故意保持为空。
-    let mut skills = HashMap::new();
-    skills.insert(
-        "alpha-storage".to_string(),
-        make_loaded_skill("alpha", "alpha-skill", "ping", "alpha_module"),
-    );
-    // Engine whose help list must detect the missing canonical entry mapping.
-    // 帮助列表必须检测缺失 canonical 入口映射的引擎。
-    let engine = make_test_engine(skills);
-
-    // Error returned before the help related-entry list can silently drop `ping`.
-    // 在帮助关联入口列表静默丢弃 `ping` 前返回的错误。
-    let error = engine
-        .list_skill_help()
-        .expect_err("unresolved related entry should fail help listing");
-    assert!(error.contains("main"));
-    assert!(error.contains("alpha-skill"));
-    assert!(error.contains("ping"));
 }
 
 /// Verify `vulcan.call` dispatch building rejects stale registry targets instead of skipping them.
@@ -3976,111 +3918,6 @@ fn managed_node_import_root_copy_rejects_symlink_entry() {
         error
     );
     let _ = fs::remove_dir_all(&temp_root);
-}
-
-/// Verify skill text-file read errors render paths through the host-visible formatter.
-/// 验证 skill 文本文件读取错误会通过宿主可见路径渲染器输出路径。
-#[test]
-fn skill_text_file_read_error_uses_host_visible_path() {
-    // Temporary skill directory used by the real text-file reader helper.
-    // 真实文本文件读取辅助函数使用的临时 skill 目录。
-    let skill_dir = make_temp_runtime_root("skill-text-read-path").join("skills/demo");
-    let _ = fs::remove_dir_all(&skill_dir);
-    fs::create_dir_all(&skill_dir).expect("create skill text fixture dir");
-    // Missing text file path resolved by the production helper.
-    // 生产辅助函数解析出的缺失文本文件路径。
-    let missing_file = skill_dir.join("docs/missing.md");
-    // Error returned by the real skill text-file reader.
-    // 真实 skill 文本文件读取器返回的错误。
-    let error = read_skill_text_file(&skill_dir, "docs/missing.md", "help")
-        .expect_err("missing skill text file should fail");
-    // Expected diagnostic prefix rendered with the shared host-visible path formatter.
-    // 使用共享宿主可见路径渲染器生成的期望诊断前缀。
-    let expected_prefix = format!(
-        "Failed to read help file {}:",
-        render_host_visible_path(&missing_file)
-    );
-
-    assert!(
-        error.starts_with(&expected_prefix),
-        "unexpected error: {}",
-        error
-    );
-    let _ = fs::remove_dir_all(
-        skill_dir
-            .parent()
-            .and_then(Path::parent)
-            .expect("test skill dir should have runtime root"),
-    );
-}
-
-/// Verify Lua help-source read errors render paths through the host-visible formatter.
-/// 验证 Lua 帮助源码读取错误会通过宿主可见路径渲染器输出路径。
-#[test]
-fn lua_help_source_read_error_uses_host_visible_path() {
-    // Temporary skill directory used by the real Lua help-source reader helper.
-    // 真实 Lua 帮助源码读取辅助函数使用的临时 skill 目录。
-    let skill_dir = make_temp_runtime_root("lua-help-source-read-path").join("skills/demo");
-    let _ = fs::remove_dir_all(&skill_dir);
-    fs::create_dir_all(&skill_dir).expect("create lua help fixture dir");
-    // Missing Lua help file path resolved by the production helper.
-    // 生产辅助函数解析出的缺失 Lua 帮助文件路径。
-    let missing_file = skill_dir.join("help/missing.lua");
-    // Error returned by the real Lua help-source reader.
-    // 真实 Lua 帮助源码读取器返回的错误。
-    let error = match read_lua_help_payload_source(&skill_dir, "help/missing.lua") {
-        Ok(_) => panic!("missing Lua help file should fail"),
-        Err(error) => error,
-    };
-    // Expected diagnostic prefix rendered with the shared host-visible path formatter.
-    // 使用共享宿主可见路径渲染器生成的期望诊断前缀。
-    let expected_prefix = format!(
-        "Failed to read help file {}:",
-        render_host_visible_path(&missing_file)
-    );
-
-    assert!(
-        error.starts_with(&expected_prefix),
-        "unexpected error: {}",
-        error
-    );
-    let _ = fs::remove_dir_all(
-        skill_dir
-            .parent()
-            .and_then(Path::parent)
-            .expect("test skill dir should have runtime root"),
-    );
-}
-
-/// Verify Lua help payload runtime errors render paths through the host-visible formatter.
-/// 验证 Lua 帮助载荷运行错误会通过宿主可见路径渲染器输出路径。
-#[test]
-fn lua_help_payload_runtime_error_uses_host_visible_path() {
-    // Lua VM used by the real help payload renderer.
-    // 真实帮助载荷渲染器使用的 Lua 虚拟机。
-    let lua = Lua::new();
-    // Help file path used only for payload diagnostics.
-    // 仅用于载荷诊断信息的帮助文件路径。
-    let helper_path = make_temp_runtime_root("lua-help-runtime-path").join("help/broken.lua");
-    // Lua help source that compiles and initializes, then fails during returned function execution.
-    // 可编译并初始化，但在返回函数执行时失败的 Lua 帮助源码。
-    let helper_source = "return function() error('help boom') end";
-    // Error returned by the real Lua help payload renderer.
-    // 真实 Lua 帮助载荷渲染器返回的错误。
-    let error = render_lua_help_payload_text(&lua, &helper_path, helper_source, "@broken-help")
-        .expect_err("runtime-failing help payload should fail");
-    // Expected diagnostic prefix rendered with the shared host-visible path formatter.
-    // 使用共享宿主可见路径渲染器生成的期望诊断前缀。
-    let expected_prefix = format!(
-        "Help runtime error for {}:",
-        render_host_visible_path(&helper_path)
-    );
-
-    assert!(
-        error.starts_with(&expected_prefix),
-        "unexpected error: {}",
-        error
-    );
 }
 
 /// Verify the host can override the isolated runlua pool sizing with the same shape as the main VM pool.
@@ -13680,4 +13517,70 @@ fn managed_runtime_malformed_envelope_worker_command() -> Command {
         command.args(["-c", script]);
         command
     }
+}
+
+/// Verifies native package discovery and pre-Lua schema validation for implicit entries.
+/// 验证隐式包原生发现及执行 Lua 前的 Schema 校验。
+#[test]
+fn implicit_registration_validates_runtime_arguments_and_exports_guides() {
+    // Create a registered package and an old package under the same temporary root.
+    // 在同一临时根目录创建一个声明注册的包和一个旧包。
+    let runtime = make_temp_runtime_root("implicit-registration");
+    fs::create_dir_all(&runtime).unwrap();
+    let package = write_minimal_skill_to_root(&runtime, "office-fixture");
+    write_minimal_skill_to_root(&runtime, "legacy-fixture");
+    fs::create_dir_all(package.join("skills/office-guide")).unwrap();
+    fs::write(
+        package.join("skills/office-guide/SKILL.md"),
+        "---\nname: office-guide\ndescription: Office guide\n---\nUse the registered tool.",
+    )
+    .unwrap();
+    // Reuse the runtime entry fixture and add a required argument with a declared type.
+    // 复用运行时入口夹具并添加有声明类型的必填参数。
+    let manifest = package.join("skill.yaml");
+    let original = fs::read_to_string(&manifest).unwrap();
+    fs::write(&manifest, format!("{original}    input_schema:\n      type: object\n      properties:\n        path: {{type: string}}\n      required: [path]\nregistration:\n  mode: implicit\n  default_locale: en-US\n  locales:\n    en-US: {{title: Office, description: Office package}}\n  prompt_skills:\n    - name: office-guide\n      file: skills/office-guide/SKILL.md\n      locales:\n        en-US: {{title: Guide, description: Office workflow}}\n")).unwrap();
+    // Load both packages through the ordinary engine registration path.
+    // 通过常规引擎注册链路加载两个包。
+    let mut engine = make_runtime_test_engine_with_host_options(LuaRuntimeHostOptions::default());
+    engine
+        .load_from_roots(&[RuntimeSkillRoot {
+            name: "ROOT".into(),
+            skills_dir: runtime.clone(),
+        }])
+        .unwrap();
+    {
+        // Check the exported manifest and the exact public entry name.
+        // 检查导出的清单和精确公开入口名。
+        let packages = engine.list_skill_registrations(SkillManagementAuthority::System);
+        assert_eq!(packages.len(), 1);
+        assert_eq!(
+            packages[0].declaration.prompt_skills[0].name,
+            "office-guide"
+        );
+        let entry = engine
+            .list_entries()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.skill_id == "office-fixture")
+            .unwrap();
+        assert_eq!(entry.public_tool_name(), "office_fixture_ping");
+        assert!(
+            engine
+                .call_skill(&entry.canonical_name, &json!({"path": 42}), None)
+                .is_err()
+        );
+        assert!(
+            engine
+                .call_skill(&entry.canonical_name, &json!({"path": "report.pdf"}), None)
+                .is_ok()
+        );
+        assert!(
+            engine
+                .call_skill("legacy-fixture-ping", &json!({}), None)
+                .is_ok()
+        );
+    }
+    drop(engine);
+    let _ = fs::remove_dir_all(runtime);
 }

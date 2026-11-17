@@ -24,38 +24,6 @@ pub struct SkillSqliteMeta {
     pub enable: bool,
 }
 
-/// Help node metadata used by the new help structure.
-/// 新 help 结构使用的帮助节点元数据。
-#[derive(Deserialize, Debug, Clone, Default)]
-pub struct SkillHelpNodeMeta {
-    /// Optional node name used by topic/workflow nodes.
-    /// 供 topic/workflow 节点使用的可选名称。
-    #[serde(default)]
-    pub name: String,
-    /// Optional human-readable description of the node.
-    /// 当前节点的人类可读描述。
-    #[serde(default)]
-    pub description: String,
-    /// Relative file path of the help payload under `help/`.
-    /// 位于 `help/` 目录下的帮助载荷相对路径。
-    #[serde(default)]
-    pub file: String,
-}
-
-/// Top-level help metadata declared by a skill.
-/// skill 顶层声明的 help 元数据。
-#[derive(Deserialize, Debug, Clone, Default)]
-pub struct SkillHelpMeta {
-    /// Main help node used for skill-level overview.
-    /// 用于 skill 级总览的主帮助节点。
-    #[serde(default)]
-    pub main: SkillHelpNodeMeta,
-    /// Topic or workflow help nodes listed under the main help.
-    /// 挂在主帮助下的 topic 或 workflow 子节点。
-    #[serde(default)]
-    pub topics: Vec<SkillHelpNodeMeta>,
-}
-
 /// Shared parameter metadata used by tool entries.
 /// 工具入口共用的参数元数据。
 #[derive(Deserialize, Debug, Clone)]
@@ -106,10 +74,10 @@ pub struct SkillToolMeta {
     /// 位于 `schemas/` 目录下、用于定义最终面向 AI 输入 schema 的可选 JSON Schema 文件路径。
     #[serde(default)]
     pub input_schema_file: String,
-    /// Optional help topic/workflow reference name.
-    /// 可选的帮助 topic/workflow 引用名称。
-    #[serde(default)]
-    pub help: String,
+    /// Legacy metadata accepted for direct registration during migration.
+    /// 迁移期间为直接注册接受的旧包元数据。
+    #[serde(default, rename = "help")]
+    _legacy_help: Option<serde_norway::Value>,
 }
 
 /// Strict skill-level metadata loaded only from skill.yaml.
@@ -147,10 +115,14 @@ pub struct SkillMeta {
     /// 严格 LuaSkills 包结构使用的顶层入口声明。
     #[serde(default)]
     pub entries: Vec<SkillToolMeta>,
-    /// New help metadata used to replace prompt-based guidance.
-    /// 用于替代 prompt 说明的新 help 元数据。
+    /// Package-owned registration. Older packages have no declaration and expose direct tools.
+    /// 包声明的注册方式。旧包无此声明，按直接工具公开。
     #[serde(default)]
-    pub help: SkillHelpMeta,
+    pub registration: Option<super::registration::SkillRegistration>,
+    /// Legacy metadata accepted during migration without registering any guide.
+    /// 迁移期间接受的旧元数据，不注册指南。
+    #[serde(default, rename = "help")]
+    _legacy_help: Option<serde_norway::Value>,
     /// Stable runtime skill identifier derived from the physical directory name.
     /// 从物理目录名称派生出的稳定运行时技能标识符。
     #[serde(skip)]
@@ -211,7 +183,7 @@ fn default_skill_enable_flag() -> bool {
 
 /// Validate one relative metadata path against a fixed prefix and reject traversal.
 /// 按固定目录前缀校验单个 skill 元数据相对路径，并拒绝路径穿越。
-fn validate_skill_relative_path(
+pub(super) fn validate_skill_relative_path(
     relative_path: &str,
     expected_prefix: &str,
     field_label: &str,
@@ -677,35 +649,6 @@ impl SkillMeta {
     /// 根据严格局部入口名查找单个入口。
     pub fn find_tool_by_local_name(&self, tool_name: &str) -> Option<&SkillToolMeta> {
         self.entries().find(|tool| tool.name.trim() == tool_name)
-    }
-
-    /// Return the main help node declared by the skill.
-    /// 返回 skill 声明的主帮助节点。
-    pub fn main_help(&self) -> &SkillHelpNodeMeta {
-        &self.help.main
-    }
-
-    /// Iterate over all topic or workflow help nodes declared by the skill.
-    /// 遍历当前 skill 声明的全部 topic 或 workflow 帮助节点。
-    pub fn help_topics(&self) -> impl Iterator<Item = &SkillHelpNodeMeta> {
-        self.help.topics.iter()
-    }
-
-    /// Find one help topic or workflow node by its declared name.
-    /// 根据声明名称查找单个 help topic 或 workflow 节点。
-    pub fn find_help_topic(&self, topic_name: &str) -> Option<&SkillHelpNodeMeta> {
-        self.help_topics()
-            .find(|topic| topic.name.trim() == topic_name)
-    }
-
-    /// Return all entries that reference one help topic/workflow name.
-    /// 返回引用某个 help topic/workflow 名称的全部入口。
-    pub fn entries_for_help_topic<'a>(
-        &'a self,
-        topic_name: &'a str,
-    ) -> impl Iterator<Item = &'a SkillToolMeta> + 'a {
-        self.entries()
-            .filter(move |tool| tool.help.trim() == topic_name)
     }
 }
 

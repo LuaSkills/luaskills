@@ -2440,17 +2440,7 @@ fn ffi_query_json_filters_root_for_delegated_authority() {
             &delegated_entries_request,
         )))
     };
-    assert_eq!(delegated_help["ok"], true);
-    assert!(
-        delegated_help["result"]
-            .as_array()
-            .expect("delegated help array")
-            .iter()
-            .all(|help| help["root_name"]
-                .as_str()
-                .map(|root_name| !root_name.trim().eq_ignore_ascii_case("ROOT"))
-                .unwrap_or(false))
-    );
+    assert_eq!(delegated_help["ok"], false);
 
     let delegated_detail_request = CString::new(
         serde_json::json!({
@@ -2467,8 +2457,7 @@ fn ffi_query_json_filters_root_for_delegated_authority() {
             borrowed_json_buffer(&delegated_detail_request),
         ))
     };
-    assert_eq!(delegated_detail["ok"], true);
-    assert!(delegated_detail["result"].is_null());
+    assert_eq!(delegated_detail["ok"], false);
 
     let delegated_is_skill_request = CString::new(
         serde_json::json!({

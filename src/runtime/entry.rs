@@ -48,3 +48,11 @@ pub struct RuntimeEntryDescriptor {
     /// 从入口元数据解析得到的最终面向 AI 输入 schema。
     pub input_schema: Value,
 }
+
+impl RuntimeEntryDescriptor {
+    /// Return the portable public tool name derived from this entry's canonical identity.
+    /// 返回根据此入口的规范标识生成的通用公开工具名。
+    pub fn public_tool_name(&self) -> String {
+        crate::public_tool_name(&self.canonical_name)
+    }
+}
