@@ -39,7 +39,7 @@ LuaSkills 给宿主提供一层运行时契约，而不是一堆口头约定。
 
 - Skill 包加载。
 - Entry 发现与调用。
-- strict help 树。
+- 本地化提示词技能与显式、隐式工具注册。
 - 运行时上下文注入。
 - skill 依赖路径注入。
 - SQLite Provider 路由。
@@ -53,7 +53,7 @@ LuaSkills 给宿主提供一层运行时契约，而不是一堆口头约定。
 | 分类 | 解决的问题 |
 | --- | --- |
 | Runtime Core | 加载 skill、重载 root、列出 entry、调用 skill 函数。 |
-| Skill Authoring | Skill 作者用稳定的 `vulcan.*` API 与结构化 help 编写能力。 |
+| Skill Authoring | Skill 作者用稳定的 `vulcan.*` API 与随包 `SKILL.md` 指南编写能力。 |
 | Product Control | 权限、预算、UI、authority、用户提示继续由宿主控制。 |
 | Data-aware Skills | SQLite 由宿主注册回调管理。 |
 | Multi-language Hosts | Rust、C ABI、TypeScript、Python、Go 或混合宿主都能接入同一套模型。 |
@@ -75,7 +75,7 @@ LuaSkills 支持多种宿主形态：
 两个仓库尤其重要：
 
 - [vulcan-codekit](https://github.com/LuaSkills/vulcan-codekit)：真实、重要的 LuaSkills 示例，展示源码导航、AST 检查、结构化搜索、Markdown 导航和 patch 工作流如何作为 skill 产品交付。
-- [demo-skill](https://github.com/LuaSkills/demo-skill)：标准 skill 仓库模板，用来学习最小目录结构、`skill.yaml`、runtime entry 和 help 文件。
+- [demo-skill](https://github.com/LuaSkills/demo-skill)：标准 skill 仓库模板，用来学习最小目录结构、`skill.yaml`、runtime entry 和指南文件。
 
 推荐学习路径：
 
@@ -103,7 +103,7 @@ LuaSkills 不把任意 Lua 包描述成天然安全。
 适合使用 LuaSkills 的场景：
 
 - 需要稳定、可复用的 skill 包结构。
-- 需要运行时管理 help 与 entry 元数据。
+- 需要运行时管理注册声明与入口元数据。
 - 需要宿主控制权限与产品展示。
 - 需要本地或嵌入式工具执行能力。
 - 需要数据库感知型 skill。

@@ -35,6 +35,8 @@ The Go SDK exposes typed model request, response, and error shapes, but process-
 
 ## Versions
 
+[v0.9.1](../releases/v0.9.1.md) targets the core and FFI SDK. The language SDKs follow the `0.9` series. Their direct FFI path continues to use `list_entries` and `call_skill`. Legacy package-help methods report retirement when called against v0.9.1, and the new registration APIs described in the guide are Rust APIs.
+
 - **Core patches keep the contract; contract changes open a minor series.** The embedded contract names its release series (`core_series`, `major.minor`) instead of the exact core version, so its bytes and `contract_sha256` stay the same for every patch of a series. The core release workflow rejects a patch whose contract differs from the previous published release of its series (`scripts/release/contract_series.py`).
 - **SDKs follow the core series.** The SDK version is the package version (`package.json`, `pyproject.toml`, Go module tag), mirrored in each repository's `VERSION` file. A new core series ships SDKs with the same `major.minor`; core patches need no SDK release, and an SDK-only fix takes the next patch number of that SDK.
 - **Each SDK resolves the newest core patch of its series.** Runtime asset installation (`DEFAULT_LUASKILLS_SERIES` / `DefaultLuaSkillsSeries`) installs the newest published core release of the SDK's series and refuses it unless its packaged contract digest equals the SDK's; there is no fallback to an older patch. The embedded compatibility check accepts any core version of that series with the same contract digest, protocol, ABI and description versions. Hosts can still pin an exact core tag, which is checked the same way.

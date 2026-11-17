@@ -23,7 +23,7 @@ Rust 核心 · LuaJIT 技能 · Rust API、C ABI、JSON FFI 与 TypeScript / Pyt
 
 ## 关于项目
 
-LuaSkills 在宿主应用内加载、运行和管理 Lua 技能包。宿主无需自建插件运行时，即可获得可脚本化的工具、结构化帮助、受管 Python 与 Node.js 运行时、依赖管理以及数据库感知的执行能力。
+LuaSkills 在宿主应用内加载、运行和管理 Lua 技能包。宿主无需自建插件运行时，即可获得可脚本化的工具、随包提示词技能、受管 Python 与 Node.js 运行时、依赖管理以及数据库感知的执行能力。
 
 **LuaSkills 负责运行技能，宿主决定技能如何成为产品功能。** 策略、认证、权限确认、预算、存储位置与用户体验都留在宿主侧。
 
@@ -34,7 +34,7 @@ LuaSkills 是 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) 技能系
 ### 🧩 技能运行时
 
 - 在 `ROOT`、`PROJECT`、`USER` 分层根目录中发现、加载、列出、调用和重载技能
-- 严格的帮助树，宿主可渲染为文档、工具描述、命令面板或界面面板
+- 支持显式和隐式工具注册，随包提供本地化介绍与 `SKILL.md` 指南
 - 每个入口一个完整的对象输入 Schema，统一使用 `{skill_id}-{entry_name}` 命名
 - 从 GitHub Release 或 URL 安装、更新、卸载，依赖经过校验和验证
 
@@ -76,7 +76,7 @@ LuaSkills 是 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) 技能系
 ```
 ┌──────────────────────────────┐         ┌──────────────────────────────────────┐
 │  宿主应用                     │  Rust   │  LuaSkills 运行时                     │
-│  策略 · 界面 · 权限           │  C ABI  │  技能加载 · 帮助 · 生命周期           │
+│  策略 · 界面 · 权限           │  C ABI  │  技能加载 · 指南 · 生命周期           │
 │  预算 · 模型供应商            │◀───────▶│  LuaJIT VM · 租约 · vulcan.* API      │
 │  宿主工具 · 存储              │  JSON   │  受管 Python / Node · 依赖            │
 │                              │  FFI    │  配置存储 · SQLite          │
@@ -87,7 +87,7 @@ LuaSkills 是 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) 技能系
 
 | 目录 | 说明 |
 | --- | --- |
-| `src/runtime` | 引擎、Lua VM、租约、上下文、帮助、结果、受管运行时 |
+| `src/runtime` | 引擎、Lua VM、租约、上下文、注册表、结果、受管运行时 |
 | `src/skill` | 清单、根目录、配置与生命周期管理 |
 | `src/dependency`、`src/download` | 依赖解析、下载与归档解压 |
 | `src/providers` | SQLite 绑定 |
@@ -100,9 +100,11 @@ LuaSkills 是 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) 技能系
 
 ### Rust 宿主
 
+v0.9.1 需要 Rust 1.99.1。版本发布后使用下方依赖声明。
+
 ```toml
 [dependencies]
-luaskills = "0.9.0"
+luaskills = "0.9.1"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md) 演示 `call_skill` 与 `vulcan.host.*` 工具桥接。
@@ -159,8 +161,8 @@ luaskills-debug package --skill-path my-skill --out-dir dist
 
 | 组件 | 版本 |
 | --- | --- |
-| LuaSkills 核心与 FFI SDK | `0.9.0` |
-| TypeScript、Python、Go SDK | `0.9.0`，在核心发布之后发布，见 [SDK 总览](docs/zh-CN/sdk/index.md#版本规则) |
+| 核心与 FFI SDK 目标版本 | `0.9.1` · [v0.9.1 升级指南](docs/zh-CN/releases/v0.9.1.md) |
+| TypeScript、Python、Go SDK | `0.9.x` · [SDK 总览](docs/zh-CN/sdk/index.md#版本规则) |
 | Lua 运行时包 | 兼容 `0.1` 系列 |
 | 受管 Python / uv | `3.14.6` / `0.11.28` |
 | 受管 Node.js / pnpm | `24.18.0` / `11.11.0` |

@@ -1,5 +1,7 @@
 # Documentação do LuaSkills
 
+Versão em desenvolvimento: v0.9.1. [Guia de atualização para v0.9.1](../releases/v0.9.1.md)
+
 [English](../index.md) | [简体中文](../zh-CN/index.md) | [日本語](../ja/index.md) | [한국어](../ko/index.md) | [Español](../es/index.md) | [Français](../fr/index.md) | [Deutsch](../de/index.md) | [Português (BR)](index.md)
 
 [README em português](../../README.pt-BR.md) | [Por que LuaSkills](product/why-luaskills.md)

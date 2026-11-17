@@ -1,5 +1,7 @@
 # 宿主工具结果桥接、宿主 LuaRuntime（`system_lua_lib`）与执行平面设计稿
 
+> 历史设计稿。当前生效接口以 [FFI 对接文档](ffi-integration-guide.md) 和 [v0.9.1 升级指南](../releases/v0.9.1.md) 为准。
+
 ## 1. 文档定位
 
 本文是在分析当前 `vulcan-luaskills` 仓库实现后，针对外部《LuaSkills 宿主工具协议与结果桥接改造方案（2026-05-09）》整理出的**仓库内落地版设计稿**。

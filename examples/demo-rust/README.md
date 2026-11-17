@@ -1,5 +1,7 @@
 # LuaSkills Rust Demo
 
+此示例使用当前检出源码。v0.9.1 需要 Rust 1.99.1，工具链由仓库根目录选择。
+
 该目录是非 FFI 模式 demo：宿主直接通过 Rust crate 引用 `luaskills`，不经过 C ABI 动态库。
 
 当前 demo 覆盖两条主链路：

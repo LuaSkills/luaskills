@@ -82,7 +82,7 @@ LuaSkills 现在支持为每个入口声明一份完整的、面向 AI 的对象
 
 推荐规则：
 
-- `skill.yaml` 继续承担 `name`、`version`、`lua_entry`、help 链接等人类友好的元数据。
+- `skill.yaml` 继续承担 `name`、`version`、`lua_entry`、注册声明等人类友好的元数据。
 - 复杂工具输入 schema 建议放到 `schemas/` 目录下的外部 JSON 文件中。
 - 当 schema 包含嵌套对象、带 `items` 的数组、`oneOf` / `anyOf`、严格 `additionalProperties` 规则时，应优先使用 `input_schema_file`。
 - 旧版 `parameters` 仅作为向后兼容或简单扁平入口的声明方式保留。
@@ -142,7 +142,7 @@ Skill 作者规则：
 
 - 新 skill 如果需要稳定会话、任务或上下文身份，应使用 entry 参数名 `LUASKILL_SID`。
 - 该字段只用于状态连续性的身份句柄，不能作为鉴权 token、密钥、数据库凭证或权限边界。
-- skill 不能假设所有宿主都能提供托管身份；help 文本应说明托管和非托管两种行为。
+- skill 不能假设所有宿主都能提供托管身份；指南应说明托管和非托管两种行为。
 - 有状态 skill 如果能够建立或恢复状态，建议提供 create、start、open 或 bootstrap 类 entry。
 - 如果调用方显式传入 `LUASKILL_SID`，skill 应复用该值，而不是生成新身份。
 - 如果调用方未传 `LUASKILL_SID`，并且 skill 支持非托管 fallback，create/start/bootstrap entry 可以生成新的公开身份。
@@ -158,7 +158,7 @@ Skill 作者规则：
 - 如果宿主希望 skill 在结果里识别并隐藏宿主管理身份，应把注入值包装为保留前缀 `LUASKILLS-SID-` 开头的形式。
 - 注入值必须在目标宿主作用域内保持稳定，不能每次调用都重新随机生成。
 - 如果宿主无法提供稳定托管身份，应保持 `LUASKILL_SID` 可见，让调用方或 skill fallback 流程处理。
-- 托管模式的 help 应告诉模型或用户：身份由宿主注入，不应询问、打印或保存原始值。
+- 托管模式的指南应告诉模型或用户：身份由宿主注入，不应询问、打印或保存原始值。
 - 如果工具结果包含被注入的原始托管身份，宿主应在返回给模型/用户前脱敏，或改写成托管状态说明。
 
 这些规则适用于所有投影层，包括 MCP、gRPC、FFI/SDK 宿主、IDE 集成和嵌入式产品宿主。
@@ -174,9 +174,9 @@ Skill 作者规则：
 - 新 skill 如果需要一个由宿主或调用方提供的项目根路径或工作区根路径，应使用入口参数名 `PWD`。
 - `PWD` 的语义应视为面向跨宿主兼容的项目/工作区路径契约，而不是权限证明、沙箱边界，也不是“运行时进程当前一定就在这个目录里”的保证。
 - 如果 skill 的行为应跟随宿主当前激活的项目/工作区作用域，而不是运行时进程目录，应优先使用显式传入的 `PWD`，不要直接把 `vulcan.runtime.cwd()` 当作同义替代。
-- skill 不能假设所有宿主都能注入 `PWD`；help 文本应说明托管和非托管两种行为。
+- skill 不能假设所有宿主都能注入 `PWD`；指南应说明托管和非托管两种行为。
 - 如果调用方显式传入 `PWD`，skill 应复用该值，而不是自己覆盖成猜测路径。
-- 如果调用方未传 `PWD`，并且 skill 有安全的 fallback，可以显式回退到 `vulcan.runtime.cwd()` 或其他已文档化的项目解析路径；但这种 fallback 必须在 help 和行为上说清楚。
+- 如果调用方未传 `PWD`，并且 skill 有安全的 fallback，可以显式回退到 `vulcan.runtime.cwd()` 或其他已文档化的项目解析路径；但这种 fallback 必须在指南和运行时行为中说清楚。
 
 宿主和 adapter 规则：
 
@@ -190,6 +190,32 @@ Skill 作者规则：
 这些规则适用于所有投影层，包括 MCP、gRPC、FFI/SDK 宿主、IDE 集成和嵌入式产品宿主。
 
 Windows 宿主取得的规范路径可能采用 `\\?\C:\...` 或 `\\?\UNC\server\share\...` 形式。LuaSkills 会在保留的顶层 `PWD` 参数进入 Lua 前移除该逐字路径前缀；其他已声明的运行时路径字段也遵循同一边界规则。任意 JSON 字符串不会仅因“看起来像路径”而被改写。只有绝对盘符与 UNC verbatim 形式具备经过证明的普通等价路径；卷 GUID、设备、管道、混合分隔符及其他 verbatim 命名空间会被显式拒绝，不会重新解释为相对路径。前缀清理只属于兼容转换，不代表授权或规范化。
+
+## 2.5 包注册与提示词技能
+
+在 `skill.yaml` 的 `registration.mode` 声明默认显式（`explicit`）或隐式（`implicit`）注册。
+附带提示词技能的包支持隐式调用，两种默认方式都适用。默认隐式的包至少声明一份指南。使用 `default_locale` 指定默认语言。包介绍使用 `locales`，
+指南介绍使用每条 `prompt_skills` 记录自己的 `locales`。两者都需要提供默认语言的
+`title` 和 `description`。
+
+```yaml
+registration:
+  mode: implicit
+  default_locale: en-US
+  locales:
+    en-US: {title: Office commands, description: Inspect local office documents.}
+  prompt_skills:
+    - name: office-workflow
+      file: skills/office-workflow/SKILL.md
+      locales:
+        en-US: {title: Office workflow, description: Read this guide for office document tasks.}
+```
+
+随包指南使用标准 `SKILL.md`。清单记录名、文件所在目录名和 frontmatter 名称一致。指南正文使用简短文本和示例
+说明调用方式，参数约束保留在入口 Schema 供运行时校验。打包时纳入 `skills/`，例如 `luaskills-debug package --skill-path my-skill --include skills --out-dir dist`。
+
+包内工具名继续使用连字符，公开工具名由运行时生成并统一使用下划线。旧包无注册声明时使用直接工具，
+解析清单时接受并忽略包级及入口级 `help` 字段。请把说明迁入已注册的指南，旧帮助接口会返回停用错误。见 [v0.9.1 升级指南](../releases/v0.9.1.md)。
 
 ## 3. 顶级能力总览
 
@@ -854,7 +880,7 @@ ROOT -> PROJECT -> USER
 
 其中 `ROOT` 是系统控制级，运行时启动或加载时必须存在该层。普通 skill 不能通过 `vulcan.runtime.skills.*` 请求安装、更新、卸载、启用或停用 `ROOT` 级 skill。普通桥接只面向宿主开放且当前实际存在的 `PROJECT` / `USER` 层级。
 
-`vulcan.runtime.skills.*` 固定等价于 `DelegatedTool` 权限：它看不到 `ROOT` skills，也不能写入 `ROOT`。FFI 查询与 prompt completion 入口在 `DelegatedTool` 下同样不会返回 `ROOT` entries、help 或 ROOT tool name 归属。`call_skill` 与 `run_lua` 是运行时执行面，允许调用当前已激活的 skill，不作为技能管理权限边界。如果 `ROOT` 已经存在同名 `skill_id`，普通层 install / update 会被拒绝；普通层 uninstall 仍可用于清理 `PROJECT` / `USER` 中的同名残留。
+`vulcan.runtime.skills.*` 固定等价于 `DelegatedTool` 权限：它看不到 `ROOT` skills，也不能写入 `ROOT`。FFI 查询与 prompt completion 入口在 `DelegatedTool` 下同样不会返回 `ROOT` entries 或 ROOT tool name 归属。`call_skill` 与 `run_lua` 是运行时执行面，允许调用当前已激活的 skill，不作为技能管理权限边界。如果 `ROOT` 已经存在同名 `skill_id`，普通层 install / update 会被拒绝；普通层 uninstall 仍可用于清理 `PROJECT` / `USER` 中的同名残留。
 
 正式桥接建议包含：
 
@@ -1703,7 +1729,7 @@ local deleted = vulcan.cache.delete(cache_id)
 说明：
 
 - 在普通 skill 调用中，这三个值通常都可用。
-- 在某些 runlua / help / 非 skill 文件场景里，可能为 `nil`。
+- 在某些 runLua 或非 skill 文件场景里，可能为 `nil`。
 - 在 System Plugin 租约 eval 中，这三个**入口专属**字段仍为 `nil`，因为该 eval 不是 Skill 入口调用。这不表示包上下文缺失：包身份应读取递归只读的 `vulcan.runtime.system_plugin` 视图，宿主授权上下文应读取 `vulcan.runtime.workspace_root / mounts`。
 - 当前实现会把 Windows verbatim 盘符/UNC 路径转换为普通等价形式，保证 Lua 侧拿到正常系统路径；不受支持的 verbatim 命名空间会被拒绝。
 
@@ -2032,7 +2058,7 @@ luaskills-debug call --runtime-root D:/runtime --skill-path my-skill --tool hell
 luaskills-debug package --skill-path my-skill --out-dir dist
 ```
 
-包内包含 `skill.yaml`、`dependencies.yaml`、README 与许可证文件，以及 `runtime`、`node`、`python`、`native`、`help`、`overflow_templates`、`resources`、`licenses`、`schemas` 目录。技能需要的其他顶层条目用 `--include <名称>` 加入。`node_modules`、`.pnpm-store`、`__pycache__`、`.DS_Store` 与 `*.pyc` 永不打包，符号链接会被拒绝。
+包内包含 `skill.yaml`、`dependencies.yaml`、README 与许可证文件，以及 `runtime`、`node`、`python`、`native`、`overflow_templates`、`resources`、`licenses`、`schemas` 目录。如有旧版 `help/` 目录，打包器也会按默认规则纳入。已注册指南使用 `--include skills` 纳入，其他顶层条目用 `--include <名称>` 加入。`node_modules`、`.pnpm-store`、`__pycache__`、`.DS_Store` 与 `*.pyc` 永不打包，符号链接会被拒绝。
 
 在 GitHub Actions 中，`LuaSkills/luaskills-debug` action 执行 `validate` 与 `package`；`new` 生成的工作流就使用它。把仓库变量 `LUASKILLS_PACKAGE_LAYOUT` 设为 `platform` 即可切换布局。
 

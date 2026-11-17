@@ -2,7 +2,7 @@
 
 [Documentation hub](../index.md) | [Detailed integration guide](../zh-CN/integration/host-database-provider-guide.md)
 
-LuaSkills 0.7.3 routes skill SQLite operations exclusively through registered host callbacks. The host owns database files, connections, concurrency, migrations and cleanup.
+Since 0.7.3, LuaSkills routes skill SQLite operations exclusively through registered host callbacks. The host owns database files, connections, concurrency, migrations and cleanup.
 
 The skill's `sqlite` declaration accepts only `enable`; retired logging options and unknown fields are rejected. `status()` and `info()` report binding readiness, without database-library placeholders or inferred host capabilities. Business input is separate from the authoritative outer binding. Suggested paths follow the fixed `databases` layout when `runtime_root` is set; otherwise they use the host's `database_dir_name`. The host still chooses the actual storage location.
 

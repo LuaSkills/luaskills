@@ -30,6 +30,8 @@ GitHub 的 `GITHUB_TOKEN` 不能获得工作流写权限；来源提交相对实
 `source_sha` 必须是包含本流程修改的最终完整提交，并与工作流触发提交完全相等；`version` 必须等于该提交的
 `Cargo.toml` 中 `package.version`。脚本不会把当前脏工作树冒充为 HEAD 对应源码。本地功能通过仅证明当前字节；发布候选仍须以实际干净的完整提交及对应构建证据为准。
 
+v0.9.1 的核心构建和原生验收从已检出源码的 `rust-toolchain.toml` 选择 Rust 1.99.1。生成正式候选前，请使目标提交的 `package.version`、候选输入版本和标签一致。包作者、FFI 宿主和 SDK 的接入变化见 [v0.9.1 升级指南](../../docs/zh-CN/releases/v0.9.1.md)。
+
 冻结作业从已核验提交读取完整 `git archive --format=tar` 字节，仅在该作业压缩一次，独占写入
 `target/frozen-source/luaskills-source-<版本>-<完整提交>.tar.gz`；冻结回归通过后上传唯一
 `frozen-core-source-<完整提交>` 产物。全部五个平台下载同一文件，并通过显式源码归档参数交给打包器。

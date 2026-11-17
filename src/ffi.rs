@@ -774,8 +774,8 @@ pub unsafe extern "C" fn luaskills_ffi_list_entries_json(
     })
 }
 
-/// List structured help trees visible to one host-injected authority through the JSON FFI surface.
-/// 通过 JSON FFI 入口列出单个宿主注入权限可见的结构化帮助树。
+/// Retired skill-help listing export. Valid requests return an error in v0.9.1.
+/// 已停用的技能帮助列表导出。v0.9.1 的合法请求返回错误。
 /// # Safety
 /// # 安全性
 /// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.
@@ -808,8 +808,8 @@ pub unsafe extern "C" fn luaskills_ffi_list_skill_help_json(
     })
 }
 
-/// Render one structured help detail payload visible to one host-injected authority through the JSON FFI surface.
-/// 通过 JSON FFI 入口渲染单个宿主注入权限可见的结构化帮助详情载荷。
+/// Retired skill-help rendering export. Valid requests return an error in v0.9.1.
+/// 已停用的技能帮助渲染导出。v0.9.1 的合法请求返回错误。
 /// # Safety
 /// # 安全性
 /// The caller must uphold the LuaSkills C ABI contract for every pointer and borrowed buffer used by this function.

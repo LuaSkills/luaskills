@@ -25,7 +25,7 @@ LuaSkills는 관습 모음이 아니라 runtime contract를 제공합니다.
 
 - skill package loading.
 - entry discovery 및 invocation.
-- strict help tree.
+- 현지화된 프롬프트 스킬과 명시적·암시적 도구 등록.
 - runtime context injection.
 - dependency path injection.
 - SQLite provider routing.
@@ -37,7 +37,7 @@ LuaSkills는 관습 모음이 아니라 runtime contract를 제공합니다.
 | 분류 | 가능해지는 것 |
 | --- | --- |
 | Runtime Core | skill 로드, root reload, entry list, skill call. |
-| Skill Authoring | `vulcan.*` API와 구조화된 help로 skill 작성. |
+| Skill Authoring | `vulcan.*` API와 번들 `SKILL.md` 가이드로 skill 작성. |
 | Product Control | 권한, budget, UI, authority를 호스트가 제어. |
 | Data-aware Skills | SQLite를 runtime, host provider, space controller로 연결. |
 | Multi-language Hosts | Rust, C ABI, TypeScript, Python, Go에서 같은 skill model 사용. |

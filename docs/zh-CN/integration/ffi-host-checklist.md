@@ -76,7 +76,7 @@
   - `resources/luaskills-packages/platform-support.json` 必须存在
   - `resources/luaskills-packages/THIRD_PARTY_LICENSES.json` 必须存在
   - `resources/luaskills-packages/THIRD_PARTY_NOTICES.md` 必须存在
-  - `resources/luaskills-packages/help/index.json` 必须存在
+  - `resources/luaskills-packages/help/index.json` 必须存在（运行时资产元数据）
   - `resources/luaskills-packages/help/packages` 必须存在
   - `resources/luaskills-packages/help/modules` 必须存在
   - `licenses/luaskills-packages/index.json` 必须存在
@@ -149,12 +149,10 @@ ROOT -> PROJECT -> USER
 2. `is_skill`
 3. `skill_name_for_tool`
 4. `prompt_argument_completions`
-5. `list_skill_help`
-6. `render_skill_help_detail`
-7. `runtime_lease create / eval / status / list / close`
-8. `system_runtime_lease create / eval / status / list / close`
-9. `managed_session_events poll / wait` 与标准 ABI wake callback
-10. `host_result` 关闭与开启两条链路
+5. `runtime_lease create / eval / status / list / close`
+6. `system_runtime_lease create / eval / status / list / close`
+7. `managed_session_events poll / wait` 与标准 ABI wake callback
+8. `host_result` 关闭与开启两条链路
 
 这样更容易定位问题，不会把“运行时主链问题”和“辅助接口问题”混在一起。
 

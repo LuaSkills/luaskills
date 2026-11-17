@@ -1,5 +1,7 @@
 # LuaSkills 中文文档
 
+当前开发文档对应 v0.9.1。 [v0.9.1 升级指南](releases/v0.9.1.md)
+
 [English](../index.md) | [简体中文](index.md) | [日本語](../ja/index.md) | [한국어](../ko/index.md) | [Español](../es/index.md) | [Français](../fr/index.md) | [Deutsch](../de/index.md) | [Português (BR)](../pt-BR/index.md)
 
 [中文首页](../../README.zh-CN.md) | [为什么是 LuaSkills](product/why-luaskills.md)

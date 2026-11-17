@@ -174,7 +174,7 @@
 - `resources/luaskills-packages/help/modules`
 - `licenses/luaskills-packages/index.json`
 
-缺少这些文件时，当前运行时会把它视为不完整 packaged runtime，并在初始化阶段直接报错。
+缺少这些文件时，当前运行时会把它视为不完整 packaged runtime，并在初始化阶段直接报错。这里的 `help/` 是 Lua 模块和运行时包的发行元数据，和技能清单中已停用的 `help` 独立。
 
 ### 3.2 动态库与头文件
 
@@ -236,8 +236,6 @@ FFI 不直接暴露 `LuaEngine` 指针，而是通过内部注册表分配一个
 2. `load_from_roots`
 3. 若干：
    - `list_entries`
-   - `list_skill_help`
-   - `render_skill_help_detail`
    - `call_skill`
    - `run_lua`
    - 生命周期操作
@@ -848,7 +846,7 @@ Windows 桌面模式对 LuaSkills 自有进程统一应用 `CREATE_NO_WINDOW`，
 
 ### 8.8 卸载边界
 
-卸载接口仅处理技能代码和依赖，不删除宿主数据库。原数据库清理选项及结果字段已移除；标准 C 卸载入口不再接收清理选项指针，JSON 卸载请求不再接收 `options`。请使用 0.7.3 头文件重新编译宿主。
+卸载接口仅处理技能代码和依赖，不删除宿主数据库。原数据库清理选项及结果字段已移除；标准 C 卸载入口不再接收清理选项指针，JSON 卸载请求不再接收 `options`。请使用与所加载动态库同版本的头文件重新编译宿主。
 
 ## 9. 接口目录总览
 
@@ -888,13 +886,11 @@ Windows 桌面模式对 LuaSkills 自有进程统一应用 `CREATE_NO_WINDOW`，
 - `luaskills_ffi_load_from_roots_json`
 - `luaskills_ffi_reload_from_roots_json`
 
-### 9.3 描述与帮助接口
+### 9.3 描述与发现接口
 
 标准 C ABI 接口：
 
 - `luaskills_ffi_list_entries`
-- `luaskills_ffi_list_skill_help`
-- `luaskills_ffi_render_skill_help_detail`
 - `luaskills_ffi_prompt_argument_completions`
 - `luaskills_ffi_is_skill`
 - `luaskills_ffi_skill_name_for_tool`
@@ -902,17 +898,15 @@ Windows 桌面模式对 LuaSkills 自有进程统一应用 `CREATE_NO_WINDOW`，
 公共 `_json` FFI 接口：
 
 - `luaskills_ffi_list_entries_json`
-- `luaskills_ffi_list_skill_help_json`
-- `luaskills_ffi_render_skill_help_detail_json`
 - `luaskills_ffi_prompt_argument_completions_json`
 - `luaskills_ffi_is_skill_json`
 - `luaskills_ffi_skill_name_for_tool_json`
 
 说明：
 
-- `list_entries / list_skill_help / render_skill_help_detail / prompt_argument_completions / is_skill / skill_name_for_tool` 都属于可见性查询，必须由宿主注入 authority。
+- `list_entries / prompt_argument_completions / is_skill / skill_name_for_tool` 都属于可见性查询，必须由宿主注入 authority。
 - `System` 可看到 `ROOT / PROJECT / USER` 的运行时描述。
-- `DelegatedTool` 只能看到 `PROJECT / USER`，不会返回 `ROOT` entries、help detail 或已知 ROOT tool name 的归属信息。
+- `DelegatedTool` 只能看到 `PROJECT / USER`，不会返回 `ROOT` entries 或已知 ROOT tool name 的归属信息。旧帮助符号见第 10.8 至 10.9 节。
 
 ### 9.4 调用接口
 
@@ -1513,41 +1507,13 @@ SDK 对接入口：
 - `_json` 请求需要包含 `"authority": "system"` 或 `"authority": "delegated_tool"`。
 - `DelegatedTool` 不返回 `ROOT` entries。
 
-### 10.8 `list_skill_help`
+### 10.8 `list_skill_help`（已停用）
 
-作用：
+从 v0.9.1 起，标准 C 与 JSON FFI 的旧符号仍有导出。合法请求返回包帮助已停用的错误。直接工具宿主通过 `list_entries` 取得入口元数据。Rust 宿主查询已注册指南使用 `list_skill_registrations`。
 
-- 按宿主注入 authority 列出每个可见 skill 的 help 树节点描述
+### 10.9 `render_skill_help_detail`（已停用）
 
-返回内容：
-
-- skill id
-- skill 版本
-- root 名
-- skill 目录
-- help 节点列表
-
-权限说明：
-
-- `DelegatedTool` 不返回 `ROOT` help 树。
-
-### 10.9 `render_skill_help_detail`
-
-作用：
-
-- 按宿主注入 authority 渲染某个可见 skill 某个 help 流程节点的详情
-
-参数：
-
-- `skill_id`
-- `flow_name`
-- 可选请求上下文
-
-说明：
-
-- 标准 C ABI 接口中的请求上下文当前通过 `FfiBorrowedBuffer request_context_json` 传入
-- 传空缓冲表示“不附带请求上下文”
-- `DelegatedTool` 请求 `ROOT` help detail 时返回未找到或空结果，不暴露 ROOT 内容。
+标准 C 与 JSON FFI 继续导出旧符号，合法请求返回停用错误。把包内用法迁移到 `registration.prompt_skills` 声明的 `SKILL.md`。宿主负责加载指南并控制其可见性，详见 [v0.9.1 升级指南](../releases/v0.9.1.md)。
 
 ### 10.10 `prompt_argument_completions`
 
@@ -2128,8 +2094,8 @@ Go 宿主如果希望用 Go module 封装主链，建议优先使用独立仓库
 3. 接入 `load_from_roots`
 4. 接入 `list_entries`
 5. 接入 `call_skill`
-6. 接入 `list_skill_help` / `render_skill_help_detail`
-7. 接入生命周期接口
+6. 接入生命周期接口
+7. 如需按指南发现和隐式调用，从 [v0.9.1 升级指南](../releases/v0.9.1.md)选择宿主接入方式。
 
 这样最稳。
 

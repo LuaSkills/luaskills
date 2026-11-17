@@ -11,7 +11,7 @@ LuaSkills owns:
 
 - Skill package loading.
 - Entry discovery and invocation.
-- Strict help parsing.
+- Validated package registration and guide paths.
 - Runtime result shaping.
 - `vulcan.*` and `vulcan.runtime.*` injection.
 - Standard `vulcan.models.*` API shape, argument validation, result envelopes, and caller-context forwarding.
@@ -52,7 +52,7 @@ The host owns:
 - Injecting the stable identity before calling the entry.
 - Prefixing host-managed injected identities with the reserved `LUASKILLS-SID-` marker when skills need a portable way to hide host-owned values in results.
 - Leaving the field visible when no stable managed identity exists.
-- Rewriting help and redacting results in managed mode so raw managed identities are not exposed accidentally.
+- Rendering guides and redacting results in managed mode so raw managed identities are not exposed accidentally.
 
 This keeps LuaSkills portable across MCP, gRPC, FFI/SDK, IDE, and embedded hosts while giving each host room to bind the identity to its own conversation, task, workspace, or product session model.
 
@@ -217,17 +217,13 @@ A skill that fails to load is skipped with an error in the log, and every other 
 
 Skill state (disabled markers, install records) and private dependencies live in directories derived from each root's parent directory, keyed by `skill_id` alone, so roots under one parent share them. Uninstalling a lower-layer copy of a skill that a higher layer sharing those directories also holds removes only the package directory; the disabled marker, install record and private dependencies stay with the higher-layer copy.
 
-## Help Model
+## Tool Registration and Prompt Skills
 
-LuaSkills treats help as structured runtime data, not as ordinary tool output.
+Rust hosts query entries with `list_entries_for_authority` and load the visible package declarations with `list_skill_registrations`. Each declaration supplies a default mode and localized metadata. A bundled `SKILL.md` makes implicit dispatch available. The host owns tool projection, guide lookup, permissions, and disclosure of local paths.
 
-The host can render help as:
+For direct tools, publish the entry with its `public_tool_name()`, expose the entry's schema, and dispatch using its exact canonical name. For implicit tools, publish guide names and descriptions, then load the requested guide through the host's skill interface. Pass the selected `RuntimeEntryDescriptor` to `call_implicit_skill`; the runtime verifies its owning instance and validates the input before Lua execution.
 
-- Markdown documentation.
-- Tool descriptions.
-- Command palette entries.
-- UI panels.
-- Agent context.
+The original package-help endpoints report retirement. FFI and SDK hosts retain direct entry discovery and execution. See [v0.9.1 migration](../releases/v0.9.1.md) and the [manifest example](../development/skill-development.md#25-package-registration-and-prompt-skills).
 
 ## Deep References
 

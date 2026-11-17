@@ -35,6 +35,8 @@ Go SDK 提供类型化的模型请求、响应与错误结构，但进程级模�
 
 ## 版本规则
 
+[v0.9.1](../releases/v0.9.1.md) 是核心与 FFI SDK 的目标版本，各语言 SDK 跟随 `0.9` 系列。直接 FFI 调用继续使用 `list_entries` 和 `call_skill`。历史包帮助方法调用 v0.9.1 核心时返回停用错误，指南中的新注册接口属于 Rust API。
+
 - **核心补丁保持契约，契约变化开启次版本系列。** 嵌入式契约只写明发布系列（`core_series`，即 `major.minor`），不写精确核心版本，因此同一系列每个补丁的契约字节及 `contract_sha256` 都相同。核心发布工作流拒绝契约与本系列上一已发布版本不同的补丁（`scripts/release/contract_series.py`）。
 - **SDK 跟随核心系列。** SDK 版本即包版本（`package.json`、`pyproject.toml`、Go 模块标签），并镜像到仓库的 `VERSION` 文件。新的核心系列随附同 `major.minor` 的 SDK；核心补丁不需要发布 SDK，仅修复 SDK 时递增该 SDK 的补丁号。
 - **每个 SDK 解析本系列最新的核心补丁。** 运行时资产安装（`DEFAULT_LUASKILLS_SERIES` / `DefaultLuaSkillsSeries`）安装 SDK 所在系列最新的已发布核心版本，只有其包内契约摘要等于 SDK 的摘要时才接受，不回退到旧补丁。嵌入式兼容检查接受该系列中契约摘要、协议、ABI 与描述版本均一致的任意核心版本。宿主仍可固定精确核心标签，并按同样规则校验。

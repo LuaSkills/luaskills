@@ -208,7 +208,7 @@ LuaSkills 不做用户授权、敏感值披露判断或加密。上级宿主应�
 
 同一个 dispatcher 可以不注册为模型工具，由宿主设置页、CLI、管理 API 或后台服务直接调用。权限仍由宿主决定；LuaSkills 只负责声明约束、包路由、事务、快照和事件。
 
-## 缺配置时的技能帮助
+## 缺配置时的指南与提示
 
 技能发现配置不完整时，应先返回可执行的英文提示，避免猜测参数或要求用户编辑内部文件：
 
@@ -219,7 +219,7 @@ After host or user authorization, set the missing declared keys.
 If mutation is unavailable, ask the user to provide the listed parameters.
 ```
 
-技能可以通过 `vulcan.config.status()` 获得缺失项和问题，通过 `vulcan.config.describe()` 获得声明结构。不得把敏感当前值拼进帮助文本。
+技能可以通过 `vulcan.config.status()` 获得缺失项和问题，通过 `vulcan.config.describe()` 获得声明结构。不得把敏感当前值拼进指南或错误提示。
 
 ## 事件
 

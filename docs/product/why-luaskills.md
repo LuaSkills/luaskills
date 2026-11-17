@@ -39,7 +39,7 @@ It standardizes:
 
 - Skill package loading.
 - Entry discovery and invocation.
-- Strict help trees.
+- Localized prompt skills and explicit or implicit tool registration.
 - Runtime context injection.
 - Skill dependency path injection.
 - SQLite provider routing.
@@ -53,7 +53,7 @@ The result is a runtime that can power command palettes, MCP tools, desktop apps
 | Category | What It Enables |
 | --- | --- |
 | Runtime core | Load skills, reload roots, list entries, and call skill functions. |
-| Skill authoring | Write Lua entries with stable `vulcan.*` APIs and structured help. |
+| Skill authoring | Write Lua entries with stable `vulcan.*` APIs and bundled `SKILL.md` guides. |
 | Product control | Keep policy, permissions, budgets, UI, and authority in the host. |
 | Data-aware skills | Route SQLite through host-owned callbacks. |
 | Multi-language hosts | Integrate from Rust, C ABI, TypeScript, Python, Go, or mixed systems. |
@@ -102,7 +102,7 @@ It keeps LuaSkills focused on runtime correctness while leaving security policy 
 LuaSkills is a good fit when you need:
 
 - Repeatable skill packaging.
-- Runtime-managed help and entry metadata.
+- Runtime-managed registration and entry metadata.
 - A host-controlled permission and presentation layer.
 - Local or embedded tool execution.
 - Database-aware skills.

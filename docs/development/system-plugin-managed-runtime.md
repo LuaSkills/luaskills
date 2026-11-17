@@ -106,9 +106,9 @@ The host fixes the following policy in `LuaRuntimeHostOptions.managed_runtime_co
 | Worker idle retirement | `60` seconds |
 | Persistent sessions per engine | `256` |
 | Retained session output per stdout/stderr stream | `1 MiB` |
-| `python.invoke` / `node.invoke` timeout | Unlimited |
+| `python.invoke` / `node.invoke` timeout | No engine default; the enclosing evaluation deadline still applies |
 
-All configured numeric values must be positive. A per-call positive `invoke.timeout_ms` overrides the engine invoke default, and a per-session positive `session.open.buffer_limit_bytes` overrides the engine output-buffer default. See [Host-selected managed runtime roots](../integration/managed-runtime-host-roots.md#engine-wide-resource-policy) for Rust, JSON FFI, standard C ABI V3, and SDK examples.
+The evaluation deadline caps live process reads, Python/Node invocation and environment setup. See [System lease execution](../../contracts/system-lease-execution.md). All configured numeric values must be positive. A per-call positive `invoke.timeout_ms` overrides the engine invoke default, and a per-session positive `session.open.buffer_limit_bytes` overrides the engine output-buffer default. See [Host-selected managed runtime roots](../integration/managed-runtime-host-roots.md#engine-wide-resource-policy) for Rust, JSON FFI, standard C ABI V3, and SDK examples.
 
 ## 3. Create A Strict System Lease
 

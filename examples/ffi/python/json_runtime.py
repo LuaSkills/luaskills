@@ -894,8 +894,8 @@ class SystemEngineJsonClient:
 
     def list_skill_help(self) -> list[JsonMap]:
         """
-        List skill help trees visible to the bound authority.
-        列出当前绑定 authority 可见的技能帮助树。
+        Call the legacy skill-help listing symbol. v0.9.1 returns a retirement error.
+        调用旧技能帮助列表符号。v0.9.1 返回停用错误。
         """
 
         result = self.call_value("luaskills_ffi_list_skill_help_json")
@@ -910,8 +910,8 @@ class SystemEngineJsonClient:
         request_context: JsonMap | None = None,
     ) -> JsonMap | None:
         """
-        Render one help-detail payload visible to the bound authority.
-        渲染当前绑定 authority 可见的一份帮助详情载荷。
+        Call the legacy skill-help rendering symbol. v0.9.1 returns a retirement error.
+        调用旧技能帮助渲染符号。v0.9.1 返回停用错误。
         """
 
         payload: JsonMap = {

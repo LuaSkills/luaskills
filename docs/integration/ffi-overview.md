@@ -59,7 +59,9 @@ For a new FFI host, stabilize the smallest runtime loop first:
 6. `run_lua`
 7. `engine_free`
 
-After that, add lifecycle operations, query helpers, installation/update flows, provider callbacks, host-tool callbacks,.
+After that, add lifecycle operations, query helpers, installation and update flows, provider callbacks, and host-tool callbacks.
+
+In v0.9.1, the legacy package-help symbols still link but report that package help was removed. Use `list_entries` and `call_skill` for the direct FFI path. Registration discovery and implicit dispatch use the Rust API. See [the v0.9.1 upgrade guide](../releases/v0.9.1.md).
 
 ## System Plugin Managed-Session Quick Path
 
@@ -141,7 +143,7 @@ Host-side setup:
 3. Remove the hidden field from the projected `required` list.
 4. Inject the stable `LUASKILL_SID` value into the entry arguments before `call_skill`.
    - When the host needs skill-side result hiding or managed-mode detection, wrap the injected identity with the reserved host-managed prefix `LUASKILLS-SID-`.
-5. Add managed-mode help text so the model or user does not ask for, print, or save the raw managed identity.
+5. Add managed-mode guide text so the model or user does not ask for, print, or save the raw managed identity.
 6. Redact or rewrite raw managed identities from projected results when needed.
 
 If the host cannot provide a stable identity, leave `LUASKILL_SID` visible and let the caller or the skill's create/start/bootstrap fallback flow provide it.

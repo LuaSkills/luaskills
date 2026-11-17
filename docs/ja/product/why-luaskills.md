@@ -25,7 +25,7 @@ LuaSkills は口頭の約束ではなく runtime contract を提供します。
 
 - skill package loading。
 - entry discovery と invocation。
-- strict help tree。
+- ローカライズされたプロンプトスキルと、明示的・暗黙的なツール登録。
 - runtime context injection。
 - dependency path injection。
 - SQLite provider routing。
@@ -37,7 +37,7 @@ LuaSkills は口頭の約束ではなく runtime contract を提供します。
 | カテゴリ | 可能になること |
 | --- | --- |
 | Runtime Core | skill の読み込み、root reload、entry list、skill call。 |
-| Skill Authoring | `vulcan.*` API と構造化 help による skill 作成。 |
+| Skill Authoring | `vulcan.*` API と同梱の `SKILL.md` ガイドによる skill 作成。 |
 | Product Control | 権限、budget、UI、authority をホスト側で制御。 |
 | Data-aware Skills | SQLite を runtime、host provider、space controller 経由で扱う。 |
 | Multi-language Hosts | Rust、C ABI、TypeScript、Python、Go から同じ skill model に接続。 |

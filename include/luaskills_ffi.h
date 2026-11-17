@@ -815,8 +815,8 @@ int32_t luaskills_ffi_list_entries(
 );
 
 /*
-List runtime help trees visible to one host-injected authority through the standard C ABI surface.
-通过标准 C ABI 接口列出单个宿主注入权限可见的运行时帮助树。
+Legacy C ABI help listing symbol. Valid requests return an error in v0.9.1.
+v0.9.1 保留旧 C ABI 帮助列表符号，合法请求返回错误。
 */
 int32_t luaskills_ffi_list_skill_help(
     uint64_t engine_id,
@@ -826,8 +826,8 @@ int32_t luaskills_ffi_list_skill_help(
 );
 
 /*
-Render one help detail visible to one host-injected authority through the standard C ABI surface.
-通过标准 C ABI 接口渲染单个宿主注入权限可见的帮助详情。
+Legacy C ABI help rendering symbol. Valid requests return an error in v0.9.1.
+v0.9.1 保留旧 C ABI 帮助渲染符号，合法请求返回错误。
 */
 int32_t luaskills_ffi_render_skill_help_detail(
     uint64_t engine_id,

@@ -83,7 +83,7 @@ LuaSkills now supports one full AI-facing object input schema per entry.
 
 Recommended rule:
 
-- Keep `skill.yaml` for human-friendly metadata such as `name`, `version`, `lua_entry`, and help links.
+- Keep `skill.yaml` for human-friendly metadata such as `name`, `version`, `lua_entry`, and registration metadata.
 - Put complex tool input schemas in external JSON files under `schemas/`.
 - Use `input_schema_file` when the schema contains nested objects, arrays with `items`, `oneOf` / `anyOf`, or strict `additionalProperties` rules.
 - Keep legacy `parameters` only for backward compatibility or simple flat entries.
@@ -143,7 +143,7 @@ Skill author rules:
 
 - New skills that need a stable session, task, or context identity should use the entry argument name `LUASKILL_SID`.
 - The field is only an identity handle for state continuity. Do not use it as an auth token, secret, database credential, or permission boundary.
-- Skills must not assume every host can provide a managed identity. Help text should describe both managed and non-managed behavior.
+- Skills must not assume every host can provide a managed identity. The bundled guide should describe both managed and non-managed behavior.
 - A stateful skill should provide a create, start, open, or bootstrap style entry when it can establish or resume state.
 - If the caller explicitly passes `LUASKILL_SID`, the skill should reuse it instead of generating a new identity.
 - If `LUASKILL_SID` is omitted and the skill supports non-managed fallback, the create/start/bootstrap entry may generate a new public identity.
@@ -159,7 +159,7 @@ Host and adapter rules:
 - When the host wants skills to detect and hide host-managed identities in tool results, it should inject the value with the reserved prefix `LUASKILLS-SID-`.
 - The injected value must remain stable for the intended host scope and must not be freshly randomized on every call.
 - If the host cannot provide a stable managed identity, it should leave `LUASKILL_SID` visible and let the caller or the skill fallback flow handle it.
-- Managed-mode help should tell the model or user that the identity is injected by the host and should not be requested, printed, or saved.
+- The managed-mode guide should tell the model or user that the identity is injected by the host and should not be requested, printed, or saved.
 - If a tool result includes the injected raw managed identity, the host should redact it or rewrite it into a managed-state note before returning it to the model/user.
 
 These rules apply to every projection layer, including MCP, gRPC, FFI/SDK hosts, IDE integrations, and embedded product hosts.
@@ -175,9 +175,9 @@ Skill author rules:
 - New skills that need one host- or caller-provided project/workspace root should use the entry argument name `PWD`.
 - Treat `PWD` as one portability-oriented project/workspace path contract, not as proof of authority, one sandbox boundary, or a guarantee that the runtime process itself is currently inside that directory.
 - Skills should prefer explicit `PWD` over `vulcan.runtime.cwd()` when behavior must follow the host's active project/workspace scope rather than the runtime process directory.
-- Skills must not assume every host can inject `PWD`; help text should describe both managed and non-managed behavior.
+- Skills must not assume every host can inject `PWD`; the guide should describe both managed and non-managed behavior.
 - If the caller explicitly passes `PWD`, the skill should reuse it rather than overwrite it with one guessed path.
-- If `PWD` is omitted and the skill has a safe fallback, the skill may fall back to `vulcan.runtime.cwd()` or another documented project-resolution path, but that fallback should be explicit in help and behavior.
+- If `PWD` is omitted and the skill has a safe fallback, the skill may fall back to `vulcan.runtime.cwd()` or another documented project-resolution path, but that fallback should be explicit in the guide and in runtime behavior.
 
 Host and adapter rules:
 
@@ -191,6 +191,35 @@ Host and adapter rules:
 These rules apply to every projection layer, including MCP, gRPC, FFI/SDK hosts, IDE integrations, and embedded product hosts.
 
 On Windows, a host may obtain a canonical path in `\\?\C:\...` or `\\?\UNC\server\share\...` form. LuaSkills removes that verbatim prefix from the reserved top-level `PWD` argument before it enters Lua. The same boundary rule applies to declared runtime path fields; arbitrary JSON strings are not rewritten merely because they resemble paths. Only absolute drive and UNC verbatim forms have proven ordinary equivalents. Volume GUID, device, pipe, mixed-separator, and other verbatim namespaces are rejected explicitly instead of being reinterpreted as relative paths. Prefix cleanup is a compatibility transformation, not authorization or canonicalization.
+
+## 2.5 Package registration and prompt skills
+
+Declare the default registration mode in `skill.yaml` as `explicit` or `implicit`.
+A bundled prompt skill enables implicit calls in either mode. An implicit default requires
+at least one guide. Set `default_locale` and supply
+its `title` and `description` in the package `locales` and each guide's own `locales`.
+
+Register each guide under `prompt_skills` with its `name` and `file`, such as
+`skills/office-workflow/SKILL.md`. The declared name, file's parent directory and
+standard frontmatter name must match. Document calls with short prose and examples.
+The entry input schema supplies runtime argument validation. Include `skills/` in the archive (for example, `luaskills-debug package --skill-path my-skill --include skills --out-dir dist`).
+
+```yaml
+registration:
+  mode: implicit
+  default_locale: en-US
+  locales:
+    en-US: {title: Office commands, description: Inspect local office documents.}
+  prompt_skills:
+    - name: office-workflow
+      file: skills/office-workflow/SKILL.md
+      locales:
+        en-US: {title: Office workflow, description: Read this guide for office document tasks.}
+```
+
+Package-local identifiers use hyphens and runtime-generated public tool names use
+underscores. Packages without a registration declaration remain direct tools.
+Legacy package and entry `help` fields are accepted and ignored. Migrate their instructions to a registered guide. The old help APIs return an error. See the [v0.9.1 upgrade guide](../releases/v0.9.1.md).
 
 ## 3. Top-Level Capability Overview
 
@@ -840,7 +869,7 @@ ROOT -> PROJECT -> USER
 
 `ROOT` is system-controlled, and a runtime must receive a `ROOT` layer when it starts or loads. Normal skills cannot use `vulcan.runtime.skills.*` to install, update, uninstall, enable, or disable `ROOT` skills. The normal bridge only targets currently existing `PROJECT` and `USER` layers exposed by the host.
 
-`vulcan.runtime.skills.*` is always equivalent to `DelegatedTool` authority: it cannot see `ROOT` skills and cannot write `ROOT`. FFI query and prompt-completion entry points under `DelegatedTool` also do not return `ROOT` entries, help, or ROOT tool ownership. `call_skill` and `run_lua` are runtime execution surfaces: they can call currently active skills, but they are not skill-management authorization boundaries. If `ROOT` already contains the same `skill_id`, normal-layer install and update are rejected; normal-layer uninstall can still clean stale same-name entries from `PROJECT` or `USER`.
+`vulcan.runtime.skills.*` is always equivalent to `DelegatedTool` authority: it cannot see `ROOT` skills and cannot write `ROOT`. FFI query and prompt-completion entry points under `DelegatedTool` also do not return `ROOT` entries or ROOT tool ownership. `call_skill` and `run_lua` are runtime execution surfaces: they can call currently active skills, but they are not skill-management authorization boundaries. If `ROOT` already contains the same `skill_id`, normal-layer install and update are rejected; normal-layer uninstall can still clean stale same-name entries from `PROJECT` or `USER`.
 
 The formal bridge should include:
 
@@ -1687,7 +1716,7 @@ File context for the currently executing skill:
 Notes:
 
 - In normal skill calls, all three are usually available.
-- In some runlua, help, or non-skill-file scenarios, they may be `nil`.
+- In some runLua or non-skill-file scenarios, they may be `nil`.
 - In a System Plugin lease eval, these three **entry-specific** fields remain `nil` because the eval is not a Skill entry call. This does not mean the package context is absent: use the recursively read-only `vulcan.runtime.system_plugin` view for package identity and `vulcan.runtime.workspace_root / mounts` for host-authorized context.
 - The current implementation converts Windows verbatim drive/UNC paths to their ordinary equivalents so Lua receives normal system paths; unsupported verbatim namespaces are rejected.
 
@@ -2016,7 +2045,7 @@ luaskills-debug call --runtime-root D:/runtime --skill-path my-skill --tool hell
 luaskills-debug package --skill-path my-skill --out-dir dist
 ```
 
-A package ships `skill.yaml`, `dependencies.yaml`, the README and license files, and the `runtime`, `node`, `python`, `native`, `help`, `overflow_templates`, `resources`, `licenses` and `schemas` directories. Pass `--include <name>` for any other top-level entry the skill needs. `node_modules`, `.pnpm-store`, `__pycache__`, `.DS_Store` and `*.pyc` are never packaged, and symbolic links are rejected.
+A package ships `skill.yaml`, `dependencies.yaml`, the README and license files, and the `runtime`, `node`, `python`, `native`, `overflow_templates`, `resources`, `licenses` and `schemas` directories. The packer also includes the legacy `help/` directory when present. Pass `--include skills` to include registered guides and `--include <name>` for other top-level entries the skill needs. `node_modules`, `.pnpm-store`, `__pycache__`, `.DS_Store` and `*.pyc` are never packaged, and symbolic links are rejected.
 
 In GitHub Actions, the `LuaSkills/luaskills-debug` action runs `validate` and `package`; the workflow that `new` writes uses it. Set the repository variable `LUASKILLS_PACKAGE_LAYOUT` to `platform` to switch layouts.
 

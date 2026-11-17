@@ -3,16 +3,21 @@ version: 0.1.0
 enable: true
 sqlite:
   enable: true
-help:
-  main:
-    description: Host-provider SQLite demo help entry.
-    file: help/help.md
+registration:
+  mode: explicit
+  default_locale: en-US
+  locales:
+    en-US: {title: Host Provider SQLite Demo, description: Runs a host-managed SQLite smoke test.}
+  prompt_skills:
+    - name: sqlite-workflow
+      file: skills/sqlite-workflow/SKILL.md
+      locales:
+        en-US: {title: Host SQLite workflow, description: Learn how to run the SQLite smoke test.}
 entries:
   - name: sqlite-smoke
     description: "Run one host-managed SQLite smoke test and return a success payload."
     lua_entry: runtime/sqlite_smoke.lua
     lua_module: host_provider_sqlite_demo_smoke
-    help: main
     parameters:
       - name: note
         type: string

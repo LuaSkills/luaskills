@@ -1,5 +1,7 @@
 # LuaSkills 문서
 
+개발 대상 버전은 v0.9.1입니다. [v0.9.1 업그레이드 가이드](../releases/v0.9.1.md)
+
 [English](../index.md) | [简体中文](../zh-CN/index.md) | [日本語](../ja/index.md) | [한국어](index.md) | [Español](../es/index.md) | [Français](../fr/index.md) | [Deutsch](../de/index.md) | [Português (BR)](../pt-BR/index.md)
 
 [한국어 README](../../README.ko.md) | [왜 LuaSkills인가](product/why-luaskills.md)

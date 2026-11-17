@@ -14,4 +14,4 @@ python examples/ffi/host_provider_demo/run_python_host_provider_demo.py
 
 示例仅实现 `execute_script` 与 `query_json`，后者返回 `{ "rows": [...] }`；其他动作明确失败。正式宿主应按自己的数据库协议实现所需动作、事务与容量限制。回调返回缓冲由 LuaSkills 分配器创建，并由对应释放接口回收。
 
-0.7.3 删除了退役数据库字段与导出符号。示例结构声明必须与同版本头文件配套，不能混用旧动态库。
+从 0.7.3 起，退役数据库字段与导出符号已移除。该示例的 `skill.yaml` 声明显式注册，FFI 宿主仍通过 `list_entries` 与 `call_skill` 执行 `sqlite-smoke`。随包 [SKILL.md](runtime_root/skills/host-provider-sqlite-demo/skills/sqlite-workflow/SKILL.md) 演示如何替换旧帮助字段。示例结构声明必须与同版本头文件配套，不能混用旧动态库。

@@ -21,7 +21,7 @@ Rust core · LuaJIT skills · Rust API, C ABI, JSON FFI, and TypeScript / Python
 
 ## About
 
-LuaSkills loads, runs, and manages Lua skill packages inside a host application. A host gets scriptable tools, structured help, managed Python and Node.js runtimes, dependency management, and database-aware execution without building its own plugin runtime.
+LuaSkills loads, runs, and manages Lua skill packages inside a host application. A host gets scriptable tools, bundled prompt skills, managed Python and Node.js runtimes, dependency management, and database-aware execution without building its own plugin runtime.
 
 **LuaSkills runs skills; the host decides how they become product features.** Policy, authentication, permission prompts, budgets, storage placement, and user experience stay with the host.
 
@@ -32,7 +32,7 @@ LuaSkills powers the skill system of [Vulcan Code](https://github.com/OpenVulcan
 ### 🧩 Skill runtime
 
 - Discover, load, list, call, and reload skills across layered `ROOT`, `PROJECT`, and `USER` roots
-- Strict help trees that hosts render as docs, tool descriptions, command palettes, or UI panels
+- Explicit and implicit tool registration with localized `SKILL.md` guides
 - A full object input schema per entry, with canonical `{skill_id}-{entry_name}` naming
 - Install, update, and uninstall from GitHub releases or URLs, with checksum-verified dependencies
 
@@ -74,7 +74,7 @@ LuaSkills powers the skill system of [Vulcan Code](https://github.com/OpenVulcan
 ```
 ┌──────────────────────────────┐         ┌──────────────────────────────────────┐
 │  Host application            │  Rust   │  LuaSkills runtime                   │
-│  policy · UI · permissions   │  C ABI  │  skill loader · help · lifecycle     │
+│  policy · UI · permissions   │  C ABI  │  skill loader · guides · lifecycle   │
 │  budgets · model providers   │◀───────▶│  LuaJIT VMs · leases · vulcan.* APIs │
 │  host tools · storage        │  JSON   │  managed Python / Node · deps        │
 │                              │  FFI    │  config stores · SQLite    │
@@ -85,7 +85,7 @@ LuaSkills powers the skill system of [Vulcan Code](https://github.com/OpenVulcan
 
 | Directory | Description |
 | --- | --- |
-| `src/runtime` | Engine, Lua VMs, leases, context, help, results, managed runtimes |
+| `src/runtime` | Engine, Lua VMs, leases, context, registration, results, managed runtimes |
 | `src/skill` | Manifests, roots, configuration, and lifecycle management |
 | `src/dependency`, `src/download` | Dependency resolution, downloads, and archive extraction |
 | `src/providers` | SQLite bindings |
@@ -98,9 +98,11 @@ LuaSkills powers the skill system of [Vulcan Code](https://github.com/OpenVulcan
 
 ### Rust hosts
 
+Rust 1.99.1 is required for v0.9.1. The dependency example below applies once v0.9.1 is published.
+
 ```toml
 [dependencies]
-luaskills = "0.9.0"
+luaskills = "0.9.1"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md) shows `call_skill` and the `vulcan.host.*` tool bridge.
@@ -157,8 +159,8 @@ luaskills-debug package --skill-path my-skill --out-dir dist
 
 | Component | Version |
 | --- | --- |
-| LuaSkills core and FFI SDK | `0.9.0` |
-| TypeScript, Python, and Go SDKs | `0.9.0`, released after the core; see the [SDK overview](docs/sdk/index.md#versions) |
+| Core and FFI SDK target | `0.9.1` · [v0.9.1 upgrade guide](docs/releases/v0.9.1.md) |
+| TypeScript, Python, and Go SDKs | `0.9.x` · [SDK overview](docs/sdk/index.md#versions) |
 | Lua runtime packages | compatible `0.1` series |
 | Managed Python / uv | `3.14.6` / `0.11.28` |
 | Managed Node.js / pnpm | `24.18.0` / `11.11.0` |

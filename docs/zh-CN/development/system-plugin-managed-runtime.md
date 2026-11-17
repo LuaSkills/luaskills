@@ -106,9 +106,9 @@ LuaSkills 不会回退使用系统 Python、系统 Node.js、外部 `node_module
 | Worker 空闲回收 | `60` 秒 |
 | 单引擎持久会话数量 | `256` |
 | 每个 Session stdout/stderr 流保留输出 | `1 MiB` |
-| `python.invoke` / `node.invoke` 超时 | 无限制 |
+| `python.invoke` / `node.invoke` 超时 | 无引擎默认值，仍受当前执行截止时间限制 |
 
-所有已配置数值都必须为正数。单次正数 `invoke.timeout_ms` 优先于引擎 invoke 默认值；单个 Session 的正数 `session.open.buffer_limit_bytes` 优先于引擎输出缓冲默认值。Rust、JSON FFI、标准 C ABI V3 与 SDK 示例见[宿主指定受管运行时根目录](../integration/managed-runtime-host-roots.md#引擎级资源策略)。
+执行截止时间同样约束进程读取、Python/Node 调用以及环境准备。见 [System 租约执行契约](../../../contracts/system-lease-execution.md)。所有已配置数值都必须为正数。单次正数 `invoke.timeout_ms` 优先于引擎 invoke 默认值；单个 Session 的正数 `session.open.buffer_limit_bytes` 优先于引擎输出缓冲默认值。Rust、JSON FFI、标准 C ABI V3 与 SDK 示例见[宿主指定受管运行时根目录](../integration/managed-runtime-host-roots.md#引擎级资源策略)。
 
 ## 3. 创建严格 System 租约
 

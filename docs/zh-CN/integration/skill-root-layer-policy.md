@@ -114,7 +114,7 @@ System = 可以写 ROOT
 DelegatedTool = 普通 tools 委托权限，不能写 ROOT，也看不到 ROOT skills
 ```
 
-可见性查询与 prompt completion 属于 authority 边界：`list_entries`、`list_skill_help`、`render_skill_help_detail`、`prompt_argument_completions`、`is_skill`、`skill_name_for_tool` 等入口在 `DelegatedTool` 下不得返回 `ROOT` skill 信息。`call_skill` 与 `run_lua` 是运行时执行面，面向当前已激活的 skill，不作为 `ROOT` 可见性或技能管理权限边界；如果宿主不希望普通用户执行任意 Lua，应在暴露 `run_lua` 前自行封装权限。
+可见性查询与 prompt completion 属于 authority 边界：`list_entries`、Rust `list_skill_registrations`、`prompt_argument_completions`、`is_skill`、`skill_name_for_tool` 等入口在 `DelegatedTool` 下不得返回 `ROOT` skill 信息。`call_skill` 与 `run_lua` 是运行时执行面，面向当前已激活的 skill，不作为 `ROOT` 可见性或技能管理权限边界；如果宿主不希望普通用户执行任意 Lua，应在暴露 `run_lua` 前自行封装权限。
 
 `System` 不是“跳过规则”。它与 `DelegatedTool` 的唯一区别是是否允许管理 `ROOT` 层 skill；ROOT 同名占用、普通层 install/update 冲突、普通层残留清理等规则完全一致。
 

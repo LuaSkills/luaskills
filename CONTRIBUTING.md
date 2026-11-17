@@ -69,7 +69,7 @@ The acceptance suite runs on slow shared runners, serially in one process, so te
   Finalizers that `lua_close` runs then get a Lua error from host functions instead of a destroyed-instance panic.
 - A budget that must not expire covers its slowest legitimate case with a wide margin: at least one second
   when it includes creating a VM, and an upper bound on elapsed time well above the operation's own timeout.
-- `rust-toolchain.toml` pins the toolchain the workflows use, so local clippy and rustfmt match CI.
+- `rust-toolchain.toml` selects Rust 1.99.1 for the v0.9.1 source. Workflows install the toolchain selected by the checked-out source, so Clippy and rustfmt use the same version locally and in CI.
 
 ## Reference
 
@@ -143,7 +143,7 @@ git push --force-with-lease
   （`src/runtime/engine/vm_closing.rs`；`clippy.toml` 拒绝直接使用 mlua 构造器）。这样 `lua_close`
   运行的终结器调用宿主函数时得到 Lua 错误，而不是实例已销毁的 panic。
 - 不应到期的预算要以充足余量覆盖最慢的合理情况：包含创建 VM 时至少一秒；对耗时的上限断言要远高于操作自身的超时。
-- `rust-toolchain.toml` 固定工作流使用的工具链，使本地 clippy 与 rustfmt 结果与 CI 一致。
+- v0.9.1 源码通过 `rust-toolchain.toml` 选用 Rust 1.99.1。工作流使用检出源码声明的工具链，使本地与 CI 的 Clippy 和 rustfmt 保持一致。
 
 ## 参考
 

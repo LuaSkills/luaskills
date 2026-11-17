@@ -4,6 +4,8 @@
 
 [Repository README](../README.md) | [Why LuaSkills](product/why-luaskills.md)
 
+The documentation targets v0.9.1. See the [upgrade guide](releases/v0.9.1.md) for package registration, Rust 1.99.1, and host migration.
+
 Documentation is grouped by what you are building. Deep host and FFI references are maintained in Chinese and linked where no English edition exists yet.
 
 ## Choose your path
@@ -38,7 +40,7 @@ Use `{skill_id}-v{version}-skill.zip`, `{skill_id}-v{version}-checksums.txt`, an
 
 For products that embed the runtime.
 
-- [Runtime architecture](integration/runtime-model.md): host and runtime responsibilities, managed identity and project-path fields, model callbacks, skill root layers, and help.
+- [Runtime architecture](integration/runtime-model.md): host and runtime responsibilities, managed identity and project-path fields, model callbacks, skill root layers, and tool registration.
 - [FFI and integration overview](integration/ffi-overview.md): integration layers, the first integration sequence, and key FFI rules.
 - [Host-selected managed runtime roots](integration/managed-runtime-host-roots.md): independent data, distribution, and environment roots, resource policy, and resolvers. [中文](zh-CN/integration/managed-runtime-host-roots.md)
 - [Package configuration host contract](integration/package-configuration.md): declarations, stores, revisions, disclosure, and events.

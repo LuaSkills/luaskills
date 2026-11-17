@@ -177,14 +177,14 @@ List runtime entry descriptors as JSON with host-injected query authority.
 FfiOwnedBuffer luaskills_ffi_list_entries_json(FfiBorrowedBuffer input_json);
 
 /*
-List runtime help descriptors as JSON with host-injected query authority.
-通过宿主注入查询权限以 JSON 形式列出运行时帮助描述。
+Legacy JSON help listing symbol. Valid requests return an error in v0.9.1.
+v0.9.1 保留旧 JSON 帮助列表符号，合法请求返回错误。
 */
 FfiOwnedBuffer luaskills_ffi_list_skill_help_json(FfiBorrowedBuffer input_json);
 
 /*
-Render one runtime help detail payload as JSON with host-injected query authority.
-通过宿主注入查询权限以 JSON 形式渲染单个运行时帮助详情。
+Legacy JSON help rendering symbol. Valid requests return an error in v0.9.1.
+v0.9.1 保留旧 JSON 帮助渲染符号，合法请求返回错误。
 */
 FfiOwnedBuffer luaskills_ffi_render_skill_help_detail_json(FfiBorrowedBuffer input_json);
 

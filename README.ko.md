@@ -23,7 +23,7 @@ Rust 코어 · LuaJIT 스킬 · Rust API, C ABI, JSON FFI, TypeScript / Python /
 
 ## 소개
 
-LuaSkills는 호스트 애플리케이션 안에서 Lua 스킬 패키지를 로드하고 실행하며 관리합니다. 호스트는 자체 플러그인 런타임을 만들지 않고도 스크립트 가능한 도구, 구조화된 도움말, 관리형 Python 및 Node.js 런타임, 의존성 관리, 데이터베이스를 인식하는 실행을 얻습니다.
+LuaSkills는 호스트 애플리케이션 안에서 Lua 스킬 패키지를 로드하고 실행하며 관리합니다. 호스트는 자체 플러그인 런타임을 만들지 않고도 스크립트 가능한 도구, 번들 프롬프트 스킬, 관리형 Python 및 Node.js 런타임, 의존성 관리, 데이터베이스를 인식하는 실행을 얻습니다.
 
 **LuaSkills는 스킬을 실행하고, 스킬을 어떤 제품 기능으로 만들지는 호스트가 결정합니다.** 정책, 인증, 권한 확인, 예산, 저장 위치, 사용자 경험은 호스트에 남습니다.
 
@@ -34,7 +34,7 @@ LuaSkills는 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code)의 스킬 
 ### 🧩 스킬 런타임
 
 - `ROOT`, `PROJECT`, `USER` 계층 루트에서 스킬 검색, 로드, 목록, 호출, 다시 로드
-- 문서, 도구 설명, 명령 팔레트, UI 패널로 렌더링할 수 있는 엄격한 도움말 트리
+- 현지화된 설명과 `SKILL.md` 가이드를 통한 명시적·암시적 도구 등록
 - 엔트리마다 완전한 객체 입력 스키마와 정규 이름 `{skill_id}-{entry_name}`
 - GitHub 릴리스나 URL에서 설치·업데이트·제거, 체크섬으로 검증된 의존성
 
@@ -76,7 +76,7 @@ LuaSkills는 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code)의 스킬 
 ```
 ┌──────────────────────────────┐         ┌──────────────────────────────────────┐
 │  Host application            │  Rust   │  LuaSkills runtime                   │
-│  policy · UI · permissions   │  C ABI  │  skill loader · help · lifecycle     │
+│  policy · UI · permissions   │  C ABI  │  skill loader · guides · lifecycle   │
 │  budgets · model providers   │◀───────▶│  LuaJIT VMs · leases · vulcan.* APIs │
 │  host tools · storage        │  JSON   │  managed Python / Node · deps        │
 │                              │  FFI    │  config stores · SQLite    │
@@ -87,7 +87,7 @@ LuaSkills는 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code)의 스킬 
 
 | 디렉터리 | 설명 |
 | --- | --- |
-| `src/runtime` | 엔진, Lua VM, 리스, 컨텍스트, 도움말, 결과, 관리형 런타임 |
+| `src/runtime` | 엔진, Lua VM, 리스, 컨텍스트, 등록 정보, 결과, 관리형 런타임 |
 | `src/skill` | 매니페스트, 루트, 설정, 수명 주기 관리 |
 | `src/dependency`, `src/download` | 의존성 해석, 다운로드, 아카이브 추출 |
 | `src/providers` | SQLite 바인딩 |
@@ -100,9 +100,11 @@ LuaSkills는 [Vulcan Code](https://github.com/OpenVulcan/vulcan-code)의 스킬 
 
 ### Rust 호스트
 
+v0.9.1에는 Rust 1.99.1이 필요합니다. 버전이 배포된 후 다음 의존성을 사용하세요.
+
 ```toml
 [dependencies]
-luaskills = "0.9.0"
+luaskills = "0.9.1"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md)에서 `call_skill`과 `vulcan.host.*` 도구 브리지를 볼 수 있습니다.
@@ -157,8 +159,8 @@ luaskills-debug package --skill-path my-skill --out-dir dist
 
 | 구성 요소 | 버전 |
 | --- | --- |
-| LuaSkills 코어와 FFI SDK | `0.9.0` |
-| TypeScript, Python, Go SDK | `0.9.0`, 코어 릴리스 이후 배포. [SDK overview](docs/sdk/index.md#versions) 참고 |
+| 코어 및 FFI SDK 대상 버전 | `0.9.1` · [v0.9.1 업그레이드 가이드](docs/releases/v0.9.1.md) |
+| TypeScript, Python, Go SDK | `0.9.x` · [SDK overview](docs/sdk/index.md#versions) |
 | Lua 런타임 패키지 | 호환 `0.1` 시리즈 |
 | 관리형 Python / uv | `3.14.6` / `0.11.28` |
 | 관리형 Node.js / pnpm | `24.18.0` / `11.11.0` |

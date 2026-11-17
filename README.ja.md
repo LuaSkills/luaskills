@@ -23,7 +23,7 @@ Rust コア · LuaJIT スキル · Rust API、C ABI、JSON FFI、TypeScript / Py
 
 ## 概要
 
-LuaSkills はホストアプリケーションの中で Lua スキルパッケージを読み込み、実行し、管理します。ホストは独自のプラグインランタイムを作らなくても、スクリプト化できるツール、構造化ヘルプ、管理された Python と Node.js ランタイム、依存関係管理、データベース対応の実行を利用できます。
+LuaSkills はホストアプリケーションの中で Lua スキルパッケージを読み込み、実行し、管理します。ホストは独自のプラグインランタイムを作らなくても、スクリプト化できるツール、同梱プロンプトスキル、管理された Python と Node.js ランタイム、依存関係管理、データベース対応の実行を利用できます。
 
 **LuaSkills はスキルを実行し、それをどうプロダクト機能にするかはホストが決めます。** ポリシー、認証、権限確認、予算、保存場所、ユーザー体験はホスト側に残ります。
 
@@ -34,7 +34,7 @@ LuaSkills は [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) のスキ
 ### 🧩 スキルランタイム
 
 - `ROOT`・`PROJECT`・`USER` の階層ルートでスキルを検出、読み込み、一覧、呼び出し、再読み込み
-- ドキュメント、ツール説明、コマンドパレット、UI パネルとして描画できる厳格なヘルプツリー
+- ローカライズされた説明と `SKILL.md` ガイドを使った明示的・暗黙的なツール登録
 - エントリごとの完全なオブジェクト入力スキーマと、正規名 `{skill_id}-{entry_name}`
 - GitHub Release や URL からのインストール・更新・アンインストール、チェックサム検証付きの依存関係
 
@@ -76,7 +76,7 @@ LuaSkills は [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) のスキ
 ```
 ┌──────────────────────────────┐         ┌──────────────────────────────────────┐
 │  Host application            │  Rust   │  LuaSkills runtime                   │
-│  policy · UI · permissions   │  C ABI  │  skill loader · help · lifecycle     │
+│  policy · UI · permissions   │  C ABI  │  skill loader · guides · lifecycle   │
 │  budgets · model providers   │◀───────▶│  LuaJIT VMs · leases · vulcan.* APIs │
 │  host tools · storage        │  JSON   │  managed Python / Node · deps        │
 │                              │  FFI    │  config stores · SQLite    │
@@ -87,7 +87,7 @@ LuaSkills は [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) のスキ
 
 | ディレクトリ | 説明 |
 | --- | --- |
-| `src/runtime` | エンジン、Lua VM、リース、コンテキスト、ヘルプ、結果、管理ランタイム |
+| `src/runtime` | エンジン、Lua VM、リース、コンテキスト、登録情報、結果、管理ランタイム |
 | `src/skill` | マニフェスト、ルート、設定、ライフサイクル管理 |
 | `src/dependency`、`src/download` | 依存関係の解決、ダウンロード、アーカイブ展開 |
 | `src/providers` | SQLite のバインディング |
@@ -100,9 +100,11 @@ LuaSkills は [Vulcan Code](https://github.com/OpenVulcan/vulcan-code) のスキ
 
 ### Rust ホスト
 
+v0.9.1 には Rust 1.99.1 が必要です。公開後は次の依存関係を指定してください。
+
 ```toml
 [dependencies]
-luaskills = "0.9.0"
+luaskills = "0.9.1"
 ```
 
 [`examples/demo-rust`](examples/demo-rust/README.md) に `call_skill` と `vulcan.host.*` ツールブリッジの例があります。
@@ -157,8 +159,8 @@ luaskills-debug package --skill-path my-skill --out-dir dist
 
 | コンポーネント | バージョン |
 | --- | --- |
-| LuaSkills コアと FFI SDK | `0.9.0` |
-| TypeScript・Python・Go SDK | `0.9.0`。コアのリリース後に公開。[SDK overview](docs/sdk/index.md#versions) を参照 |
+| コアと FFI SDK の対象バージョン | `0.9.1` · [v0.9.1 移行ガイド](docs/releases/v0.9.1.md) |
+| TypeScript・Python・Go SDK | `0.9.x` · [SDK overview](docs/sdk/index.md#versions) |
 | Lua ランタイムパッケージ | 互換 `0.1` 系列 |
 | 管理 Python / uv | `3.14.6` / `0.11.28` |
 | 管理 Node.js / pnpm | `24.18.0` / `11.11.0` |

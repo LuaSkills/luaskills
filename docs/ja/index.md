@@ -1,5 +1,7 @@
 # LuaSkills ドキュメント
 
+開発対象は v0.9.1 です。 [v0.9.1 移行ガイド](../releases/v0.9.1.md)
+
 [English](../index.md) | [简体中文](../zh-CN/index.md) | [日本語](index.md) | [한국어](../ko/index.md) | [Español](../es/index.md) | [Français](../fr/index.md) | [Deutsch](../de/index.md) | [Português (BR)](../pt-BR/index.md)
 
 [日本語 README](../../README.ja.md) | [LuaSkills を選ぶ理由](product/why-luaskills.md)

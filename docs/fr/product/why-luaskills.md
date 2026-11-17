@@ -25,7 +25,7 @@ LuaSkills fournit un contrat runtime, pas une simple collection de conventions.
 
 - Chargement de packages skill.
 - Découverte et invocation d'entries.
-- Strict help trees.
+- Skills de prompt localisés et enregistrement explicite ou implicite des outils.
 - Injection de contexte runtime.
 - Injection des chemins de dépendances.
 - Routing des providers SQLite.
@@ -37,7 +37,7 @@ LuaSkills fournit un contrat runtime, pas une simple collection de conventions.
 | Catégorie | Ce que cela permet |
 | --- | --- |
 | Runtime Core | Charger des skills, recharger des roots, lister des entries et appeler des skills. |
-| Skill Authoring | Écrire des skills avec les APIs `vulcan.*` et une aide structurée. |
+| Skill Authoring | Écrire des skills avec les APIs `vulcan.*` et des guides `SKILL.md` inclus. |
 | Product Control | Garder permissions, budget, UI et authority côté hôte. |
 | Data-aware Skills | Connecter SQLite via runtime, host provider ou space controller. |
 | Multi-language Hosts | Utiliser le même modèle depuis Rust, C ABI, TypeScript, Python et Go. |
