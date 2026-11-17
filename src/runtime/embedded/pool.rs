@@ -480,7 +480,7 @@ impl ModulePool {
             // Opaque instance identities never repeat, including abandoned preparations.
             // 不透明实例身份绝不重复，包含已放弃的准备。
             let sequence = NEXT_INSTANCE_ID
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .map_err(|_| {
                     EmbeddedError::new(
                         EmbeddedErrorCode::Internal,

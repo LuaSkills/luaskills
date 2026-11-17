@@ -3038,7 +3038,7 @@ fn reserve_detached_child_reaper_slot() -> Result<DetachedChildReaperPermit, Str
     let reaper = detached_child_reaper()?;
     reaper
         .reserved
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
             (reserved < DETACHED_CHILD_REAPER_CAPACITY).then_some(reserved + 1)
         })
         .map_err(|_| {

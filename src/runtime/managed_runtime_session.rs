@@ -947,7 +947,7 @@ fn reserve_managed_snapshot_cleanup_slot() -> Result<ManagedSnapshotCleanupPermi
     let retry = managed_snapshot_cleanup_retry()?;
     retry
         .reserved
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
             (reserved < MANAGED_SNAPSHOT_CLEANUP_CAPACITY).then_some(reserved + 1)
         })
         .map_err(|_| {
@@ -2540,7 +2540,7 @@ fn prepare_managed_package_snapshot_with_lease(
         // Nonzero snapshot sequence that refuses to wrap.
         // 拒绝回绕的非零快照序号。
         let sequence = NEXT_MANAGED_PACKAGE_SNAPSHOT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .map(|previous| previous + 1)
@@ -2648,7 +2648,7 @@ fn prepare_managed_package_snapshot_with_lease(
 fn allocate_managed_snapshot_quarantine(snapshots_root: &Path) -> Result<PathBuf, String> {
     for _attempt in 0..MAX_MANAGED_PACKAGE_SNAPSHOT_CREATE_ATTEMPTS {
         let sequence = NEXT_MANAGED_PACKAGE_SNAPSHOT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .map(|previous| previous + 1)

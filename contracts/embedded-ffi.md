@@ -178,7 +178,7 @@ SDK 必须同步包内契约后才能消费候选库，不能仅依据包版本�
 
 ## 验证入口
 
-- Rust 定向测试：`rtk proxy cargo +1.94.0 test --locked --lib ffi_embedded -j 4 -- --test-threads=1`。
+- Rust 定向测试：`rtk proxy cargo test --locked --lib ffi_embedded -j 4 -- --test-threads=1`。
 - 实际 Lua 全链路覆盖：`src/runtime/engine/tests/embedded/ffi.rs`，仅通过五个新公开 C 入口驱动插件、池、普通调用、会话和能力事件泵。
 - 真实动态库 C 消费者：`tests/ffi_embedded_transport.c`，显式传入待验收动态库路径。它包含公开头文件，解析实际导出并执行创建、描述、关闭、错误释放与真实释放，最后卸载库。
 - 五平台编译、SDK 和发布产物测试将在对应阶段接入发布门禁；本文件不将本地 Windows 证据扩展为其他平台已通过。

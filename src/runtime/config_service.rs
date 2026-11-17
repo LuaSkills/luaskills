@@ -505,7 +505,7 @@ impl SkillConfigEventQueue {
         // 序号耗尽后停止接收事件，避免回绕并破坏游标顺序。
         let Ok(previous) =
             self.next_sequence
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     current.checked_add(1)
                 })
         else {

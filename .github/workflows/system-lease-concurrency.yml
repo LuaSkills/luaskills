@@ -16,7 +16,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the checked-out Rust toolchain
+        run: rustup toolchain install --profile minimal --no-self-update
       - uses: Swatinem/rust-cache@v2
       - name: System paths and deterministic concurrency
         run: cargo test -j 4 --lib system_runtime_lease -- --test-threads=1

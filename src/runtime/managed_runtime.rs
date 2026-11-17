@@ -775,7 +775,7 @@ fn reserve_managed_runtime_backup_recovery_slot() -> Result<
     let center = managed_runtime_backup_recovery_center()?;
     center
         .reserved
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
             (reserved < MAX_MANAGED_RUNTIME_BACKUP_RECOVERY_RECORDS).then_some(reserved + 1)
         })
         .map_err(|reserved| {
@@ -1457,7 +1457,7 @@ fn unlock_managed_runtime_env_lease_file(_file: &File) -> Result<(), std::io::Er
 /// 分配一个非零构建序号，并在耗尽时拒绝回绕。
 fn allocate_managed_runtime_build_sequence() -> Result<u64, String> {
     NEXT_MANAGED_RUNTIME_BUILD_SEQUENCE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .map(|previous| previous + 1)

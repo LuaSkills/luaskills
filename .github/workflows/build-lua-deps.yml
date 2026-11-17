@@ -186,9 +186,8 @@ jobs:
         with:
           name: frozen-core-source-${{ needs.freeze.outputs.source_sha }}
           path: target/frozen-source
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.0
+      - name: Install the checked-out Rust toolchain
+        run: rustup toolchain install --profile minimal --no-self-update
       - name: Setup MSVC
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1

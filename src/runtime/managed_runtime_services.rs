@@ -754,7 +754,7 @@ impl ManagedRuntimeServices {
     #[cfg(test)]
     fn consume_forced_teardown_failure(&self) -> bool {
         self.forced_teardown_failures
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()

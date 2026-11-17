@@ -77,11 +77,8 @@ jobs:
             throw "Native acceptance checkout differs from the frozen full source SHA"
           }
 
-      - name: Setup Rust 1.94
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.0
-          components: clippy, rustfmt
+      - name: Install the checked-out Rust toolchain
+        run: rustup toolchain install --profile minimal --no-self-update
 
       - name: Fetch exact managed runtimes on Windows
         if: runner.os == 'Windows'
@@ -234,9 +231,8 @@ jobs:
         with:
           ref: ${{ inputs.source_sha || github.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.0
+      - name: Install the checked-out Rust toolchain
+        run: rustup toolchain install --profile minimal --no-self-update
       # Non-PIE hosts combine low main heaps with high worker arenas; PIE tests alone miss GC64 truncation.
       # 非 PIE 宿主混用低地址主堆与高地址线程区域；仅运行 PIE 测试无法覆盖 GC64 截断。
       - name: Verify native allocator under ARM64 non-PIE heap reuse

@@ -73,7 +73,7 @@ fn registry() -> Result<MutexGuard<'static, BTreeMap<u64, Arc<Transport>>>, Embe
 /// 分配绝不复用的身份，或在发布前拒绝身份耗尽。
 pub(super) fn identity() -> Result<u64, EmbeddedFfiStatus> {
     NEXT_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .map_err(|_| EmbeddedFfiStatus::Internal)
 }
 

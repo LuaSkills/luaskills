@@ -2,7 +2,7 @@
 name = "luaskills"
 version = "0.9.1"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.99.1"
 license = "MIT"
 description = "LuaSkills core runtime library for loading, invoking, and managing Lua skill packages."
 repository = "https://github.com/LuaSkills/luaskills"

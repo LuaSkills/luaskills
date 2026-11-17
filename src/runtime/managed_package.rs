@@ -772,7 +772,7 @@ impl ManagedRuntimePackageContext {
 /// 分配一个非零进程内所有者令牌，并在耗尽时拒绝回绕。
 fn allocate_managed_runtime_owner_token() -> Result<u64, String> {
     NEXT_MANAGED_RUNTIME_OWNER_TOKEN
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .map(|previous| previous + 1)

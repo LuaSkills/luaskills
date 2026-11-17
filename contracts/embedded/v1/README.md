@@ -5,8 +5,8 @@
 生成与只读检查：
 
 ```powershell
-rtk proxy cargo +1.94.0 run --locked --features contract-generation --bin generate_embedded_contract -j 4
-rtk proxy cargo +1.94.0 run --locked --features contract-generation --bin generate_embedded_contract -j 4 -- --check
+rtk proxy cargo run --locked --features contract-generation --bin generate_embedded_contract -j 4
+rtk proxy cargo run --locked --features contract-generation --bin generate_embedded_contract -j 4 -- --check
 ```
 
 生成器的 `contract-generation` 功能默认关闭，普通 DLL、静态库及宿主构建不需要加载 Schema 生成器。Schemars 版本由 `Cargo.toml` 精确固定并纳入 `Cargo.lock`；产物保存生成入口源码摘要及发布系列 `core_series`（`major.minor`），不保存精确核心包版本或依赖锁摘要，因此同一系列的补丁版本保持契约字节与摘要不变。补丁版本改变契约时，核心发布工作流中的 `scripts/release/contract_series.py` 拒绝发布；契约变化必须开启新的次版本系列。生成源码摘要归一化 CRLF；产物经 `.gitattributes` 固定 LF，不能按平台重新转换后复用旧摘要。
@@ -33,7 +33,7 @@ SDK 同步时复制完整契约及摘要到自己的发布包，再从这份离�
 
 核心先以有深度限制的 serde_json 访问器检查全部嵌套键，再检查整数词元范围，最后执行原类型化反序列化及语义验证。校验发生在任何命令分发之前，不把已解析映射当成重复字段证据。SDK 解析失败仍须释放实际返回缓冲；宿主完成值编码失败仍由各自回调泵的完成恢复规则处理，不能将编码失败解释成副作用未发生。
 
-执行 `rtk proxy cargo +1.94.0 test --locked --features contract-generation --lib embedded_ -j 4 -- --test-threads=1`，将检查产物字节、摘要、离线引用、命令覆盖、空值和严格字段，并把真实 C 入口和 Lua 执行结果对照对应 Schema 校验。五平台工作流已加入相同检查；本地执行通过不代表远端矩阵已通过。
+执行 `rtk proxy cargo test --locked --features contract-generation --lib embedded_ -j 4 -- --test-threads=1`，将检查产物字节、摘要、离线引用、命令覆盖、空值和严格字段，并把真实 C 入口和 Lua 执行结果对照对应 Schema 校验。五平台工作流已加入相同检查；本地执行通过不代表远端矩阵已通过。
 
 上游依据：[Schemars 的 Serde 属性支持](https://graham.cool/schemars/deriving/attributes/)和[序列化／反序列化生成方向](https://docs.rs/schemars/1.2.2/schemars/generate/struct.SchemaSettings.html)。生成类型、Serde 属性、返回结构、错误枚举、依赖锁或生成逻辑变化时，必须重新生成并校验，再更新各 SDK 副本。
 

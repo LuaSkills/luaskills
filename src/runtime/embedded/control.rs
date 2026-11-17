@@ -80,12 +80,12 @@ impl Drop for HostWaitMeasurement {
         // The integer's representable domain is the sole saturation bound.
         // 整数可表示域是唯一饱和边界。
         let elapsed = self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-        let _ = self.control.diagnostic_host_wait_ns.fetch_update(
+        let _ = self.control.diagnostic_host_wait_ns.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |previous| Some(previous.saturating_add(elapsed)),
         );
-        let _ = self.control.diagnostic_host_wait_calls.fetch_update(
+        let _ = self.control.diagnostic_host_wait_calls.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |previous| Some(previous.saturating_add(1)),
