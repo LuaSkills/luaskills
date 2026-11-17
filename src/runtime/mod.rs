@@ -32,8 +32,9 @@ pub use path::render_host_visible_path;
 pub(crate) mod native_process;
 pub(crate) mod path;
 pub mod process_session;
-/// Shared platform window policy for every runtime-owned child process.
-/// 所有运行库自有子进程共享的平台窗口策略。
+/// Shared Windows visibility policy for runtime-owned child processes.
+/// 运行库自有子进程共享的 Windows 窗口可见性策略。
+#[cfg(windows)]
 pub(crate) mod process_window;
 pub mod result;
 #[cfg(test)]
