@@ -8141,6 +8141,10 @@ const MANAGED_SESSION_NODE_INVOKE_SOURCE: &str = include_str!(concat!(
 /// 仅由预构建集成环境使用的合成包管理器版本。
 const MANAGED_SESSION_TEST_PACKAGE_MANAGER_VERSION: &str = "0.0.0-test";
 
+/// Budget for integration evals that verify installed runtimes and run several real operations in one call.
+/// 集成测试一次执行中会验证运行时安装并运行多个真实操作，此预算仅供该测试使用。
+const MANAGED_SESSION_TEST_EVAL_TIMEOUT_MS: u64 = 240_000;
+
 /// Language runtime exercised by one real managed-session integration fixture.
 /// 单个真实受管会话集成夹具所验证的语言运行时。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9424,6 +9428,7 @@ fn eval_managed_session_test_lease(
         "lease_id": lease.lease_id,
         "generation": lease.generation,
         "code": code,
+        "timeout_ms": MANAGED_SESSION_TEST_EVAL_TIMEOUT_MS,
     });
     serde_json::from_str(
         &engine
