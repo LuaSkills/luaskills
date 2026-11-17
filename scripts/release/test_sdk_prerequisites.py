@@ -155,6 +155,9 @@ class PrerequisiteTests(unittest.TestCase):
         # Keep candidate's native files and Cargo fixtures; add explicitly synthetic compiler verbose evidence.
         # 保留 candidate 原生文件及 Cargo 夹具；增加明确合成的编译器 verbose 证据。
         original_fixture = helper.platform_fixture
+        # Use the frozen source's selected toolchain so its minimum-version gate stays meaningful after upgrades.
+        # 使用冻结源码选定的工具链，确保升级后最低版本门禁仍然有效。
+        self.toolchain = candidate.tomllib.loads(helper.source_files["rust-toolchain.toml"].decode("utf-8"))["toolchain"]["channel"]
 
         def platform_fixture(platform):
             """Extend existing fixture with valid-shaped synthetic compiler proof; return original package shape.
@@ -164,7 +167,7 @@ class PrerequisiteTests(unittest.TestCase):
             # 既有助手保留源码摘要、平台库及实际 Cargo 结构归属。
             files, manifest = original_fixture(platform)
             report = candidate.decode_json(files["embedded-build-inputs.json"])
-            report["fields"]["rustc"] = f"rustc 1.97.1 (explicit offline fixture)\nrelease: 1.97.1\ncommit-hash: {'e'*40}\nhost: {candidate.PLATFORMS[platform][0]}"
+            report["fields"]["rustc"] = f"rustc {self.toolchain} (explicit offline fixture)\nrelease: {self.toolchain}\ncommit-hash: {'e'*40}\nhost: {candidate.PLATFORMS[platform][0]}"
             files["embedded-build-inputs.json"] = candidate.encode(report)
             build = {**report["fields"], "cargo_features":report["cargo_features"], "inputs_sha256":candidate.digest(files["embedded-build-inputs.json"])}
             description = candidate.decode_json(files["embedded-core-description.json"])
@@ -236,7 +239,7 @@ class PrerequisiteTests(unittest.TestCase):
         """
         self.assertEqual(env["CARGO_BUILD_JOBS"], "4")
         self.assertEqual(env["RUST_TEST_THREADS"], "1")
-        self.assertEqual(env["RUSTUP_TOOLCHAIN"], "1.97.1")
+        self.assertEqual(env["RUSTUP_TOOLCHAIN"], self.toolchain)
         self.assertNotIn("GH_TOKEN", env)
         if command == ["rustc", "--version", "--verbose"]:
             return subprocess.CompletedProcess(command, 0, self.toolchain_record["build"]["rustc"].encode(), b"")
@@ -319,7 +322,7 @@ class PrerequisiteTests(unittest.TestCase):
             inputs = gate.toolchain_inputs(self.base / "gate/prerequisites.json", platform, http=self.http)
         self.assertFalse(inputs["complete"])
         self.assertEqual(inputs["phase"], "github-only")
-        self.assertEqual(inputs["toolchain"], "1.97.1")
+        self.assertEqual(inputs["toolchain"], self.toolchain)
         self.assertEqual(inputs["rustc"]["host"], candidate.PLATFORMS[platform][0])
         self.assertEqual(inputs["cargo"], self.toolchain_record["cargo"])
         self.assertEqual(inputs["github"]["commit_source_sha256"], proof["github"]["commit_source_sha256"])
@@ -368,7 +371,9 @@ class PrerequisiteTests(unittest.TestCase):
         manifest = candidate.read_json(self.base / "gate/candidate/candidate-manifest.json")
         records = manifest["platforms"]
         changed = next(record for record in records if record["platform"] == self.toolchain_record["platform"])
-        changed["build"]["rustc"] = changed["build"]["rustc"].replace("1.97.1", "1.97.2")
+        # Change only the compiler revision to simulate drift between otherwise equal platform records.
+        # 只改变编译器提交摘要，模拟其他字段一致时的平台间漂移。
+        changed["build"]["rustc"] = changed["build"]["rustc"].replace("e" * 40, "f" * 40)
         with self.assertRaisesRegex(ValueError, "compiler identities disagree"):
             gate.release_toolchain(records)
 
